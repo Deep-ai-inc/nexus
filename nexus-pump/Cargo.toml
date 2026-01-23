@@ -1,0 +1,11 @@
+[package]
+name = "nexus-pump"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nexus-api = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+memmap2 = { workspace = true }

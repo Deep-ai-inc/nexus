@@ -1,0 +1,24 @@
+[package]
+name = "nexus-ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nexus"
+path = "src/main.rs"
+
+[dependencies]
+nexus-api = { workspace = true }
+nexus-kernel = { workspace = true }
+nexus-pump = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+# UI dependencies - commented until GPUI is set up
+# gpui = { workspace = true }
+# alacritty_terminal = { workspace = true }
