@@ -1,11 +1,9 @@
 [package]
-name = "nexus-pump"
+name = "nexus-term"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-nexus-api = { workspace = true }
+alacritty_terminal = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true }
-memmap2 = { workspace = true }

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::io::Read;
 use std::time::Instant;
 
-use crossbeam_channel::Sender;
+use tokio::sync::broadcast::Sender;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Pid};
 use nexus_api::{BlockId, ShellEvent};

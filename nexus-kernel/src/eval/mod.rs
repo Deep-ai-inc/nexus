@@ -3,7 +3,7 @@
 mod expand;
 mod builtins;
 
-use crossbeam_channel::Sender;
+use tokio::sync::broadcast::Sender;
 use nexus_api::ShellEvent;
 
 use crate::parser::*;

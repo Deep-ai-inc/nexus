@@ -1,4 +1,6 @@
-//! Nexus UI - GPUI frontend for the Nexus shell.
+//! Nexus UI - Iced-based frontend for the Nexus shell.
 
-pub mod view_model;
-pub mod components;
+pub mod app;
+pub mod widgets;
+pub mod theme;
+pub mod pty;

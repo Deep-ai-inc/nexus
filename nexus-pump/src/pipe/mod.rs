@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::Sender;
+use tokio::sync::broadcast::Sender;
 use nexus_api::{BlockId, ShellEvent};
 
 use crate::sniffer;

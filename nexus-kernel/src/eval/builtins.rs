@@ -1,6 +1,6 @@
 //! Built-in shell commands.
 
-use crossbeam_channel::Sender;
+use tokio::sync::broadcast::Sender;
 use nexus_api::ShellEvent;
 use std::path::PathBuf;
 
