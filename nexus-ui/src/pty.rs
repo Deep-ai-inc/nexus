@@ -1,9 +1,10 @@
 //! PTY handling for spawning and communicating with shell processes.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use tokio::sync::mpsc;
 
 use nexus_api::BlockId;
@@ -12,7 +13,11 @@ use crate::app::PtyEvent;
 /// Handle to a running PTY process.
 pub struct PtyHandle {
     pub block_id: BlockId,
-    // The actual PTY is managed by the reader thread
+    /// Writer to send input to the PTY.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Child process for signal handling.
+    #[allow(dead_code)]
+    child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
 }
 
 impl PtyHandle {
@@ -39,13 +44,18 @@ impl PtyHandle {
         cmd.cwd(cwd);
 
         // Spawn the child process
-        let mut child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
+        let child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>> =
+            Arc::new(Mutex::new(Some(child)));
 
-        // Get reader for the master side
+        // Get reader and writer for the master side
         let mut reader = pair.master.try_clone_reader()?;
+        let writer = pair.master.take_writer()?;
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
 
         // Spawn reader thread
         let tx_clone = tx.clone();
+        let child_clone = child.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
@@ -65,18 +75,63 @@ impl PtyHandle {
             }
 
             // Wait for child and send exit status
-            match child.wait() {
-                Ok(status) => {
-                    let code = status.exit_code() as i32;
-                    let _ = tx_clone.send((block_id, PtyEvent::Exited(code)));
-                }
-                Err(e) => {
-                    tracing::error!("Failed to wait for child: {}", e);
-                    let _ = tx_clone.send((block_id, PtyEvent::Exited(1)));
+            if let Some(mut child) = child_clone.lock().unwrap().take() {
+                match child.wait() {
+                    Ok(status) => {
+                        let code = status.exit_code() as i32;
+                        let _ = tx_clone.send((block_id, PtyEvent::Exited(code)));
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to wait for child: {}", e);
+                        let _ = tx_clone.send((block_id, PtyEvent::Exited(1)));
+                    }
                 }
             }
         });
 
-        Ok(Self { block_id })
+        Ok(Self {
+            block_id,
+            writer,
+            child,
+        })
+    }
+
+    /// Write input to the PTY.
+    pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.write_all(data)?;
+        writer.flush()
+    }
+
+    /// Write a string to the PTY.
+    #[allow(dead_code)]
+    pub fn write_str(&self, s: &str) -> std::io::Result<()> {
+        self.write(s.as_bytes())
+    }
+
+    /// Send Ctrl+C (SIGINT) to the process.
+    pub fn send_interrupt(&self) -> std::io::Result<()> {
+        // Send ETX (Ctrl+C) character
+        self.write(&[0x03])
+    }
+
+    /// Send Ctrl+D (EOF) to the process.
+    pub fn send_eof(&self) -> std::io::Result<()> {
+        // Send EOT (Ctrl+D) character
+        self.write(&[0x04])
+    }
+
+    /// Send Ctrl+Z (SIGTSTP) to the process.
+    pub fn send_suspend(&self) -> std::io::Result<()> {
+        // Send SUB (Ctrl+Z) character
+        self.write(&[0x1a])
+    }
+
+    /// Kill the process.
+    #[allow(dead_code)]
+    pub fn kill(&self) {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            let _ = child.kill();
+        }
     }
 }

@@ -2,8 +2,9 @@
 
 use std::time::Instant;
 
+use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{column, container, row, scrollable, text, text_input, Column};
-use iced::{Element, Length, Subscription, Task, Theme};
+use iced::{event, Element, Event, Length, Subscription, Task, Theme};
 use tokio::sync::mpsc;
 
 use nexus_api::{BlockId, BlockState, OutputFormat};
@@ -19,6 +20,7 @@ pub struct Block {
     pub command: String,
     pub parser: TerminalParser,
     pub state: BlockState,
+    #[allow(dead_code)]
     pub format: OutputFormat,
     pub collapsed: bool,
     pub started_at: Instant,
@@ -38,6 +40,10 @@ impl Block {
             duration_ms: None,
         }
     }
+
+    fn is_running(&self) -> bool {
+        matches!(self.state, BlockState::Running)
+    }
 }
 
 /// Messages for the Nexus application.
@@ -54,10 +60,14 @@ pub enum Message {
     PtyExited(BlockId, i32),
     /// Toggle block collapsed state.
     ToggleBlock(BlockId),
-    /// Window resized.
-    WindowResized(u32, u32),
+    /// Focus a specific block for input.
+    FocusBlock(BlockId),
+    /// Keyboard event when a block is focused.
+    KeyPressed(Key, Modifiers),
     /// Tick for animations/updates.
     Tick,
+    /// Generic event (for subscription).
+    Event(Event),
 }
 
 /// The main Nexus application state.
@@ -76,6 +86,10 @@ pub struct Nexus {
     pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
     /// Receiver for PTY events.
     pty_rx: mpsc::UnboundedReceiver<(BlockId, PtyEvent)>,
+    /// Currently focused block (receives keyboard input).
+    focused_block: Option<BlockId>,
+    /// Whether the input field is focused.
+    input_focused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +113,8 @@ impl Default for Nexus {
             pty_handles: Vec::new(),
             pty_tx,
             pty_rx,
+            focused_block: None,
+            input_focused: true,
         }
     }
 }
@@ -117,6 +133,8 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
     match message {
         Message::InputChanged(value) => {
             state.input = value;
+            state.input_focused = true;
+            state.focused_block = None;
         }
         Message::Submit => {
             if !state.input.trim().is_empty() {
@@ -128,11 +146,6 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
         Message::PtyOutput(block_id, data) => {
             if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
                 block.parser.feed(&data);
-                // Detect format from output
-                let grid_text = block.parser.grid().to_string();
-                if block.format == OutputFormat::PlainText && grid_text.trim_start().starts_with('{') {
-                    block.format = OutputFormat::Json;
-                }
             }
         }
         Message::PtyExited(block_id, exit_code) => {
@@ -144,16 +157,69 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 };
                 block.duration_ms = Some(block.started_at.elapsed().as_millis() as u64);
             }
-            // Remove the PTY handle
             state.pty_handles.retain(|h| h.block_id != block_id);
+
+            // If the focused block exited, clear focus
+            if state.focused_block == Some(block_id) {
+                state.focused_block = None;
+                state.input_focused = true;
+            }
         }
         Message::ToggleBlock(block_id) => {
             if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
                 block.collapsed = !block.collapsed;
             }
         }
-        Message::WindowResized(_width, _height) => {
-            // Could resize terminal parsers here
+        Message::FocusBlock(block_id) => {
+            // Only allow focusing running blocks
+            if state.blocks.iter().any(|b| b.id == block_id && b.is_running()) {
+                state.focused_block = Some(block_id);
+                state.input_focused = false;
+            }
+        }
+        Message::KeyPressed(key, modifiers) => {
+            // Handle keyboard input for focused block
+            if let Some(block_id) = state.focused_block {
+                if let Some(handle) = state.pty_handles.iter().find(|h| h.block_id == block_id) {
+                    // Handle Ctrl+C
+                    if modifiers.control() {
+                        match &key {
+                            Key::Character(c) if c.as_str() == "c" => {
+                                let _ = handle.send_interrupt();
+                                return Task::none();
+                            }
+                            Key::Character(c) if c.as_str() == "d" => {
+                                let _ = handle.send_eof();
+                                return Task::none();
+                            }
+                            Key::Character(c) if c.as_str() == "z" => {
+                                let _ = handle.send_suspend();
+                                return Task::none();
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Convert key to bytes and send to PTY
+                    if let Some(bytes) = key_to_bytes(&key, &modifiers) {
+                        let _ = handle.write(&bytes);
+                    }
+                }
+            } else if !state.input_focused {
+                // Escape returns focus to input
+                if matches!(key, Key::Named(keyboard::key::Named::Escape)) {
+                    state.input_focused = true;
+                }
+            }
+        }
+        Message::Event(event) => {
+            // Handle keyboard events
+            if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
+                // Only process if we have a focused block or need to handle escape
+                if state.focused_block.is_some() || !state.input_focused {
+                    return update(state, Message::KeyPressed(key, modifiers));
+                }
+            }
         }
         Message::Tick => {
             // Drain all pending PTY events from the channel
@@ -162,11 +228,6 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                     PtyEvent::Output(data) => {
                         if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
                             block.parser.feed(&data);
-                            // Detect format from output
-                            let grid_text = block.parser.grid().to_string();
-                            if block.format == OutputFormat::PlainText && grid_text.trim_start().starts_with('{') {
-                                block.format = OutputFormat::Json;
-                            }
                         }
                     }
                     PtyEvent::Exited(exit_code) => {
@@ -178,14 +239,59 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                             };
                             block.duration_ms = Some(block.started_at.elapsed().as_millis() as u64);
                         }
-                        // Remove the PTY handle
                         state.pty_handles.retain(|h| h.block_id != block_id);
+
+                        if state.focused_block == Some(block_id) {
+                            state.focused_block = None;
+                            state.input_focused = true;
+                        }
                     }
                 }
             }
         }
     }
     Task::none()
+}
+
+/// Convert a keyboard key to bytes to send to the PTY.
+fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Option<Vec<u8>> {
+    match key {
+        Key::Character(c) => {
+            let s = c.as_str();
+            if modifiers.control() && s.len() == 1 {
+                // Ctrl+letter = ASCII 1-26
+                let ch = s.chars().next()?;
+                if ch.is_ascii_alphabetic() {
+                    let ctrl_code = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
+                    return Some(vec![ctrl_code]);
+                }
+            }
+            Some(s.as_bytes().to_vec())
+        }
+        Key::Named(named) => {
+            use keyboard::key::Named;
+            match named {
+                Named::Enter => Some(vec![b'\r']),
+                Named::Backspace => Some(vec![0x7f]),
+                Named::Tab => Some(vec![b'\t']),
+                Named::Escape => Some(vec![0x1b]),
+                Named::Space => Some(vec![b' ']),
+                // Arrow keys (ANSI escape sequences)
+                Named::ArrowUp => Some(vec![0x1b, b'[', b'A']),
+                Named::ArrowDown => Some(vec![0x1b, b'[', b'B']),
+                Named::ArrowRight => Some(vec![0x1b, b'[', b'C']),
+                Named::ArrowLeft => Some(vec![0x1b, b'[', b'D']),
+                Named::Home => Some(vec![0x1b, b'[', b'H']),
+                Named::End => Some(vec![0x1b, b'[', b'F']),
+                Named::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
+                Named::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
+                Named::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
+                Named::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn view(state: &Nexus) -> Element<'_, Message> {
@@ -227,10 +333,19 @@ fn view(state: &Nexus) -> Element<'_, Message> {
         .into()
 }
 
-fn subscription(_state: &Nexus) -> Subscription<Message> {
-    // Poll at 60fps to check for PTY events
-    iced::time::every(std::time::Duration::from_millis(16))
-        .map(|_| Message::Tick)
+fn subscription(state: &Nexus) -> Subscription<Message> {
+    let tick = iced::time::every(std::time::Duration::from_millis(16))
+        .map(|_| Message::Tick);
+
+    // Only subscribe to keyboard events if we have a focused block
+    if state.focused_block.is_some() {
+        Subscription::batch([
+            tick,
+            event::listen().map(Message::Event),
+        ])
+    } else {
+        tick
+    }
 }
 
 fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
@@ -266,6 +381,10 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
     let block = Block::new(block_id, command.clone());
     state.blocks.push(block);
 
+    // Auto-focus the new block for interactive commands
+    state.focused_block = Some(block_id);
+    state.input_focused = false;
+
     // Spawn PTY
     let tx = state.pty_tx.clone();
     let cwd = state.cwd.clone();
@@ -280,13 +399,17 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
                 block.state = BlockState::Failed(1);
                 block.parser.feed(format!("Error: {}\n", e).as_bytes());
             }
+            state.focused_block = None;
+            state.input_focused = true;
         }
     }
 
     Task::none()
 }
 
-fn view_block<'a>(_state: &'a Nexus, block: &'a Block) -> Element<'a, Message> {
+fn view_block<'a>(state: &'a Nexus, block: &'a Block) -> Element<'a, Message> {
+    let is_focused = state.focused_block == Some(block.id);
+
     let status_color = match block.state {
         BlockState::Running => iced::Color::from_rgb(0.2, 0.6, 1.0),
         BlockState::Success => iced::Color::from_rgb(0.3, 0.8, 0.5),
@@ -306,19 +429,34 @@ fn view_block<'a>(_state: &'a Nexus, block: &'a Block) -> Element<'a, Message> {
         .map(|ms| format!(" ({}ms)", ms))
         .unwrap_or_default();
 
-    let header = iced::widget::button(
+    let focus_hint = if is_focused && block.is_running() {
+        " [focused - type to interact, Ctrl+C to interrupt]"
+    } else if block.is_running() {
+        " [click to focus]"
+    } else {
+        ""
+    };
+
+    let mut header_button = iced::widget::button(
         row![
             text(status_icon).color(status_color),
             text(" ").size(14),
             text(&block.command).size(14),
             text(duration_text).size(12),
+            text(focus_hint).size(11).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center)
     )
     .style(iced::widget::button::text)
-    .on_press(Message::ToggleBlock(block.id))
     .padding(8);
+
+    // Make running blocks clickable to focus them
+    if block.is_running() {
+        header_button = header_button.on_press(Message::FocusBlock(block.id));
+    } else {
+        header_button = header_button.on_press(Message::ToggleBlock(block.id));
+    }
 
     let content: Element<Message> = if block.collapsed {
         text("").into()
@@ -327,14 +465,20 @@ fn view_block<'a>(_state: &'a Nexus, block: &'a Block) -> Element<'a, Message> {
             .into()
     };
 
+    let border_color = if is_focused {
+        iced::Color::from_rgb(0.3, 0.6, 1.0) // Blue border when focused
+    } else {
+        iced::Color::from_rgb(0.2, 0.2, 0.22)
+    };
+
     container(
-        column![header, content].spacing(0)
+        column![header_button, content].spacing(0)
     )
-    .style(|_theme| container::Style {
+    .style(move |_theme| container::Style {
         background: Some(iced::Background::Color(iced::Color::from_rgb(0.12, 0.12, 0.14))),
         border: iced::Border {
-            color: iced::Color::from_rgb(0.2, 0.2, 0.22),
-            width: 1.0,
+            color: border_color,
+            width: if is_focused { 2.0 } else { 1.0 },
             radius: 6.0.into(),
         },
         ..Default::default()
