@@ -295,41 +295,35 @@ fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Option<Vec<u8>> {
 }
 
 fn view(state: &Nexus) -> Element<'_, Message> {
-    let blocks_view: Element<Message> = if state.blocks.is_empty() {
-        container(
-            text("Welcome to Nexus. Type a command to get started.")
-                .size(16)
-        )
-        .padding(20)
-        .into()
-    } else {
-        let blocks: Vec<Element<Message>> = state
-            .blocks
-            .iter()
-            .map(|block| view_block(state, block))
-            .collect();
+    // Build all blocks as a continuous terminal output
+    let mut content_elements: Vec<Element<Message>> = Vec::new();
 
-        scrollable(
-            Column::with_children(blocks)
-                .spacing(8)
-                .padding(10)
-        )
-        .height(Length::Fill)
-        .into()
-    };
+    for block in &state.blocks {
+        content_elements.push(view_block(state, block));
+    }
 
-    let input_line = view_input(state);
+    // Scrollable area for command history
+    let history = scrollable(
+        Column::with_children(content_elements)
+            .spacing(4)
+            .padding([10, 15])
+    )
+    .height(Length::Fill);
 
-    let content = column![
-        blocks_view,
-        input_line,
-    ]
-    .spacing(0);
+    // Input line always visible at bottom
+    let input_line = container(view_input(state))
+        .padding([8, 15])
+        .width(Length::Fill);
+
+    let content = column![history, input_line].spacing(0);
 
     container(content)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(container::dark)
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(0.07, 0.07, 0.09))),
+            ..Default::default()
+        })
         .into()
 }
 
@@ -407,114 +401,60 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
     Task::none()
 }
 
-fn view_block<'a>(state: &'a Nexus, block: &'a Block) -> Element<'a, Message> {
-    let is_focused = state.focused_block == Some(block.id);
+fn view_block<'a>(_state: &'a Nexus, block: &'a Block) -> Element<'a, Message> {
+    let prompt_color = iced::Color::from_rgb(0.3, 0.8, 0.5);
+    let command_color = iced::Color::from_rgb(0.9, 0.9, 0.9);
 
-    let status_color = match block.state {
-        BlockState::Running => iced::Color::from_rgb(0.2, 0.6, 1.0),
-        BlockState::Success => iced::Color::from_rgb(0.3, 0.8, 0.5),
-        BlockState::Failed(_) => iced::Color::from_rgb(0.9, 0.3, 0.3),
-        BlockState::Killed(_) => iced::Color::from_rgb(0.8, 0.6, 0.2),
-    };
+    let prompt_line = row![
+        text("$ ").size(14).color(prompt_color).font(iced::Font::MONOSPACE),
+        text(&block.command).size(14).color(command_color).font(iced::Font::MONOSPACE),
+    ]
+    .spacing(0);
 
-    let status_icon = match block.state {
-        BlockState::Running => "⟳",
-        BlockState::Success => "✓",
-        BlockState::Failed(_) => "✗",
-        BlockState::Killed(_) => "⚡",
-    };
-
-    let duration_text = block
-        .duration_ms
-        .map(|ms| format!(" ({}ms)", ms))
-        .unwrap_or_default();
-
-    let focus_hint = if is_focused && block.is_running() {
-        " [focused - type to interact, Ctrl+C to interrupt]"
-    } else if block.is_running() {
-        " [click to focus]"
-    } else {
-        ""
-    };
-
-    let mut header_button = iced::widget::button(
-        row![
-            text(status_icon).color(status_color),
-            text(" ").size(14),
-            text(&block.command).size(14),
-            text(duration_text).size(12),
-            text(focus_hint).size(11).color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
-        ]
-        .spacing(4)
-        .align_y(iced::Alignment::Center)
-    )
-    .style(iced::widget::button::text)
-    .padding(8);
-
-    // Make running blocks clickable to focus them
-    if block.is_running() {
-        header_button = header_button.on_press(Message::FocusBlock(block.id));
-    } else {
-        header_button = header_button.on_press(Message::ToggleBlock(block.id));
-    }
-
-    let content: Element<Message> = if block.collapsed {
-        text("").into()
+    // Terminal output - only show cursor for running commands
+    let output: Element<Message> = if block.collapsed {
+        column![].into()
     } else {
         TerminalView::new(block.parser.grid())
+            .show_cursor(block.is_running())
             .into()
     };
 
-    let border_color = if is_focused {
-        iced::Color::from_rgb(0.3, 0.6, 1.0) // Blue border when focused
-    } else {
-        iced::Color::from_rgb(0.2, 0.2, 0.22)
-    };
-
-    container(
-        column![header_button, content].spacing(0)
-    )
-    .style(move |_theme| container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb(0.12, 0.12, 0.14))),
-        border: iced::Border {
-            color: border_color,
-            width: if is_focused { 2.0 } else { 1.0 },
-            radius: 6.0.into(),
-        },
-        ..Default::default()
-    })
-    .width(Length::Fill)
-    .into()
+    column![prompt_line, output]
+        .spacing(0)
+        .into()
 }
 
 fn view_input(state: &Nexus) -> Element<'_, Message> {
-    let prompt = text(format!("{} > ", state.cwd))
-        .size(14)
-        .color(iced::Color::from_rgb(0.3, 0.7, 1.0));
+    let prompt_color = iced::Color::from_rgb(0.3, 0.8, 0.5);
 
-    let input = text_input("Type a command...", &state.input)
+    let prompt = text("$ ")
+        .size(14)
+        .color(prompt_color)
+        .font(iced::Font::MONOSPACE);
+
+    let input = text_input("", &state.input)
         .on_input(Message::InputChanged)
         .on_submit(Message::Submit)
-        .padding(10)
-        .size(14);
+        .padding(0)
+        .size(14)
+        .style(|_theme, _status| text_input::Style {
+            background: iced::Background::Color(iced::Color::TRANSPARENT),
+            border: iced::Border {
+                width: 0.0,
+                ..Default::default()
+            },
+            icon: iced::Color::from_rgb(0.5, 0.5, 0.5),
+            placeholder: iced::Color::from_rgb(0.4, 0.4, 0.4),
+            value: iced::Color::from_rgb(0.9, 0.9, 0.9),
+            selection: iced::Color::from_rgb(0.3, 0.5, 0.8),
+        })
+        .font(iced::Font::MONOSPACE);
 
-    container(
-        row![prompt, input]
-            .spacing(8)
-            .align_y(iced::Alignment::Center)
-    )
-    .padding(10)
-    .style(|_theme| container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb(0.08, 0.08, 0.1))),
-        border: iced::Border {
-            color: iced::Color::from_rgb(0.2, 0.2, 0.22),
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        ..Default::default()
-    })
-    .width(Length::Fill)
-    .into()
+    row![prompt, input]
+        .spacing(0)
+        .align_y(iced::Alignment::Center)
+        .into()
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {

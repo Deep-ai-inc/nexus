@@ -14,6 +14,7 @@ pub struct TerminalView {
     font_size: f32,
     line_height: f32,
     char_width: f32,
+    show_cursor: bool,
 }
 
 impl TerminalView {
@@ -24,7 +25,14 @@ impl TerminalView {
             font_size: 14.0,
             line_height: 1.4,
             char_width: 8.4, // Approximate monospace char width at 14px
+            show_cursor: true,
         }
+    }
+
+    /// Set whether to show the cursor.
+    pub fn show_cursor(mut self, show: bool) -> Self {
+        self.show_cursor = show;
+        self
     }
 
     /// Set the font size.
@@ -54,6 +62,29 @@ impl TerminalView {
                 Color::from_rgb(*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0)
             }
         }
+    }
+
+    /// Count the number of rows that have actual content.
+    fn count_content_rows(&self) -> usize {
+        let mut last_content_row = 0;
+
+        for (row_idx, row) in self.grid.rows_iter().enumerate() {
+            let has_content = row.iter().any(|cell| cell.c != '\0' && cell.c != ' ');
+            if has_content {
+                last_content_row = row_idx + 1;
+            }
+        }
+
+        // Include cursor row only if cursor is shown
+        if self.show_cursor && self.grid.cursor_visible() {
+            let (_col, cursor_row) = self.grid.cursor();
+            let cursor_row = (cursor_row as usize) + 1;
+            if cursor_row > last_content_row {
+                return cursor_row;
+            }
+        }
+
+        last_content_row
     }
 }
 
@@ -109,9 +140,12 @@ where
         _renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let (cols, rows) = self.grid.size();
+        let (cols, _rows) = self.grid.size();
         let width = cols as f32 * self.char_width;
-        let height = rows as f32 * self.cell_height();
+
+        // Only count rows that have actual content
+        let content_rows = self.count_content_rows();
+        let height = content_rows as f32 * self.cell_height();
 
         let size = limits
             .width(Length::Fill)
@@ -176,8 +210,8 @@ where
             );
         }
 
-        // Draw cursor if visible
-        if self.grid.cursor_visible() {
+        // Draw cursor if visible and enabled
+        if self.show_cursor && self.grid.cursor_visible() {
             let (cursor_col, cursor_row) = self.grid.cursor();
             let cursor_x = bounds.x + cursor_col as f32 * self.char_width;
             let cursor_y = bounds.y + cursor_row as f32 * cell_height;

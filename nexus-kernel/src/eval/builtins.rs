@@ -3,6 +3,7 @@
 use tokio::sync::broadcast::Sender;
 use nexus_api::ShellEvent;
 use std::path::PathBuf;
+use std::io::Write;
 
 use crate::ShellState;
 
@@ -12,6 +13,7 @@ pub fn is_builtin(name: &str) -> bool {
         name,
         "cd" | "pwd"
             | "echo"
+            | "printf"
             | "exit"
             | "export"
             | "unset"
@@ -26,6 +28,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "unalias"
             | "source"
             | "."
+            | "eval"
             | "jobs"
             | "fg"
             | "bg"
@@ -34,6 +37,10 @@ pub fn is_builtin(name: &str) -> bool {
             | "return"
             | "break"
             | "continue"
+            | "readonly"
+            | "command"
+            | "basename"
+            | "dirname"
     )
 }
 
@@ -48,13 +55,21 @@ pub fn try_builtin(
         "cd" => Ok(Some(builtin_cd(args, state, events)?)),
         "pwd" => Ok(Some(builtin_pwd(state)?)),
         "echo" => Ok(Some(builtin_echo(args)?)),
+        "printf" => Ok(Some(builtin_printf(args)?)),
         "exit" => Ok(Some(builtin_exit(args)?)),
         "export" => Ok(Some(builtin_export(args, state, events)?)),
         "unset" => Ok(Some(builtin_unset(args, state, events)?)),
+        "set" => Ok(Some(builtin_set(args, state)?)),
         "true" | ":" => Ok(Some(0)),
         "false" => Ok(Some(1)),
         "test" | "[" => Ok(Some(builtin_test(args)?)),
         "type" => Ok(Some(builtin_type(args, state)?)),
+        "source" | "." => Ok(Some(builtin_source(args, state, events)?)),
+        "eval" => Ok(Some(builtin_eval(args, state, events)?)),
+        "readonly" => Ok(Some(builtin_readonly(args, state)?)),
+        "command" => Ok(Some(builtin_command(args, state, events)?)),
+        "basename" => Ok(Some(builtin_basename(args)?)),
+        "dirname" => Ok(Some(builtin_dirname(args)?)),
         _ => Ok(None),
     }
 }
@@ -141,6 +156,7 @@ fn builtin_echo(args: &[String]) -> anyhow::Result<i32> {
         println!("{}", output);
     } else {
         print!("{}", output);
+        let _ = std::io::stdout().flush();
     }
 
     Ok(0)
@@ -187,6 +203,162 @@ fn interpret_escape_sequences(s: &str) -> String {
     result
 }
 
+fn builtin_printf(args: &[String]) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        eprintln!("printf: usage: printf format [arguments]");
+        return Ok(1);
+    }
+
+    let format = &args[0];
+    let mut arg_idx = 1;
+
+    let mut result = String::new();
+    let mut chars = format.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Handle escape sequences
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('\\') => result.push('\\'),
+                Some('"') => result.push('"'),
+                Some('0') => {
+                    // Octal
+                    let mut octal = String::new();
+                    for _ in 0..3 {
+                        if let Some(&c) = chars.peek() {
+                            if c.is_digit(8) {
+                                octal.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if !octal.is_empty() {
+                        if let Ok(code) = u8::from_str_radix(&octal, 8) {
+                            result.push(code as char);
+                        }
+                    } else {
+                        result.push('\0');
+                    }
+                }
+                Some(c) => {
+                    result.push('\\');
+                    result.push(c);
+                }
+                None => result.push('\\'),
+            }
+        } else if c == '%' {
+            // Handle format specifiers
+            match chars.peek() {
+                Some('%') => {
+                    chars.next();
+                    result.push('%');
+                }
+                Some(_) => {
+                    // Parse width/precision
+                    let mut spec = String::new();
+                    spec.push('%');
+
+                    // Flags
+                    while let Some(&c) = chars.peek() {
+                        if c == '-' || c == '+' || c == ' ' || c == '#' || c == '0' {
+                            spec.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Width
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_digit() {
+                            spec.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Precision
+                    if chars.peek() == Some(&'.') {
+                        spec.push(chars.next().unwrap());
+                        while let Some(&c) = chars.peek() {
+                            if c.is_ascii_digit() {
+                                spec.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Conversion specifier
+                    if let Some(conv) = chars.next() {
+                        spec.push(conv);
+                        let arg = args.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
+                        arg_idx += 1;
+
+                        match conv {
+                            's' => result.push_str(arg),
+                            'd' | 'i' => {
+                                let n: i64 = arg.parse().unwrap_or(0);
+                                result.push_str(&format!("{}", n));
+                            }
+                            'u' => {
+                                let n: u64 = arg.parse().unwrap_or(0);
+                                result.push_str(&format!("{}", n));
+                            }
+                            'o' => {
+                                let n: u64 = arg.parse().unwrap_or(0);
+                                result.push_str(&format!("{:o}", n));
+                            }
+                            'x' => {
+                                let n: u64 = arg.parse().unwrap_or(0);
+                                result.push_str(&format!("{:x}", n));
+                            }
+                            'X' => {
+                                let n: u64 = arg.parse().unwrap_or(0);
+                                result.push_str(&format!("{:X}", n));
+                            }
+                            'f' | 'F' => {
+                                let n: f64 = arg.parse().unwrap_or(0.0);
+                                result.push_str(&format!("{}", n));
+                            }
+                            'e' => {
+                                let n: f64 = arg.parse().unwrap_or(0.0);
+                                result.push_str(&format!("{:e}", n));
+                            }
+                            'E' => {
+                                let n: f64 = arg.parse().unwrap_or(0.0);
+                                result.push_str(&format!("{:E}", n));
+                            }
+                            'c' => {
+                                if let Some(c) = arg.chars().next() {
+                                    result.push(c);
+                                }
+                            }
+                            'b' => {
+                                // %b interprets escape sequences in the argument
+                                result.push_str(&interpret_escape_sequences(arg));
+                            }
+                            _ => {
+                                result.push_str(&spec);
+                            }
+                        }
+                    }
+                }
+                None => result.push('%'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    print!("{}", result);
+    let _ = std::io::stdout().flush();
+    Ok(0)
+}
+
 fn builtin_exit(args: &[String]) -> anyhow::Result<i32> {
     let code = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     std::process::exit(code);
@@ -197,6 +369,14 @@ fn builtin_export(
     state: &mut ShellState,
     events: &Sender<ShellEvent>,
 ) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        // Print all exported variables
+        for (key, value) in &state.env {
+            println!("export {}={:?}", key, value);
+        }
+        return Ok(0);
+    }
+
     for arg in args {
         if let Some((name, value)) = arg.split_once('=') {
             state.set_env(name, value);
@@ -235,6 +415,85 @@ fn builtin_unset(
     Ok(0)
 }
 
+fn builtin_set(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        // Print all variables
+        for (key, value) in &state.vars {
+            println!("{}={}", key, value);
+        }
+        for (key, value) in &state.env {
+            println!("{}={}", key, value);
+        }
+        return Ok(0);
+    }
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+
+        if arg.starts_with('-') || arg.starts_with('+') {
+            let enable = arg.starts_with('-');
+            let flags = &arg[1..];
+
+            for flag in flags.chars() {
+                match flag {
+                    'o' => {
+                        // set -o option_name
+                        i += 1;
+                        if i < args.len() {
+                            let opt_name = &args[i];
+                            // Map long option names to short flags
+                            let short_flag = match opt_name.as_str() {
+                                "errexit" => Some('e'),
+                                "nounset" => Some('u'),
+                                "xtrace" => Some('x'),
+                                "verbose" => Some('v'),
+                                "noexec" => Some('n'),
+                                "noglob" => Some('f'),
+                                "noclobber" => Some('C'),
+                                "allexport" => Some('a'),
+                                "notify" => Some('b'),
+                                "hashall" => Some('h'),
+                                _ => None,
+                            };
+                            if let Some(f) = short_flag {
+                                state.options.set_option(f, enable);
+                            } else {
+                                eprintln!("set: {}: invalid option name", opt_name);
+                                return Ok(1);
+                            }
+                        } else if !enable {
+                            // set +o with no arg prints options
+                            println!("{}", state.options.print_options());
+                        }
+                    }
+                    '-' => {
+                        // set -- ends option processing
+                        i += 1;
+                        // Remaining args become positional parameters
+                        state.positional_params = args[i..].to_vec();
+                        return Ok(0);
+                    }
+                    _ => {
+                        if !state.options.set_option(flag, enable) {
+                            eprintln!("set: -{}: invalid option", flag);
+                            return Ok(1);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Positional parameters
+            state.positional_params = args[i..].to_vec();
+            return Ok(0);
+        }
+
+        i += 1;
+    }
+
+    Ok(0)
+}
+
 fn builtin_test(args: &[String]) -> anyhow::Result<i32> {
     // Remove trailing ] if present
     let args: Vec<&str> = args
@@ -266,6 +525,7 @@ fn builtin_test(args: &[String]) -> anyhow::Result<i32> {
             "-r" => if PathBuf::from(val).exists() { 0 } else { 1 }, // Simplified
             "-w" => if PathBuf::from(val).exists() { 0 } else { 1 }, // Simplified
             "-x" => if PathBuf::from(val).exists() { 0 } else { 1 }, // Simplified
+            "-L" | "-h" => if PathBuf::from(val).is_symlink() { 0 } else { 1 },
             "-s" => {
                 if let Ok(meta) = std::fs::metadata(val) {
                     if meta.len() > 0 { 0 } else { 1 }
@@ -273,7 +533,8 @@ fn builtin_test(args: &[String]) -> anyhow::Result<i32> {
                     1
                 }
             }
-            "!" => if val.is_empty() { 0 } else { 1 },
+            "!" => builtin_test(args[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())
+                .map(|code| if code == 0 { 1 } else { 0 })?,
             _ => 1,
         });
     }
@@ -317,8 +578,43 @@ fn builtin_test(args: &[String]) -> anyhow::Result<i32> {
                 let r: i64 = right.parse().unwrap_or(0);
                 if l >= r { 0 } else { 1 }
             }
+            "-nt" => {
+                // Newer than
+                let left_time = std::fs::metadata(left).and_then(|m| m.modified()).ok();
+                let right_time = std::fs::metadata(right).and_then(|m| m.modified()).ok();
+                match (left_time, right_time) {
+                    (Some(l), Some(r)) => if l > r { 0 } else { 1 },
+                    _ => 1,
+                }
+            }
+            "-ot" => {
+                // Older than
+                let left_time = std::fs::metadata(left).and_then(|m| m.modified()).ok();
+                let right_time = std::fs::metadata(right).and_then(|m| m.modified()).ok();
+                match (left_time, right_time) {
+                    (Some(l), Some(r)) => if l < r { 0 } else { 1 },
+                    _ => 1,
+                }
+            }
             _ => 1,
         });
+    }
+
+    // Handle -a (AND) and -o (OR) for longer expressions
+    if args.len() > 3 {
+        // Look for -a or -o
+        for (i, &arg) in args.iter().enumerate() {
+            if arg == "-a" {
+                let left_result = builtin_test(args[..i].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())?;
+                let right_result = builtin_test(args[i+1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())?;
+                return Ok(if left_result == 0 && right_result == 0 { 0 } else { 1 });
+            }
+            if arg == "-o" {
+                let left_result = builtin_test(args[..i].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())?;
+                let right_result = builtin_test(args[i+1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())?;
+                return Ok(if left_result == 0 || right_result == 0 { 0 } else { 1 });
+            }
+        }
     }
 
     Ok(1)
@@ -330,6 +626,8 @@ fn builtin_type(args: &[String], state: &ShellState) -> anyhow::Result<i32> {
     for arg in args {
         if is_builtin(arg) {
             println!("{} is a shell builtin", arg);
+        } else if state.aliases.contains_key(arg) {
+            println!("{} is aliased to `{}'", arg, state.aliases.get(arg).unwrap());
         } else if let Some(path) = find_in_path(arg, state) {
             println!("{} is {}", arg, path.display());
         } else {
@@ -341,11 +639,211 @@ fn builtin_type(args: &[String], state: &ShellState) -> anyhow::Result<i32> {
     Ok(exit_code)
 }
 
+fn builtin_source(
+    args: &[String],
+    state: &mut ShellState,
+    events: &Sender<ShellEvent>,
+) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        eprintln!("source: filename argument required");
+        return Ok(2);
+    }
+
+    let filename = &args[0];
+    let path = if PathBuf::from(filename).is_absolute() {
+        PathBuf::from(filename)
+    } else {
+        state.cwd.join(filename)
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("source: {}: {}", filename, e);
+            return Ok(1);
+        }
+    };
+
+    // Parse and execute each line
+    let mut parser = crate::Parser::new()?;
+    let mut last_exit = 0;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        match parser.parse(line) {
+            Ok(ast) => {
+                last_exit = crate::eval::execute(state, &ast, events)?;
+            }
+            Err(e) => {
+                eprintln!("source: {}: parse error: {}", filename, e);
+                return Ok(1);
+            }
+        }
+    }
+
+    Ok(last_exit)
+}
+
+fn builtin_eval(
+    args: &[String],
+    state: &mut ShellState,
+    events: &Sender<ShellEvent>,
+) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        return Ok(0);
+    }
+
+    let command = args.join(" ");
+    let mut parser = crate::Parser::new()?;
+
+    match parser.parse(&command) {
+        Ok(ast) => crate::eval::execute(state, &ast, events),
+        Err(e) => {
+            eprintln!("eval: parse error: {}", e);
+            Ok(1)
+        }
+    }
+}
+
+fn builtin_readonly(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        // Print all readonly variables
+        for name in &state.readonly_vars {
+            if let Some(value) = state.vars.get(name) {
+                println!("readonly {}={}", name, value);
+            } else if let Some(value) = state.get_env(name) {
+                println!("readonly {}={}", name, value);
+            } else {
+                println!("readonly {}", name);
+            }
+        }
+        return Ok(0);
+    }
+
+    for arg in args {
+        if let Some((name, value)) = arg.split_once('=') {
+            state.set_var(name.to_string(), value.to_string());
+            state.readonly_vars.insert(name.to_string());
+        } else {
+            state.readonly_vars.insert(arg.to_string());
+        }
+    }
+
+    Ok(0)
+}
+
+fn builtin_command(
+    args: &[String],
+    state: &mut ShellState,
+    events: &Sender<ShellEvent>,
+) -> anyhow::Result<i32> {
+    // command runs a command bypassing aliases and functions
+    // For now, just execute normally since we don't have full alias support
+    if args.is_empty() {
+        return Ok(0);
+    }
+
+    let name = &args[0];
+    let cmd_args = &args[1..];
+
+    // Skip builtin check for -p flag
+    let (name, cmd_args, use_default_path) = if name == "-p" {
+        if args.len() < 2 {
+            return Ok(0);
+        }
+        (&args[1], &args[2..], true)
+    } else if name == "-v" || name == "-V" {
+        // command -v acts like type
+        return builtin_type(&args[1..].to_vec(), state);
+    } else {
+        (name, cmd_args, false)
+    };
+
+    // If it's a builtin, run it
+    if is_builtin(name) {
+        return try_builtin(name, &cmd_args.to_vec(), state, events)?
+            .ok_or_else(|| anyhow::anyhow!("builtin not found"));
+    }
+
+    // Find in PATH and execute
+    let path = if use_default_path {
+        find_in_default_path(name)
+    } else {
+        find_in_path(name, state)
+    };
+
+    if let Some(_path) = path {
+        // External command - would be handled by process module
+        // For now, return that we couldn't execute it internally
+        Ok(127)
+    } else {
+        eprintln!("command: {}: not found", name);
+        Ok(127)
+    }
+}
+
+fn builtin_basename(args: &[String]) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        eprintln!("basename: missing operand");
+        return Ok(1);
+    }
+
+    let path = PathBuf::from(&args[0]);
+    let name = path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Optional suffix removal
+    let result = if args.len() > 1 {
+        let suffix = &args[1];
+        name.strip_suffix(suffix).unwrap_or(&name).to_string()
+    } else {
+        name
+    };
+
+    println!("{}", result);
+    Ok(0)
+}
+
+fn builtin_dirname(args: &[String]) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        eprintln!("dirname: missing operand");
+        return Ok(1);
+    }
+
+    let path = PathBuf::from(&args[0]);
+    let parent = path.parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
+
+    let result = if parent.is_empty() { "." } else { &parent };
+    println!("{}", result);
+    Ok(0)
+}
+
 /// Find a command in PATH.
 fn find_in_path(cmd: &str, state: &ShellState) -> Option<PathBuf> {
     let path_var = state.get_env("PATH")?;
 
     for dir in path_var.split(':') {
+        let candidate = PathBuf::from(dir).join(cmd);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+/// Find a command in the default PATH (for command -p).
+fn find_in_default_path(cmd: &str) -> Option<PathBuf> {
+    let default_path = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+    for dir in default_path.split(':') {
         let candidate = PathBuf::from(dir).join(cmd);
         if candidate.is_file() {
             return Some(candidate);
