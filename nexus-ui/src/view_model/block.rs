@@ -1,5 +1,7 @@
 //! Block view model - a single command and its output.
 
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 

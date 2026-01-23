@@ -1,10 +1,12 @@
 //! The central store for UI state.
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crossbeam_channel::Receiver;
-use nexus_api::{BlockId, BlockState, ShellEvent};
+use nexus_api::{BlockId, ShellEvent};
 
 use super::BlockViewModel;
 

@@ -1,5 +1,7 @@
 //! Block list component - virtualized list of command blocks.
 
+#![allow(dead_code)]
+
 use crate::view_model::Store;
 
 /// A virtualized list of blocks.

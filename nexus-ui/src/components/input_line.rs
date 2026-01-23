@@ -1,5 +1,7 @@
 //! Input line component - command input with editing.
 
+#![allow(dead_code)]
+
 /// The input line state.
 pub struct InputLine {
     /// Current input text.

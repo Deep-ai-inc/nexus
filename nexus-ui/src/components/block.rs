@@ -1,8 +1,8 @@
 //! Block component - renders a single command block.
 
-use nexus_api::{BlockState, OutputFormat};
+#![allow(dead_code)]
 
-use crate::view_model::BlockViewModel;
+use nexus_api::{BlockState, OutputFormat};
 
 /// Display mode for a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,5 +1,7 @@
 //! Lenses - different views for command output.
 
+#![allow(dead_code)]
+
 use nexus_api::OutputFormat;
 
 /// Trait for output lenses.

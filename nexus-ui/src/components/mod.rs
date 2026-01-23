@@ -2,6 +2,9 @@
 //!
 //! These will be GPUI components once integrated.
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 mod block_list;
 mod block;
 mod input_line;

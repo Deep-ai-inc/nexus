@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use nexus_api::{
-    Anchor, Completion, Documentation, ParsedSidecarOutput, ProviderRequest, ProviderResponse,
+    Completion, Documentation, ParsedSidecarOutput, ProviderRequest, ProviderResponse,
     SidecarSpec,
 };
 

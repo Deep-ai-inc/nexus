@@ -4,7 +4,7 @@ mod ast;
 
 pub use ast::*;
 
-use tree_sitter::{Language, Node, Tree};
+use tree_sitter::Node;
 
 use crate::ShellError;
 

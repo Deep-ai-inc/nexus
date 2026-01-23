@@ -4,12 +4,11 @@ mod expand;
 mod builtins;
 
 use crossbeam_channel::Sender;
-use nexus_api::{BlockId, ShellEvent};
+use nexus_api::ShellEvent;
 
 use crate::parser::*;
-use crate::process::{self, ProcessHandle};
+use crate::process;
 use crate::state::{next_block_id, ShellState};
-use crate::ShellError;
 
 pub use builtins::is_builtin;
 

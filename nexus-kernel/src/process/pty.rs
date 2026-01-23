@@ -74,6 +74,7 @@ pub fn set_nonblocking(file: &File, nonblocking: bool) -> anyhow::Result<()> {
 }
 
 /// Get the window size of a PTY.
+#[allow(dead_code)]
 pub fn get_window_size(file: &File) -> io::Result<(u16, u16)> {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     let fd = file.as_raw_fd();
@@ -88,6 +89,7 @@ pub fn get_window_size(file: &File) -> io::Result<(u16, u16)> {
 }
 
 /// Set the window size of a PTY.
+#[allow(dead_code)]
 pub fn set_window_size(file: &File, cols: u16, rows: u16) -> io::Result<()> {
     let size = libc::winsize {
         ws_row: rows,

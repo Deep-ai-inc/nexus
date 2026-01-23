@@ -8,9 +8,8 @@ pub use pty::PtyHandle;
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::time::Instant;
 
 use crossbeam_channel::Sender;
@@ -18,7 +17,7 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Pid};
 use nexus_api::{BlockId, ShellEvent};
 
-use crate::parser::{Command, Redirect, SimpleCommand};
+use crate::parser::{Command, Redirect};
 use crate::ShellState;
 
 /// Handle for a spawned process.
@@ -33,7 +32,7 @@ pub fn spawn(
     cwd: &Path,
     env: &HashMap<String, String>,
     env_overrides: &[(String, String)],
-    redirects: &[Redirect],
+    _redirects: &[Redirect],
 ) -> anyhow::Result<ProcessHandle> {
     // Create a PTY for interactive processes
     let pty = pty::open_pty()?;
