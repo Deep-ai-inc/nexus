@@ -1,11 +1,13 @@
 //! Main Nexus application using Iced's Elm architecture.
 
+use std::sync::Arc;
 use std::time::Instant;
 
+use iced::futures::stream;
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{column, container, row, scrollable, text, text_input, Column};
 use iced::{event, Element, Event, Length, Subscription, Task, Theme};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use nexus_api::{BlockId, BlockState, OutputFormat};
 use nexus_term::TerminalParser;
@@ -84,8 +86,8 @@ pub struct Nexus {
     pty_handles: Vec<PtyHandle>,
     /// Channel for PTY output.
     pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
-    /// Receiver for PTY events.
-    pty_rx: mpsc::UnboundedReceiver<(BlockId, PtyEvent)>,
+    /// Receiver for PTY events (shared with subscription).
+    pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
     /// Currently focused block (receives keyboard input).
     focused_block: Option<BlockId>,
     /// Whether the input field is focused.
@@ -112,7 +114,7 @@ impl Default for Nexus {
             cwd,
             pty_handles: Vec::new(),
             pty_tx,
-            pty_rx,
+            pty_rx: Arc::new(Mutex::new(pty_rx)),
             focused_block: None,
             input_focused: true,
         }
@@ -222,32 +224,7 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             }
         }
         Message::Tick => {
-            // Drain all pending PTY events from the channel
-            while let Ok((block_id, event)) = state.pty_rx.try_recv() {
-                match event {
-                    PtyEvent::Output(data) => {
-                        if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
-                            block.parser.feed(&data);
-                        }
-                    }
-                    PtyEvent::Exited(exit_code) => {
-                        if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
-                            block.state = if exit_code == 0 {
-                                BlockState::Success
-                            } else {
-                                BlockState::Failed(exit_code)
-                            };
-                            block.duration_ms = Some(block.started_at.elapsed().as_millis() as u64);
-                        }
-                        state.pty_handles.retain(|h| h.block_id != block_id);
-
-                        if state.focused_block == Some(block_id) {
-                            state.focused_block = None;
-                            state.input_focused = true;
-                        }
-                    }
-                }
-            }
+            // No longer used - kept for API compatibility
         }
     }
     Task::none()
@@ -328,18 +305,45 @@ fn view(state: &Nexus) -> Element<'_, Message> {
 }
 
 fn subscription(state: &Nexus) -> Subscription<Message> {
-    let tick = iced::time::every(std::time::Duration::from_millis(16))
-        .map(|_| Message::Tick);
+    let mut subscriptions = vec![pty_subscription(state.pty_rx.clone())];
 
     // Only subscribe to keyboard events if we have a focused block
     if state.focused_block.is_some() {
-        Subscription::batch([
-            tick,
-            event::listen().map(Message::Event),
-        ])
-    } else {
-        tick
+        subscriptions.push(event::listen().map(Message::Event));
     }
+
+    Subscription::batch(subscriptions)
+}
+
+/// Async subscription that awaits PTY events instead of polling.
+fn pty_subscription(
+    rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
+) -> Subscription<Message> {
+    struct PtySubscription;
+
+    Subscription::run_with_id(
+        std::any::TypeId::of::<PtySubscription>(),
+        stream::unfold(rx, |rx| async move {
+            let event = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            };
+
+            match event {
+                Some((block_id, PtyEvent::Output(data))) => {
+                    Some((Message::PtyOutput(block_id, data), rx))
+                }
+                Some((block_id, PtyEvent::Exited(code))) => {
+                    Some((Message::PtyExited(block_id, code), rx))
+                }
+                None => {
+                    // Channel closed - this shouldn't happen in normal operation
+                    // Return a pending future that never resolves
+                    None
+                }
+            }
+        }),
+    )
 }
 
 fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
