@@ -15,6 +15,19 @@ use nexus_term::TerminalParser;
 use crate::pty::PtyHandle;
 use crate::widgets::terminal_view::TerminalView;
 
+// ============================================================================
+// Terminal rendering constants - single source of truth
+// ============================================================================
+
+/// Font size for terminal text.
+pub const FONT_SIZE: f32 = 14.0;
+/// Line height multiplier.
+pub const LINE_HEIGHT_FACTOR: f32 = 1.4;
+/// Character width - slightly conservative (8.5 vs 8.4) for font anti-aliasing buffers.
+pub const CHAR_WIDTH: f32 = 8.5;
+/// Computed line height.
+pub const LINE_HEIGHT: f32 = FONT_SIZE * LINE_HEIGHT_FACTOR; // 19.6
+
 /// Scrollable ID for auto-scrolling.
 const HISTORY_SCROLLABLE: &str = "history";
 
@@ -51,6 +64,25 @@ impl Block {
 
     fn is_running(&self) -> bool {
         matches!(self.state, BlockState::Running)
+    }
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        // Different blocks are never equal
+        if self.id != other.id {
+            return false;
+        }
+
+        // Running blocks always need redrawing (cursor, new output)
+        if self.is_running() {
+            return false;
+        }
+
+        // Finished blocks: check if anything visual changed
+        self.version == other.version
+            && self.collapsed == other.collapsed
+            && self.parser.size() == other.parser.size()
     }
 }
 
@@ -231,15 +263,12 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             }
         }
         Message::WindowResized(width, height) => {
-            // Calculate terminal dimensions immediately (no debounce)
-            // Use 8.5 instead of 8.4 to be conservative - prevents overestimating columns
-            let char_width = 8.5_f32;
-            let line_height = 19.6_f32; // 14px * 1.4 line height
+            // Calculate terminal dimensions using centralized constants
             let h_padding = 30.0; // Left + right padding
             let v_padding = 80.0; // Top/bottom padding + input area
 
-            let cols = ((width as f32 - h_padding) / char_width) as u16;
-            let rows = ((height as f32 - v_padding) / line_height) as u16;
+            let cols = ((width as f32 - h_padding) / CHAR_WIDTH) as u16;
+            let rows = ((height as f32 - v_padding) / LINE_HEIGHT) as u16;
 
             // Clamp to reasonable ranges
             let cols = cols.max(40).min(500);
@@ -368,6 +397,8 @@ fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Option<Vec<u8>> {
 
 fn view(state: &Nexus) -> Element<'_, Message> {
     // Build all blocks
+    // Note: lazy widget requires 'static data, so we render blocks directly
+    // The PartialEq impl on Block is available for future optimization
     let content_elements: Vec<Element<Message>> = state
         .blocks
         .iter()

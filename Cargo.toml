@@ -40,7 +40,8 @@ memmap2 = "0.9"
 alacritty_terminal = "0.25"
 
 # UI dependencies (Iced + WGPU)
-iced = { version = "0.13", features = ["tokio", "advanced", "wgpu"] }
+# "lazy" feature enables cached/memoized widget rendering for performance
+iced = { version = "0.13", features = ["tokio", "advanced", "wgpu", "lazy"] }
 cosmic-text = "0.12"
 
 # Internal crates

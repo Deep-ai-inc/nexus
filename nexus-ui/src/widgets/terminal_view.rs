@@ -8,6 +8,8 @@ use iced::{Color, Element, Length, Rectangle, Size, Theme};
 
 use nexus_term::{Color as TermColor, TerminalGrid};
 
+use crate::app::{CHAR_WIDTH, FONT_SIZE, LINE_HEIGHT_FACTOR};
+
 /// A widget that renders a terminal grid.
 pub struct TerminalView {
     grid: TerminalGrid,
@@ -22,9 +24,9 @@ impl TerminalView {
     pub fn new(grid: TerminalGrid) -> Self {
         Self {
             grid,
-            font_size: 14.0,
-            line_height: 1.4,
-            char_width: 8.4, // Approximate monospace char width at 14px
+            font_size: FONT_SIZE,
+            line_height: LINE_HEIGHT_FACTOR,
+            char_width: CHAR_WIDTH,
             show_cursor: true,
         }
     }
