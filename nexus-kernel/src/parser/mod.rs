@@ -136,7 +136,7 @@ fn build_simple_command(node: &Node, source: &str) -> Result<SimpleCommand, Shel
             "command_name" => {
                 name = Some(node_text(&child, source));
             }
-            "word" | "string" | "raw_string" | "concatenation" => {
+            "word" | "string" | "raw_string" | "concatenation" | "number" => {
                 if name.is_none() {
                     name = Some(node_text(&child, source));
                 } else {
@@ -158,7 +158,14 @@ fn build_simple_command(node: &Node, source: &str) -> Result<SimpleCommand, Shel
                 let assignment = build_assignment(&child, source)?;
                 env_assignments.push(assignment);
             }
-            _ => {}
+            _ => {
+                // Log unknown node types for debugging
+                tracing::debug!(
+                    "unknown node in simple_command: kind={}, text={}",
+                    child.kind(),
+                    node_text(&child, source)
+                );
+            }
         }
     }
 
@@ -438,4 +445,32 @@ fn extract_variable_name(node: &Node, source: &str) -> String {
         .trim_start_matches('$')
         .trim_end_matches('}')
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pipeline_with_args() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("ls | head -5").unwrap();
+
+        // Check that we have a pipeline
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Pipeline(pipeline) = &ast.commands[0] {
+            assert_eq!(pipeline.commands.len(), 2);
+
+            // Check head command has -5 argument
+            if let Command::Simple(head_cmd) = &pipeline.commands[1] {
+                assert_eq!(head_cmd.name, "head");
+                assert_eq!(head_cmd.args.len(), 1);
+                assert_eq!(head_cmd.args[0].as_literal(), Some("-5"));
+            } else {
+                panic!("Expected simple command for head");
+            }
+        } else {
+            panic!("Expected pipeline");
+        }
+    }
 }

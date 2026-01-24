@@ -72,4 +72,15 @@ impl Kernel {
     pub fn emit(&self, event: ShellEvent) {
         let _ = self.event_tx.send(event);
     }
+
+    /// Parse and execute a command line, returning the exit code.
+    pub fn execute(&mut self, input: &str) -> anyhow::Result<i32> {
+        let ast = self.parser.parse(input)?;
+        eval::execute(&mut self.state, &ast, &self.event_tx, &self.commands)
+    }
+
+    /// Get the event sender (for spawning commands that need to emit events).
+    pub fn event_sender(&self) -> &broadcast::Sender<ShellEvent> {
+        &self.event_tx
+    }
 }

@@ -8,10 +8,10 @@ use iced::futures::stream;
 use iced::keyboard::{self, Key, Modifiers};
 use iced::widget::{column, container, row, scrollable, text, text_input, Column};
 use iced::{event, Element, Event, Length, Subscription, Task, Theme};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
-use nexus_api::{BlockId, BlockState, OutputFormat, Value};
-use nexus_kernel::CommandRegistry;
+use nexus_api::{BlockId, BlockState, OutputFormat, ShellEvent, Value};
+use nexus_kernel::{CommandRegistry, Kernel};
 use nexus_term::TerminalParser;
 
 use crate::glyph_cache::get_cell_metrics;
@@ -125,6 +125,8 @@ pub enum Message {
     /// VSync-aligned frame for batched rendering.
     /// Fires when the monitor is ready for the next frame.
     NextFrame(Instant),
+    /// Kernel event (from pipeline execution).
+    KernelEvent(ShellEvent),
 }
 
 /// Global keyboard shortcuts.
@@ -198,6 +200,10 @@ pub struct Nexus {
     is_dirty: bool,
     /// Registry of native (in-process) commands.
     commands: CommandRegistry,
+    /// Kernel for pipeline execution.
+    kernel: Arc<Mutex<Kernel>>,
+    /// Receiver for kernel events (shared with subscription).
+    kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +269,9 @@ impl Default for Nexus {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~".to_string());
 
+        // Create kernel for pipeline execution
+        let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
+
         Self {
             input: String::new(),
             blocks: Vec::new(),
@@ -285,6 +294,8 @@ impl Default for Nexus {
             input_before_event: String::new(),
             is_dirty: false,
             commands: CommandRegistry::new(),
+            kernel: Arc::new(Mutex::new(kernel)),
+            kernel_rx: Arc::new(Mutex::new(kernel_rx)),
         }
     }
 }
@@ -366,6 +377,66 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             // If the focused block exited, return focus to input
             if state.focus == Focus::Block(block_id) {
                 state.focus = Focus::Input;
+            }
+        }
+        Message::KernelEvent(shell_event) => {
+            match shell_event {
+                ShellEvent::CommandStarted { block_id, command, cwd: _ } => {
+                    // Create block if it doesn't exist
+                    if !state.block_index.contains_key(&block_id) {
+                        let mut block = Block::new(block_id, command);
+                        block.parser = TerminalParser::new(state.terminal_size.0, state.terminal_size.1);
+                        let block_idx = state.blocks.len();
+                        state.blocks.push(block);
+                        state.block_index.insert(block_id, block_idx);
+                    }
+                }
+                ShellEvent::StdoutChunk { block_id, data } => {
+                    if let Some(&idx) = state.block_index.get(&block_id) {
+                        if let Some(block) = state.blocks.get_mut(idx) {
+                            block.parser.feed(&data);
+                            block.version += 1;
+                        }
+                    }
+                    state.is_dirty = true;
+                }
+                ShellEvent::StderrChunk { block_id, data } => {
+                    if let Some(&idx) = state.block_index.get(&block_id) {
+                        if let Some(block) = state.blocks.get_mut(idx) {
+                            block.parser.feed(&data);
+                            block.version += 1;
+                        }
+                    }
+                    state.is_dirty = true;
+                }
+                ShellEvent::CommandOutput { block_id, value } => {
+                    if let Some(&idx) = state.block_index.get(&block_id) {
+                        if let Some(block) = state.blocks.get_mut(idx) {
+                            block.native_output = Some(value);
+                        }
+                    }
+                }
+                ShellEvent::CommandFinished { block_id, exit_code, duration_ms } => {
+                    if let Some(&idx) = state.block_index.get(&block_id) {
+                        if let Some(block) = state.blocks.get_mut(idx) {
+                            block.state = if exit_code == 0 {
+                                BlockState::Success
+                            } else {
+                                BlockState::Failed(exit_code)
+                            };
+                            block.duration_ms = Some(duration_ms);
+                            block.version += 1;
+                        }
+                    }
+                    state.last_exit_code = Some(exit_code);
+                    state.focus = Focus::Input;
+
+                    return scrollable::snap_to(
+                        scrollable::Id::new(HISTORY_SCROLLABLE),
+                        scrollable::RelativeOffset::END,
+                    );
+                }
+                _ => {}
             }
         }
         Message::KeyPressed(key, modifiers) => {
@@ -765,7 +836,10 @@ fn view(state: &Nexus) -> Element<'_, Message> {
 }
 
 fn subscription(state: &Nexus) -> Subscription<Message> {
-    let mut subscriptions = vec![pty_subscription(state.pty_rx.clone())];
+    let mut subscriptions = vec![
+        pty_subscription(state.pty_rx.clone()),
+        kernel_subscription(state.kernel_rx.clone()),
+    ];
 
     // Listen for all events with window ID - focus-dependent routing happens in update()
     subscriptions.push(
@@ -786,6 +860,37 @@ fn subscription(state: &Nexus) -> Subscription<Message> {
     }
 
     Subscription::batch(subscriptions)
+}
+
+/// Async subscription that awaits kernel events.
+fn kernel_subscription(
+    rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
+) -> Subscription<Message> {
+    struct KernelSubscription;
+
+    Subscription::run_with_id(
+        std::any::TypeId::of::<KernelSubscription>(),
+        stream::unfold(rx, |rx| async move {
+            loop {
+                let result = {
+                    let mut guard = rx.lock().await;
+                    guard.recv().await
+                };
+
+                match result {
+                    Ok(shell_event) => return Some((Message::KernelEvent(shell_event), rx)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Messages were dropped due to slow receiver, continue
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Channel closed, stop subscription
+                        return None;
+                    }
+                }
+            }
+        }),
+    )
 }
 
 /// Async subscription that awaits PTY events instead of polling.
@@ -866,13 +971,17 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
     let cmd_name = parts.first().map(|s| *s).unwrap_or("");
 
-    // Check for native (in-process) command
-    if state.commands.contains(cmd_name) {
+    // Check if command contains a pipe - if so, we need the kernel to parse the pipeline
+    let has_pipe = trimmed.contains('|');
+
+    // Check for native (in-process) command - but only if not a pipeline
+    // Pipelines need to go through the kernel for proper parsing and execution
+    if !has_pipe && state.commands.contains(cmd_name) {
         return execute_native_command(state, block_id, &trimmed, cmd_name, &parts[1..]);
     }
 
-    // External command - spawn via PTY
-    execute_external_command(state, block_id, command)
+    // External command or pipeline - execute via kernel
+    execute_kernel_command(state, block_id, command)
 }
 
 /// Execute a native (in-process) command and return immediately.
@@ -941,8 +1050,37 @@ fn execute_native_command(
     )
 }
 
-/// Execute an external command via PTY.
-fn execute_external_command(state: &mut Nexus, block_id: BlockId, command: String) -> Task<Message> {
+/// Execute a command via the kernel (handles pipelines with native commands).
+fn execute_kernel_command(state: &mut Nexus, block_id: BlockId, command: String) -> Task<Message> {
+    // Check if this is a pipeline - if so, use kernel
+    let has_pipe = command.contains('|');
+
+    if has_pipe {
+        // Pipeline execution via kernel
+        // The kernel will emit events that we'll receive via the subscription
+        let kernel = state.kernel.clone();
+        let cwd = state.cwd.clone();
+        let cmd = command.clone();
+
+        // Spawn kernel execution in a thread
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let mut kernel = kernel.lock().await;
+                // Update kernel's cwd to match UI
+                let _ = kernel.state_mut().set_cwd(std::path::PathBuf::from(&cwd));
+                let _ = kernel.execute(&cmd);
+            });
+        });
+
+        // Return immediately - kernel events will update the UI
+        return scrollable::snap_to(
+            scrollable::Id::new(HISTORY_SCROLLABLE),
+            scrollable::RelativeOffset::END,
+        );
+    }
+
+    // Single external command - use PTY for interactive support
     // Create new block with current terminal size
     let mut block = Block::new(block_id, command.clone());
     block.parser = TerminalParser::new(state.terminal_size.0, state.terminal_size.1);

@@ -217,3 +217,110 @@ pub fn wait_pipeline(
 
     Ok(last_exit)
 }
+
+/// Spawn an external command with optional stdin input (for native→external piping).
+///
+/// This function:
+/// 1. Spawns the process using pipes (not PTY) for stdin/stdout
+/// 2. Writes stdin_text to the process's stdin if provided
+/// 3. Reads stdout and emits events
+/// 4. Returns the exit code
+pub fn spawn_with_stdin(
+    name: &str,
+    args: &[String],
+    stdin_text: Option<String>,
+    state: &ShellState,
+    block_id: BlockId,
+    events: &Sender<ShellEvent>,
+) -> anyhow::Result<i32> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let start = Instant::now();
+
+    // Build the command
+    let mut cmd = Command::new(name);
+    cmd.args(args)
+        .current_dir(&state.cwd)
+        .stdin(if stdin_text.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Set environment
+    for (key, value) in &state.env {
+        cmd.env(key, value);
+    }
+
+    // Spawn the process
+    let mut child = cmd.spawn()?;
+
+    // Write stdin if provided
+    if let Some(text) = stdin_text {
+        if let Some(mut stdin) = child.stdin.take() {
+            // Write in a thread to avoid deadlock with stdout reading
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(text.as_bytes());
+                // stdin is dropped here, closing the pipe
+            });
+        }
+    }
+
+    // Read stdout in chunks and emit events
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Read stdout
+    if let Some(mut stdout) = stdout {
+        let events_clone = events.clone();
+        let block_id_clone = block_id;
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stdout, &mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let _ = events_clone.send(ShellEvent::StdoutChunk {
+                            block_id: block_id_clone,
+                            data: buffer[..n].to_vec(),
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Read stderr
+    if let Some(mut stderr) = stderr {
+        let events_clone = events.clone();
+        let block_id_clone = block_id;
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stderr, &mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let _ = events_clone.send(ShellEvent::StderrChunk {
+                            block_id: block_id_clone,
+                            data: buffer[..n].to_vec(),
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Wait for process to complete
+    let status = child.wait()?;
+    let exit_code = status.code().unwrap_or(1);
+
+    // Note: CommandFinished is emitted by the pipeline executor, not here
+    let _ = start.elapsed(); // Silence unused warning
+
+    Ok(exit_code)
+}

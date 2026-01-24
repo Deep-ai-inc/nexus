@@ -198,20 +198,152 @@ fn execute_pipeline(
         return execute_command(state, &pipeline.commands[0], events, commands);
     }
 
-    // For now, execute sequentially and connect with pipes
-    // TODO: Proper pipe setup with pump threads, native command chaining
+    // Check if any command in the pipeline is a native command
+    let has_native = pipeline.commands.iter().any(|cmd| {
+        if let Command::Simple(simple) = cmd {
+            commands.contains(&simple.name)
+        } else {
+            false
+        }
+    });
+
+    if has_native {
+        // Use native pipeline execution for mixed or all-native pipelines
+        execute_native_pipeline(state, pipeline, events, commands)
+    } else {
+        // All external - use legacy path
+        let block_id = next_block_id();
+
+        let _ = events.send(ShellEvent::CommandStarted {
+            block_id,
+            command: "[pipeline]".to_string(),
+            cwd: state.cwd.clone(),
+        });
+
+        let handles = process::spawn_pipeline(state, &pipeline.commands)?;
+        let exit_code = process::wait_pipeline(handles, block_id, events)?;
+
+        Ok(exit_code)
+    }
+}
+
+/// Execute a pipeline containing native commands.
+///
+/// For each stage in the pipeline:
+/// 1. If native command: execute in-process, capture `Value` output
+/// 2. If external command AND previous was native: serialize `Value` to text, pipe to stdin
+/// 3. If external command AND previous was external: currently unsupported (use legacy path)
+fn execute_native_pipeline(
+    state: &mut ShellState,
+    pipeline: &Pipeline,
+    events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
+) -> anyhow::Result<i32> {
+    use nexus_api::Value;
+
     let block_id = next_block_id();
+
+    // Build command string for display
+    let cmd_str = pipeline
+        .commands
+        .iter()
+        .filter_map(|cmd| {
+            if let Command::Simple(s) = cmd {
+                let args_str = s.args.iter().filter_map(|w| w.as_literal()).collect::<Vec<_>>().join(" ");
+                if args_str.is_empty() {
+                    Some(s.name.clone())
+                } else {
+                    Some(format!("{} {}", s.name, args_str))
+                }
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
 
     let _ = events.send(ShellEvent::CommandStarted {
         block_id,
-        command: "[pipeline]".to_string(),
+        command: cmd_str,
         cwd: state.cwd.clone(),
     });
 
-    let handles = process::spawn_pipeline(state, &pipeline.commands)?;
-    let exit_code = process::wait_pipeline(handles, block_id, events)?;
+    let start = std::time::Instant::now();
+    let mut current_value: Option<Value> = None;
+    let mut last_exit = 0;
 
-    Ok(exit_code)
+    for cmd in &pipeline.commands {
+        let Command::Simple(simple) = cmd else {
+            continue;
+        };
+
+        // Expand command name and args
+        let name = expand::expand_word_to_string(&Word::Literal(simple.name.clone()), state);
+        let args: Vec<String> = simple
+            .args
+            .iter()
+            .map(|w| expand::expand_word_to_string(w, state))
+            .collect();
+
+        if let Some(native_cmd) = commands.get(&name) {
+            // Native command: pass Value via ctx.stdin
+            let mut ctx = CommandContext {
+                state,
+                events,
+                block_id,
+                stdin: current_value.take(),
+            };
+
+            match native_cmd.execute(&args, &mut ctx) {
+                Ok(value) => {
+                    // Don't pass Unit values down the pipeline
+                    current_value = if matches!(value, Value::Unit) {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                    last_exit = 0;
+                }
+                Err(e) => {
+                    let _ = events.send(ShellEvent::StderrChunk {
+                        block_id,
+                        data: format!("{}: {}\n", name, e).into_bytes(),
+                    });
+                    let _ = events.send(ShellEvent::CommandFinished {
+                        block_id,
+                        exit_code: 1,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                    return Ok(1);
+                }
+            }
+        } else {
+            // External command: serialize Value to text, spawn process with stdin
+            let input_text = current_value.take().map(|v| v.to_text());
+            last_exit = process::spawn_with_stdin(
+                &name,
+                &args,
+                input_text,
+                state,
+                block_id,
+                events,
+            )?;
+            current_value = None; // External commands produce bytes, not Value
+        }
+    }
+
+    // Emit final output if we have a value from a native command
+    if let Some(value) = current_value {
+        let _ = events.send(ShellEvent::CommandOutput { block_id, value });
+    }
+
+    let _ = events.send(ShellEvent::CommandFinished {
+        block_id,
+        exit_code: last_exit,
+        duration_ms: start.elapsed().as_millis() as u64,
+    });
+
+    Ok(last_exit)
 }
 
 /// Execute a list of commands with &&, ||, ;, &.

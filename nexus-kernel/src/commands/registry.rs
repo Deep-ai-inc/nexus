@@ -1,6 +1,6 @@
 //! Command registry for looking up in-process commands.
 
-use super::{ls::LsCommand, NexusCommand};
+use super::{head::HeadCommand, ls::LsCommand, NexusCommand};
 use std::collections::HashMap;
 
 /// Registry of all available in-process commands.
@@ -16,6 +16,7 @@ impl CommandRegistry {
         };
 
         // Register built-in commands
+        registry.register(HeadCommand);
         registry.register(LsCommand);
 
         registry

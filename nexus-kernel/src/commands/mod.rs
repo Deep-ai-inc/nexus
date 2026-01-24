@@ -3,6 +3,7 @@
 //! Commands implemented here run within the shell process (no fork/exec),
 //! return structured `Value` data, and can leverage full GUI capabilities.
 
+mod head;
 mod ls;
 mod registry;
 
