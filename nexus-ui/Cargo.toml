@@ -22,3 +22,6 @@ tokio = { workspace = true }
 iced = { workspace = true }
 portable-pty = { workspace = true }
 arboard = { workspace = true }  # Clipboard support
+fontdue = { workspace = true }  # Glyph rasterization for GPU atlas
+bytemuck = { workspace = true }  # Safe transmutes for GPU buffers
+wgpu = { workspace = true }  # GPU access for custom shaders

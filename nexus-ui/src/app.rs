@@ -13,8 +13,9 @@ use tokio::sync::{mpsc, Mutex};
 use nexus_api::{BlockId, BlockState, OutputFormat};
 use nexus_term::TerminalParser;
 
+use crate::glyph_cache::get_cell_metrics;
 use crate::pty::PtyHandle;
-use crate::widgets::terminal_view::TerminalView;
+use crate::widgets::terminal_shader::TerminalShader;
 
 // ============================================================================
 // Terminal rendering constants - single source of truth
@@ -719,8 +720,6 @@ fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Option<Vec<u8>> {
 
 fn view(state: &Nexus) -> Element<'_, Message> {
     // Build all blocks
-    // Note: lazy widget requires 'static data, so we render blocks directly
-    // The PartialEq impl on Block is available for future optimization
     let font_size = state.font_size;
     let content_elements: Vec<Element<Message>> = state
         .blocks
@@ -744,7 +743,7 @@ fn view(state: &Nexus) -> Element<'_, Message> {
 
     let content = column![history, input_line].spacing(0);
 
-    container(content)
+    let result = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_theme| container::Style {
@@ -753,7 +752,9 @@ fn view(state: &Nexus) -> Element<'_, Message> {
             ))),
             ..Default::default()
         })
-        .into()
+        .into();
+
+    result
 }
 
 fn subscription(state: &Nexus) -> Subscription<Message> {
@@ -911,21 +912,26 @@ fn view_block(block: &Block, font_size: f32) -> Element<'_, Message> {
     .spacing(0);
 
     // Terminal output - only show cursor for running commands
-    // Show full scrollback so user can scroll up while output streams,
-    // EXCEPT for alternate screen mode (TUI apps like vim, htop).
+    // For RUNNING blocks: use viewport-only grid (O(1) extraction)
+    // For FINISHED blocks: use full scrollback (cached, O(1) after first extraction)
+    // For alternate screen (TUI apps): always viewport only
     let output: Element<Message> = if block.collapsed {
         column![].into()
     } else {
-        let grid = if block.parser.is_alternate_screen() {
-            // Alternate screen (TUI apps): viewport only
+        let grid = if block.parser.is_alternate_screen() || block.is_running() {
+            // Running or alternate screen: viewport only (fast, O(1))
             block.parser.grid()
         } else {
-            // Normal mode: show all content including scrollback
-            // This lets users scroll up to read streaming output
+            // Finished blocks: show all content including scrollback
+            // This is cached after first extraction
             block.parser.grid_with_scrollback()
         };
-        TerminalView::new(grid, font_size)
-            .show_cursor(block.is_running())
+
+        // Use GPU shader renderer for performance
+        let content_rows = grid.content_rows() as usize;
+        let (_cell_width, cell_height) = get_cell_metrics(font_size);
+        TerminalShader::<Message>::new(&grid, font_size, 0, content_rows, cell_height)
+            .widget()
             .into()
     };
 

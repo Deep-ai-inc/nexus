@@ -41,9 +41,13 @@ alacritty_terminal = "0.25"
 
 # UI dependencies (Iced + WGPU)
 # "lazy" feature enables cached/memoized widget rendering for performance
-iced = { version = "0.13", features = ["tokio", "advanced", "wgpu", "lazy"] }
+# Use wgpu-only (no tiny-skia fallback) to enable Shader widget
+iced = { version = "0.13", default-features = false, features = ["tokio", "advanced", "wgpu", "lazy"] }
 cosmic-text = "0.12"
 arboard = "3.4"  # Cross-platform clipboard
+fontdue = "0.9"  # Fast font rasterization for glyph atlas
+bytemuck = { version = "1.14", features = ["derive"] }  # Safe transmutes for GPU buffers
+wgpu = "23.0"  # GPU access (same version Iced uses)
 
 # Internal crates
 nexus-api = { path = "nexus-api" }

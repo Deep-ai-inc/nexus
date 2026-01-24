@@ -119,6 +119,9 @@ impl TerminalGrid {
             return cached;
         }
 
+        // Cache miss - need to scan
+        let scan_start = std::time::Instant::now();
+
         // OPTIMIZATION: Scan REVERSE (bottom-up) to find content immediately.
         // For a full screen, this is O(1) instead of O(N).
         let mut last_content_row: u16 = 0;
@@ -145,6 +148,10 @@ impl TerminalGrid {
         }
 
         let result = last_content_row.max(1);
+        let scan_time = scan_start.elapsed();
+        if scan_time.as_micros() > 100 {
+            eprintln!("[CONTENT_ROWS] cache MISS - {}us to scan {} rows", scan_time.as_micros(), self.rows);
+        }
         self.content_rows_cache.set(Some(result));
         result
     }
