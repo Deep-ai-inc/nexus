@@ -121,7 +121,17 @@ fn ansi_to_rgba(index: u8) -> [f32; 4] {
 impl From<AnsiColor> for Color {
     fn from(color: AnsiColor) -> Self {
         match color {
-            AnsiColor::Named(named) => Color::Named(named as u8),
+            AnsiColor::Named(named) => {
+                // Alacritty uses NamedColor::Foreground (256) and Background (257)
+                // for default colors. These don't fit in u8, so detect them.
+                let idx = named as u16;
+                if idx >= 256 {
+                    // Default foreground/background - use our Default variant
+                    Color::Default
+                } else {
+                    Color::Named(idx as u8)
+                }
+            }
             AnsiColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
             AnsiColor::Indexed(idx) => Color::Indexed(idx),
         }
