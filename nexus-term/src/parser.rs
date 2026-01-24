@@ -1,5 +1,8 @@
 //! Terminal parser - feeds bytes through alacritty_terminal to update grid state.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
@@ -10,11 +13,18 @@ use crate::cell::{Cell, CellFlags, Color};
 use crate::grid::TerminalGrid;
 
 /// A terminal parser that maintains grid state.
+///
+/// Uses interior mutability (RefCell) for grid caching to allow
+/// cache population during `&self` view calls.
 pub struct TerminalParser {
     /// The alacritty terminal state.
     term: Term<EventProxy>,
     /// ANSI parser/processor.
     processor: Processor,
+    /// Cached viewport grid (for running blocks).
+    cached_viewport: RefCell<Option<Rc<TerminalGrid>>>,
+    /// Cached full grid with scrollback (for finished blocks).
+    cached_scrollback: RefCell<Option<Rc<TerminalGrid>>>,
 }
 
 impl std::fmt::Debug for TerminalParser {
@@ -49,16 +59,44 @@ impl TerminalParser {
         let term = Term::new(config, &size, EventProxy);
         let processor = Processor::new();
 
-        Self { term, processor }
+        Self {
+            term,
+            processor,
+            cached_viewport: RefCell::new(None),
+            cached_scrollback: RefCell::new(None),
+        }
     }
 
-    /// Feed bytes into the parser.
+    /// Feed bytes into the parser. Invalidates cached grids.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+        // Invalidate caches - new content means grids need regeneration
+        *self.cached_viewport.borrow_mut() = None;
+        *self.cached_scrollback.borrow_mut() = None;
+    }
+
+    /// Invalidate all cached grids (call after resize).
+    pub fn invalidate_cache(&self) {
+        *self.cached_viewport.borrow_mut() = None;
+        *self.cached_scrollback.borrow_mut() = None;
     }
 
     /// Extract the current grid state (viewport only).
-    pub fn grid(&self) -> TerminalGrid {
+    /// Uses caching - only regenerates when cache is invalid.
+    pub fn grid(&self) -> Rc<TerminalGrid> {
+        // Check if cache is valid
+        if let Some(ref cached) = *self.cached_viewport.borrow() {
+            return Rc::clone(cached);
+        }
+
+        // Cache miss - extract grid
+        let grid = Rc::new(self.extract_viewport());
+        *self.cached_viewport.borrow_mut() = Some(Rc::clone(&grid));
+        grid
+    }
+
+    /// Internal: extract viewport without caching.
+    fn extract_viewport(&self) -> TerminalGrid {
         let term_content = self.term.renderable_content();
         let cols = self.term.columns();
         let rows = self.term.screen_lines();
@@ -90,7 +128,21 @@ impl TerminalParser {
     /// Extract ALL content including scrollback history.
     /// Returns a grid sized to fit all content (scrollback + visible).
     /// Used for finished blocks that need to show complete output.
-    pub fn grid_with_scrollback(&self) -> TerminalGrid {
+    /// Uses caching - only regenerates when cache is invalid.
+    pub fn grid_with_scrollback(&self) -> Rc<TerminalGrid> {
+        // Check if cache is valid
+        if let Some(ref cached) = *self.cached_scrollback.borrow() {
+            return Rc::clone(cached);
+        }
+
+        // Cache miss - extract full grid
+        let grid = Rc::new(self.extract_scrollback());
+        *self.cached_scrollback.borrow_mut() = Some(Rc::clone(&grid));
+        grid
+    }
+
+    /// Internal: extract full grid with scrollback without caching.
+    fn extract_scrollback(&self) -> TerminalGrid {
         let grid = self.term.grid();
         let cols = self.term.columns();
         let screen_lines = self.term.screen_lines();
@@ -98,7 +150,7 @@ impl TerminalParser {
         let total_lines = screen_lines + history_lines;
 
         // Calculate actual content height to avoid huge empty grids
-        let content_rows = self.content_height();
+        let content_rows = self.compute_content_height();
         let total_to_render = content_rows.min(total_lines).max(1);
 
         // Create a grid sized to actual content
@@ -143,10 +195,13 @@ impl TerminalParser {
         self.term.screen_lines() + self.term.grid().history_size()
     }
 
-    /// Resize the terminal.
+    /// Resize the terminal. Invalidates cached grids.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let size = TermSize::new(cols as usize, rows as usize);
         self.term.resize(size);
+        // Invalidate caches - size change means grids need regeneration
+        *self.cached_viewport.borrow_mut() = None;
+        *self.cached_scrollback.borrow_mut() = None;
     }
 
     /// Get terminal dimensions.
@@ -163,6 +218,11 @@ impl TerminalParser {
     /// Includes both visible screen AND scrollback history.
     /// Used for sizing finished blocks to show all their content.
     pub fn content_height(&self) -> usize {
+        self.compute_content_height()
+    }
+
+    /// Internal: compute content height by scanning grid.
+    fn compute_content_height(&self) -> usize {
         let grid = self.term.grid();
         let cols = self.term.columns();
         let screen_lines = self.term.screen_lines();

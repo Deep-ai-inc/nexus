@@ -1,5 +1,7 @@
 //! Terminal view widget - renders a terminal grid using Iced primitives.
 
+use std::rc::Rc;
+
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;
 use iced::advanced::widget::{self, Widget};
@@ -11,8 +13,9 @@ use nexus_term::{Color as TermColor, TerminalGrid};
 use crate::app::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
 
 /// A widget that renders a terminal grid.
+/// Uses Rc<TerminalGrid> for cheap cloning - the grid is cached in the parser.
 pub struct TerminalView {
-    grid: TerminalGrid,
+    grid: Rc<TerminalGrid>,
     font_size: f32,
     line_height: f32,
     char_width: f32,
@@ -21,7 +24,7 @@ pub struct TerminalView {
 
 impl TerminalView {
     /// Create a new terminal view with the given font size.
-    pub fn new(grid: TerminalGrid, font_size: f32) -> Self {
+    pub fn new(grid: Rc<TerminalGrid>, font_size: f32) -> Self {
         Self {
             grid,
             font_size,
@@ -56,29 +59,6 @@ impl TerminalView {
                 Color::from_rgb(*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0)
             }
         }
-    }
-
-    /// Count the number of rows that have actual content.
-    fn count_content_rows(&self) -> usize {
-        let mut last_content_row = 0;
-
-        for (row_idx, row) in self.grid.rows_iter().enumerate() {
-            let has_content = row.iter().any(|cell| cell.c != '\0' && cell.c != ' ');
-            if has_content {
-                last_content_row = row_idx + 1;
-            }
-        }
-
-        // Include cursor row only if cursor is shown
-        if self.show_cursor && self.grid.cursor_visible() {
-            let (_col, cursor_row) = self.grid.cursor();
-            let cursor_row = (cursor_row as usize) + 1;
-            if cursor_row > last_content_row {
-                return cursor_row;
-            }
-        }
-
-        last_content_row
     }
 }
 
@@ -137,8 +117,8 @@ where
         let (cols, _rows) = self.grid.size();
         let width = cols as f32 * self.char_width;
 
-        // Only count rows that have actual content
-        let content_rows = self.count_content_rows();
+        // Use cached content rows from grid (no re-scanning)
+        let content_rows = self.grid.content_rows() as usize;
         let height = content_rows as f32 * self.cell_height();
 
         let size = limits
@@ -157,14 +137,14 @@ where
         _style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
         let cell_height = self.cell_height();
+        let (cols, total_rows) = self.grid.size();
 
         // Calculate actual content width based on grid columns
         // Add a small buffer (0.5 char) to account for float precision errors in font rendering
-        let (cols, _) = self.grid.size();
         let content_width = (cols as f32 * self.char_width) + (self.char_width * 0.5);
 
         // Use the larger of bounds or content width for text layout
@@ -176,12 +156,43 @@ where
             ..bounds
         };
 
-        // Draw each row
+        // === VIEWPORT VIRTUALIZATION ===
+        // Calculate which rows are actually visible in the viewport.
+        // bounds.y is the widget's position; viewport is the visible screen area.
+        // A row is visible if its Y position falls within the viewport.
+        let first_visible_row = if viewport.y > bounds.y {
+            // Viewport starts below widget top - calculate first visible row
+            ((viewport.y - bounds.y) / cell_height).floor() as usize
+        } else {
+            0
+        };
+
+        // Last visible row: where viewport ends relative to widget
+        let viewport_bottom = viewport.y + viewport.height;
+        let last_visible_row = if viewport_bottom > bounds.y {
+            ((viewport_bottom - bounds.y) / cell_height).ceil() as usize
+        } else {
+            0
+        };
+
+        // Clamp to actual grid bounds and add 1 row buffer for partial visibility
+        let first_row = first_visible_row.saturating_sub(1);
+        let last_row = (last_visible_row + 1).min(total_rows as usize);
+
+        // Pre-allocate string buffer for row text
+        let mut line_text = String::with_capacity(cols as usize);
+
+        // Draw only visible rows
         for (row_idx, row) in self.grid.rows_iter().enumerate() {
+            // Skip rows outside viewport
+            if row_idx < first_row || row_idx > last_row {
+                continue;
+            }
+
             let y = bounds.y + row_idx as f32 * cell_height;
 
-            // Build the line text and collect color spans
-            let mut line_text = String::new();
+            // Reuse string buffer
+            line_text.clear();
             let mut has_content = false;
 
             for cell in row {
@@ -218,25 +229,30 @@ where
             );
         }
 
-        // Draw cursor if visible and enabled
+        // Draw cursor if visible, enabled, and within viewport
         if self.show_cursor && self.grid.cursor_visible() {
             let (cursor_col, cursor_row) = self.grid.cursor();
-            let cursor_x = bounds.x + cursor_col as f32 * self.char_width;
-            let cursor_y = bounds.y + cursor_row as f32 * cell_height;
+            let cursor_row = cursor_row as usize;
 
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: Rectangle {
-                        x: cursor_x,
-                        y: cursor_y,
-                        width: self.char_width,
-                        height: cell_height,
+            // Only draw cursor if it's in the visible range
+            if cursor_row >= first_row && cursor_row <= last_row {
+                let cursor_x = bounds.x + cursor_col as f32 * self.char_width;
+                let cursor_y = bounds.y + cursor_row as f32 * cell_height;
+
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle {
+                            x: cursor_x,
+                            y: cursor_y,
+                            width: self.char_width,
+                            height: cell_height,
+                        },
+                        border: iced::Border::default(),
+                        shadow: iced::Shadow::default(),
                     },
-                    border: iced::Border::default(),
-                    shadow: iced::Shadow::default(),
-                },
-                Color::from_rgba(0.9, 0.9, 0.9, 0.7),
-            );
+                    Color::from_rgba(0.9, 0.9, 0.9, 0.7),
+                );
+            }
         }
     }
 }

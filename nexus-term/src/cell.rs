@@ -4,7 +4,8 @@ use alacritty_terminal::term::cell::Flags as AlacrittyFlags;
 use alacritty_terminal::vte::ansi::Color as AnsiColor;
 
 /// A single cell in the terminal grid.
-#[derive(Debug, Clone, Default)]
+/// This struct is Copy since it's small (≈12 bytes) and frequently copied.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Cell {
     /// The character in this cell.
     pub c: char,
