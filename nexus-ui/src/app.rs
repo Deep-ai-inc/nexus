@@ -19,14 +19,12 @@ use crate::widgets::terminal_view::TerminalView;
 // Terminal rendering constants - single source of truth
 // ============================================================================
 
-/// Font size for terminal text.
-pub const FONT_SIZE: f32 = 14.0;
+/// Default font size for terminal text.
+pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// Line height multiplier.
 pub const LINE_HEIGHT_FACTOR: f32 = 1.4;
-/// Character width - slightly conservative (8.5 vs 8.4) for font anti-aliasing buffers.
-pub const CHAR_WIDTH: f32 = 8.5;
-/// Computed line height.
-pub const LINE_HEIGHT: f32 = FONT_SIZE * LINE_HEIGHT_FACTOR; // 19.6
+/// Character width ratio relative to font size.
+pub const CHAR_WIDTH_RATIO: f32 = 0.607; // ~8.5/14.0, conservative for anti-aliasing
 
 /// Scrollable ID for auto-scrolling.
 const HISTORY_SCROLLABLE: &str = "history";
@@ -108,10 +106,42 @@ pub enum Message {
     PtyExited(BlockId, i32),
     /// Keyboard event when a block is focused.
     KeyPressed(Key, Modifiers),
-    /// Generic event (for subscription).
-    Event(Event),
+    /// Generic event (for subscription) with window ID.
+    Event(Event, iced::window::Id),
     /// Window resized.
     WindowResized(u32, u32),
+    /// Global keyboard shortcut (Cmd+K, Cmd+Q, etc.)
+    GlobalShortcut(GlobalShortcut),
+    /// Input-specific key event (Up/Down for history)
+    InputKey(Key, Modifiers),
+    /// Zoom font size
+    Zoom(ZoomDirection),
+}
+
+/// Global keyboard shortcuts.
+#[derive(Debug, Clone)]
+pub enum GlobalShortcut {
+    /// Cmd+K - Clear screen
+    ClearScreen,
+    /// Cmd+W - Close window
+    CloseWindow,
+    /// Cmd+Q - Quit application
+    Quit,
+    /// Cmd+C - Copy
+    Copy,
+    /// Cmd+V - Paste
+    Paste,
+}
+
+/// Zoom direction for font size changes.
+#[derive(Debug, Clone)]
+pub enum ZoomDirection {
+    /// Cmd++ - Increase font size
+    In,
+    /// Cmd+- - Decrease font size
+    Out,
+    /// Cmd+0 - Reset to default
+    Reset,
 }
 
 /// The main Nexus application state.
@@ -134,12 +164,80 @@ pub struct Nexus {
     focus: Focus,
     /// Terminal dimensions (cols, rows).
     terminal_size: (u16, u16),
+    /// Window dimensions in pixels (for recalculating on zoom).
+    window_dims: (f32, f32),
+    /// Current font size (mutable for zoom).
+    font_size: f32,
+    /// Command history for Up/Down navigation.
+    command_history: Vec<String>,
+    /// Current position in history (None = new command being typed).
+    history_index: Option<usize>,
+    /// Saved input when browsing history (to restore on Down).
+    saved_input: String,
+    /// Exit code of last command (for prompt color).
+    last_exit_code: Option<i32>,
+    /// Window ID for resize operations.
+    window_id: Option<iced::window::Id>,
+    /// Suppress next input change (after Cmd shortcut to prevent typing).
+    suppress_next_input: bool,
+    /// Input value before current event (to detect ghost characters).
+    input_before_event: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum PtyEvent {
     Output(Vec<u8>),
     Exited(i32),
+}
+
+impl Nexus {
+    /// Get current character width based on font size.
+    fn char_width(&self) -> f32 {
+        self.font_size * CHAR_WIDTH_RATIO
+    }
+
+    /// Get current line height based on font size.
+    fn line_height(&self) -> f32 {
+        self.font_size * LINE_HEIGHT_FACTOR
+    }
+
+    /// Recalculate terminal dimensions based on window size and font metrics.
+    /// Returns (cols, rows) and updates terminal_size.
+    fn recalculate_terminal_size(&mut self) -> (u16, u16) {
+        let h_padding = 30.0; // Left + right padding
+        let v_padding = 80.0; // Top/bottom padding + input area
+
+        let (width, height) = self.window_dims;
+        let cols = ((width - h_padding) / self.char_width()) as u16;
+        let rows = ((height - v_padding) / self.line_height()) as u16;
+
+        // Clamp to reasonable ranges
+        let cols = cols.max(40).min(500);
+        let rows = rows.max(5).min(200);
+
+        self.terminal_size = (cols, rows);
+        (cols, rows)
+    }
+
+    /// Apply terminal resize to all blocks and PTYs.
+    fn apply_resize(&mut self, cols: u16, rows: u16) {
+        for block in &mut self.blocks {
+            if block.is_running() {
+                block.parser.resize(cols, rows);
+            } else {
+                // Finished blocks: two-step resize for reflow
+                let (_, current_rows) = block.parser.size();
+                block.parser.resize(cols, current_rows);
+                let needed_rows = block.parser.content_height() as u16;
+                block.parser.resize(cols, needed_rows.max(1));
+            }
+        }
+
+        // Resize all active PTYs
+        for handle in &self.pty_handles {
+            let _ = handle.resize(cols, rows);
+        }
+    }
 }
 
 impl Default for Nexus {
@@ -159,6 +257,15 @@ impl Default for Nexus {
             pty_rx: Arc::new(Mutex::new(pty_rx)),
             focus: Focus::Input,
             terminal_size: (120, 24),
+            window_dims: (1200.0, 800.0), // Match initial window size
+            font_size: DEFAULT_FONT_SIZE,
+            command_history: Vec::new(),
+            history_index: None,
+            saved_input: String::new(),
+            last_exit_code: None,
+            window_id: None,
+            suppress_next_input: false,
+            input_before_event: String::new(),
         }
     }
 }
@@ -176,6 +283,13 @@ pub fn run() -> iced::Result {
 fn update(state: &mut Nexus, message: Message) -> Task<Message> {
     match message {
         Message::InputChanged(value) => {
+            // Suppress input if a Cmd shortcut just fired (prevents typing shortcut char)
+            if state.suppress_next_input {
+                state.suppress_next_input = false;
+                return Task::none();
+            }
+            // Track previous value for ghost character detection
+            state.input_before_event = state.input.clone();
             state.input = value;
             state.focus = Focus::Input;
         }
@@ -209,6 +323,9 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             }
             state.pty_handles.retain(|h| h.block_id != block_id);
 
+            // Track last exit code for prompt color
+            state.last_exit_code = Some(exit_code);
+
             // If the focused block exited, return focus to input
             if state.focus == Focus::Block(block_id) {
                 state.focus = Focus::Input;
@@ -219,20 +336,22 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 if let Some(handle) = state.pty_handles.iter().find(|h| h.block_id == block_id) {
                     // Handle Ctrl+C/D/Z
                     if modifiers.control() {
-                        match &key {
-                            Key::Character(c) if c.as_str() == "c" => {
-                                let _ = handle.send_interrupt();
-                                return Task::none();
+                        if let Key::Character(c) = &key {
+                            match c.to_lowercase().as_str() {
+                                "c" => {
+                                    let _ = handle.send_interrupt();
+                                    return Task::none();
+                                }
+                                "d" => {
+                                    let _ = handle.send_eof();
+                                    return Task::none();
+                                }
+                                "z" => {
+                                    let _ = handle.send_suspend();
+                                    return Task::none();
+                                }
+                                _ => {}
                             }
-                            Key::Character(c) if c.as_str() == "d" => {
-                                let _ = handle.send_eof();
-                                return Task::none();
-                            }
-                            Key::Character(c) if c.as_str() == "z" => {
-                                let _ = handle.send_suspend();
-                                return Task::none();
-                            }
-                            _ => {}
                         }
                     }
 
@@ -249,11 +368,67 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 }
             }
         }
-        Message::Event(event) => {
+        Message::Event(event, window_id) => {
+            // Capture window ID for resize operations
+            if state.window_id.is_none() {
+                state.window_id = Some(window_id);
+            }
+
             match event {
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-                    if let Focus::Block(_) = state.focus {
-                        return update(state, Message::KeyPressed(key, modifiers));
+                    // Global shortcuts (Cmd+K, Cmd+Q, etc.) work regardless of focus
+                    if modifiers.command() {
+                        if let Key::Character(c) = &key {
+                            let ch = c.to_lowercase();
+                            let task = match ch.as_str() {
+                                "k" => Some(update(state, Message::GlobalShortcut(GlobalShortcut::ClearScreen))),
+                                "w" => Some(update(state, Message::GlobalShortcut(GlobalShortcut::CloseWindow))),
+                                "q" => Some(update(state, Message::GlobalShortcut(GlobalShortcut::Quit))),
+                                "c" => Some(update(state, Message::GlobalShortcut(GlobalShortcut::Copy))),
+                                "v" => Some(update(state, Message::GlobalShortcut(GlobalShortcut::Paste))),
+                                "=" | "+" => Some(update(state, Message::Zoom(ZoomDirection::In))),
+                                "-" => Some(update(state, Message::Zoom(ZoomDirection::Out))),
+                                "0" => Some(update(state, Message::Zoom(ZoomDirection::Reset))),
+                                _ => None,
+                            };
+                            if let Some(task) = task {
+                                // Suppress next input to prevent shortcut char from being typed
+                                state.suppress_next_input = true;
+                                return task;
+                            }
+                        }
+                    }
+
+                    // Ctrl+C in input clears the line (like traditional shell)
+                    if modifiers.control() && matches!(state.focus, Focus::Input) {
+                        if let Key::Character(c) = &key {
+                            if c.to_lowercase().as_str() == "c" {
+                                state.input.clear();
+                                state.history_index = None;
+                                state.saved_input.clear();
+                                return Task::none();
+                            }
+                        }
+                    }
+
+                    // Focus-dependent key handling
+                    match state.focus {
+                        Focus::Input => {
+                            // Up/Down for history navigation
+                            match &key {
+                                Key::Named(keyboard::key::Named::ArrowUp) if !modifiers.shift() => {
+                                    return update(state, Message::InputKey(key, modifiers));
+                                }
+                                Key::Named(keyboard::key::Named::ArrowDown) if !modifiers.shift() => {
+                                    return update(state, Message::InputKey(key, modifiers));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Focus::Block(_) => {
+                            // Forward key events to PTY
+                            return update(state, Message::KeyPressed(key, modifiers));
+                        }
                     }
                 }
                 Event::Window(iced::window::Event::Resized(size)) => {
@@ -263,44 +438,149 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             }
         }
         Message::WindowResized(width, height) => {
-            // Calculate terminal dimensions using centralized constants
-            let h_padding = 30.0; // Left + right padding
-            let v_padding = 80.0; // Top/bottom padding + input area
-
-            let cols = ((width as f32 - h_padding) / CHAR_WIDTH) as u16;
-            let rows = ((height as f32 - v_padding) / LINE_HEIGHT) as u16;
-
-            // Clamp to reasonable ranges
-            let cols = cols.max(40).min(500);
-            let rows = rows.max(5).min(200);
+            // Store window dimensions for zoom recalculation
+            state.window_dims = (width as f32, height as f32);
 
             let old_cols = state.terminal_size.0;
-            state.terminal_size = (cols, rows);
+            let (cols, rows) = state.recalculate_terminal_size();
 
             // Only resize if column count changed
             if cols != old_cols {
-                for block in &mut state.blocks {
-                    if block.is_running() {
-                        // Running blocks: resize to window dimensions for TUIs
-                        block.parser.resize(cols, rows);
-                    } else {
-                        // Finished blocks: two-step resize
-                        // 1. First resize width only (triggers reflow)
-                        let (_, current_rows) = block.parser.size();
-                        block.parser.resize(cols, current_rows);
+                state.apply_resize(cols, rows);
+            }
+        }
+        Message::GlobalShortcut(shortcut) => {
+            // Strip the shortcut character ONLY if text_input just typed it
+            // (compare current input to input_before_event to avoid false positives)
+            let strip_char = match &shortcut {
+                GlobalShortcut::ClearScreen => Some('k'),
+                GlobalShortcut::CloseWindow => Some('w'),
+                GlobalShortcut::Quit => Some('q'),
+                GlobalShortcut::Copy => Some('c'),
+                GlobalShortcut::Paste => Some('v'),
+            };
+            if let Some(ch) = strip_char {
+                // Only pop if input grew by exactly this character
+                let expected_lower = format!("{}{}", state.input_before_event, ch);
+                let expected_upper = format!("{}{}", state.input_before_event, ch.to_ascii_uppercase());
+                if state.input == expected_lower || state.input == expected_upper {
+                    state.input.pop();
+                }
+            }
 
-                        // 2. Calculate the actual height needed for wrapped text
-                        let needed_rows = block.parser.content_height() as u16;
-
-                        // 3. Resize parser to exact content height
-                        block.parser.resize(cols, needed_rows.max(1));
+            match shortcut {
+                GlobalShortcut::ClearScreen => {
+                    state.blocks.clear();
+                }
+                GlobalShortcut::CloseWindow | GlobalShortcut::Quit => {
+                    return iced::exit();
+                }
+                GlobalShortcut::Copy => {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        // Copy the input (after stripping the 'c')
+                        let _ = clipboard.set_text(&state.input);
                     }
                 }
-
-                // Resize all active PTYs
-                for handle in &state.pty_handles {
-                    let _ = handle.resize(cols, rows);
+                GlobalShortcut::Paste => {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            state.input.push_str(&text);
+                        }
+                    }
                 }
+            }
+        }
+        Message::Zoom(direction) => {
+            // Strip the shortcut character ONLY if text_input just typed it
+            let strip_chars: &[char] = match &direction {
+                ZoomDirection::In => &['=', '+'],
+                ZoomDirection::Out => &['-'],
+                ZoomDirection::Reset => &['0'],
+            };
+            for &ch in strip_chars {
+                let expected = format!("{}{}", state.input_before_event, ch);
+                if state.input == expected {
+                    state.input.pop();
+                    break;
+                }
+            }
+
+            let old_size = state.font_size;
+            state.font_size = match direction {
+                ZoomDirection::In => (state.font_size + 1.0).min(32.0),
+                ZoomDirection::Out => (state.font_size - 1.0).max(8.0),
+                ZoomDirection::Reset => DEFAULT_FONT_SIZE,
+            };
+
+            // Only resize if font size actually changed
+            if (state.font_size - old_size).abs() > 0.001 {
+                // Keep same terminal dimensions, resize window proportionally
+                let (cols, rows) = state.terminal_size;
+                let new_char_width = state.font_size * CHAR_WIDTH_RATIO;
+                let new_line_height = state.font_size * LINE_HEIGHT_FACTOR;
+
+                let h_padding = 30.0;
+                let v_padding = 80.0;
+
+                let new_width = (cols as f32 * new_char_width) + h_padding;
+                let new_height = (rows as f32 * new_line_height) + v_padding;
+
+                // Update cached window dims
+                state.window_dims = (new_width, new_height);
+
+                // Resize window if we have the ID
+                if let Some(window_id) = state.window_id {
+                    return iced::window::resize(
+                        window_id,
+                        iced::Size::new(new_width, new_height),
+                    );
+                }
+            }
+        }
+        Message::InputKey(key, _modifiers) => {
+            match &key {
+                Key::Named(keyboard::key::Named::ArrowUp) => {
+                    // Navigate to previous history entry
+                    if state.command_history.is_empty() {
+                        return Task::none();
+                    }
+
+                    match state.history_index {
+                        None => {
+                            // First press: save current input before browsing
+                            state.saved_input = state.input.clone();
+                            state.history_index = Some(state.command_history.len() - 1);
+                        }
+                        Some(0) => {
+                            // Already at oldest, do nothing
+                        }
+                        Some(i) => {
+                            state.history_index = Some(i - 1);
+                        }
+                    }
+
+                    if let Some(i) = state.history_index {
+                        state.input = state.command_history[i].clone();
+                    }
+                }
+                Key::Named(keyboard::key::Named::ArrowDown) => {
+                    match state.history_index {
+                        None => {
+                            // Not in history mode, do nothing
+                        }
+                        Some(i) if i >= state.command_history.len() - 1 => {
+                            // At newest entry, restore saved input
+                            state.history_index = None;
+                            state.input = state.saved_input.clone();
+                            state.saved_input.clear();
+                        }
+                        Some(i) => {
+                            state.history_index = Some(i + 1);
+                            state.input = state.command_history[i + 1].clone();
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -399,10 +679,11 @@ fn view(state: &Nexus) -> Element<'_, Message> {
     // Build all blocks
     // Note: lazy widget requires 'static data, so we render blocks directly
     // The PartialEq impl on Block is available for future optimization
+    let font_size = state.font_size;
     let content_elements: Vec<Element<Message>> = state
         .blocks
         .iter()
-        .map(|block| view_block(block))
+        .map(|block| view_block(block, font_size))
         .collect();
 
     // Scrollable area for command history with ID for auto-scroll
@@ -436,21 +717,12 @@ fn view(state: &Nexus) -> Element<'_, Message> {
 fn subscription(state: &Nexus) -> Subscription<Message> {
     let mut subscriptions = vec![pty_subscription(state.pty_rx.clone())];
 
-    // Subscribe to keyboard and window events when a block is focused
-    if matches!(state.focus, Focus::Block(_)) {
-        subscriptions.push(event::listen().map(Message::Event));
-    } else {
-        // Still listen for window resize events
-        subscriptions.push(
-            event::listen_with(|event, _status, _id| {
-                if let Event::Window(iced::window::Event::Resized(_)) = event {
-                    Some(Message::Event(event))
-                } else {
-                    None
-                }
-            })
-        );
-    }
+    // Listen for all events with window ID - focus-dependent routing happens in update()
+    subscriptions.push(
+        event::listen_with(|event, _status, window_id| {
+            Some(Message::Event(event, window_id))
+        })
+    );
 
     Subscription::batch(subscriptions)
 }
@@ -483,11 +755,28 @@ fn pty_subscription(
 }
 
 fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
+    let trimmed = command.trim().to_string();
+
+    // Record in history (skip duplicates of last command, skip empty)
+    if !trimmed.is_empty() {
+        if state.command_history.last() != Some(&trimmed) {
+            state.command_history.push(trimmed.clone());
+            // Limit history size to prevent unbounded growth
+            if state.command_history.len() > 1000 {
+                state.command_history.remove(0);
+            }
+        }
+    }
+
+    // Reset history navigation state
+    state.history_index = None;
+    state.saved_input.clear();
+
     let block_id = BlockId(state.next_block_id);
     state.next_block_id += 1;
 
     // Handle built-in commands
-    if command.trim() == "clear" {
+    if trimmed == "clear" {
         state.blocks.clear();
         return Task::none();
     }
@@ -546,17 +835,17 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
     )
 }
 
-fn view_block(block: &Block) -> Element<'_, Message> {
+fn view_block(block: &Block, font_size: f32) -> Element<'_, Message> {
     let prompt_color = iced::Color::from_rgb(0.3, 0.8, 0.5);
     let command_color = iced::Color::from_rgb(0.9, 0.9, 0.9);
 
     let prompt_line = row![
         text("$ ")
-            .size(14)
+            .size(font_size)
             .color(prompt_color)
             .font(iced::Font::MONOSPACE),
         text(&block.command)
-            .size(14)
+            .size(font_size)
             .color(command_color)
             .font(iced::Font::MONOSPACE),
     ]
@@ -574,7 +863,7 @@ fn view_block(block: &Block) -> Element<'_, Message> {
             // Finished blocks: all content including scrollback
             block.parser.grid_with_scrollback()
         };
-        TerminalView::new(grid)
+        TerminalView::new(grid, font_size)
             .show_cursor(block.is_running())
             .into()
     };
@@ -583,10 +872,24 @@ fn view_block(block: &Block) -> Element<'_, Message> {
 }
 
 fn view_input(state: &Nexus) -> Element<'_, Message> {
-    let prompt_color = iced::Color::from_rgb(0.3, 0.8, 0.5);
+    // Cornflower blue for path
+    let path_color = iced::Color::from_rgb8(100, 149, 237);
+    // Green for success, red for failure
+    let prompt_color = match state.last_exit_code {
+        Some(code) if code != 0 => iced::Color::from_rgb8(220, 50, 50), // Red
+        _ => iced::Color::from_rgb8(50, 205, 50), // Lime green
+    };
+
+    // Shorten path (replace home with ~)
+    let display_path = shorten_path(&state.cwd);
+
+    let path_text = text(format!("{} ", display_path))
+        .size(state.font_size)
+        .color(path_color)
+        .font(iced::Font::MONOSPACE);
 
     let prompt = text("$ ")
-        .size(14)
+        .size(state.font_size)
         .color(prompt_color)
         .font(iced::Font::MONOSPACE);
 
@@ -594,7 +897,7 @@ fn view_input(state: &Nexus) -> Element<'_, Message> {
         .on_input(Message::InputChanged)
         .on_submit(Message::Submit)
         .padding(0)
-        .size(14)
+        .size(state.font_size)
         .style(|_theme, _status| text_input::Style {
             background: iced::Background::Color(iced::Color::TRANSPARENT),
             border: iced::Border {
@@ -608,10 +911,21 @@ fn view_input(state: &Nexus) -> Element<'_, Message> {
         })
         .font(iced::Font::MONOSPACE);
 
-    row![prompt, input]
+    row![path_text, prompt, input]
         .spacing(0)
         .align_y(iced::Alignment::Center)
         .into()
+}
+
+/// Shorten a path by replacing home directory with ~.
+fn shorten_path(path: &str) -> String {
+    if let Some(home) = home_dir() {
+        let home_str = home.display().to_string();
+        if path.starts_with(&home_str) {
+            return path.replacen(&home_str, "~", 1);
+        }
+    }
+    path.to_string()
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {

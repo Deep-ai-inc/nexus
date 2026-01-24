@@ -43,6 +43,7 @@ alacritty_terminal = "0.25"
 # "lazy" feature enables cached/memoized widget rendering for performance
 iced = { version = "0.13", features = ["tokio", "advanced", "wgpu", "lazy"] }
 cosmic-text = "0.12"
+arboard = "3.4"  # Cross-platform clipboard
 
 # Internal crates
 nexus-api = { path = "nexus-api" }

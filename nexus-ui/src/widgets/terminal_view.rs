@@ -8,7 +8,7 @@ use iced::{Color, Element, Length, Rectangle, Size, Theme};
 
 use nexus_term::{Color as TermColor, TerminalGrid};
 
-use crate::app::{CHAR_WIDTH, FONT_SIZE, LINE_HEIGHT_FACTOR};
+use crate::app::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
 
 /// A widget that renders a terminal grid.
 pub struct TerminalView {
@@ -20,13 +20,13 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    /// Create a new terminal view.
-    pub fn new(grid: TerminalGrid) -> Self {
+    /// Create a new terminal view with the given font size.
+    pub fn new(grid: TerminalGrid, font_size: f32) -> Self {
         Self {
             grid,
-            font_size: FONT_SIZE,
+            font_size,
             line_height: LINE_HEIGHT_FACTOR,
-            char_width: CHAR_WIDTH,
+            char_width: font_size * CHAR_WIDTH_RATIO,
             show_cursor: true,
         }
     }
@@ -34,14 +34,6 @@ impl TerminalView {
     /// Set whether to show the cursor.
     pub fn show_cursor(mut self, show: bool) -> Self {
         self.show_cursor = show;
-        self
-    }
-
-    /// Set the font size.
-    #[allow(dead_code)]
-    pub fn font_size(mut self, size: f32) -> Self {
-        self.font_size = size;
-        self.char_width = size * 0.6; // Approximate ratio for monospace
         self
     }
 

@@ -21,3 +21,4 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 iced = { workspace = true }
 portable-pty = { workspace = true }
+arboard = { workspace = true }  # Clipboard support
