@@ -230,19 +230,47 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 _ => {}
             }
         }
-        Message::WindowResized(width, _height) => {
-            // Calculate terminal columns based on window width
-            // Approximate: 8.4 pixels per character at 14px font
-            let char_width = 8.4_f32;
-            let padding = 30.0; // Left + right padding
-            let cols = ((width as f32 - padding) / char_width) as u16;
-            let cols = cols.max(80).min(300); // Clamp to reasonable range
+        Message::WindowResized(width, height) => {
+            // Calculate terminal dimensions immediately (no debounce)
+            // Use 8.5 instead of 8.4 to be conservative - prevents overestimating columns
+            let char_width = 8.5_f32;
+            let line_height = 19.6_f32; // 14px * 1.4 line height
+            let h_padding = 30.0; // Left + right padding
+            let v_padding = 80.0; // Top/bottom padding + input area
 
-            if cols != state.terminal_size.0 {
-                state.terminal_size = (cols, state.terminal_size.1);
-                // Resize all running PTYs
+            let cols = ((width as f32 - h_padding) / char_width) as u16;
+            let rows = ((height as f32 - v_padding) / line_height) as u16;
+
+            // Clamp to reasonable ranges
+            let cols = cols.max(40).min(500);
+            let rows = rows.max(5).min(200);
+
+            let old_cols = state.terminal_size.0;
+            state.terminal_size = (cols, rows);
+
+            // Only resize if column count changed
+            if cols != old_cols {
+                for block in &mut state.blocks {
+                    if block.is_running() {
+                        // Running blocks: resize to window dimensions for TUIs
+                        block.parser.resize(cols, rows);
+                    } else {
+                        // Finished blocks: two-step resize
+                        // 1. First resize width only (triggers reflow)
+                        let (_, current_rows) = block.parser.size();
+                        block.parser.resize(cols, current_rows);
+
+                        // 2. Calculate the actual height needed for wrapped text
+                        let needed_rows = block.parser.content_height() as u16;
+
+                        // 3. Resize parser to exact content height
+                        block.parser.resize(cols, needed_rows.max(1));
+                    }
+                }
+
+                // Resize all active PTYs
                 for handle in &state.pty_handles {
-                    let _ = handle.resize(cols, state.terminal_size.1);
+                    let _ = handle.resize(cols, rows);
                 }
             }
         }
@@ -504,10 +532,18 @@ fn view_block(block: &Block) -> Element<'_, Message> {
     .spacing(0);
 
     // Terminal output - only show cursor for running commands
+    // Use grid_with_scrollback for finished blocks to show all content including history
     let output: Element<Message> = if block.collapsed {
         column![].into()
     } else {
-        TerminalView::new(block.parser.grid())
+        let grid = if block.is_running() {
+            // Running blocks: viewport only (live updates)
+            block.parser.grid()
+        } else {
+            // Finished blocks: all content including scrollback
+            block.parser.grid_with_scrollback()
+        };
+        TerminalView::new(grid)
             .show_cursor(block.is_running())
             .into()
     };

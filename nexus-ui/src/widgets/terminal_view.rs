@@ -168,6 +168,20 @@ where
         let bounds = layout.bounds();
         let cell_height = self.cell_height();
 
+        // Calculate actual content width based on grid columns
+        // Add a small buffer (0.5 char) to account for float precision errors in font rendering
+        let (cols, _) = self.grid.size();
+        let content_width = (cols as f32 * self.char_width) + (self.char_width * 0.5);
+
+        // Use the larger of bounds or content width for text layout
+        let render_width = bounds.width.max(content_width);
+
+        // Expand clip bounds slightly to prevent chopping last character
+        let clip_bounds = Rectangle {
+            width: bounds.width + self.char_width,
+            ..bounds
+        };
+
         // Draw each row
         for (row_idx, row) in self.grid.rows_iter().enumerate() {
             let y = bounds.y + row_idx as f32 * cell_height;
@@ -195,7 +209,7 @@ where
             renderer.fill_text(
                 iced::advanced::text::Text {
                     content: line_text.trim_end().to_string(),
-                    bounds: Size::new(bounds.width, cell_height),
+                    bounds: Size::new(render_width, cell_height),
                     size: iced::Pixels(self.font_size),
                     line_height: iced::advanced::text::LineHeight::Relative(self.line_height),
                     font: iced::Font::MONOSPACE,
@@ -206,7 +220,7 @@ where
                 },
                 iced::Point::new(bounds.x, y),
                 Color::from_rgb(0.9, 0.9, 0.9),
-                bounds,
+                clip_bounds, // Slightly expanded to prevent clipping last character
             );
         }
 
