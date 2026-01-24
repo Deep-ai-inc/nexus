@@ -1,6 +1,7 @@
 //! GPU-accelerated terminal renderer using custom shaders.
 //!
 //! Uses instanced rendering to draw all visible character cells in a single draw call.
+//! Optimized for minimal GPU bandwidth and CPU overhead.
 
 use iced::widget::shader::{self, wgpu, Storage};
 use iced::{Length, Rectangle, Size};
@@ -9,26 +10,47 @@ use nexus_term::TerminalGrid;
 
 use crate::glyph_cache::GlyphCache;
 
-/// Instance data for a single character cell (sent to GPU).
+/// Compressed instance data for a single character cell (32 bytes instead of 64).
+/// Colors are packed as u32 RGBA8, position uses grid coordinates.
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct CellInstance {
-    /// Position (x, y) and size (w, h) in pixels.
-    pub pos_size: [f32; 4],
-    /// UV coordinates in atlas (u, v, w, h).
-    pub uv: [f32; 4],
-    /// Foreground color (RGBA).
-    pub fg_color: [f32; 4],
-    /// Background color (RGBA).
-    pub bg_color: [f32; 4],
+    /// Grid position (col, row) as u16, glyph size (w, h) as u16.
+    pub grid_pos_size: [u16; 4],  // 8 bytes
+    /// UV coordinates in atlas (u, v, w, h) as u16 (normalized * 65535).
+    pub uv: [u16; 4],             // 8 bytes
+    /// Foreground color as packed RGBA8.
+    pub fg_color: u32,            // 4 bytes
+    /// Background color as packed RGBA8.
+    pub bg_color: u32,            // 4 bytes
+    /// Font metric offsets (offset_x, offset_y) for glyph alignment.
+    pub offsets: [i32; 2],        // 8 bytes
 }
+// Total: 32 bytes per instance (was 64)
 
 /// Extracted cell data for GPU rendering (Send + Sync).
 #[derive(Debug, Clone)]
 pub struct CellData {
     pub c: char,
-    pub fg: [f32; 4],
-    pub bg: [f32; 4],
+    pub fg: u32,  // Packed RGBA8
+    pub bg: u32,  // Packed RGBA8
+}
+
+/// Pack [f32; 4] RGBA into u32.
+#[inline]
+fn pack_color(rgba: [f32; 4]) -> u32 {
+    let r = (rgba[0] * 255.0) as u32;
+    let g = (rgba[1] * 255.0) as u32;
+    let b = (rgba[2] * 255.0) as u32;
+    let a = (rgba[3] * 255.0) as u32;
+    r | (g << 8) | (b << 16) | (a << 24)
+}
+
+/// Check if background is effectively transparent (alpha near zero).
+#[inline]
+fn is_transparent_bg(bg: u32) -> bool {
+    // Alpha is in the high byte
+    (bg >> 24) < 10  // Alpha < ~4%
 }
 
 /// Shader program for terminal rendering.
@@ -56,7 +78,7 @@ impl<Message> TerminalProgram<Message> {
         let cols = cols as usize;
         let grid_cells = grid.cells();
 
-        // Extract cell data for visible rows
+        // Extract cell data for visible rows (pre-pack colors)
         let mut cells = Vec::with_capacity((last_row - first_row) * cols);
         for row_idx in first_row..last_row {
             let row_start = row_idx * cols;
@@ -67,8 +89,8 @@ impl<Message> TerminalProgram<Message> {
             for cell in &grid_cells[row_start..row_end] {
                 cells.push(CellData {
                     c: if cell.c == '\0' { ' ' } else { cell.c },
-                    fg: cell.fg.to_rgba(true),
-                    bg: cell.bg.to_rgba(false),
+                    fg: pack_color(cell.fg.to_rgba(true)),
+                    bg: pack_color(cell.bg.to_rgba(false)),
                 });
             }
         }
@@ -141,17 +163,11 @@ impl shader::Primitive for TerminalPrimitive {
 
         // Get or create the pipeline (with scaled font size for crisp rendering)
         if !storage.has::<TerminalPipeline>() {
-            let pipeline = create_pipeline(device, format, physical_font_size);
+            let pipeline = create_pipeline(device, queue, format, physical_font_size);
             storage.store(pipeline);
         }
 
         let pipeline = storage.get_mut::<TerminalPipeline>().unwrap();
-
-        // Update atlas if glyph cache is dirty
-        if pipeline.glyph_cache.is_dirty() {
-            update_atlas_texture(queue, pipeline);
-            pipeline.glyph_cache.mark_clean();
-        }
 
         // Scale bounds to physical pixels for GPU rendering
         let physical_bounds = Rectangle {
@@ -162,41 +178,50 @@ impl shader::Primitive for TerminalPrimitive {
         };
 
         // Build instance data for visible cells (in physical pixels)
+        // This may add new glyphs to the cache
         let instances = build_instances(
             &self.cells,
             self.cols,
-            self.num_rows,
             &mut pipeline.glyph_cache,
             physical_bounds,
         );
 
-        // Re-upload atlas if new glyphs were added
+        // Partial texture upload if atlas changed
         if pipeline.glyph_cache.is_dirty() {
-            update_atlas_texture(queue, pipeline);
+            upload_dirty_region(queue, pipeline);
             pipeline.glyph_cache.mark_clean();
         }
 
         // Update instance buffer
-        let instance_bytes = bytemuck::cast_slice(&instances);
-        if instance_bytes.len() > pipeline.instance_buffer.size() as usize {
-            // Need a bigger buffer
-            pipeline.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Terminal Instance Buffer"),
-                size: instance_bytes.len() as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+        if !instances.is_empty() {
+            let instance_bytes = bytemuck::cast_slice(&instances);
+            if instance_bytes.len() > pipeline.instance_buffer.size() as usize {
+                // Need a bigger buffer - grow by 2x
+                let new_size = (instance_bytes.len() * 2) as u64;
+                pipeline.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Terminal Instance Buffer"),
+                    size: new_size,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(&pipeline.instance_buffer, 0, instance_bytes);
         }
-        queue.write_buffer(&pipeline.instance_buffer, 0, instance_bytes);
         pipeline.instance_count = instances.len() as u32;
 
-        // Update globals (transform matrix)
+        // Update globals (transform matrix + cell metrics + origin + ascent)
         let target_size = viewport.physical_size();
-        let transform = create_transform(Size::new(target_size.width, target_size.height));
+        let globals = Globals {
+            transform: create_transform(Size::new(target_size.width, target_size.height)),
+            cell_size: [pipeline.glyph_cache.cell_width, pipeline.glyph_cache.cell_height],
+            origin: [physical_bounds.x, physical_bounds.y],
+            ascent: pipeline.glyph_cache.ascent,
+            _padding: [0.0; 3],
+        };
         queue.write_buffer(
             &pipeline.globals_buffer,
             0,
-            bytemuck::cast_slice(&transform),
+            bytemuck::bytes_of(&globals),
         );
     }
 
@@ -211,13 +236,17 @@ impl shader::Primitive for TerminalPrimitive {
             return;
         };
 
+        if pipeline.instance_count == 0 {
+            return;
+        }
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Terminal Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load, // Don't clear - we're rendering over existing content
+                    load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -226,7 +255,6 @@ impl shader::Primitive for TerminalPrimitive {
             occlusion_query_set: None,
         });
 
-        // Set scissor rect to clip rendering to bounds
         pass.set_scissor_rect(
             clip_bounds.x,
             clip_bounds.y,
@@ -238,11 +266,23 @@ impl shader::Primitive for TerminalPrimitive {
         pass.set_bind_group(0, &pipeline.globals_bind_group, &[]);
         pass.set_bind_group(1, &pipeline.atlas_bind_group, &[]);
         pass.set_vertex_buffer(0, pipeline.instance_buffer.slice(..));
-        pass.draw(0..6, 0..pipeline.instance_count); // 6 vertices per quad
+        pass.draw(0..6, 0..pipeline.instance_count);
     }
 }
 
-fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, font_size: f32) -> TerminalPipeline {
+/// Globals uniform buffer data.
+/// WGSL struct alignment requires size to be multiple of 16 (mat4x4 alignment).
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct Globals {
+    transform: [[f32; 4]; 4],  // 64 bytes
+    cell_size: [f32; 2],       // 8 bytes
+    origin: [f32; 2],          // 8 bytes - widget position for scrolling
+    ascent: f32,               // 4 bytes
+    _padding: [f32; 3],        // 12 bytes (pad to 96, multiple of 16)
+}
+
+fn create_pipeline(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, font_size: f32) -> TerminalPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Terminal Shader"),
         source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/terminal.wgsl").into()),
@@ -253,7 +293,7 @@ fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, font_size
         label: Some("Terminal Globals Layout"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -302,29 +342,35 @@ fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, font_size
                 array_stride: std::mem::size_of::<CellInstance>() as u64,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
-                    // pos_size
+                    // grid_pos_size (4x u16)
                     wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
+                        format: wgpu::VertexFormat::Uint16x4,
                         offset: 0,
                         shader_location: 0,
                     },
-                    // uv
+                    // uv (4x u16)
                     wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 16,
+                        format: wgpu::VertexFormat::Uint16x4,
+                        offset: 8,
                         shader_location: 1,
                     },
-                    // fg_color
+                    // fg_color (u32)
                     wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 32,
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 16,
                         shader_location: 2,
                     },
-                    // bg_color
+                    // bg_color (u32)
                     wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x4,
-                        offset: 48,
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 20,
                         shader_location: 3,
+                    },
+                    // offsets (vec2<i32>)
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Sint32x2,
+                        offset: 24,
+                        shader_location: 4,
                     },
                 ],
             }],
@@ -368,6 +414,28 @@ fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, font_size
         view_formats: &[],
     });
 
+    // Initial full upload
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &atlas_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        glyph_cache.atlas_data(),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(atlas_width * 4),
+            rows_per_image: Some(atlas_height),
+        },
+        wgpu::Extent3d {
+            width: atlas_width,
+            height: atlas_height,
+            depth_or_array_layers: 1,
+        },
+    );
+    glyph_cache.mark_clean();
+
     let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
@@ -390,10 +458,10 @@ fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, font_size
         ],
     });
 
-    // Create globals buffer
+    // Create globals buffer (larger now with cell metrics)
     let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Terminal Globals Buffer"),
-        size: 64, // 4x4 matrix
+        size: std::mem::size_of::<Globals>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -410,7 +478,7 @@ fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, font_size
     // Create instance buffer (start with reasonable size)
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Terminal Instance Buffer"),
-        size: 1024 * std::mem::size_of::<CellInstance>() as u64,
+        size: 4096 * std::mem::size_of::<CellInstance>() as u64,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -427,90 +495,109 @@ fn create_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat, font_size
     }
 }
 
-fn update_atlas_texture(queue: &wgpu::Queue, pipeline: &mut TerminalPipeline) {
-    let (width, height) = pipeline.glyph_cache.atlas_size();
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &pipeline.atlas_texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        pipeline.glyph_cache.atlas_data(),
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+/// Upload only the dirty region of the atlas texture.
+fn upload_dirty_region(queue: &wgpu::Queue, pipeline: &mut TerminalPipeline) {
+    let Some(region) = pipeline.glyph_cache.dirty_region_data() else {
+        return;
+    };
+
+    // Upload row by row within the dirty region
+    // (wgpu requires contiguous data, but our atlas rows aren't contiguous for subregions)
+    let atlas_data = pipeline.glyph_cache.atlas_data();
+    let bytes_per_row = region.atlas_width * 4;
+
+    for row in 0..region.height {
+        let y = region.y + row;
+        let src_offset = (y * region.atlas_width + region.x) as usize * 4;
+        let row_bytes = (region.width * 4) as usize;
+
+        if src_offset + row_bytes <= atlas_data.len() {
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &pipeline.atlas_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: region.x,
+                        y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &atlas_data[src_offset..src_offset + row_bytes],
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(region.width * 4),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: region.width,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
 }
 
 fn build_instances(
     cells: &[CellData],
     cols: usize,
-    num_rows: usize,
     glyph_cache: &mut GlyphCache,
     bounds: Rectangle,
 ) -> Vec<CellInstance> {
-    let cell_width = glyph_cache.cell_width;
-    let cell_height = glyph_cache.cell_height;
-    let ascent = glyph_cache.ascent;
-    let atlas_width = glyph_cache.atlas_size().0 as f32;
-    let atlas_height = glyph_cache.atlas_size().1 as f32;
+    // Pre-calculate inverse atlas dimensions (avoid division in hot loop)
+    let (atlas_w, atlas_h) = glyph_cache.atlas_size();
+    let inv_atlas_w = 65535.0 / atlas_w as f32;
+    let inv_atlas_h = 65535.0 / atlas_h as f32;
 
-    let mut instances = Vec::with_capacity(cells.len());
+    // Estimate capacity (assume ~50% non-empty cells)
+    let mut instances = Vec::with_capacity(cells.len() / 2);
 
     for (idx, cell) in cells.iter().enumerate() {
-        let row_idx = idx / cols;
-        let col_idx = idx % cols;
+        // Cull empty cells (space with transparent background)
+        if (cell.c == ' ' || cell.c == '\0') && is_transparent_bg(cell.bg) {
+            continue;
+        }
+
+        let row_idx = (idx / cols) as u16;
+        let col_idx = (idx % cols) as u16;
 
         // Ensure glyph is cached and extract data
         let glyph = glyph_cache.get_glyph(cell.c);
-        let offset_x = glyph.offset_x;
-        let offset_y = glyph.offset_y;
-        let glyph_width = glyph.width;
-        let glyph_height = glyph.height;
+        let glyph_width = glyph.width as u16;
+        let glyph_height = glyph.height as u16;
         let atlas_x = glyph.atlas_x;
         let atlas_y = glyph.atlas_y;
-        // Drop the borrow here by ending the scope of glyph reference
+        let offset_x = glyph.offset_x;
+        let offset_y = glyph.offset_y;
 
-        // Compute UV from atlas position
-        let u = atlas_x as f32 / atlas_width;
-        let v = atlas_y as f32 / atlas_height;
-        let uv_w = glyph_width as f32 / atlas_width;
-        let uv_h = glyph_height as f32 / atlas_height;
-
-        // Calculate screen position
-        let x = bounds.x + col_idx as f32 * cell_width;
-        let y = bounds.y + row_idx as f32 * cell_height;
-
-        // Adjust position based on glyph metrics
-        let glyph_x = x + offset_x as f32;
-        let glyph_y = y + ascent - offset_y as f32 - glyph_height as f32;
+        // Compute normalized UV (scaled to u16 range 0-65535)
+        let u = (atlas_x as f32 * inv_atlas_w) as u16;
+        let v = (atlas_y as f32 * inv_atlas_h) as u16;
+        let uv_w = (glyph.width as f32 * inv_atlas_w) as u16;
+        let uv_h = (glyph.height as f32 * inv_atlas_h) as u16;
 
         instances.push(CellInstance {
-            pos_size: [glyph_x, glyph_y, glyph_width as f32, glyph_height as f32],
+            grid_pos_size: [col_idx, row_idx, glyph_width, glyph_height],
             uv: [u, v, uv_w, uv_h],
             fg_color: cell.fg,
             bg_color: cell.bg,
+            offsets: [offset_x, offset_y],
         });
     }
 
-    let _ = num_rows; // Suppress unused warning
+    // Store bounds offset in first instance if needed (or pass via uniform)
+    // For now, bounds.x/y are passed through the transform matrix
+    let _ = bounds;
+
     instances
 }
 
 fn create_transform(target_size: Size<u32>) -> [[f32; 4]; 4] {
-    // Create orthographic projection matrix
     let width = target_size.width as f32;
     let height = target_size.height as f32;
 
-    // Transform from pixel coordinates to clip space (-1 to 1)
+    // Orthographic projection: pixel coords -> clip space
     [
         [2.0 / width, 0.0, 0.0, 0.0],
         [0.0, -2.0 / height, 0.0, 0.0],
