@@ -85,18 +85,26 @@ impl TerminalGrid {
     }
 
     /// Get the number of rows with actual content (cached).
-    /// This scans the grid once and caches the result.
+    /// Scans from bottom-up for O(1) best case (full screens).
     pub fn content_rows(&self) -> u16 {
         if let Some(cached) = self.content_rows_cache.get() {
             return cached;
         }
 
-        // Scan from bottom to top to find last row with content
+        // OPTIMIZATION: Scan REVERSE (bottom-up) to find content immediately.
+        // For a full screen, this is O(1) instead of O(N).
         let mut last_content_row: u16 = 0;
-        for (row_idx, row) in self.rows_iter().enumerate() {
-            let has_content = row.iter().any(|cell| cell.c != '\0' && cell.c != ' ');
-            if has_content {
+        let cols = self.cols as usize;
+
+        // Iterate rows from bottom to top using direct indexing
+        for row_idx in (0..self.rows as usize).rev() {
+            let row_start = row_idx * cols;
+            let row_end = row_start + cols;
+            let row = &self.cells[row_start..row_end];
+
+            if row.iter().any(|cell| cell.c != '\0' && cell.c != ' ') {
                 last_content_row = (row_idx + 1) as u16;
+                break; // Found the bottom content row, stop scanning
             }
         }
 
@@ -145,18 +153,24 @@ impl TerminalGrid {
 
     /// Resize the grid, preserving content where possible.
     pub fn resize(&mut self, new_cols: u16, new_rows: u16) {
-        let mut new_cells = vec![Cell::default(); new_cols as usize * new_rows as usize];
+        let total_cells = new_cols as usize * new_rows as usize;
 
-        // Copy existing content (Cell is Copy, so no clone needed)
+        // Pre-allocate then fill (avoids zero-init + copy overhead)
+        let mut new_cells = Vec::with_capacity(total_cells);
+        new_cells.resize(total_cells, Cell::default());
+
+        // Copy existing content using row-wise memcpy where possible
         let copy_cols = self.cols.min(new_cols) as usize;
         let copy_rows = self.rows.min(new_rows) as usize;
+        let old_cols = self.cols as usize;
+        let new_cols_usize = new_cols as usize;
 
         for row in 0..copy_rows {
-            for col in 0..copy_cols {
-                let old_idx = row * self.cols as usize + col;
-                let new_idx = row * new_cols as usize + col;
-                new_cells[new_idx] = self.cells[old_idx];
-            }
+            let old_start = row * old_cols;
+            let new_start = row * new_cols_usize;
+            // Copy entire row slice at once (Cell is Copy)
+            new_cells[new_start..new_start + copy_cols]
+                .copy_from_slice(&self.cells[old_start..old_start + copy_cols]);
         }
 
         self.cells = new_cells;

@@ -141,33 +141,23 @@ where
     ) {
         let bounds = layout.bounds();
         let cell_height = self.cell_height();
+        let char_width = self.char_width;
         let (cols, total_rows) = self.grid.size();
-
-        // Calculate actual content width based on grid columns
-        // Add a small buffer (0.5 char) to account for float precision errors in font rendering
-        let content_width = (cols as f32 * self.char_width) + (self.char_width * 0.5);
-
-        // Use the larger of bounds or content width for text layout
-        let render_width = bounds.width.max(content_width);
 
         // Expand clip bounds slightly to prevent chopping last character
         let clip_bounds = Rectangle {
-            width: bounds.width + self.char_width,
+            width: bounds.width + char_width,
             ..bounds
         };
 
         // === VIEWPORT VIRTUALIZATION ===
         // Calculate which rows are actually visible in the viewport.
-        // bounds.y is the widget's position; viewport is the visible screen area.
-        // A row is visible if its Y position falls within the viewport.
         let first_visible_row = if viewport.y > bounds.y {
-            // Viewport starts below widget top - calculate first visible row
             ((viewport.y - bounds.y) / cell_height).floor() as usize
         } else {
             0
         };
 
-        // Last visible row: where viewport ends relative to widget
         let viewport_bottom = viewport.y + viewport.height;
         let last_visible_row = if viewport_bottom > bounds.y {
             ((viewport_bottom - bounds.y) / cell_height).ceil() as usize
@@ -175,58 +165,97 @@ where
             0
         };
 
-        // Clamp to actual grid bounds and add 1 row buffer for partial visibility
+        // Clamp to actual grid bounds with 1 row buffer
         let first_row = first_visible_row.saturating_sub(1);
         let last_row = (last_visible_row + 1).min(total_rows as usize);
 
-        // Pre-allocate string buffer for row text
-        let mut line_text = String::with_capacity(cols as usize);
+        // === HOISTED ALLOCATION ===
+        // Single string buffer reused across ALL rows and style runs
+        let mut text_buffer = String::with_capacity(cols as usize);
 
-        // Draw only visible rows
+        // Draw only visible rows with STYLE BATCHING
         for (row_idx, row) in self.grid.rows_iter().enumerate() {
-            // Skip rows outside viewport
             if row_idx < first_row || row_idx > last_row {
                 continue;
             }
 
             let y = bounds.y + row_idx as f32 * cell_height;
 
-            // Reuse string buffer
-            line_text.clear();
-            let mut has_content = false;
-
-            for cell in row {
-                let c = if cell.c == '\0' || cell.c == ' ' {
-                    ' '
-                } else {
-                    has_content = true;
-                    cell.c
-                };
-                line_text.push(c);
-            }
-
-            if !has_content {
+            // Skip entirely empty rows (quick check)
+            if row.iter().all(|c| c.c == '\0' || c.c == ' ') {
                 continue;
             }
 
-            // For simplicity, render the whole line with default color
-            // A more advanced implementation would batch by color
-            renderer.fill_text(
-                iced::advanced::text::Text {
-                    content: line_text.trim_end().to_string(),
-                    bounds: Size::new(render_width, cell_height),
-                    size: iced::Pixels(self.font_size),
-                    line_height: iced::advanced::text::LineHeight::Relative(self.line_height),
-                    font: iced::Font::MONOSPACE,
-                    horizontal_alignment: iced::alignment::Horizontal::Left,
-                    vertical_alignment: iced::alignment::Vertical::Top,
-                    shaping: iced::advanced::text::Shaping::Basic,
-                    wrapping: iced::advanced::text::Wrapping::None,
-                },
-                iced::Point::new(bounds.x, y),
-                Color::from_rgb(0.9, 0.9, 0.9),
-                clip_bounds, // Slightly expanded to prevent clipping last character
-            );
+            // === STYLE BATCHING (RLE) ===
+            // Track current style and batch contiguous cells with same style.
+            // Only issue a draw call when style changes.
+            text_buffer.clear();
+            let mut current_fg = row[0].fg;
+            let mut run_start_col: usize = 0;
+
+            for (col_idx, cell) in row.iter().enumerate() {
+                // Check if style changed (we batch by foreground color)
+                let style_changed = cell.fg != current_fg;
+
+                if style_changed && !text_buffer.is_empty() {
+                    // FLUSH: Draw the accumulated run
+                    let run_x = bounds.x + (run_start_col as f32 * char_width);
+                    let fg_color = self.term_color_to_iced(&current_fg, true);
+
+                    renderer.fill_text(
+                        iced::advanced::text::Text {
+                            content: text_buffer.clone(),
+                            bounds: Size::new(text_buffer.len() as f32 * char_width + char_width, cell_height),
+                            size: iced::Pixels(self.font_size),
+                            line_height: iced::advanced::text::LineHeight::Relative(self.line_height),
+                            font: iced::Font::MONOSPACE,
+                            horizontal_alignment: iced::alignment::Horizontal::Left,
+                            vertical_alignment: iced::alignment::Vertical::Top,
+                            shaping: iced::advanced::text::Shaping::Basic,
+                            wrapping: iced::advanced::text::Wrapping::None,
+                        },
+                        iced::Point::new(run_x, y),
+                        fg_color,
+                        clip_bounds,
+                    );
+
+                    // Reset for new run
+                    text_buffer.clear();
+                    current_fg = cell.fg;
+                    run_start_col = col_idx;
+                }
+
+                // Append char to current run
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                text_buffer.push(c);
+            }
+
+            // FLUSH FINAL RUN (don't forget the last chunk)
+            if !text_buffer.is_empty() {
+                // Trim trailing spaces for the final run
+                let trimmed = text_buffer.trim_end();
+                if !trimmed.is_empty() {
+                    let run_x = bounds.x + (run_start_col as f32 * char_width);
+                    let fg_color = self.term_color_to_iced(&current_fg, true);
+
+                    renderer.fill_text(
+                        iced::advanced::text::Text {
+                            content: trimmed.to_string(),
+                            bounds: Size::new(trimmed.len() as f32 * char_width + char_width, cell_height),
+                            size: iced::Pixels(self.font_size),
+                            line_height: iced::advanced::text::LineHeight::Relative(self.line_height),
+                            font: iced::Font::MONOSPACE,
+                            horizontal_alignment: iced::alignment::Horizontal::Left,
+                            vertical_alignment: iced::alignment::Vertical::Top,
+                            shaping: iced::advanced::text::Shaping::Basic,
+                            wrapping: iced::advanced::text::Wrapping::None,
+                        },
+                        iced::Point::new(run_x, y),
+                        fg_color,
+                        clip_bounds,
+                    );
+                }
+            }
         }
 
         // Draw cursor if visible, enabled, and within viewport
@@ -234,9 +263,8 @@ where
             let (cursor_col, cursor_row) = self.grid.cursor();
             let cursor_row = cursor_row as usize;
 
-            // Only draw cursor if it's in the visible range
             if cursor_row >= first_row && cursor_row <= last_row {
-                let cursor_x = bounds.x + cursor_col as f32 * self.char_width;
+                let cursor_x = bounds.x + cursor_col as f32 * char_width;
                 let cursor_y = bounds.y + cursor_row as f32 * cell_height;
 
                 renderer.fill_quad(
@@ -244,7 +272,7 @@ where
                         bounds: Rectangle {
                             x: cursor_x,
                             y: cursor_y,
-                            width: self.char_width,
+                            width: char_width,
                             height: cell_height,
                         },
                         border: iced::Border::default(),

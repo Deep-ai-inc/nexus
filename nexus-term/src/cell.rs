@@ -18,7 +18,7 @@ pub struct Cell {
 }
 
 /// Cell attribute flags.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CellFlags {
     pub bold: bool,
     pub italic: bool,
