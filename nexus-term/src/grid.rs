@@ -75,13 +75,41 @@ impl TerminalGrid {
     }
 
     /// Set a cell at the given position.
+    /// Maintains content_rows cache incrementally for O(1) updates.
     pub fn set(&mut self, col: u16, row: u16, cell: Cell) {
         if col < self.cols && row < self.rows {
             let idx = row as usize * self.cols as usize + col as usize;
             self.cells[idx] = cell;
-            // Invalidate content rows cache when cells change
-            self.content_rows_cache.set(None);
+
+            // Incremental cache maintenance:
+            // If we wrote visible content at or below cached bottom, bump cache upward.
+            // If we might be clearing the last content row, drop cache to force rescan.
+            if cell.c != '\0' && cell.c != ' ' {
+                if let Some(cached) = self.content_rows_cache.get() {
+                    let needed = row + 1;
+                    if needed > cached {
+                        self.content_rows_cache.set(Some(needed));
+                    }
+                }
+            } else {
+                // Clearing a cell - if it's on the cached last row, we must rescan
+                if let Some(cached) = self.content_rows_cache.get() {
+                    if row + 1 == cached {
+                        self.content_rows_cache.set(None);
+                    }
+                }
+            }
         }
+    }
+
+    /// Invalidate the content rows cache (call after bulk modifications).
+    pub fn invalidate_content_cache(&mut self) {
+        self.content_rows_cache.set(None);
+    }
+
+    /// Set the content rows cache directly (for use after extraction).
+    pub fn set_content_rows_cache(&self, rows: u16) {
+        self.content_rows_cache.set(Some(rows));
     }
 
     /// Get the number of rows with actual content (cached).

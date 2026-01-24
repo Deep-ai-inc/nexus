@@ -1,5 +1,6 @@
 //! Main Nexus application using Iced's Elm architecture.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -116,6 +117,9 @@ pub enum Message {
     InputKey(Key, Modifiers),
     /// Zoom font size
     Zoom(ZoomDirection),
+    /// VSync-aligned frame for batched rendering.
+    /// Fires when the monitor is ready for the next frame.
+    NextFrame(Instant),
 }
 
 /// Global keyboard shortcuts.
@@ -148,8 +152,10 @@ pub enum ZoomDirection {
 pub struct Nexus {
     /// Current input text.
     input: String,
-    /// Command blocks.
+    /// Command blocks (ordered).
     blocks: Vec<Block>,
+    /// Block index by ID for O(1) lookup.
+    block_index: HashMap<BlockId, usize>,
     /// Next block ID.
     next_block_id: u64,
     /// Current working directory.
@@ -182,6 +188,9 @@ pub struct Nexus {
     suppress_next_input: bool,
     /// Input value before current event (to detect ghost characters).
     input_before_event: String,
+    /// Is there processed PTY data that hasn't been drawn yet?
+    /// Used for 60 FPS throttling during high-throughput output.
+    is_dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +259,7 @@ impl Default for Nexus {
         Self {
             input: String::new(),
             blocks: Vec::new(),
+            block_index: HashMap::new(),
             next_block_id: 1,
             cwd,
             pty_handles: Vec::new(),
@@ -266,6 +276,7 @@ impl Default for Nexus {
             window_id: None,
             suppress_next_input: false,
             input_before_event: String::new(),
+            is_dirty: false,
         }
     }
 }
@@ -301,25 +312,43 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             }
         }
         Message::PtyOutput(block_id, data) => {
-            if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
-                block.parser.feed(&data);
-                block.version += 1; // Invalidate lazy cache
+            // O(1) lookup via HashMap
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.parser.feed(&data);
+                    block.version += 1; // Invalidate lazy cache
+                }
             }
-            // Auto-scroll to bottom
-            return scrollable::snap_to(
-                scrollable::Id::new(HISTORY_SCROLLABLE),
-                scrollable::RelativeOffset::END,
-            );
+
+            // VSYNC-BATCHED THROTTLING:
+            // For small updates (typing echo), draw immediately for 0ms latency.
+            // For large updates (streaming output), batch via dirty flag and
+            // let NextFrame handle it (VSync-aligned for smooth rendering).
+            if data.len() < 128 {
+                // Small data = likely typing echo, draw immediately
+                state.is_dirty = false; // We're handling it now
+                return scrollable::snap_to(
+                    scrollable::Id::new(HISTORY_SCROLLABLE),
+                    scrollable::RelativeOffset::END,
+                );
+            } else {
+                // Large data = streaming, mark dirty for VSync batching
+                state.is_dirty = true;
+                return Task::none();
+            }
         }
         Message::PtyExited(block_id, exit_code) => {
-            if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
-                block.state = if exit_code == 0 {
-                    BlockState::Success
-                } else {
-                    BlockState::Failed(exit_code)
-                };
-                block.duration_ms = Some(block.started_at.elapsed().as_millis() as u64);
-                block.version += 1;
+            // O(1) lookup via HashMap
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.state = if exit_code == 0 {
+                        BlockState::Success
+                    } else {
+                        BlockState::Failed(exit_code)
+                    };
+                    block.duration_ms = Some(block.started_at.elapsed().as_millis() as u64);
+                    block.version += 1;
+                }
             }
             state.pty_handles.retain(|h| h.block_id != block_id);
 
@@ -471,6 +500,7 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             match shortcut {
                 GlobalShortcut::ClearScreen => {
                     state.blocks.clear();
+                    state.block_index.clear();
                 }
                 GlobalShortcut::CloseWindow | GlobalShortcut::Quit => {
                     return iced::exit();
@@ -535,6 +565,18 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                         iced::Size::new(new_width, new_height),
                     );
                 }
+            }
+        }
+        Message::NextFrame(_timestamp) => {
+            // VSync-aligned frame - fires when monitor is ready for next frame
+            // Only subscribed when is_dirty is true
+            if state.is_dirty {
+                state.is_dirty = false;
+                // Request redraw by scrolling to bottom (this triggers view refresh)
+                return scrollable::snap_to(
+                    scrollable::Id::new(HISTORY_SCROLLABLE),
+                    scrollable::RelativeOffset::END,
+                );
             }
         }
         Message::InputKey(key, _modifiers) => {
@@ -724,6 +766,17 @@ fn subscription(state: &Nexus) -> Subscription<Message> {
         })
     );
 
+    // VSYNC SUBSCRIPTION for throttled rendering:
+    // Only subscribe to frame events if we have pending changes (is_dirty).
+    // This fires when the monitor is ready for the next frame (VSync-aligned),
+    // adapting to the user's monitor refresh rate (60Hz, 120Hz, 144Hz, etc.).
+    // When idle (is_dirty = false), we don't subscribe, ensuring 0% CPU usage.
+    if state.is_dirty {
+        subscriptions.push(
+            iced::window::frames().map(|_| Message::NextFrame(Instant::now()))
+        );
+    }
+
     Subscription::batch(subscriptions)
 }
 
@@ -778,6 +831,7 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
     // Handle built-in commands
     if trimmed == "clear" {
         state.blocks.clear();
+        state.block_index.clear();
         return Task::none();
     }
 
@@ -803,7 +857,9 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
     // Create new block with current terminal size
     let mut block = Block::new(block_id, command.clone());
     block.parser = TerminalParser::new(state.terminal_size.0, state.terminal_size.1);
+    let block_idx = state.blocks.len();
     state.blocks.push(block);
+    state.block_index.insert(block_id, block_idx);
 
     // Auto-focus the new block for interactive commands
     state.focus = Focus::Block(block_id);
@@ -819,10 +875,13 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
         }
         Err(e) => {
             tracing::error!("Failed to spawn PTY: {}", e);
-            if let Some(block) = state.blocks.iter_mut().find(|b| b.id == block_id) {
-                block.state = BlockState::Failed(1);
-                block.parser.feed(format!("Error: {}\n", e).as_bytes());
-                block.version += 1;
+            // O(1) lookup via HashMap
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.state = BlockState::Failed(1);
+                    block.parser.feed(format!("Error: {}\n", e).as_bytes());
+                    block.version += 1;
+                }
             }
             state.focus = Focus::Input;
         }
@@ -852,15 +911,17 @@ fn view_block(block: &Block, font_size: f32) -> Element<'_, Message> {
     .spacing(0);
 
     // Terminal output - only show cursor for running commands
-    // Use grid_with_scrollback for finished blocks to show all content including history
+    // Show full scrollback so user can scroll up while output streams,
+    // EXCEPT for alternate screen mode (TUI apps like vim, htop).
     let output: Element<Message> = if block.collapsed {
         column![].into()
     } else {
-        let grid = if block.is_running() {
-            // Running blocks: viewport only (live updates)
+        let grid = if block.parser.is_alternate_screen() {
+            // Alternate screen (TUI apps): viewport only
             block.parser.grid()
         } else {
-            // Finished blocks: all content including scrollback
+            // Normal mode: show all content including scrollback
+            // This lets users scroll up to read streaming output
             block.parser.grid_with_scrollback()
         };
         TerminalView::new(grid, font_size)

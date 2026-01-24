@@ -173,16 +173,17 @@ where
         // Single string buffer reused across ALL rows and style runs
         let mut text_buffer = String::with_capacity(cols as usize);
 
-        // Draw only visible rows with STYLE BATCHING
-        for (row_idx, row) in self.grid.rows_iter().enumerate() {
-            if row_idx < first_row || row_idx > last_row {
-                continue;
-            }
+        // === SKIP DIRECTLY TO VISIBLE ROWS ===
+        // Use skip() and take() to avoid iterating non-visible rows at all
+        let visible_row_count = last_row.saturating_sub(first_row);
 
+        for (local_idx, row) in self.grid.rows_iter().skip(first_row).take(visible_row_count).enumerate() {
+            let row_idx = first_row + local_idx;
             let y = bounds.y + row_idx as f32 * cell_height;
 
-            // Skip entirely empty rows (quick check)
-            if row.iter().all(|c| c.c == '\0' || c.c == ' ') {
+            // Skip entirely empty rows (quick check on first cell, then full scan if needed)
+            let first_cell = row.first().map(|c| c.c).unwrap_or('\0');
+            if (first_cell == '\0' || first_cell == ' ') && row.iter().all(|c| c.c == '\0' || c.c == ' ') {
                 continue;
             }
 
@@ -201,11 +202,13 @@ where
                     // FLUSH: Draw the accumulated run
                     let run_x = bounds.x + (run_start_col as f32 * char_width);
                     let fg_color = self.term_color_to_iced(&current_fg, true);
+                    let run_len = text_buffer.len();
 
+                    // Use take() to move ownership instead of clone() + clear()
                     renderer.fill_text(
                         iced::advanced::text::Text {
-                            content: text_buffer.clone(),
-                            bounds: Size::new(text_buffer.len() as f32 * char_width + char_width, cell_height),
+                            content: std::mem::take(&mut text_buffer),
+                            bounds: Size::new(run_len as f32 * char_width + char_width, cell_height),
                             size: iced::Pixels(self.font_size),
                             line_height: iced::advanced::text::LineHeight::Relative(self.line_height),
                             font: iced::Font::MONOSPACE,
@@ -219,8 +222,7 @@ where
                         clip_bounds,
                     );
 
-                    // Reset for new run
-                    text_buffer.clear();
+                    // Reset for new run (text_buffer is already empty from take())
                     current_fg = cell.fg;
                     run_start_col = col_idx;
                 }
@@ -232,16 +234,19 @@ where
 
             // FLUSH FINAL RUN (don't forget the last chunk)
             if !text_buffer.is_empty() {
-                // Trim trailing spaces for the final run
-                let trimmed = text_buffer.trim_end();
-                if !trimmed.is_empty() {
+                // Trim trailing spaces in-place
+                let trimmed_len = text_buffer.trim_end().len();
+                if trimmed_len > 0 {
+                    text_buffer.truncate(trimmed_len);
                     let run_x = bounds.x + (run_start_col as f32 * char_width);
                     let fg_color = self.term_color_to_iced(&current_fg, true);
+                    let run_len = text_buffer.len();
 
+                    // Use take() to move ownership
                     renderer.fill_text(
                         iced::advanced::text::Text {
-                            content: trimmed.to_string(),
-                            bounds: Size::new(trimmed.len() as f32 * char_width + char_width, cell_height),
+                            content: std::mem::take(&mut text_buffer),
+                            bounds: Size::new(run_len as f32 * char_width + char_width, cell_height),
                             size: iced::Pixels(self.font_size),
                             line_height: iced::advanced::text::LineHeight::Relative(self.line_height),
                             font: iced::Font::MONOSPACE,
