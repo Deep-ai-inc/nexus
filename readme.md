@@ -2,6 +2,43 @@
 
 **Mission:** Build a converged shell runtime where the interpreter, pipeline, and GUI are a single unified system.
 
+## Quick Start
+
+```bash
+# Build all crates
+cargo build
+
+# Run the terminal UI
+cargo run -p nexus-ui
+
+# Run in release mode (recommended for performance)
+cargo run -p nexus-ui --release
+
+# Run tests
+cargo test
+
+# Check for errors without building
+cargo check
+```
+
+## Development Commands
+
+```bash
+# Build specific crate
+cargo build -p nexus-kernel
+cargo build -p nexus-ui
+cargo build -p nexus-term
+
+# Run with debug logging
+RUST_LOG=debug cargo run -p nexus-ui
+
+# Format code
+cargo fmt
+
+# Lint code
+cargo clippy
+```
+
 ## 1. Project Structure (Rust Workspace)
 
 ```text
