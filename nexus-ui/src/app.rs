@@ -10,7 +10,8 @@ use iced::widget::{column, container, row, scrollable, text, text_input, Column}
 use iced::{event, Element, Event, Length, Subscription, Task, Theme};
 use tokio::sync::{mpsc, Mutex};
 
-use nexus_api::{BlockId, BlockState, OutputFormat};
+use nexus_api::{BlockId, BlockState, OutputFormat, Value};
+use nexus_kernel::CommandRegistry;
 use nexus_term::TerminalParser;
 
 use crate::glyph_cache::get_cell_metrics;
@@ -45,6 +46,8 @@ pub struct Block {
     pub duration_ms: Option<u64>,
     /// Version counter for lazy invalidation.
     pub version: u64,
+    /// Native command output (structured data, not terminal output).
+    pub native_output: Option<Value>,
 }
 
 impl Block {
@@ -59,6 +62,7 @@ impl Block {
             started_at: Instant::now(),
             duration_ms: None,
             version: 0,
+            native_output: None,
         }
     }
 
@@ -192,6 +196,8 @@ pub struct Nexus {
     /// Is there processed PTY data that hasn't been drawn yet?
     /// Used for 60 FPS throttling during high-throughput output.
     is_dirty: bool,
+    /// Registry of native (in-process) commands.
+    commands: CommandRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +284,7 @@ impl Default for Nexus {
             suppress_next_input: false,
             input_before_event: String::new(),
             is_dirty: false,
+            commands: CommandRegistry::new(),
         }
     }
 }
@@ -855,6 +862,87 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
         return Task::none();
     }
 
+    // Parse command to get name and args
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let cmd_name = parts.first().map(|s| *s).unwrap_or("");
+
+    // Check for native (in-process) command
+    if state.commands.contains(cmd_name) {
+        return execute_native_command(state, block_id, &trimmed, cmd_name, &parts[1..]);
+    }
+
+    // External command - spawn via PTY
+    execute_external_command(state, block_id, command)
+}
+
+/// Execute a native (in-process) command and return immediately.
+fn execute_native_command(
+    state: &mut Nexus,
+    block_id: BlockId,
+    full_command: &str,
+    cmd_name: &str,
+    args: &[&str],
+) -> Task<Message> {
+    use nexus_kernel::commands::CommandContext;
+    use nexus_api::ShellEvent;
+
+    // Create block
+    let mut block = Block::new(block_id, full_command.to_string());
+    block.parser = TerminalParser::new(state.terminal_size.0, state.terminal_size.1);
+    let block_idx = state.blocks.len();
+
+    // Get the command
+    let native_cmd = state.commands.get(cmd_name).expect("command exists");
+
+    // Create a minimal shell state for the command
+    let mut shell_state = nexus_kernel::ShellState::from_cwd(
+        std::path::PathBuf::from(&state.cwd)
+    );
+
+    // Create a dummy event sender (we don't use kernel events in UI yet)
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<ShellEvent>(16);
+
+    // Execute the command
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let mut ctx = CommandContext {
+        state: &mut shell_state,
+        events: &event_tx,
+        block_id,
+        stdin: None,
+    };
+
+    let start = std::time::Instant::now();
+    let result = native_cmd.execute(&args, &mut ctx);
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(value) => {
+            block.native_output = Some(value);
+            block.state = BlockState::Success;
+            block.duration_ms = Some(duration_ms);
+            state.last_exit_code = Some(0);
+        }
+        Err(e) => {
+            block.parser.feed(format!("error: {}\n", e).as_bytes());
+            block.state = BlockState::Failed(1);
+            block.duration_ms = Some(duration_ms);
+            state.last_exit_code = Some(1);
+        }
+    }
+
+    state.blocks.push(block);
+    state.block_index.insert(block_id, block_idx);
+    state.focus = Focus::Input; // Native commands complete immediately
+
+    // Scroll to bottom
+    scrollable::snap_to(
+        scrollable::Id::new(HISTORY_SCROLLABLE),
+        scrollable::RelativeOffset::END,
+    )
+}
+
+/// Execute an external command via PTY.
+fn execute_external_command(state: &mut Nexus, block_id: BlockId, command: String) -> Task<Message> {
     // Create new block with current terminal size
     let mut block = Block::new(block_id, command.clone());
     block.parser = TerminalParser::new(state.terminal_size.0, state.terminal_size.1);
@@ -911,13 +999,17 @@ fn view_block(block: &Block, font_size: f32) -> Element<'_, Message> {
     ]
     .spacing(0);
 
-    // Terminal output - only show cursor for running commands
-    // For RUNNING blocks: use viewport-only grid (O(1) extraction)
-    // For FINISHED blocks: use full scrollback (cached, O(1) after first extraction)
-    // For alternate screen (TUI apps): always viewport only
+    // Check for native output first
     let output: Element<Message> = if block.collapsed {
         column![].into()
+    } else if let Some(value) = &block.native_output {
+        // Render structured value from native command
+        render_value(value, font_size)
     } else {
+        // Terminal output - only show cursor for running commands
+        // For RUNNING blocks: use viewport-only grid (O(1) extraction)
+        // For FINISHED blocks: use full scrollback (cached, O(1) after first extraction)
+        // For alternate screen (TUI apps): always viewport only
         let grid = if block.parser.is_alternate_screen() || block.is_running() {
             // Running or alternate screen: viewport only (fast, O(1))
             block.parser.grid()
@@ -936,6 +1028,148 @@ fn view_block(block: &Block, font_size: f32) -> Element<'_, Message> {
     };
 
     column![prompt_line, output].spacing(0).into()
+}
+
+/// Render a structured Value from a native command.
+fn render_value(value: &Value, font_size: f32) -> Element<'static, Message> {
+    use nexus_api::FileEntry;
+
+    match value {
+        Value::Unit => column![].into(),
+
+        Value::List(items) => {
+            // Check if it's a list of FileEntry
+            let file_entries: Vec<&FileEntry> = items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::FileEntry(entry) => Some(entry.as_ref()),
+                    _ => None,
+                })
+                .collect();
+
+            if file_entries.len() == items.len() && !file_entries.is_empty() {
+                // Render as file list
+                render_file_list(&file_entries, font_size)
+            } else {
+                // Generic list rendering
+                let lines: Vec<Element<Message>> = items
+                    .iter()
+                    .map(|item| {
+                        text(item.to_text())
+                            .size(font_size)
+                            .color(iced::Color::from_rgb(0.8, 0.8, 0.8))
+                            .font(iced::Font::MONOSPACE)
+                            .into()
+                    })
+                    .collect();
+                Column::with_children(lines).spacing(0).into()
+            }
+        }
+
+        Value::Table { columns, rows } => render_table(columns, rows, font_size),
+
+        Value::FileEntry(entry) => {
+            render_file_list(&[entry.as_ref()], font_size)
+        }
+
+        // For other types, just render as text
+        _ => {
+            text(value.to_text())
+                .size(font_size)
+                .color(iced::Color::from_rgb(0.8, 0.8, 0.8))
+                .font(iced::Font::MONOSPACE)
+                .into()
+        }
+    }
+}
+
+/// Render a list of file entries (simple ls-style output).
+fn render_file_list(entries: &[&nexus_api::FileEntry], font_size: f32) -> Element<'static, Message> {
+    use nexus_api::FileType;
+
+    let lines: Vec<Element<Message>> = entries
+        .iter()
+        .map(|entry| {
+            // Color based on file type
+            let color = match entry.file_type {
+                FileType::Directory => iced::Color::from_rgb(0.4, 0.6, 1.0), // Blue for dirs
+                FileType::Symlink => iced::Color::from_rgb(0.4, 0.9, 0.9),   // Cyan for symlinks
+                _ if entry.permissions & 0o111 != 0 => iced::Color::from_rgb(0.4, 0.9, 0.4), // Green for executables
+                _ => iced::Color::from_rgb(0.8, 0.8, 0.8), // White for regular files
+            };
+
+            let display_name = if let Some(target) = &entry.symlink_target {
+                format!("{} -> {}", entry.name, target.display())
+            } else {
+                entry.name.clone()
+            };
+
+            text(display_name)
+                .size(font_size)
+                .color(color)
+                .font(iced::Font::MONOSPACE)
+                .into()
+        })
+        .collect();
+
+    Column::with_children(lines).spacing(0).into()
+}
+
+/// Render a table (for ls -l style output).
+fn render_table(
+    columns: &[String],
+    rows: &[Vec<Value>],
+    font_size: f32,
+) -> Element<'static, Message> {
+    // Calculate column widths
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.to_text().len());
+            }
+        }
+    }
+
+    // Build rows
+    let mut lines: Vec<Element<Message>> = Vec::new();
+
+    for row in rows {
+        let mut line = String::new();
+        for (i, cell) in row.iter().enumerate() {
+            let cell_text = cell.to_text();
+            let width = widths.get(i).copied().unwrap_or(0);
+
+            // Right-align numbers, left-align text
+            let formatted = match cell {
+                Value::Int(_) | Value::Float(_) => format!("{:>width$}", cell_text, width = width),
+                _ => format!("{:<width$}", cell_text, width = width),
+            };
+            line.push_str(&formatted);
+            line.push_str("  "); // Column spacing
+        }
+
+        // Color the last column (filename) based on content
+        let name_color = if line.starts_with('d') {
+            iced::Color::from_rgb(0.4, 0.6, 1.0) // Blue for directories
+        } else if line.contains(" -> ") {
+            iced::Color::from_rgb(0.4, 0.9, 0.9) // Cyan for symlinks
+        } else if line.contains('x') {
+            iced::Color::from_rgb(0.4, 0.9, 0.4) // Green for executables
+        } else {
+            iced::Color::from_rgb(0.8, 0.8, 0.8) // Default
+        };
+
+        lines.push(
+            text(line.trim_end().to_string())
+                .size(font_size)
+                .color(name_color)
+                .font(iced::Font::MONOSPACE)
+                .into(),
+        );
+    }
+
+    Column::with_children(lines).spacing(0).into()
 }
 
 fn view_input(state: &Nexus) -> Element<'_, Message> {

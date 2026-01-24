@@ -1,10 +1,11 @@
 //! Built-in shell commands.
 
-use tokio::sync::broadcast::Sender;
 use nexus_api::ShellEvent;
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
+use tokio::sync::broadcast::Sender;
 
+use crate::commands::CommandRegistry;
 use crate::ShellState;
 
 /// Check if a command name is a builtin.
@@ -50,6 +51,7 @@ pub fn try_builtin(
     args: &[String],
     state: &mut ShellState,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<Option<i32>> {
     match name {
         "cd" => Ok(Some(builtin_cd(args, state, events)?)),
@@ -63,11 +65,11 @@ pub fn try_builtin(
         "true" | ":" => Ok(Some(0)),
         "false" => Ok(Some(1)),
         "test" | "[" => Ok(Some(builtin_test(args)?)),
-        "type" => Ok(Some(builtin_type(args, state)?)),
-        "source" | "." => Ok(Some(builtin_source(args, state, events)?)),
-        "eval" => Ok(Some(builtin_eval(args, state, events)?)),
+        "type" => Ok(Some(builtin_type(args, state, commands)?)),
+        "source" | "." => Ok(Some(builtin_source(args, state, events, commands)?)),
+        "eval" => Ok(Some(builtin_eval(args, state, events, commands)?)),
         "readonly" => Ok(Some(builtin_readonly(args, state)?)),
-        "command" => Ok(Some(builtin_command(args, state, events)?)),
+        "command" => Ok(Some(builtin_command(args, state, events, commands)?)),
         "basename" => Ok(Some(builtin_basename(args)?)),
         "dirname" => Ok(Some(builtin_dirname(args)?)),
         _ => Ok(None),
@@ -620,12 +622,18 @@ fn builtin_test(args: &[String]) -> anyhow::Result<i32> {
     Ok(1)
 }
 
-fn builtin_type(args: &[String], state: &ShellState) -> anyhow::Result<i32> {
+fn builtin_type(
+    args: &[String],
+    state: &ShellState,
+    commands: &CommandRegistry,
+) -> anyhow::Result<i32> {
     let mut exit_code = 0;
 
     for arg in args {
         if is_builtin(arg) {
             println!("{} is a shell builtin", arg);
+        } else if commands.contains(arg) {
+            println!("{} is a native command", arg);
         } else if state.aliases.contains_key(arg) {
             println!("{} is aliased to `{}'", arg, state.aliases.get(arg).unwrap());
         } else if let Some(path) = find_in_path(arg, state) {
@@ -643,6 +651,7 @@ fn builtin_source(
     args: &[String],
     state: &mut ShellState,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     if args.is_empty() {
         eprintln!("source: filename argument required");
@@ -676,7 +685,7 @@ fn builtin_source(
 
         match parser.parse(line) {
             Ok(ast) => {
-                last_exit = crate::eval::execute(state, &ast, events)?;
+                last_exit = crate::eval::execute(state, &ast, events, commands)?;
             }
             Err(e) => {
                 eprintln!("source: {}: parse error: {}", filename, e);
@@ -692,6 +701,7 @@ fn builtin_eval(
     args: &[String],
     state: &mut ShellState,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     if args.is_empty() {
         return Ok(0);
@@ -701,7 +711,7 @@ fn builtin_eval(
     let mut parser = crate::Parser::new()?;
 
     match parser.parse(&command) {
-        Ok(ast) => crate::eval::execute(state, &ast, events),
+        Ok(ast) => crate::eval::execute(state, &ast, events, commands),
         Err(e) => {
             eprintln!("eval: parse error: {}", e);
             Ok(1)
@@ -740,6 +750,7 @@ fn builtin_command(
     args: &[String],
     state: &mut ShellState,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     // command runs a command bypassing aliases and functions
     // For now, just execute normally since we don't have full alias support
@@ -758,14 +769,14 @@ fn builtin_command(
         (&args[1], &args[2..], true)
     } else if name == "-v" || name == "-V" {
         // command -v acts like type
-        return builtin_type(&args[1..].to_vec(), state);
+        return builtin_type(&args[1..].to_vec(), state, commands);
     } else {
         (name, cmd_args, false)
     };
 
     // If it's a builtin, run it
     if is_builtin(name) {
-        return try_builtin(name, &cmd_args.to_vec(), state, events)?
+        return try_builtin(name, &cmd_args.to_vec(), state, events, commands)?
             .ok_or_else(|| anyhow::anyhow!("builtin not found"));
     }
 

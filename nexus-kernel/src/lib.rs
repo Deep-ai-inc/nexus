@@ -4,26 +4,30 @@
 //! - Parser (Tree-sitter integration)
 //! - Evaluator (AST walker)
 //! - State management
+//! - In-process commands (ls, cat, etc.)
 
-pub mod parser;
+pub mod commands;
 pub mod eval;
+pub mod parser;
 pub mod process;
 
-mod state;
 mod error;
+mod state;
 
-pub use state::ShellState;
+pub use commands::CommandRegistry;
 pub use error::ShellError;
 pub use parser::Parser;
+pub use state::ShellState;
 
-use tokio::sync::broadcast;
 use nexus_api::ShellEvent;
+use tokio::sync::broadcast;
 
 /// The shell kernel - owns interpreter state and executes commands.
 pub struct Kernel {
     state: ShellState,
     event_tx: broadcast::Sender<ShellEvent>,
     parser: parser::Parser,
+    commands: CommandRegistry,
 }
 
 impl Kernel {
@@ -34,8 +38,14 @@ impl Kernel {
             state: ShellState::new()?,
             event_tx,
             parser: parser::Parser::new()?,
+            commands: CommandRegistry::new(),
         };
         Ok((kernel, event_rx))
+    }
+
+    /// Get a reference to the command registry.
+    pub fn commands(&self) -> &CommandRegistry {
+        &self.commands
     }
 
     /// Get a reference to the current shell state.

@@ -1,11 +1,12 @@
 //! Evaluator - AST walker that executes commands.
 
-mod expand;
 mod builtins;
+mod expand;
 
-use tokio::sync::broadcast::Sender;
 use nexus_api::ShellEvent;
+use tokio::sync::broadcast::Sender;
 
+use crate::commands::{CommandContext, CommandRegistry};
 use crate::parser::*;
 use crate::process;
 use crate::state::{next_block_id, ShellState};
@@ -17,11 +18,12 @@ pub fn execute(
     state: &mut ShellState,
     ast: &Ast,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     let mut last_exit = 0;
 
     for command in &ast.commands {
-        last_exit = execute_command(state, command, events)?;
+        last_exit = execute_command(state, command, events, commands)?;
         state.last_exit_code = last_exit;
     }
 
@@ -33,16 +35,17 @@ fn execute_command(
     state: &mut ShellState,
     command: &Command,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     match command {
-        Command::Simple(simple) => execute_simple(state, simple, events),
-        Command::Pipeline(pipeline) => execute_pipeline(state, pipeline, events),
-        Command::List(list) => execute_list(state, list, events),
-        Command::Subshell(subshell) => execute_subshell(state, subshell, events),
+        Command::Simple(simple) => execute_simple(state, simple, events, commands),
+        Command::Pipeline(pipeline) => execute_pipeline(state, pipeline, events, commands),
+        Command::List(list) => execute_list(state, list, events, commands),
+        Command::Subshell(subshell) => execute_subshell(state, subshell, events, commands),
         Command::Assignment(assignment) => execute_assignment(state, assignment),
-        Command::If(if_stmt) => execute_if(state, if_stmt, events),
-        Command::While(while_stmt) => execute_while(state, while_stmt, events),
-        Command::For(for_stmt) => execute_for(state, for_stmt, events),
+        Command::If(if_stmt) => execute_if(state, if_stmt, events, commands),
+        Command::While(while_stmt) => execute_while(state, while_stmt, events, commands),
+        Command::For(for_stmt) => execute_for(state, for_stmt, events, commands),
     }
 }
 
@@ -51,6 +54,7 @@ fn execute_simple(
     state: &mut ShellState,
     cmd: &SimpleCommand,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     // Expand the command name and arguments
     let name = expand::expand_word_to_string(&Word::Literal(cmd.name.clone()), state);
@@ -72,12 +76,95 @@ fn execute_simple(
         })
         .collect();
 
-    // Check for builtins
-    if let Some(exit_code) = builtins::try_builtin(&name, &args, state, events)? {
+    // Check for builtins (shell-specific: cd, export, etc.)
+    if let Some(exit_code) = builtins::try_builtin(&name, &args, state, events, commands)? {
         return Ok(exit_code);
     }
 
-    // External command - spawn a process
+    // Check for native commands (in-process: ls, cat, etc.)
+    if let Some(native_cmd) = commands.get(&name) {
+        return execute_native(state, native_cmd, &args, events);
+    }
+
+    // External command - spawn a process via PTY (legacy)
+    execute_external(state, &name, args, env_overrides, &cmd.redirects, events)
+}
+
+/// Execute a native (in-process) command.
+fn execute_native(
+    state: &mut ShellState,
+    cmd: &dyn crate::commands::NexusCommand,
+    args: &[String],
+    events: &Sender<ShellEvent>,
+) -> anyhow::Result<i32> {
+    let block_id = next_block_id();
+
+    // Emit command started event
+    let _ = events.send(ShellEvent::CommandStarted {
+        block_id,
+        command: format!("{} {}", cmd.name(), args.join(" ")),
+        cwd: state.cwd.clone(),
+    });
+
+    let start = std::time::Instant::now();
+
+    // Create command context
+    let mut ctx = CommandContext {
+        state,
+        events,
+        block_id,
+        stdin: None, // TODO: piped input support
+    };
+
+    // Execute the command
+    let result = cmd.execute(args, &mut ctx);
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(value) => {
+            // Emit structured output
+            let _ = events.send(ShellEvent::CommandOutput {
+                block_id,
+                value: value.clone(),
+            });
+
+            // Emit command finished
+            let _ = events.send(ShellEvent::CommandFinished {
+                block_id,
+                exit_code: 0,
+                duration_ms,
+            });
+
+            Ok(0)
+        }
+        Err(e) => {
+            // Emit error as stderr
+            let _ = events.send(ShellEvent::StderrChunk {
+                block_id,
+                data: format!("{}: {}\n", cmd.name(), e).into_bytes(),
+            });
+
+            let _ = events.send(ShellEvent::CommandFinished {
+                block_id,
+                exit_code: 1,
+                duration_ms,
+            });
+
+            Ok(1)
+        }
+    }
+}
+
+/// Execute an external command via PTY (legacy path).
+fn execute_external(
+    state: &mut ShellState,
+    name: &str,
+    args: Vec<String>,
+    env_overrides: Vec<(String, String)>,
+    redirects: &[Redirect],
+    events: &Sender<ShellEvent>,
+) -> anyhow::Result<i32> {
     let block_id = next_block_id();
 
     // Emit command started event
@@ -88,11 +175,11 @@ fn execute_simple(
     });
 
     // Build the full argv
-    let mut argv = vec![name];
+    let mut argv = vec![name.to_string()];
     argv.extend(args);
 
     // Spawn the process
-    let handle = process::spawn(&argv, &state.cwd, &state.env, &env_overrides, &cmd.redirects)?;
+    let handle = process::spawn(&argv, &state.cwd, &state.env, &env_overrides, redirects)?;
 
     // Wait for completion and stream output
     let exit_code = process::wait_with_events(handle, block_id, events)?;
@@ -105,13 +192,14 @@ fn execute_pipeline(
     state: &mut ShellState,
     pipeline: &Pipeline,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     if pipeline.commands.len() == 1 {
-        return execute_command(state, &pipeline.commands[0], events);
+        return execute_command(state, &pipeline.commands[0], events, commands);
     }
 
     // For now, execute sequentially and connect with pipes
-    // TODO: Proper pipe setup with pump threads
+    // TODO: Proper pipe setup with pump threads, native command chaining
     let block_id = next_block_id();
 
     let _ = events.send(ShellEvent::CommandStarted {
@@ -131,6 +219,7 @@ fn execute_list(
     state: &mut ShellState,
     list: &List,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     let mut last_exit = 0;
 
@@ -155,9 +244,9 @@ fn execute_list(
 
             if is_background {
                 // TODO: Spawn in background
-                last_exit = execute_command(state, cmd, events)?;
+                last_exit = execute_command(state, cmd, events, commands)?;
             } else {
-                last_exit = execute_command(state, cmd, events)?;
+                last_exit = execute_command(state, cmd, events, commands)?;
             }
         }
     }
@@ -170,6 +259,7 @@ fn execute_subshell(
     state: &mut ShellState,
     subshell: &Subshell,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     // Create a copy of state for the subshell
     // In a real implementation, this would fork
@@ -180,7 +270,7 @@ fn execute_subshell(
 
     let mut last_exit = 0;
     for cmd in &subshell.commands {
-        last_exit = execute_command(&mut subshell_state, cmd, events)?;
+        last_exit = execute_command(&mut subshell_state, cmd, events, commands)?;
     }
 
     Ok(last_exit)
@@ -198,25 +288,26 @@ fn execute_if(
     state: &mut ShellState,
     if_stmt: &IfStatement,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     // Execute condition
     let mut condition_exit = 0;
     for cmd in &if_stmt.condition {
-        condition_exit = execute_command(state, cmd, events)?;
+        condition_exit = execute_command(state, cmd, events, commands)?;
     }
 
     if condition_exit == 0 {
         // Execute then branch
         let mut last_exit = 0;
         for cmd in &if_stmt.then_branch {
-            last_exit = execute_command(state, cmd, events)?;
+            last_exit = execute_command(state, cmd, events, commands)?;
         }
         Ok(last_exit)
     } else if let Some(else_branch) = &if_stmt.else_branch {
         // Execute else branch
         let mut last_exit = 0;
         for cmd in else_branch {
-            last_exit = execute_command(state, cmd, events)?;
+            last_exit = execute_command(state, cmd, events, commands)?;
         }
         Ok(last_exit)
     } else {
@@ -229,6 +320,7 @@ fn execute_while(
     state: &mut ShellState,
     while_stmt: &WhileStatement,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     let mut last_exit = 0;
 
@@ -236,7 +328,7 @@ fn execute_while(
         // Execute condition
         let mut condition_exit = 0;
         for cmd in &while_stmt.condition {
-            condition_exit = execute_command(state, cmd, events)?;
+            condition_exit = execute_command(state, cmd, events, commands)?;
         }
 
         if condition_exit != 0 {
@@ -245,7 +337,7 @@ fn execute_while(
 
         // Execute body
         for cmd in &while_stmt.body {
-            last_exit = execute_command(state, cmd, events)?;
+            last_exit = execute_command(state, cmd, events, commands)?;
         }
     }
 
@@ -257,6 +349,7 @@ fn execute_for(
     state: &mut ShellState,
     for_stmt: &ForStatement,
     events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     let mut last_exit = 0;
 
@@ -270,7 +363,7 @@ fn execute_for(
         state.set_var(for_stmt.variable.clone(), item);
 
         for cmd in &for_stmt.body {
-            last_exit = execute_command(state, cmd, events)?;
+            last_exit = execute_command(state, cmd, events, commands)?;
         }
     }
 

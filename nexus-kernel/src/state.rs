@@ -95,6 +95,25 @@ impl ShellState {
         })
     }
 
+    /// Create a new shell state with a specific working directory.
+    /// Inherits environment from the current process.
+    pub fn from_cwd(cwd: PathBuf) -> Self {
+        let env: HashMap<String, String> = std::env::vars().collect();
+
+        Self {
+            env,
+            vars: HashMap::new(),
+            cwd,
+            jobs: Vec::new(),
+            last_exit_code: 0,
+            last_bg_pid: None,
+            aliases: HashMap::new(),
+            readonly_vars: HashSet::new(),
+            positional_params: Vec::new(),
+            options: ShellOptions::default(),
+        }
+    }
+
     /// Get an environment variable.
     pub fn get_env(&self, key: &str) -> Option<&str> {
         self.env.get(key).map(|s| s.as_str())

@@ -1,5 +1,6 @@
 //! Shell events emitted by the kernel to subscribers (UI, history, etc.)
 
+use crate::Value;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -27,6 +28,12 @@ pub enum ShellEvent {
     StderrChunk {
         block_id: BlockId,
         data: Vec<u8>,
+    },
+
+    /// Structured output from a native (in-process) command.
+    CommandOutput {
+        block_id: BlockId,
+        value: Value,
     },
 
     /// A command has finished executing.
