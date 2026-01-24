@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 /// A structured value that can be passed between commands and rendered by the UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     /// No value (like void/unit)
     Unit,
@@ -43,7 +43,7 @@ pub enum Value {
 }
 
 /// Metadata about a file or directory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub name: String,
     pub path: PathBuf,

@@ -3,9 +3,33 @@
 //! Commands implemented here run within the shell process (no fork/exec),
 //! return structured `Value` data, and can leverage full GUI capabilities.
 
+mod basic;
+mod cat;
+mod cut;
+mod date;
+mod env;
+mod find;
+mod fs;
+mod grep;
 mod head;
+mod json;
 mod ls;
+mod math;
+mod nl;
+mod path;
 mod registry;
+mod rev;
+mod select;
+mod seq;
+mod shuf;
+mod sort;
+mod split;
+mod tail;
+mod tee;
+mod tr;
+mod uniq;
+mod wc;
+mod which;
 
 pub use registry::CommandRegistry;
 
