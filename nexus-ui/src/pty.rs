@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::mpsc;
 
 use nexus_api::BlockId;
@@ -15,24 +15,39 @@ pub struct PtyHandle {
     pub block_id: BlockId,
     /// Writer to send input to the PTY.
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Master PTY for resize operations.
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     /// Child process for signal handling.
     #[allow(dead_code)]
     child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
 }
 
 impl PtyHandle {
-    /// Spawn a new PTY running the given command.
+    /// Spawn a new PTY running the given command with default size.
+    #[allow(dead_code)]
     pub fn spawn(
         command: &str,
         cwd: &str,
         block_id: BlockId,
         tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_size(command, cwd, block_id, tx, 120, 24)
+    }
+
+    /// Spawn a new PTY running the given command with specified size.
+    pub fn spawn_with_size(
+        command: &str,
+        cwd: &str,
+        block_id: BlockId,
+        tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
 
         let pair = pty_system.openpty(PtySize {
-            rows: 24,
-            cols: 120,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -52,6 +67,7 @@ impl PtyHandle {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
+        let master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
         // Spawn reader thread
         let tx_clone = tx.clone();
@@ -92,6 +108,7 @@ impl PtyHandle {
         Ok(Self {
             block_id,
             writer,
+            master,
             child,
         })
     }
@@ -107,6 +124,18 @@ impl PtyHandle {
     #[allow(dead_code)]
     pub fn write_str(&self, s: &str) -> std::io::Result<()> {
         self.write(s.as_bytes())
+    }
+
+    /// Resize the PTY.
+    pub fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        let master = self.master.lock().unwrap();
+        master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        Ok(())
     }
 
     /// Send Ctrl+C (SIGINT) to the process.
