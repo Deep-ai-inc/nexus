@@ -3,11 +3,15 @@
 //! Uses fontdue for fast cross-platform glyph rasterization.
 //! Glyphs are cached lazily and packed into a texture atlas.
 //! Optimized with O(1) ASCII lookup and pre-calculated UVs.
+//! Supports dynamic atlas resizing to handle CJK/emoji/large character sets.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use fontdue::{Font, FontSettings};
+
+/// Maximum atlas size (8K is safe for most GPUs).
+const MAX_ATLAS_SIZE: u32 = 8192;
 
 /// Embedded font data - loaded once.
 static FONT: OnceLock<Font> = OnceLock::new();
@@ -98,6 +102,8 @@ pub struct GlyphCache {
     row_height: u32,
     /// Dirty region for partial uploads.
     dirty_rect: DirtyRect,
+    /// Flag indicating atlas was resized (texture must be recreated).
+    resized: bool,
     /// Metrics for the font at this size.
     pub cell_width: f32,
     pub cell_height: f32,
@@ -118,9 +124,9 @@ impl GlyphCache {
         let cell_height = line_metrics.new_line_size;
         let ascent = line_metrics.ascent;
 
-        // Start with a reasonable atlas size
-        let atlas_width = 1024;
-        let atlas_height = 1024;
+        // Start with smaller atlas to save VRAM, grow as needed
+        let atlas_width = 512;
+        let atlas_height = 512;
         let atlas_data = vec![0u8; (atlas_width * atlas_height * 4) as usize];
 
         Self {
@@ -134,6 +140,7 @@ impl GlyphCache {
             pack_y: 1,
             row_height: 0,
             dirty_rect: DirtyRect::default(),
+            resized: false,
             cell_width,
             cell_height,
             ascent,
@@ -167,14 +174,21 @@ impl GlyphCache {
         let width = metrics.width as u32;
         let height = metrics.height as u32;
 
-        // Find position in atlas
+        // Find position in atlas, growing if needed
         let (atlas_x, atlas_y) = match self.pack_glyph(width, height) {
             Some(pos) => pos,
             None => {
-                // Atlas overflow - clear and restart
-                self.clear_atlas();
-                self.pack_glyph(width, height)
-                    .expect("Single glyph too large for atlas")
+                // Atlas is full - try to grow
+                if self.grow_atlas() {
+                    // Growth succeeded, try packing again
+                    self.pack_glyph(width, height)
+                        .expect("Grow failed to make space for glyph")
+                } else {
+                    // At max size - clear and reuse
+                    self.clear_atlas_state();
+                    self.pack_glyph(width, height)
+                        .expect("Single glyph too large for max atlas")
+                }
             }
         };
 
@@ -249,8 +263,41 @@ impl GlyphCache {
         Some((x, y))
     }
 
-    /// Clear the atlas and glyph cache (called on overflow).
-    fn clear_atlas(&mut self) {
+    /// Try to grow the atlas by doubling its size.
+    /// Returns true if successful, false if at MAX_ATLAS_SIZE.
+    fn grow_atlas(&mut self) -> bool {
+        let new_width = self.atlas_width * 2;
+        let new_height = self.atlas_height * 2;
+
+        if new_width > MAX_ATLAS_SIZE || new_height > MAX_ATLAS_SIZE {
+            return false;
+        }
+
+        // Create new larger buffer
+        self.atlas_data = vec![0u8; (new_width * new_height * 4) as usize];
+        self.atlas_width = new_width;
+        self.atlas_height = new_height;
+
+        // Reset packing state (existing glyphs need re-rasterization)
+        self.clear_atlas_state();
+
+        // Signal that texture must be recreated
+        self.resized = true;
+
+        // Mark entire atlas dirty for full upload
+        self.dirty_rect = DirtyRect {
+            min_x: 0,
+            min_y: 0,
+            max_x: new_width,
+            max_y: new_height,
+            is_dirty: true,
+        };
+
+        true
+    }
+
+    /// Clear glyph cache state without changing atlas size.
+    fn clear_atlas_state(&mut self) {
         self.glyphs.clear();
         self.ascii_cache = [None; 128];
         self.atlas_data.fill(0);
@@ -308,6 +355,16 @@ impl GlyphCache {
     /// Mark atlas as uploaded.
     pub fn mark_clean(&mut self) {
         self.dirty_rect.clear();
+    }
+
+    /// Check if atlas was resized (texture needs recreation).
+    pub fn was_resized(&self) -> bool {
+        self.resized
+    }
+
+    /// Acknowledge resize after recreating texture.
+    pub fn ack_resize(&mut self) {
+        self.resized = false;
     }
 
     /// Pre-cache common ASCII characters.

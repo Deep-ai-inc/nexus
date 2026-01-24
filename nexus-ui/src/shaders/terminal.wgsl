@@ -98,8 +98,16 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let glyph = textureSample(atlas_texture, atlas_sampler, in.uv);
-    let alpha = glyph.a;
-    let color = mix(in.bg_color.rgb, in.fg_color.rgb, alpha);
+
+    // Alpha from atlas (glyph shape) * foreground alpha
+    let alpha = glyph.a * in.fg_color.a;
+
+    // Mix background and foreground based on glyph shape
+    // This enables block cursors, selection highlights, and TUI app styling
+    let rgb = mix(in.bg_color.rgb, in.fg_color.rgb, alpha);
+
+    // Combine alphas: background + foreground (masked by glyph)
     let out_alpha = in.bg_color.a + alpha * (1.0 - in.bg_color.a);
-    return vec4<f32>(color, out_alpha);
+
+    return vec4<f32>(rgb, out_alpha);
 }

@@ -61,8 +61,6 @@ pub struct TerminalProgram<Message> {
     cols: usize,
     /// Font size.
     font_size: f32,
-    /// Number of rows in this batch.
-    num_rows: usize,
     /// Phantom for Message type.
     _message: std::marker::PhantomData<Message>,
 }
@@ -99,7 +97,6 @@ impl<Message> TerminalProgram<Message> {
             cells,
             cols,
             font_size,
-            num_rows: last_row - first_row,
             _message: std::marker::PhantomData,
         }
     }
@@ -112,6 +109,8 @@ pub struct TerminalPipeline {
     globals_bind_group: wgpu::BindGroup,
     atlas_texture: wgpu::Texture,
     atlas_bind_group: wgpu::BindGroup,
+    atlas_layout: wgpu::BindGroupLayout,  // Stored for recreating bind group on resize
+    atlas_sampler: wgpu::Sampler,         // Reused on resize
     instance_buffer: wgpu::Buffer,
     instance_count: u32,
     glyph_cache: GlyphCache,
@@ -125,14 +124,12 @@ impl<Message: Clone + 'static> shader::Program<Message> for TerminalProgram<Mess
         &self,
         _state: &Self::State,
         _cursor: iced::mouse::Cursor,
-        bounds: Rectangle,
+        _bounds: Rectangle,
     ) -> Self::Primitive {
         TerminalPrimitive {
             cells: self.cells.clone(),
             cols: self.cols,
             font_size: self.font_size,
-            num_rows: self.num_rows,
-            bounds,
         }
     }
 }
@@ -143,8 +140,6 @@ pub struct TerminalPrimitive {
     cells: Vec<CellData>,
     cols: usize,
     font_size: f32,
-    num_rows: usize,
-    bounds: Rectangle,
 }
 
 impl shader::Primitive for TerminalPrimitive {
@@ -178,7 +173,7 @@ impl shader::Primitive for TerminalPrimitive {
         };
 
         // Build instance data for visible cells (in physical pixels)
-        // This may add new glyphs to the cache
+        // This may add new glyphs to the cache and trigger atlas resize
         let instances = build_instances(
             &self.cells,
             self.cols,
@@ -186,8 +181,13 @@ impl shader::Primitive for TerminalPrimitive {
             physical_bounds,
         );
 
-        // Partial texture upload if atlas changed
-        if pipeline.glyph_cache.is_dirty() {
+        // Check if atlas was resized (need to recreate texture)
+        if pipeline.glyph_cache.was_resized() {
+            resize_atlas_texture(device, queue, pipeline);
+            pipeline.glyph_cache.ack_resize();
+            pipeline.glyph_cache.mark_clean();
+        } else if pipeline.glyph_cache.is_dirty() {
+            // Partial texture upload if atlas changed
             upload_dirty_region(queue, pipeline);
             pipeline.glyph_cache.mark_clean();
         }
@@ -489,6 +489,8 @@ fn create_pipeline(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::Tex
         globals_bind_group,
         atlas_texture,
         atlas_bind_group,
+        atlas_layout,
+        atlas_sampler,
         instance_buffer,
         instance_count: 0,
         glyph_cache,
@@ -504,8 +506,6 @@ fn upload_dirty_region(queue: &wgpu::Queue, pipeline: &mut TerminalPipeline) {
     // Upload row by row within the dirty region
     // (wgpu requires contiguous data, but our atlas rows aren't contiguous for subregions)
     let atlas_data = pipeline.glyph_cache.atlas_data();
-    let bytes_per_row = region.atlas_width * 4;
-
     for row in 0..region.height {
         let y = region.y + row;
         let src_offset = (y * region.atlas_width + region.x) as usize * 4;
@@ -539,6 +539,69 @@ fn upload_dirty_region(queue: &wgpu::Queue, pipeline: &mut TerminalPipeline) {
     }
 }
 
+/// Recreate atlas texture after glyph cache resize.
+fn resize_atlas_texture(device: &wgpu::Device, queue: &wgpu::Queue, pipeline: &mut TerminalPipeline) {
+    let (width, height) = pipeline.glyph_cache.atlas_size();
+
+    // Create new larger texture
+    let new_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Glyph Atlas (Resized)"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    // Full upload of new atlas data
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &new_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pipeline.glyph_cache.atlas_data(),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    // Recreate bind group with new texture view
+    let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let new_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Atlas Bind Group (Resized)"),
+        layout: &pipeline.atlas_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&new_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&pipeline.atlas_sampler),
+            },
+        ],
+    });
+
+    // Replace old texture and bind group
+    pipeline.atlas_texture = new_texture;
+    pipeline.atlas_bind_group = new_bind_group;
+}
+
 fn build_instances(
     cells: &[CellData],
     cols: usize,
@@ -548,25 +611,41 @@ fn build_instances(
     // Estimate capacity (assume ~50% non-empty cells)
     let mut instances = Vec::with_capacity(cells.len() / 2);
 
-    for (idx, cell) in cells.iter().enumerate() {
-        // Cull empty cells (space with transparent background)
-        if (cell.c == ' ' || cell.c == '\0') && is_transparent_bg(cell.bg) {
+    // Retry loop to handle mid-frame atlas resizing.
+    // If atlas resizes during iteration, old UVs become invalid.
+    loop {
+        instances.clear();
+
+        // Track if resize was already pending at start
+        let was_resized_start = glyph_cache.was_resized();
+
+        for (idx, cell) in cells.iter().enumerate() {
+            // Cull empty cells (space with transparent background)
+            if (cell.c == ' ' || cell.c == '\0') && is_transparent_bg(cell.bg) {
+                continue;
+            }
+
+            let row_idx = (idx / cols) as u16;
+            let col_idx = (idx % cols) as u16;
+
+            // Get glyph data - this might trigger atlas resize!
+            let glyph = glyph_cache.get_glyph(cell.c);
+
+            instances.push(CellInstance {
+                grid_pos_size: [col_idx, row_idx, glyph.width, glyph.height],
+                uv: [glyph.uv_x, glyph.uv_y, glyph.uv_w, glyph.uv_h],
+                fg_color: cell.fg,
+                bg_color: cell.bg,
+                offsets: [glyph.offset_x, glyph.offset_y],
+            });
+        }
+
+        // If resize happened during this loop, UVs are invalid - restart
+        if !was_resized_start && glyph_cache.was_resized() {
             continue;
         }
 
-        let row_idx = (idx / cols) as u16;
-        let col_idx = (idx % cols) as u16;
-
-        // Get pre-calculated glyph data (O(1) for ASCII, no float math)
-        let glyph = glyph_cache.get_glyph(cell.c);
-
-        instances.push(CellInstance {
-            grid_pos_size: [col_idx, row_idx, glyph.width, glyph.height],
-            uv: [glyph.uv_x, glyph.uv_y, glyph.uv_w, glyph.uv_h],
-            fg_color: cell.fg,
-            bg_color: cell.bg,
-            offsets: [glyph.offset_x, glyph.offset_y],
-        });
+        break;
     }
 
     instances
