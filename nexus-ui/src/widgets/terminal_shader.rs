@@ -543,13 +543,8 @@ fn build_instances(
     cells: &[CellData],
     cols: usize,
     glyph_cache: &mut GlyphCache,
-    bounds: Rectangle,
+    _bounds: Rectangle,
 ) -> Vec<CellInstance> {
-    // Pre-calculate inverse atlas dimensions (avoid division in hot loop)
-    let (atlas_w, atlas_h) = glyph_cache.atlas_size();
-    let inv_atlas_w = 65535.0 / atlas_w as f32;
-    let inv_atlas_h = 65535.0 / atlas_h as f32;
-
     // Estimate capacity (assume ~50% non-empty cells)
     let mut instances = Vec::with_capacity(cells.len() / 2);
 
@@ -562,33 +557,17 @@ fn build_instances(
         let row_idx = (idx / cols) as u16;
         let col_idx = (idx % cols) as u16;
 
-        // Ensure glyph is cached and extract data
+        // Get pre-calculated glyph data (O(1) for ASCII, no float math)
         let glyph = glyph_cache.get_glyph(cell.c);
-        let glyph_width = glyph.width as u16;
-        let glyph_height = glyph.height as u16;
-        let atlas_x = glyph.atlas_x;
-        let atlas_y = glyph.atlas_y;
-        let offset_x = glyph.offset_x;
-        let offset_y = glyph.offset_y;
-
-        // Compute normalized UV (scaled to u16 range 0-65535)
-        let u = (atlas_x as f32 * inv_atlas_w) as u16;
-        let v = (atlas_y as f32 * inv_atlas_h) as u16;
-        let uv_w = (glyph.width as f32 * inv_atlas_w) as u16;
-        let uv_h = (glyph.height as f32 * inv_atlas_h) as u16;
 
         instances.push(CellInstance {
-            grid_pos_size: [col_idx, row_idx, glyph_width, glyph_height],
-            uv: [u, v, uv_w, uv_h],
+            grid_pos_size: [col_idx, row_idx, glyph.width, glyph.height],
+            uv: [glyph.uv_x, glyph.uv_y, glyph.uv_w, glyph.uv_h],
             fg_color: cell.fg,
             bg_color: cell.bg,
-            offsets: [offset_x, offset_y],
+            offsets: [glyph.offset_x, glyph.offset_y],
         });
     }
-
-    // Store bounds offset in first instance if needed (or pass via uniform)
-    // For now, bounds.x/y are passed through the transform matrix
-    let _ = bounds;
 
     instances
 }

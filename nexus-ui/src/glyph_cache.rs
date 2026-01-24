@@ -2,6 +2,7 @@
 //!
 //! Uses fontdue for fast cross-platform glyph rasterization.
 //! Glyphs are cached lazily and packed into a texture atlas.
+//! Optimized with O(1) ASCII lookup and pre-calculated UVs.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -30,20 +31,19 @@ pub fn get_cell_metrics(font_size: f32) -> (f32, f32) {
     (metrics.advance_width, line_metrics.new_line_size)
 }
 
-/// A cached glyph with its metrics (bitmap not stored after atlas copy).
-#[derive(Debug, Clone)]
+/// A cached glyph with pre-calculated UVs for the shader.
+/// Small enough to be Copy (24 bytes).
+#[derive(Debug, Clone, Copy)]
 pub struct CachedGlyph {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// Horizontal offset from cursor position.
+    pub width: u16,
+    pub height: u16,
     pub offset_x: i32,
-    /// Vertical offset from baseline.
     pub offset_y: i32,
-    /// Position in atlas (x, y).
-    pub atlas_x: u32,
-    pub atlas_y: u32,
+    /// Pre-calculated UVs (0-65535 normalized range)
+    pub uv_x: u16,
+    pub uv_y: u16,
+    pub uv_w: u16,
+    pub uv_h: u16,
 }
 
 /// Dirty region tracking for partial texture uploads.
@@ -82,8 +82,10 @@ impl DirtyRect {
 /// Glyph cache that lazily rasterizes and packs glyphs into an atlas.
 pub struct GlyphCache {
     font_size: f32,
-    /// Cache of rasterized glyphs by character.
+    /// Cache of rasterized glyphs by character (non-ASCII).
     glyphs: HashMap<char, CachedGlyph>,
+    /// Fast O(1) lookup for ASCII characters (0-127).
+    ascii_cache: [Option<CachedGlyph>; 128],
     /// Atlas texture data (RGBA).
     atlas_data: Vec<u8>,
     /// Atlas dimensions.
@@ -124,6 +126,7 @@ impl GlyphCache {
         Self {
             font_size,
             glyphs: HashMap::new(),
+            ascii_cache: [None; 128],
             atlas_data,
             atlas_width,
             atlas_height,
@@ -138,11 +141,22 @@ impl GlyphCache {
     }
 
     /// Get or create a cached glyph for the given character.
-    pub fn get_glyph(&mut self, ch: char) -> &CachedGlyph {
+    /// Returns by value (Copy) to avoid borrow issues in hot loops.
+    #[inline]
+    pub fn get_glyph(&mut self, ch: char) -> CachedGlyph {
+        // Fast path: ASCII characters (99% of terminal content)
+        if ch < '\u{80}' {
+            let idx = ch as usize;
+            if let Some(g) = self.ascii_cache[idx] {
+                return g;
+            }
+        }
+
+        // Slow path: check HashMap or rasterize
         if !self.glyphs.contains_key(&ch) {
             self.rasterize_and_cache(ch);
         }
-        self.glyphs.get(&ch).unwrap()
+        *self.glyphs.get(&ch).unwrap()
     }
 
     /// Rasterize a glyph and add it to the cache and atlas.
@@ -182,15 +196,25 @@ impl GlyphCache {
         // Track dirty region for partial upload
         self.dirty_rect.expand(atlas_x, atlas_y, width, height);
 
+        // Pre-calculate UVs (avoid float math in hot loop)
+        let inv_w = 65535.0 / self.atlas_width as f32;
+        let inv_h = 65535.0 / self.atlas_height as f32;
+
         let glyph = CachedGlyph {
-            width,
-            height,
+            width: width as u16,
+            height: height as u16,
             offset_x: metrics.xmin,
             offset_y: metrics.ymin,
-            atlas_x,
-            atlas_y,
+            uv_x: (atlas_x as f32 * inv_w) as u16,
+            uv_y: (atlas_y as f32 * inv_h) as u16,
+            uv_w: (width as f32 * inv_w) as u16,
+            uv_h: (height as f32 * inv_h) as u16,
         };
 
+        // Store in both caches for ASCII
+        if ch < '\u{80}' {
+            self.ascii_cache[ch as usize] = Some(glyph);
+        }
         self.glyphs.insert(ch, glyph);
     }
 
@@ -228,6 +252,7 @@ impl GlyphCache {
     /// Clear the atlas and glyph cache (called on overflow).
     fn clear_atlas(&mut self) {
         self.glyphs.clear();
+        self.ascii_cache = [None; 128];
         self.atlas_data.fill(0);
         self.pack_x = 1;
         self.pack_y = 1;
@@ -255,11 +280,6 @@ impl GlyphCache {
     /// Check if atlas has dirty regions needing upload.
     pub fn is_dirty(&self) -> bool {
         self.dirty_rect.is_dirty
-    }
-
-    /// Get the dirty rect for partial upload.
-    pub fn dirty_rect(&self) -> &DirtyRect {
-        &self.dirty_rect
     }
 
     /// Get the bytes for just the dirty region.
@@ -293,7 +313,7 @@ impl GlyphCache {
     /// Pre-cache common ASCII characters.
     pub fn precache_ascii(&mut self) {
         for ch in (32u8..=126u8).map(|b| b as char) {
-            if !self.glyphs.contains_key(&ch) {
+            if self.ascii_cache[ch as usize].is_none() {
                 self.rasterize_and_cache(ch);
             }
         }
