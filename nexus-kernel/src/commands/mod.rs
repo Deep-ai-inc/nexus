@@ -5,31 +5,46 @@
 
 mod basic;
 mod cat;
+mod claude;
+mod cmp;
 mod cut;
 mod date;
 mod env;
 mod find;
 mod fs;
 mod grep;
+mod hash;
 mod head;
+mod history;
+mod jobs;
 mod json;
+mod links;
 mod ls;
 mod math;
 mod nl;
 mod path;
+mod perms;
+mod printf;
 mod registry;
 mod rev;
 mod select;
 mod seq;
 mod shuf;
+mod signal;
 mod sort;
 mod split;
+mod system;
 mod tail;
+mod times;
+mod ulimit;
 mod tee;
 mod tr;
 mod uniq;
 mod wc;
 mod which;
+
+#[cfg(test)]
+mod test_utils;
 
 pub use registry::CommandRegistry;
 

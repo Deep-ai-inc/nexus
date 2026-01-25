@@ -9,18 +9,26 @@ use super::basic::{
     WhoamiCommand, YesCommand,
 };
 use super::cat::CatCommand;
+use super::claude::ClaudeCommand;
+use super::cmp::CmpCommand;
 use super::cut::CutCommand;
 use super::date::DateCommand;
 use super::env::{EnvCommand, ExportCommand, PrintenvCommand, UnsetCommand};
 use super::find::FindCommand;
 use super::fs::{CpCommand, MkdirCommand, MvCommand, RmCommand, RmdirCommand, TouchCommand};
 use super::grep::GrepCommand;
+use super::hash::HashCommand;
 use super::head::HeadCommand;
+use super::history::FcCommand;
+use super::jobs::{BgCommand, FgCommand, JobsCommand, WaitCommand};
 use super::json::{FromJsonCommand, GetCommand, ToJsonCommand};
+use super::links::{LinkCommand, LnCommand, UnlinkCommand};
 use super::ls::LsCommand;
 use super::math::{AvgCommand, CountCommand, MaxCommand, MinCommand, SumCommand};
 use super::nl::NlCommand;
 use super::path::{BasenameCommand, DirnameCommand, ExtnameCommand, RealpathCommand, StemCommand};
+use super::perms::{ChgrpCommand, ChmodCommand, ChownCommand};
+use super::printf::PrintfCommand;
 use super::rev::{RevCommand, TacCommand};
 use super::select::{
     CompactCommand, EnumerateCommand, FirstCommand, FlattenCommand, LastCommand, NthCommand,
@@ -28,12 +36,16 @@ use super::select::{
 };
 use super::seq::SeqCommand;
 use super::shuf::ShufCommand;
+use super::signal::KillCommand;
 use super::sort::SortCommand;
+use super::system::{TtyCommand, UmaskCommand, UnameCommand};
 use super::split::{
     BytesCommand, CharsCommand, JoinCommand, LinesCommand, SplitCommand, WordsCommand,
 };
 use super::tail::TailCommand;
 use super::tee::TeeCommand;
+use super::times::TimesCommand;
+use super::ulimit::UlimitCommand;
 use super::tr::TrCommand;
 use super::uniq::UniqCommand;
 use super::wc::WcCommand;
@@ -129,6 +141,16 @@ impl CommandRegistry {
         // Date/time
         registry.register(DateCommand);
 
+        // Formatting
+        registry.register(PrintfCommand);
+
+        // Job control
+        registry.register(JobsCommand);
+        registry.register(FgCommand);
+        registry.register(BgCommand);
+        registry.register(WaitCommand);
+        registry.register(KillCommand);
+
         // File finding
         registry.register(FindCommand);
 
@@ -140,12 +162,37 @@ impl CommandRegistry {
         registry.register(CpCommand);
         registry.register(MvCommand);
 
+        // Permissions
+        registry.register(ChmodCommand);
+        registry.register(ChownCommand);
+        registry.register(ChgrpCommand);
+
+        // Links
+        registry.register(LnCommand);
+        registry.register(LinkCommand);
+        registry.register(UnlinkCommand);
+
         // I/O
         registry.register(TeeCommand);
+
+        // System info
+        registry.register(TtyCommand);
+        registry.register(UnameCommand);
+        registry.register(UmaskCommand);
+        registry.register(CmpCommand);
+
+        // Resource/process info
+        registry.register(UlimitCommand);
+        registry.register(TimesCommand);
+        registry.register(HashCommand);
+        registry.register(FcCommand);
 
         // Command lookup
         registry.register(WhichCommand);
         registry.register(TypeCommand);
+
+        // Claude integration
+        registry.register(ClaudeCommand);
 
         registry
     }

@@ -1,9 +1,9 @@
 //! Process management - PTY allocation, job control, signals.
 
 mod pty;
-mod job;
+pub mod job;
 
-pub use job::Job;
+pub use job::{Job, JobState};
 pub use pty::PtyHandle;
 
 use std::collections::HashMap;

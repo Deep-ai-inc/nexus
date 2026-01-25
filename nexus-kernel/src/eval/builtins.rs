@@ -1,38 +1,37 @@
-//! Built-in shell commands.
+//! Built-in shell commands that require special shell integration.
+//!
+//! These are commands that must be builtins because they:
+//! - Control flow signals (break, continue, return)
+//! - Modify parser/evaluator state (alias expansion)
+//! - Modify shell variables (shift, read, getopts)
+//! - Replace shell process (exec)
+//! - Register signal handlers (trap)
 
 use nexus_api::ShellEvent;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use tokio::sync::broadcast::Sender;
 
 use crate::commands::CommandRegistry;
+use crate::state::TrapAction;
 use crate::ShellState;
 
 /// Check if a command name is a builtin.
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "cd" | "pwd"
-            | "echo"
-            | "printf"
-            | "exit"
+        "cd" | "exit"
             | "export"
             | "unset"
             | "set"
-            | "true"
-            | "false"
             | ":"
             | "test"
             | "["
-            | "type"
             | "alias"
             | "unalias"
             | "source"
             | "."
             | "eval"
-            | "jobs"
-            | "fg"
-            | "bg"
             | "read"
             | "shift"
             | "return"
@@ -40,8 +39,9 @@ pub fn is_builtin(name: &str) -> bool {
             | "continue"
             | "readonly"
             | "command"
-            | "basename"
-            | "dirname"
+            | "getopts"
+            | "trap"
+            | "exec"
     )
 }
 
@@ -55,23 +55,28 @@ pub fn try_builtin(
 ) -> anyhow::Result<Option<i32>> {
     match name {
         "cd" => Ok(Some(builtin_cd(args, state, events)?)),
-        "pwd" => Ok(Some(builtin_pwd(state)?)),
-        "echo" => Ok(Some(builtin_echo(args)?)),
-        "printf" => Ok(Some(builtin_printf(args)?)),
         "exit" => Ok(Some(builtin_exit(args)?)),
         "export" => Ok(Some(builtin_export(args, state, events)?)),
         "unset" => Ok(Some(builtin_unset(args, state, events)?)),
         "set" => Ok(Some(builtin_set(args, state)?)),
-        "true" | ":" => Ok(Some(0)),
-        "false" => Ok(Some(1)),
+        ":" => Ok(Some(0)),
         "test" | "[" => Ok(Some(builtin_test(args)?)),
-        "type" => Ok(Some(builtin_type(args, state, commands)?)),
         "source" | "." => Ok(Some(builtin_source(args, state, events, commands)?)),
         "eval" => Ok(Some(builtin_eval(args, state, events, commands)?)),
         "readonly" => Ok(Some(builtin_readonly(args, state)?)),
         "command" => Ok(Some(builtin_command(args, state, events, commands)?)),
-        "basename" => Ok(Some(builtin_basename(args)?)),
-        "dirname" => Ok(Some(builtin_dirname(args)?)),
+        "alias" => Ok(Some(builtin_alias(args, state)?)),
+        "unalias" => Ok(Some(builtin_unalias(args, state)?)),
+        "read" => Ok(Some(builtin_read(args, state)?)),
+        "shift" => Ok(Some(builtin_shift(args, state)?)),
+        "getopts" => Ok(Some(builtin_getopts(args, state)?)),
+        "trap" => Ok(Some(builtin_trap(args, state)?)),
+        "exec" => Ok(Some(builtin_exec(args, state)?)),
+        // Control flow builtins - these return special exit codes
+        // but the evaluator needs to handle break/continue/return specially
+        "break" => Ok(Some(builtin_break(args)?)),
+        "continue" => Ok(Some(builtin_continue(args)?)),
+        "return" => Ok(Some(builtin_return(args)?)),
         _ => Ok(None),
     }
 }
@@ -120,245 +125,6 @@ fn builtin_cd(
         eprintln!("cd: {}: No such file or directory", args.get(0).unwrap_or(&String::new()));
         Ok(1)
     }
-}
-
-fn builtin_pwd(state: &ShellState) -> anyhow::Result<i32> {
-    println!("{}", state.cwd.display());
-    Ok(0)
-}
-
-fn builtin_echo(args: &[String]) -> anyhow::Result<i32> {
-    let mut newline = true;
-    let mut interpret_escapes = false;
-    let mut start_idx = 0;
-
-    // Parse flags
-    for (i, arg) in args.iter().enumerate() {
-        match arg.as_str() {
-            "-n" => newline = false,
-            "-e" => interpret_escapes = true,
-            "-E" => interpret_escapes = false,
-            _ => {
-                start_idx = i;
-                break;
-            }
-        }
-        start_idx = i + 1;
-    }
-
-    let output = args[start_idx..].join(" ");
-
-    let output = if interpret_escapes {
-        interpret_escape_sequences(&output)
-    } else {
-        output
-    };
-
-    if newline {
-        println!("{}", output);
-    } else {
-        print!("{}", output);
-        let _ = std::io::stdout().flush();
-    }
-
-    Ok(0)
-}
-
-fn interpret_escape_sequences(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('t') => result.push('\t'),
-                Some('r') => result.push('\r'),
-                Some('\\') => result.push('\\'),
-                Some('0') => {
-                    // Octal escape
-                    let mut octal = String::new();
-                    for _ in 0..3 {
-                        if let Some(&c) = chars.peek() {
-                            if c.is_digit(8) {
-                                octal.push(chars.next().unwrap());
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    if let Ok(code) = u8::from_str_radix(&octal, 8) {
-                        result.push(code as char);
-                    }
-                }
-                Some(c) => {
-                    result.push('\\');
-                    result.push(c);
-                }
-                None => result.push('\\'),
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
-fn builtin_printf(args: &[String]) -> anyhow::Result<i32> {
-    if args.is_empty() {
-        eprintln!("printf: usage: printf format [arguments]");
-        return Ok(1);
-    }
-
-    let format = &args[0];
-    let mut arg_idx = 1;
-
-    let mut result = String::new();
-    let mut chars = format.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            // Handle escape sequences
-            match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('t') => result.push('\t'),
-                Some('r') => result.push('\r'),
-                Some('\\') => result.push('\\'),
-                Some('"') => result.push('"'),
-                Some('0') => {
-                    // Octal
-                    let mut octal = String::new();
-                    for _ in 0..3 {
-                        if let Some(&c) = chars.peek() {
-                            if c.is_digit(8) {
-                                octal.push(chars.next().unwrap());
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    if !octal.is_empty() {
-                        if let Ok(code) = u8::from_str_radix(&octal, 8) {
-                            result.push(code as char);
-                        }
-                    } else {
-                        result.push('\0');
-                    }
-                }
-                Some(c) => {
-                    result.push('\\');
-                    result.push(c);
-                }
-                None => result.push('\\'),
-            }
-        } else if c == '%' {
-            // Handle format specifiers
-            match chars.peek() {
-                Some('%') => {
-                    chars.next();
-                    result.push('%');
-                }
-                Some(_) => {
-                    // Parse width/precision
-                    let mut spec = String::new();
-                    spec.push('%');
-
-                    // Flags
-                    while let Some(&c) = chars.peek() {
-                        if c == '-' || c == '+' || c == ' ' || c == '#' || c == '0' {
-                            spec.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Width
-                    while let Some(&c) = chars.peek() {
-                        if c.is_ascii_digit() {
-                            spec.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Precision
-                    if chars.peek() == Some(&'.') {
-                        spec.push(chars.next().unwrap());
-                        while let Some(&c) = chars.peek() {
-                            if c.is_ascii_digit() {
-                                spec.push(chars.next().unwrap());
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Conversion specifier
-                    if let Some(conv) = chars.next() {
-                        spec.push(conv);
-                        let arg = args.get(arg_idx).map(|s| s.as_str()).unwrap_or("");
-                        arg_idx += 1;
-
-                        match conv {
-                            's' => result.push_str(arg),
-                            'd' | 'i' => {
-                                let n: i64 = arg.parse().unwrap_or(0);
-                                result.push_str(&format!("{}", n));
-                            }
-                            'u' => {
-                                let n: u64 = arg.parse().unwrap_or(0);
-                                result.push_str(&format!("{}", n));
-                            }
-                            'o' => {
-                                let n: u64 = arg.parse().unwrap_or(0);
-                                result.push_str(&format!("{:o}", n));
-                            }
-                            'x' => {
-                                let n: u64 = arg.parse().unwrap_or(0);
-                                result.push_str(&format!("{:x}", n));
-                            }
-                            'X' => {
-                                let n: u64 = arg.parse().unwrap_or(0);
-                                result.push_str(&format!("{:X}", n));
-                            }
-                            'f' | 'F' => {
-                                let n: f64 = arg.parse().unwrap_or(0.0);
-                                result.push_str(&format!("{}", n));
-                            }
-                            'e' => {
-                                let n: f64 = arg.parse().unwrap_or(0.0);
-                                result.push_str(&format!("{:e}", n));
-                            }
-                            'E' => {
-                                let n: f64 = arg.parse().unwrap_or(0.0);
-                                result.push_str(&format!("{:E}", n));
-                            }
-                            'c' => {
-                                if let Some(c) = arg.chars().next() {
-                                    result.push(c);
-                                }
-                            }
-                            'b' => {
-                                // %b interprets escape sequences in the argument
-                                result.push_str(&interpret_escape_sequences(arg));
-                            }
-                            _ => {
-                                result.push_str(&spec);
-                            }
-                        }
-                    }
-                }
-                None => result.push('%'),
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    print!("{}", result);
-    let _ = std::io::stdout().flush();
-    Ok(0)
 }
 
 fn builtin_exit(args: &[String]) -> anyhow::Result<i32> {
@@ -622,31 +388,6 @@ fn builtin_test(args: &[String]) -> anyhow::Result<i32> {
     Ok(1)
 }
 
-fn builtin_type(
-    args: &[String],
-    state: &ShellState,
-    commands: &CommandRegistry,
-) -> anyhow::Result<i32> {
-    let mut exit_code = 0;
-
-    for arg in args {
-        if is_builtin(arg) {
-            println!("{} is a shell builtin", arg);
-        } else if commands.contains(arg) {
-            println!("{} is a native command", arg);
-        } else if state.aliases.contains_key(arg) {
-            println!("{} is aliased to `{}'", arg, state.aliases.get(arg).unwrap());
-        } else if let Some(path) = find_in_path(arg, state) {
-            println!("{} is {}", arg, path.display());
-        } else {
-            eprintln!("type: {}: not found", arg);
-            exit_code = 1;
-        }
-    }
-
-    Ok(exit_code)
-}
-
 fn builtin_source(
     args: &[String],
     state: &mut ShellState,
@@ -753,7 +494,6 @@ fn builtin_command(
     commands: &CommandRegistry,
 ) -> anyhow::Result<i32> {
     // command runs a command bypassing aliases and functions
-    // For now, just execute normally since we don't have full alias support
     if args.is_empty() {
         return Ok(0);
     }
@@ -761,15 +501,33 @@ fn builtin_command(
     let name = &args[0];
     let cmd_args = &args[1..];
 
-    // Skip builtin check for -p flag
+    // Handle flags
     let (name, cmd_args, use_default_path) = if name == "-p" {
         if args.len() < 2 {
             return Ok(0);
         }
         (&args[1], &args[2..], true)
     } else if name == "-v" || name == "-V" {
-        // command -v acts like type
-        return builtin_type(&args[1..].to_vec(), state, commands);
+        // command -v prints path/type info
+        let mut exit_code = 0;
+        for arg in &args[1..] {
+            if is_builtin(arg) {
+                println!("{}", arg);
+            } else if commands.contains(arg) {
+                println!("{}", arg);
+            } else if state.aliases.contains_key(arg) {
+                if name == "-V" {
+                    println!("{} is aliased to `{}'", arg, state.aliases.get(arg).unwrap());
+                } else {
+                    println!("alias {}='{}'", arg, state.aliases.get(arg).unwrap());
+                }
+            } else if let Some(path) = find_in_path(arg, state) {
+                println!("{}", path.display());
+            } else {
+                exit_code = 1;
+            }
+        }
+        return Ok(exit_code);
     } else {
         (name, cmd_args, false)
     };
@@ -795,45 +553,6 @@ fn builtin_command(
         eprintln!("command: {}: not found", name);
         Ok(127)
     }
-}
-
-fn builtin_basename(args: &[String]) -> anyhow::Result<i32> {
-    if args.is_empty() {
-        eprintln!("basename: missing operand");
-        return Ok(1);
-    }
-
-    let path = PathBuf::from(&args[0]);
-    let name = path.file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    // Optional suffix removal
-    let result = if args.len() > 1 {
-        let suffix = &args[1];
-        name.strip_suffix(suffix).unwrap_or(&name).to_string()
-    } else {
-        name
-    };
-
-    println!("{}", result);
-    Ok(0)
-}
-
-fn builtin_dirname(args: &[String]) -> anyhow::Result<i32> {
-    if args.is_empty() {
-        eprintln!("dirname: missing operand");
-        return Ok(1);
-    }
-
-    let path = PathBuf::from(&args[0]);
-    let parent = path.parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| ".".to_string());
-
-    let result = if parent.is_empty() { "." } else { &parent };
-    println!("{}", result);
-    Ok(0)
 }
 
 /// Find a command in PATH.
@@ -862,4 +581,476 @@ fn find_in_default_path(cmd: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+// ============================================================================
+// alias / unalias - Manage shell aliases
+// ============================================================================
+
+fn builtin_alias(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        // Print all aliases
+        for (name, value) in &state.aliases {
+            println!("alias {}='{}'", name, value);
+        }
+        return Ok(0);
+    }
+
+    for arg in args {
+        if let Some((name, value)) = arg.split_once('=') {
+            // Set alias
+            state.aliases.insert(name.to_string(), value.to_string());
+        } else {
+            // Print specific alias
+            if let Some(value) = state.aliases.get(arg) {
+                println!("alias {}='{}'", arg, value);
+            } else {
+                eprintln!("alias: {}: not found", arg);
+                return Ok(1);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn builtin_unalias(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        eprintln!("unalias: usage: unalias [-a] name [name ...]");
+        return Ok(2);
+    }
+
+    if args.len() == 1 && args[0] == "-a" {
+        // Remove all aliases
+        state.aliases.clear();
+        return Ok(0);
+    }
+
+    let mut exit_code = 0;
+    for arg in args {
+        if arg == "-a" {
+            continue;
+        }
+        if state.aliases.remove(arg).is_none() {
+            eprintln!("unalias: {}: not found", arg);
+            exit_code = 1;
+        }
+    }
+    Ok(exit_code)
+}
+
+// ============================================================================
+// read - Read input into shell variables
+// ============================================================================
+
+fn builtin_read(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    let mut raw_mode = false;
+    let mut prompt = String::new();
+    let mut var_names: Vec<&str> = Vec::new();
+
+    // Parse options
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-r" => raw_mode = true,
+            "-p" => {
+                i += 1;
+                if i < args.len() {
+                    prompt = args[i].clone();
+                }
+            }
+            arg if arg.starts_with('-') => {
+                // Ignore other options for simplicity
+            }
+            _ => {
+                var_names = args[i..].iter().map(|s| s.as_str()).collect();
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    // Default variable name
+    if var_names.is_empty() {
+        var_names.push("REPLY");
+    }
+
+    // Print prompt if specified
+    if !prompt.is_empty() {
+        eprint!("{}", prompt);
+        let _ = std::io::stderr().flush();
+    }
+
+    // Read a line from stdin
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) => return Ok(1), // EOF
+        Ok(_) => {}
+        Err(_) => return Ok(1),
+    }
+
+    // Remove trailing newline
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+
+    // Process backslashes unless -r
+    let line = if raw_mode {
+        line
+    } else {
+        line.replace("\\", "")
+    };
+
+    // Split and assign to variables
+    let words: Vec<&str> = line.split_whitespace().collect();
+
+    for (idx, var_name) in var_names.iter().enumerate() {
+        if idx < words.len() {
+            if idx == var_names.len() - 1 {
+                // Last variable gets remaining words
+                let remaining: Vec<&str> = words[idx..].to_vec();
+                state.set_var(var_name.to_string(), remaining.join(" "));
+            } else {
+                state.set_var(var_name.to_string(), words[idx].to_string());
+            }
+        } else {
+            // Variable gets empty string if no more words
+            state.set_var(var_name.to_string(), String::new());
+        }
+    }
+
+    Ok(0)
+}
+
+// ============================================================================
+// shift - Shift positional parameters
+// ============================================================================
+
+fn builtin_shift(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    let n: usize = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    if n > state.positional_params.len() {
+        eprintln!("shift: shift count out of range");
+        return Ok(1);
+    }
+
+    state.positional_params = state.positional_params[n..].to_vec();
+    Ok(0)
+}
+
+// ============================================================================
+// getopts - Parse positional parameters (simplified)
+// ============================================================================
+
+fn builtin_getopts(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if args.len() < 2 {
+        eprintln!("getopts: usage: getopts optstring name [args]");
+        return Ok(2);
+    }
+
+    let optstring = &args[0];
+    let var_name = &args[1];
+
+    // Get current OPTIND (1-based index into positional params)
+    let optind: usize = state
+        .get_var("OPTIND")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    // Get the arguments to parse (either from args or positional_params)
+    let parse_args = if args.len() > 2 {
+        &args[2..]
+    } else {
+        &state.positional_params[..]
+    };
+
+    if optind > parse_args.len() {
+        state.set_var(var_name.to_string(), "?".to_string());
+        return Ok(1); // No more options
+    }
+
+    let arg = &parse_args[optind - 1];
+
+    // Check if it's an option
+    if !arg.starts_with('-') || arg == "-" || arg == "--" {
+        state.set_var(var_name.to_string(), "?".to_string());
+        return Ok(1);
+    }
+
+    // Get the option character (simplified: only handle single char options)
+    let opt_char = arg.chars().nth(1).unwrap_or('?');
+    let opt_str = opt_char.to_string();
+
+    // Check if option is valid
+    if optstring.contains(opt_char) {
+        // Check if option requires an argument
+        let char_pos = optstring.find(opt_char).unwrap();
+        let needs_arg = optstring.chars().nth(char_pos + 1) == Some(':');
+
+        if needs_arg {
+            // Check for argument in same string (-oARG) or next arg
+            if arg.len() > 2 {
+                state.set_var("OPTARG".to_string(), arg[2..].to_string());
+                state.set_var("OPTIND".to_string(), (optind + 1).to_string());
+            } else if optind < parse_args.len() {
+                state.set_var("OPTARG".to_string(), parse_args[optind].clone());
+                state.set_var("OPTIND".to_string(), (optind + 2).to_string());
+            } else {
+                // Missing argument
+                if optstring.starts_with(':') {
+                    state.set_var(var_name.to_string(), ":".to_string());
+                    state.set_var("OPTARG".to_string(), opt_str.clone());
+                } else {
+                    eprintln!("getopts: option requires an argument -- {}", opt_char);
+                    state.set_var(var_name.to_string(), "?".to_string());
+                }
+                state.set_var("OPTIND".to_string(), (optind + 1).to_string());
+                return Ok(0);
+            }
+        } else {
+            state.set_var("OPTIND".to_string(), (optind + 1).to_string());
+        }
+        state.set_var(var_name.to_string(), opt_str);
+        Ok(0)
+    } else {
+        // Invalid option
+        if optstring.starts_with(':') {
+            state.set_var(var_name.to_string(), "?".to_string());
+            state.set_var("OPTARG".to_string(), opt_str);
+        } else {
+            eprintln!("getopts: illegal option -- {}", opt_char);
+            state.set_var(var_name.to_string(), "?".to_string());
+        }
+        state.set_var("OPTIND".to_string(), (optind + 1).to_string());
+        Ok(0)
+    }
+}
+
+// ============================================================================
+// trap - Register signal handlers (simplified)
+// ============================================================================
+
+fn builtin_trap(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        // Print current traps
+        for (signal, action) in &state.traps {
+            let sig_name = signal_name(*signal);
+            match action {
+                TrapAction::Default => {}
+                TrapAction::Ignore => println!("trap -- '' {}", sig_name),
+                TrapAction::Command(cmd) => println!("trap -- '{}' {}", cmd, sig_name),
+            }
+        }
+        return Ok(0);
+    }
+
+    // trap -l: list signal names
+    if args.len() == 1 && args[0] == "-l" {
+        println!(" 1) SIGHUP   2) SIGINT   3) SIGQUIT  4) SIGILL");
+        println!(" 5) SIGTRAP  6) SIGABRT  9) SIGKILL 10) SIGUSR1");
+        println!("11) SIGSEGV 12) SIGUSR2 13) SIGPIPE 14) SIGALRM");
+        println!("15) SIGTERM 17) SIGCHLD 18) SIGCONT 19) SIGSTOP");
+        return Ok(0);
+    }
+
+    // Parse: trap [-p] [[action] signal ...]
+    let mut list_mode = false;
+    let mut arg_start = 0;
+
+    if args[0] == "-p" {
+        list_mode = true;
+        arg_start = 1;
+    }
+
+    if list_mode {
+        // Print traps for specified signals
+        for sig_arg in &args[arg_start..] {
+            if let Some(sig_num) = parse_signal(sig_arg) {
+                if let Some(action) = state.traps.get(&sig_num) {
+                    let sig_name = signal_name(sig_num);
+                    match action {
+                        TrapAction::Ignore => println!("trap -- '' {}", sig_name),
+                        TrapAction::Command(cmd) => println!("trap -- '{}' {}", cmd, sig_name),
+                        TrapAction::Default => {}
+                    }
+                }
+            }
+        }
+        return Ok(0);
+    }
+
+    // trap action signal [signal ...]
+    if args.len() < 2 {
+        eprintln!("trap: usage: trap [action] signal [signal ...]");
+        return Ok(2);
+    }
+
+    let action_str = &args[0];
+    let action = if action_str.is_empty() || action_str == "-" {
+        TrapAction::Default
+    } else if action_str == "''" || action_str == "\"\"" {
+        TrapAction::Ignore
+    } else {
+        TrapAction::Command(action_str.clone())
+    };
+
+    for sig_arg in &args[1..] {
+        if let Some(sig_num) = parse_signal(sig_arg) {
+            state.traps.insert(sig_num, action.clone());
+        } else {
+            eprintln!("trap: {}: invalid signal specification", sig_arg);
+            return Ok(1);
+        }
+    }
+
+    Ok(0)
+}
+
+fn parse_signal(s: &str) -> Option<i32> {
+    // Try as number
+    if let Ok(n) = s.parse::<i32>() {
+        return Some(n);
+    }
+
+    // Try as signal name
+    let s = s.to_uppercase();
+    let s = s.strip_prefix("SIG").unwrap_or(&s);
+
+    match s.as_ref() {
+        "EXIT" | "0" => Some(0),
+        "HUP" => Some(1),
+        "INT" => Some(2),
+        "QUIT" => Some(3),
+        "ILL" => Some(4),
+        "TRAP" => Some(5),
+        "ABRT" => Some(6),
+        "KILL" => Some(9),
+        "USR1" => Some(10),
+        "SEGV" => Some(11),
+        "USR2" => Some(12),
+        "PIPE" => Some(13),
+        "ALRM" => Some(14),
+        "TERM" => Some(15),
+        "CHLD" => Some(17),
+        "CONT" => Some(18),
+        "STOP" => Some(19),
+        "ERR" => Some(-1),   // Special: on error
+        "DEBUG" => Some(-2), // Special: before each command
+        _ => None,
+    }
+}
+
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        0 => "EXIT",
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        9 => "SIGKILL",
+        10 => "SIGUSR1",
+        11 => "SIGSEGV",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        17 => "SIGCHLD",
+        18 => "SIGCONT",
+        19 => "SIGSTOP",
+        -1 => "ERR",
+        -2 => "DEBUG",
+        _ => "UNKNOWN",
+    }
+}
+
+// ============================================================================
+// exec - Replace shell with command
+// ============================================================================
+
+fn builtin_exec(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if args.is_empty() {
+        // exec with no args - just modify file descriptors (not implemented)
+        return Ok(0);
+    }
+
+    // Find the command
+    let cmd_name = &args[0];
+    let cmd_path = find_in_path(cmd_name, state)
+        .or_else(|| {
+            let p = PathBuf::from(cmd_name);
+            if p.exists() { Some(p) } else { None }
+        });
+
+    let Some(cmd_path) = cmd_path else {
+        eprintln!("exec: {}: not found", cmd_name);
+        return Ok(127);
+    };
+
+    // Use nix to exec - this replaces the current process
+    use std::ffi::CString;
+    use nix::unistd::execv;
+
+    // Convert args to CStrings
+    let argv: Vec<CString> = args
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect();
+
+    let path_cstr = CString::new(cmd_path.to_string_lossy().as_ref()).unwrap();
+
+    // Set up environment
+    // Safety: We're about to exec, so modifying the environment is safe
+    for (key, value) in &state.env {
+        unsafe { std::env::set_var(key, value); }
+    }
+
+    // This replaces the process - never returns on success
+    execv(&path_cstr, &argv)?;
+    unreachable!()
+}
+
+// ============================================================================
+// Control flow builtins
+// These return special exit codes that the evaluator should handle.
+// For now, they just return fixed codes that can be detected.
+// ============================================================================
+
+// Special exit codes for control flow (high values to avoid conflicts)
+pub const BREAK_EXIT_CODE: i32 = 256;
+pub const CONTINUE_EXIT_CODE: i32 = 257;
+pub const RETURN_EXIT_CODE_BASE: i32 = 258;
+
+fn builtin_break(args: &[String]) -> anyhow::Result<i32> {
+    let n: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if n == 0 {
+        eprintln!("break: loop count out of range");
+        return Ok(1);
+    }
+    // Encode the break level in the exit code
+    Ok(BREAK_EXIT_CODE + n as i32 - 1)
+}
+
+fn builtin_continue(args: &[String]) -> anyhow::Result<i32> {
+    let n: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
+    if n == 0 {
+        eprintln!("continue: loop count out of range");
+        return Ok(1);
+    }
+    // Encode the continue level in the exit code
+    Ok(CONTINUE_EXIT_CODE + n as i32 - 1)
+}
+
+fn builtin_return(args: &[String]) -> anyhow::Result<i32> {
+    let code: i32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Signal a return with the specified code
+    // The evaluator needs to handle this specially for functions/sourced scripts
+    Ok(RETURN_EXIT_CODE_BASE + code)
 }

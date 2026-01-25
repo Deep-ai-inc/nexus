@@ -8,6 +8,17 @@ use nexus_api::BlockId;
 
 use crate::process::Job;
 
+/// Actions that can be taken for a trapped signal.
+#[derive(Debug, Clone)]
+pub enum TrapAction {
+    /// Reset to default signal handling
+    Default,
+    /// Ignore the signal
+    Ignore,
+    /// Execute a command string
+    Command(String),
+}
+
 /// Counter for generating unique block IDs.
 static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -31,6 +42,12 @@ pub struct ShellState {
     /// Active jobs.
     pub jobs: Vec<Job>,
 
+    /// Next job ID to assign.
+    pub next_job_id: u32,
+
+    /// Whether this is an interactive shell.
+    pub interactive: bool,
+
     /// Last exit code.
     pub last_exit_code: i32,
 
@@ -48,6 +65,12 @@ pub struct ShellState {
 
     /// Shell options (set -e, set -x, etc.).
     pub options: ShellOptions,
+
+    /// Signal traps (signal number -> action).
+    pub traps: HashMap<i32, TrapAction>,
+
+    /// Cached command paths (for hash builtin).
+    pub command_hash: HashMap<String, PathBuf>,
 }
 
 /// Shell options controlled by `set` builtin.
@@ -86,12 +109,16 @@ impl ShellState {
             vars: HashMap::new(),
             cwd,
             jobs: Vec::new(),
+            next_job_id: 1,
+            interactive: true,
             last_exit_code: 0,
             last_bg_pid: None,
             aliases: HashMap::new(),
             readonly_vars: HashSet::new(),
             positional_params: Vec::new(),
             options: ShellOptions::default(),
+            traps: HashMap::new(),
+            command_hash: HashMap::new(),
         })
     }
 
@@ -105,12 +132,16 @@ impl ShellState {
             vars: HashMap::new(),
             cwd,
             jobs: Vec::new(),
+            next_job_id: 1,
+            interactive: true,
             last_exit_code: 0,
             last_bg_pid: None,
             aliases: HashMap::new(),
             readonly_vars: HashSet::new(),
             positional_params: Vec::new(),
             options: ShellOptions::default(),
+            traps: HashMap::new(),
+            command_hash: HashMap::new(),
         }
     }
 
