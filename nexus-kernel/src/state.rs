@@ -40,6 +40,12 @@ pub fn next_block_id() -> BlockId {
     BlockId(BLOCK_ID_COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
+/// Get the current block ID for this execution context.
+/// If an external block_id was set (from UI), use that; otherwise generate new.
+pub fn get_or_create_block_id(external_id: Option<BlockId>) -> BlockId {
+    external_id.unwrap_or_else(next_block_id)
+}
+
 /// The shell's mutable state.
 #[derive(Debug)]
 pub struct ShellState {

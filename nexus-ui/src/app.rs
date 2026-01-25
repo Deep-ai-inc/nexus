@@ -1105,14 +1105,15 @@ fn execute_kernel_command(state: &mut Nexus, block_id: BlockId, command: String)
         let cwd = state.cwd.clone();
         let cmd = command.clone();
 
-        // Spawn kernel execution in a thread
+        // Spawn kernel execution in a thread, passing UI's block_id
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let mut kernel = kernel.lock().await;
                 // Update kernel's cwd to match UI
                 let _ = kernel.state_mut().set_cwd(std::path::PathBuf::from(&cwd));
-                let _ = kernel.execute(&cmd);
+                // Pass UI's block_id so events are routed correctly
+                let _ = kernel.execute_with_block_id(&cmd, Some(block_id));
             });
         });
 

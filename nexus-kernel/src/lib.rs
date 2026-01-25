@@ -104,12 +104,30 @@ impl Kernel {
     /// - Lines starting with `|` are pipeline continuations from previous output.
     ///   `| grep foo` becomes `_ | grep foo` internally.
     pub fn execute(&mut self, input: &str) -> anyhow::Result<i32> {
+        self.execute_with_block_id(input, None)
+    }
+
+    /// Parse and execute a command line with a specific block ID.
+    ///
+    /// If block_id is provided, all events will use that ID (for UI integration).
+    /// If None, the kernel will generate its own ID.
+    pub fn execute_with_block_id(
+        &mut self,
+        input: &str,
+        block_id: Option<nexus_api::BlockId>,
+    ) -> anyhow::Result<i32> {
         // Handle pipeline continuation: `| cmd` becomes `_ | cmd`
         let processed_input = preprocess_input(input);
         let start = std::time::Instant::now();
 
         let ast = self.parser.parse(&processed_input)?;
-        let exit_code = eval::execute(&mut self.state, &ast, &self.event_tx, &self.commands)?;
+        let exit_code = eval::execute_with_block_id(
+            &mut self.state,
+            &ast,
+            &self.event_tx,
+            &self.commands,
+            block_id,
+        )?;
 
         // Save to history (non-blocking, ignore errors)
         let duration_ms = start.elapsed().as_millis() as u64;
