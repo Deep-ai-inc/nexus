@@ -14,6 +14,9 @@ pub fn expand_word_to_string(word: &Word, state: &ShellState) -> String {
 
 /// Expand a literal string, handling embedded variables and escapes.
 fn expand_literal(s: &str, state: &ShellState) -> String {
+    // Handle tilde expansion at the start of the word
+    let s = expand_tilde(s, state);
+
     let mut result = String::new();
     let mut chars = s.chars().peekable();
 
@@ -236,6 +239,97 @@ fn remove_suffix(s: &str, pattern: &str, longest: bool) -> String {
     s.to_string()
 }
 
+/// Expand tilde at the start of a word.
+///
+/// Supports:
+/// - `~` or `~/path` → $HOME or $HOME/path
+/// - `~+` or `~+/path` → $PWD or $PWD/path
+/// - `~-` or `~-/path` → $OLDPWD or $OLDPWD/path
+fn expand_tilde(s: &str, state: &ShellState) -> String {
+    if !s.starts_with('~') {
+        return s.to_string();
+    }
+
+    // Check what follows the tilde
+    let rest = &s[1..];
+
+    // ~+ (PWD)
+    if rest.is_empty() || rest.starts_with('/') {
+        // Plain ~ or ~/path
+        let home = state.get_env("HOME").unwrap_or_default();
+        if rest.is_empty() {
+            return home.to_string();
+        } else {
+            return format!("{}{}", home, rest);
+        }
+    }
+
+    if rest == "+" || rest.starts_with("+/") {
+        // ~+ or ~+/path (PWD)
+        let pwd = state.cwd.to_string_lossy();
+        if rest == "+" {
+            return pwd.to_string();
+        } else {
+            return format!("{}{}", pwd, &rest[1..]);
+        }
+    }
+
+    if rest == "-" || rest.starts_with("-/") {
+        // ~- or ~-/path (OLDPWD)
+        let oldpwd = state.get_env("OLDPWD").unwrap_or_default();
+        if rest == "-" {
+            return oldpwd.to_string();
+        } else {
+            return format!("{}{}", oldpwd, &rest[1..]);
+        }
+    }
+
+    // ~user form - look up user's home directory
+    let (username, path_rest) = if let Some(slash_pos) = rest.find('/') {
+        (&rest[..slash_pos], &rest[slash_pos..])
+    } else {
+        (rest, "")
+    };
+
+    // Try to get user's home directory
+    if let Some(home) = get_user_home(username) {
+        format!("{}{}", home, path_rest)
+    } else {
+        // User not found, return unchanged
+        s.to_string()
+    }
+}
+
+/// Get a user's home directory.
+#[cfg(unix)]
+fn get_user_home(username: &str) -> Option<String> {
+    use nix::libc;
+    use std::ffi::CString;
+
+    let c_username = CString::new(username).ok()?;
+
+    unsafe {
+        let pwd = libc::getpwnam(c_username.as_ptr());
+        if pwd.is_null() {
+            return None;
+        }
+        let home = (*pwd).pw_dir;
+        if home.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr(home)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+#[cfg(not(unix))]
+fn get_user_home(_username: &str) -> Option<String> {
+    None
+}
+
 /// Expand command substitution $(cmd) or `cmd`.
 fn expand_command_substitution(cmd: &str, _state: &ShellState) -> String {
     // Strip $() or ``
@@ -258,5 +352,89 @@ fn expand_command_substitution(cmd: &str, _state: &ShellState) -> String {
                 .to_string()
         }
         Err(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn make_state() -> ShellState {
+        let mut state = ShellState::from_cwd(PathBuf::from("/tmp"));
+        state.set_env("HOME".to_string(), "/home/testuser".to_string());
+        state.set_env("OLDPWD".to_string(), "/old/path".to_string());
+        state
+    }
+
+    #[test]
+    fn test_tilde_home() {
+        let state = make_state();
+        assert_eq!(expand_tilde("~", &state), "/home/testuser");
+    }
+
+    #[test]
+    fn test_tilde_home_path() {
+        let state = make_state();
+        assert_eq!(expand_tilde("~/projects", &state), "/home/testuser/projects");
+        assert_eq!(
+            expand_tilde("~/a/b/c", &state),
+            "/home/testuser/a/b/c"
+        );
+    }
+
+    #[test]
+    fn test_tilde_pwd() {
+        let state = make_state();
+        assert_eq!(expand_tilde("~+", &state), "/tmp");
+        assert_eq!(expand_tilde("~+/foo", &state), "/tmp/foo");
+    }
+
+    #[test]
+    fn test_tilde_oldpwd() {
+        let state = make_state();
+        assert_eq!(expand_tilde("~-", &state), "/old/path");
+        assert_eq!(expand_tilde("~-/bar", &state), "/old/path/bar");
+    }
+
+    #[test]
+    fn test_tilde_no_expansion() {
+        let state = make_state();
+        // No tilde at start
+        assert_eq!(expand_tilde("foo~bar", &state), "foo~bar");
+        assert_eq!(expand_tilde("/path/to/~", &state), "/path/to/~");
+    }
+
+    #[test]
+    fn test_tilde_in_literal() {
+        let state = make_state();
+        // Full expansion through expand_literal
+        assert_eq!(expand_literal("~", &state), "/home/testuser");
+        assert_eq!(expand_literal("~/bin", &state), "/home/testuser/bin");
+    }
+
+    #[test]
+    fn test_expand_variable_basic() {
+        let mut state = make_state();
+        state.set_var("FOO".to_string(), "bar".to_string());
+        assert_eq!(expand_variable("FOO", &state), "bar");
+    }
+
+    #[test]
+    fn test_expand_variable_default() {
+        let state = make_state();
+        // ${var:-default}
+        assert_eq!(
+            expand_variable("UNDEFINED:-fallback", &state),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn test_expand_special_vars() {
+        let state = make_state();
+        assert_eq!(expand_variable("0", &state), "nexus");
+        assert_eq!(expand_variable("PWD", &state), "/tmp");
+        assert_eq!(expand_variable("HOME", &state), "/home/testuser");
     }
 }
