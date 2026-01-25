@@ -3,7 +3,7 @@
 mod builtins;
 mod expand;
 
-use nexus_api::ShellEvent;
+use nexus_api::{ShellEvent, Value};
 use tokio::sync::broadcast::Sender;
 
 use crate::commands::{CommandContext, CommandRegistry};
@@ -122,8 +122,15 @@ fn execute_native(
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    let command_str = format!("{} {}", cmd.name(), args.join(" "));
+
     match result {
         Ok(value) => {
+            // Store output for $_ / $prev and $_N references (Persistent Memory)
+            if !matches!(value, Value::Unit) {
+                ctx.state.store_output(block_id, command_str.clone(), value.clone());
+            }
+
             // Emit structured output
             let _ = events.send(ShellEvent::CommandOutput {
                 block_id,
@@ -333,9 +340,34 @@ fn execute_native_pipeline(
         }
     }
 
+    // Build command string for storage
+    let cmd_str = pipeline
+        .commands
+        .iter()
+        .filter_map(|cmd| {
+            if let Command::Simple(s) = cmd {
+                let args_str = s.args.iter().filter_map(|w| w.as_literal()).collect::<Vec<_>>().join(" ");
+                if args_str.is_empty() {
+                    Some(s.name.clone())
+                } else {
+                    Some(format!("{} {}", s.name, args_str))
+                }
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
     // Emit final output if we have a value from a native command
-    if let Some(value) = current_value {
-        let _ = events.send(ShellEvent::CommandOutput { block_id, value });
+    if let Some(ref value) = current_value {
+        // Store output for $_ / $prev (Persistent Memory)
+        state.store_output(block_id, cmd_str, value.clone());
+
+        let _ = events.send(ShellEvent::CommandOutput {
+            block_id,
+            value: value.clone(),
+        });
     }
 
     let _ = events.send(ShellEvent::CommandFinished {

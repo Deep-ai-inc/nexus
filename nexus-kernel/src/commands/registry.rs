@@ -32,6 +32,7 @@ use super::math::{AvgCommand, CountCommand, MaxCommand, MinCommand, SumCommand};
 use super::nl::NlCommand;
 use super::path::{BasenameCommand, DirnameCommand, ExtnameCommand, RealpathCommand, StemCommand};
 use super::perms::{ChgrpCommand, ChmodCommand, ChownCommand};
+use super::prev::{OutputsCommand, Prev1Command, Prev2Command, Prev3Command, PrevCommand};
 use super::printf::PrintfCommand;
 use super::rev::{RevCommand, TacCommand};
 use super::select::{
@@ -197,6 +198,13 @@ impl CommandRegistry {
 
         // Claude integration
         registry.register(ClaudeCommand);
+
+        // Persistent memory - access previous outputs
+        registry.register(PrevCommand);    // _ - last output
+        registry.register(Prev1Command);   // _1 - most recent
+        registry.register(Prev2Command);   // _2 - second most recent
+        registry.register(Prev3Command);   // _3 - third most recent
+        registry.register(OutputsCommand); // outputs - list recent outputs
 
         // Git commands (native, structured output)
         registry.register(GitCommand);  // Main dispatcher: git <subcommand>

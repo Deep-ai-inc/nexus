@@ -1,12 +1,25 @@
 //! Shell state - environment, variables, jobs, working directory.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nexus_api::BlockId;
+use nexus_api::{BlockId, Value};
 
 use crate::process::Job;
+
+/// Stored output from a command block.
+#[derive(Debug, Clone)]
+pub struct BlockOutput {
+    /// The block ID
+    pub id: BlockId,
+    /// The command that was run
+    pub command: String,
+    /// The structured output
+    pub value: Value,
+    /// When this was executed (unix timestamp)
+    pub timestamp: u64,
+}
 
 /// Actions that can be taken for a trapped signal.
 #[derive(Debug, Clone)]
@@ -71,6 +84,17 @@ pub struct ShellState {
 
     /// Cached command paths (for hash builtin).
     pub command_hash: HashMap<String, PathBuf>,
+
+    // === Persistent Memory (Year 3000 Terminal) ===
+    /// Last command output - accessible via $_ or $prev
+    pub last_output: Option<Value>,
+
+    /// Recent block outputs - ring buffer of last N outputs
+    /// Accessible via $_1, $_2, etc. (1 = most recent, 2 = second most recent)
+    pub block_outputs: VecDeque<BlockOutput>,
+
+    /// Maximum number of block outputs to retain
+    pub max_block_outputs: usize,
 }
 
 /// Shell options controlled by `set` builtin.
@@ -119,6 +143,9 @@ impl ShellState {
             options: ShellOptions::default(),
             traps: HashMap::new(),
             command_hash: HashMap::new(),
+            last_output: None,
+            block_outputs: VecDeque::new(),
+            max_block_outputs: 100, // Keep last 100 outputs
         })
     }
 
@@ -142,6 +169,9 @@ impl ShellState {
             options: ShellOptions::default(),
             traps: HashMap::new(),
             command_hash: HashMap::new(),
+            last_output: None,
+            block_outputs: VecDeque::new(),
+            max_block_outputs: 100,
         }
     }
 
@@ -188,6 +218,55 @@ impl ShellState {
     /// Mark a variable as readonly.
     pub fn mark_readonly(&mut self, name: &str) {
         self.readonly_vars.insert(name.to_string());
+    }
+
+    // === Persistent Memory Methods ===
+
+    /// Store a command's output, making it available via $_ and $_N references.
+    pub fn store_output(&mut self, block_id: BlockId, command: String, value: Value) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Update last_output for $_ / $prev
+        self.last_output = Some(value.clone());
+
+        // Add to block_outputs ring buffer
+        let output = BlockOutput {
+            id: block_id,
+            command,
+            value,
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+
+        self.block_outputs.push_front(output);
+
+        // Trim if over max
+        while self.block_outputs.len() > self.max_block_outputs {
+            self.block_outputs.pop_back();
+        }
+    }
+
+    /// Get the last output ($_ or $prev).
+    pub fn get_last_output(&self) -> Option<&Value> {
+        self.last_output.as_ref()
+    }
+
+    /// Get output by index (1 = most recent, 2 = second most recent, etc.).
+    pub fn get_output_by_index(&self, index: usize) -> Option<&Value> {
+        if index == 0 {
+            return None;
+        }
+        self.block_outputs.get(index - 1).map(|o| &o.value)
+    }
+
+    /// Get output by block ID.
+    pub fn get_output_by_id(&self, block_id: BlockId) -> Option<&Value> {
+        self.block_outputs
+            .iter()
+            .find(|o| o.id == block_id)
+            .map(|o| &o.value)
     }
 }
 

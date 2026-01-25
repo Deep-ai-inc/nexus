@@ -25,6 +25,7 @@ mod math;
 mod nl;
 mod path;
 mod perms;
+mod prev;
 mod printf;
 mod registry;
 mod rev;

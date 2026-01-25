@@ -74,13 +74,38 @@ impl Kernel {
     }
 
     /// Parse and execute a command line, returning the exit code.
+    ///
+    /// Special syntax:
+    /// - Lines starting with `|` are pipeline continuations from previous output.
+    ///   `| grep foo` becomes `_ | grep foo` internally.
     pub fn execute(&mut self, input: &str) -> anyhow::Result<i32> {
-        let ast = self.parser.parse(input)?;
+        // Handle pipeline continuation: `| cmd` becomes `_ | cmd`
+        let processed_input = preprocess_input(input);
+        let ast = self.parser.parse(&processed_input)?;
         eval::execute(&mut self.state, &ast, &self.event_tx, &self.commands)
     }
 
     /// Get the event sender (for spawning commands that need to emit events).
     pub fn event_sender(&self) -> &broadcast::Sender<ShellEvent> {
         &self.event_tx
+    }
+
+    /// Check if there's a previous output available for pipeline continuation.
+    pub fn has_previous_output(&self) -> bool {
+        self.state.last_output.is_some()
+    }
+}
+
+/// Preprocess input to handle special syntax.
+///
+/// - Lines starting with `|` become `_ | ...` (pipeline continuation)
+fn preprocess_input(input: &str) -> String {
+    let trimmed = input.trim_start();
+
+    // Pipeline continuation: `| cmd` -> `_ | cmd`
+    if trimmed.starts_with('|') {
+        format!("_ {}", trimmed)
+    } else {
+        input.to_string()
     }
 }
