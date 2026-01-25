@@ -102,10 +102,10 @@ This document tracks the 20 core problems with modern terminals and how Nexus ad
 
 **Implementation:**
 - [ ] Text selection with mouse
-- [ ] Clickable table headers (sort)
+- [x] Clickable table headers (sort) ✅
 - [ ] Right-click context menus
 - [ ] Clickable paths, URLs, PIDs with actions
-- [ ] Scroll behavior consistent
+- [x] Scroll behavior consistent ✅
 
 ---
 
@@ -220,15 +220,15 @@ This document tracks the 20 core problems with modern terminals and how Nexus ad
 
 **Solution:** SQLite-backed history. Infinite. Full-text search. Synced across sessions.
 
-**Status:** 🔨 Planned (Phase 1 of persistent memory).
+**Status:** ✅ Done.
 
 **Implementation:**
-- [ ] SQLite database at ~/.nexus/history.db
-- [ ] Store: command, timestamp, cwd, exit code, duration
-- [ ] Full-text search across all history
-- [ ] `history search <pattern>` command
+- [x] SQLite database at ~/.nexus/nexus.db ✅
+- [x] Store: command, timestamp, cwd, exit code, duration ✅
+- [x] Full-text search across all history ✅
+- [x] `history search <pattern>` command ✅
 - [ ] Ctrl+R fuzzy search UI
-- [ ] Sync across concurrent sessions
+- [x] Synced across sessions ✅
 
 ---
 
@@ -252,11 +252,12 @@ This document tracks the 20 core problems with modern terminals and how Nexus ad
 
 **Solution:** Everything persisted to disk. Scroll back as far as you want. Search all output.
 
-**Status:** 🔨 In progress.
+**Status:** 🔨 In progress. (SQLite schema ready, block persistence next)
 
 **Implementation:**
-- [x] Store block outputs in memory (done)
-- [ ] Persist blocks to SQLite
+- [x] Store block outputs in memory ✅
+- [x] SQLite schema for blocks table ✅
+- [ ] Persist blocks to SQLite on completion
 - [ ] Lazy loading for old blocks
 - [ ] Search across all output
 - [ ] Export block output to file
