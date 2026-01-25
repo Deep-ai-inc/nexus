@@ -17,7 +17,7 @@ mod state;
 pub use commands::CommandRegistry;
 pub use error::ShellError;
 pub use parser::Parser;
-pub use state::ShellState;
+pub use state::{ShellState, TrapAction};
 
 use nexus_api::ShellEvent;
 use tokio::sync::broadcast;

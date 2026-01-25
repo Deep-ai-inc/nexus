@@ -11,8 +11,11 @@ use iced::{event, Element, Event, Length, Subscription, Task, Theme};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_api::{BlockId, BlockState, OutputFormat, ShellEvent, Value};
+use nexus_claude::ReaderMessage as ClaudeReaderMessage;
 use nexus_kernel::{CommandRegistry, Kernel};
 use nexus_term::TerminalParser;
+
+use crate::claude_panel::{ClaudePanel, ClaudePanelMessage, ClaudeOutputWrapper};
 
 use crate::glyph_cache::get_cell_metrics;
 use crate::pty::PtyHandle;
@@ -127,6 +130,8 @@ pub enum Message {
     NextFrame(Instant),
     /// Kernel event (from pipeline execution).
     KernelEvent(ShellEvent),
+    /// Claude panel message.
+    ClaudePanel(ClaudePanelMessage),
 }
 
 /// Global keyboard shortcuts.
@@ -204,6 +209,8 @@ pub struct Nexus {
     kernel: Arc<Mutex<Kernel>>,
     /// Receiver for kernel events (shared with subscription).
     kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
+    /// Claude panel for native Claude Code UI.
+    claude_panel: ClaudePanel,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +303,9 @@ impl Default for Nexus {
             commands: CommandRegistry::new(),
             kernel: Arc::new(Mutex::new(kernel)),
             kernel_rx: Arc::new(Mutex::new(kernel_rx)),
+            claude_panel: ClaudePanel::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            ),
         }
     }
 }
@@ -436,8 +446,16 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                         scrollable::RelativeOffset::END,
                     );
                 }
+                ShellEvent::OpenClaudePanel { initial_prompt, cwd } => {
+                    // Update Claude panel cwd and open it
+                    state.claude_panel = ClaudePanel::new(cwd);
+                    let _ = state.claude_panel.open(initial_prompt);
+                }
                 _ => {}
             }
+        }
+        Message::ClaudePanel(msg) => {
+            return state.claude_panel.update(msg).map(Message::ClaudePanel);
         }
         Message::KeyPressed(key, modifiers) => {
             if let Focus::Block(block_id) = state.focus {
@@ -797,6 +815,11 @@ fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Option<Vec<u8>> {
 }
 
 fn view(state: &Nexus) -> Element<'_, Message> {
+    // If Claude panel is visible, show it
+    if state.claude_panel.is_visible() {
+        return state.claude_panel.view(state.font_size).map(Message::ClaudePanel);
+    }
+
     // Build all blocks
     let font_size = state.font_size;
     let content_elements: Vec<Element<Message>> = state
@@ -840,6 +863,11 @@ fn subscription(state: &Nexus) -> Subscription<Message> {
         pty_subscription(state.pty_rx.clone()),
         kernel_subscription(state.kernel_rx.clone()),
     ];
+
+    // Add Claude panel subscription if active
+    if let Some(rx) = state.claude_panel.event_receiver() {
+        subscriptions.push(claude_subscription(rx));
+    }
 
     // Listen for all events with window ID - focus-dependent routing happens in update()
     subscriptions.push(
@@ -920,6 +948,41 @@ fn pty_subscription(
     )
 }
 
+/// Async subscription that awaits Claude panel events.
+fn claude_subscription(
+    rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ClaudeReaderMessage>>>,
+) -> Subscription<Message> {
+    struct ClaudeSubscription;
+
+    Subscription::run_with_id(
+        std::any::TypeId::of::<ClaudeSubscription>(),
+        stream::unfold(rx, |rx| async move {
+            let event = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            };
+
+            match event {
+                Some(ClaudeReaderMessage::Output(claude_output)) => {
+                    let msg = Message::ClaudePanel(ClaudePanelMessage::ClaudeOutput(
+                        ClaudeOutputWrapper(Arc::new(claude_output)),
+                    ));
+                    Some((msg, rx))
+                }
+                Some(ClaudeReaderMessage::Closed) => {
+                    let msg = Message::ClaudePanel(ClaudePanelMessage::ProcessClosed);
+                    Some((msg, rx))
+                }
+                Some(ClaudeReaderMessage::Error(e)) => {
+                    let msg = Message::ClaudePanel(ClaudePanelMessage::ProcessError(e));
+                    Some((msg, rx))
+                }
+                None => None,
+            }
+        }),
+    )
+}
+
 fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
     let trimmed = command.trim().to_string();
 
@@ -964,6 +1027,19 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
                 let _ = std::env::set_current_dir(&canonical);
             }
         }
+        return Task::none();
+    }
+
+    // Handle claude command - opens Claude panel directly
+    if trimmed == "claude" || trimmed.starts_with("claude ") {
+        let initial_prompt = if trimmed == "claude" {
+            None
+        } else {
+            Some(trimmed.strip_prefix("claude ").unwrap_or("").to_string())
+        };
+        let cwd = std::path::PathBuf::from(&state.cwd);
+        state.claude_panel = ClaudePanel::new(cwd);
+        let _ = state.claude_panel.open(initial_prompt);
         return Task::none();
     }
 

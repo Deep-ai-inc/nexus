@@ -3,6 +3,7 @@
 //! Main entry point for the Iced-based GUI.
 
 mod app;
+mod claude_panel;
 mod glyph_cache;
 mod widgets;
 mod theme;

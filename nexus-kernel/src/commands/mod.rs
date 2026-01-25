@@ -12,6 +12,7 @@ mod date;
 mod env;
 mod find;
 mod fs;
+mod git;
 mod grep;
 mod hash;
 mod head;

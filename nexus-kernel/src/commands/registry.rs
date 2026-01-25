@@ -16,6 +16,10 @@ use super::date::DateCommand;
 use super::env::{EnvCommand, ExportCommand, PrintenvCommand, UnsetCommand};
 use super::find::FindCommand;
 use super::fs::{CpCommand, MkdirCommand, MvCommand, RmCommand, RmdirCommand, TouchCommand};
+use super::git::{
+    GitAddCommand, GitBranchCommand, GitCommand, GitCommitCommand, GitDiffCommand,
+    GitLogCommand, GitRemoteCommand, GitStashCommand, GitStatusCommand,
+};
 use super::grep::GrepCommand;
 use super::hash::HashCommand;
 use super::head::HeadCommand;
@@ -193,6 +197,17 @@ impl CommandRegistry {
 
         // Claude integration
         registry.register(ClaudeCommand);
+
+        // Git commands (native, structured output)
+        registry.register(GitCommand);  // Main dispatcher: git <subcommand>
+        registry.register(GitStatusCommand);
+        registry.register(GitLogCommand);
+        registry.register(GitBranchCommand);
+        registry.register(GitDiffCommand);
+        registry.register(GitAddCommand);
+        registry.register(GitCommitCommand);
+        registry.register(GitRemoteCommand);
+        registry.register(GitStashCommand);
 
         registry
     }

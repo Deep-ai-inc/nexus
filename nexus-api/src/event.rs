@@ -60,6 +60,14 @@ pub enum ShellEvent {
         job_id: u32,
         state: JobState,
     },
+
+    /// Request to open the Claude panel.
+    OpenClaudePanel {
+        /// Initial prompt to send (if any).
+        initial_prompt: Option<String>,
+        /// Working directory for the Claude session.
+        cwd: PathBuf,
+    },
 }
 
 /// State of a background job.
