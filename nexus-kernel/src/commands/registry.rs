@@ -23,7 +23,7 @@ use super::git::{
 use super::grep::GrepCommand;
 use super::hash::HashCommand;
 use super::head::HeadCommand;
-use super::history::FcCommand;
+use super::history::{FcCommand, HistoryCommand};
 use super::jobs::{BgCommand, FgCommand, JobsCommand, WaitCommand};
 use super::json::{FromJsonCommand, GetCommand, ToJsonCommand};
 use super::links::{LinkCommand, LnCommand, UnlinkCommand};
@@ -191,6 +191,7 @@ impl CommandRegistry {
         registry.register(TimesCommand);
         registry.register(HashCommand);
         registry.register(FcCommand);
+        registry.register(HistoryCommand);
 
         // Command lookup
         registry.register(WhichCommand);

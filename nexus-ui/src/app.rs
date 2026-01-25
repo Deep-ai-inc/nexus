@@ -287,6 +287,19 @@ impl Default for Nexus {
         // Create kernel for pipeline execution
         let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
 
+        // Load command history from SQLite (kernel's store)
+        let command_history = kernel
+            .store()
+            .and_then(|store| store.get_recent_history(1000).ok())
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .rev() // Oldest first for up-arrow navigation
+                    .map(|e| e.command)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             input: String::new(),
             blocks: Vec::new(),
@@ -300,7 +313,7 @@ impl Default for Nexus {
             terminal_size: (120, 24),
             window_dims: (1200.0, 800.0), // Match initial window size
             font_size: DEFAULT_FONT_SIZE,
-            command_history: Vec::new(),
+            command_history,
             history_index: None,
             saved_input: String::new(),
             last_exit_code: None,

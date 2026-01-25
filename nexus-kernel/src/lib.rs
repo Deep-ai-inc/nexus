@@ -5,10 +5,12 @@
 //! - Evaluator (AST walker)
 //! - State management
 //! - In-process commands (ls, cat, etc.)
+//! - Persistence (SQLite-backed history and sessions)
 
 pub mod commands;
 pub mod eval;
 pub mod parser;
+pub mod persistence;
 pub mod process;
 
 mod error;
@@ -17,6 +19,7 @@ mod state;
 pub use commands::CommandRegistry;
 pub use error::ShellError;
 pub use parser::Parser;
+pub use persistence::Store;
 pub use state::{ShellState, TrapAction};
 
 use nexus_api::ShellEvent;
@@ -28,17 +31,39 @@ pub struct Kernel {
     event_tx: broadcast::Sender<ShellEvent>,
     parser: parser::Parser,
     commands: CommandRegistry,
+    /// SQLite-backed persistence for history and sessions.
+    store: Option<Store>,
+    /// Current session ID.
+    session_id: Option<i64>,
 }
 
 impl Kernel {
     /// Create a new kernel with an event broadcast channel.
     pub fn new() -> anyhow::Result<(Self, broadcast::Receiver<ShellEvent>)> {
         let (event_tx, event_rx) = broadcast::channel(1024);
+
+        // Try to open persistence store (non-fatal if it fails)
+        let (store, session_id) = match Store::open_default() {
+            Ok(store) => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "/".to_string());
+                let session_id = store.start_session(&cwd).ok();
+                (Some(store), session_id)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open persistence store: {}", e);
+                (None, None)
+            }
+        };
+
         let kernel = Self {
             state: ShellState::new()?,
             event_tx,
             parser: parser::Parser::new()?,
             commands: CommandRegistry::new(),
+            store,
+            session_id,
         };
         Ok((kernel, event_rx))
     }
@@ -81,8 +106,35 @@ impl Kernel {
     pub fn execute(&mut self, input: &str) -> anyhow::Result<i32> {
         // Handle pipeline continuation: `| cmd` becomes `_ | cmd`
         let processed_input = preprocess_input(input);
+        let start = std::time::Instant::now();
+
         let ast = self.parser.parse(&processed_input)?;
-        eval::execute(&mut self.state, &ast, &self.event_tx, &self.commands)
+        let exit_code = eval::execute(&mut self.state, &ast, &self.event_tx, &self.commands)?;
+
+        // Save to history (non-blocking, ignore errors)
+        let duration_ms = start.elapsed().as_millis() as u64;
+        if let Some(store) = &self.store {
+            let cwd = self.state.cwd.display().to_string();
+            let _ = store.add_history(
+                input.trim(),
+                &cwd,
+                Some(exit_code),
+                Some(duration_ms),
+                self.session_id,
+            );
+        }
+
+        Ok(exit_code)
+    }
+
+    /// Get a reference to the persistence store.
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+
+    /// Get the current session ID.
+    pub fn session_id(&self) -> Option<i64> {
+        self.session_id
     }
 
     /// Get the event sender (for spawning commands that need to emit events).

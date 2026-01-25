@@ -39,6 +39,8 @@ rand = "0.8"
 filetime = "0.2"
 uuid = { version = "1.0", features = ["v4"] }
 git2 = "0.19"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 # Pump dependencies
 memmap2 = "0.9"

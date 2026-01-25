@@ -1,8 +1,121 @@
-//! fc - Fix command (history manipulation) - read-only simplified version.
+//! history - Command history with full-text search.
+//!
+//! Uses SQLite for persistent, searchable command history.
 
 use super::{CommandContext, NexusCommand};
+use crate::persistence::Store;
 use nexus_api::Value;
 
+pub struct HistoryCommand;
+
+impl NexusCommand for HistoryCommand {
+    fn name(&self) -> &'static str {
+        "history"
+    }
+
+    fn execute(&self, args: &[String], _ctx: &mut CommandContext) -> anyhow::Result<Value> {
+        // Parse arguments
+        let mut search_query: Option<String> = None;
+        let mut limit: usize = 50;
+        let mut show_all = false;
+
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-n" | "--limit" => {
+                    if i + 1 < args.len() {
+                        limit = args[i + 1].parse().unwrap_or(50);
+                        i += 1;
+                    }
+                }
+                "-a" | "--all" => {
+                    show_all = true;
+                }
+                "search" => {
+                    // history search <query>
+                    if i + 1 < args.len() {
+                        search_query = Some(args[i + 1..].join(" "));
+                        break;
+                    }
+                }
+                arg if !arg.starts_with('-') && search_query.is_none() => {
+                    // Bare argument is treated as search query
+                    search_query = Some(arg.to_string());
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        if show_all {
+            limit = 10000; // Large limit for "all"
+        }
+
+        // Open the store (read-only connection)
+        let store = match Store::open_default() {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(Value::Error {
+                    code: 1,
+                    message: format!("Failed to open history database: {}", e),
+                });
+            }
+        };
+
+        // Search or list history
+        let entries = if let Some(query) = search_query {
+            // Full-text search
+            match store.search_history(&query, limit) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Ok(Value::Error {
+                        code: 1,
+                        message: format!("Search failed: {}", e),
+                    });
+                }
+            }
+        } else {
+            // Recent history
+            match store.get_recent_history(limit) {
+                Ok(e) => e,
+                Err(e) => {
+                    return Ok(Value::Error {
+                        code: 1,
+                        message: format!("Failed to get history: {}", e),
+                    });
+                }
+            }
+        };
+
+        // Convert to structured output
+        let columns = vec![
+            "id".to_string(),
+            "command".to_string(),
+            "exit".to_string(),
+            "duration".to_string(),
+            "when".to_string(),
+        ];
+
+        let rows: Vec<Vec<Value>> = entries
+            .iter()
+            .map(|entry| {
+                vec![
+                    Value::Int(entry.id),
+                    Value::String(entry.command.clone()),
+                    entry.exit_code.map(|c| Value::Int(c as i64)).unwrap_or(Value::Unit),
+                    entry.duration_ms
+                        .map(|d| Value::String(format_duration(d)))
+                        .unwrap_or(Value::Unit),
+                    Value::String(format_relative_time(entry.timestamp)),
+                ]
+            })
+            .collect();
+
+        Ok(Value::Table { columns, rows })
+    }
+}
+
+/// fc - Fix command (POSIX compatibility, uses same history).
 pub struct FcCommand;
 
 impl NexusCommand for FcCommand {
@@ -10,216 +123,78 @@ impl NexusCommand for FcCommand {
         "fc"
     }
 
-    fn execute(&self, args: &[String], _ctx: &mut CommandContext) -> anyhow::Result<Value> {
+    fn execute(&self, args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value> {
+        // fc -l is equivalent to history
+        let mut new_args = Vec::new();
         let mut list_mode = false;
-        let mut reverse = false;
-        let mut suppress_numbers = false;
-        let mut first: Option<i32> = None;
-        let mut last: Option<i32> = None;
 
-        // Parse options
-        let mut i = 0;
-        while i < args.len() {
-            let arg = &args[i];
+        for arg in args {
             match arg.as_str() {
                 "-l" => list_mode = true,
-                "-r" => reverse = true,
-                "-n" => suppress_numbers = true,
-                "-s" => {
-                    // Re-execute command - not supported in simplified version
-                    anyhow::bail!("fc -s: re-execution not supported");
-                }
-                "-e" => {
-                    // Editor - not supported in simplified version
-                    i += 1; // Skip editor name
-                }
-                arg if !arg.starts_with('-') => {
-                    // Range specification
-                    if first.is_none() {
-                        first = arg.parse().ok();
-                    } else if last.is_none() {
-                        last = arg.parse().ok();
-                    }
-                }
-                _ => {}
+                "-s" => anyhow::bail!("fc -s: re-execution not supported"),
+                "-e" => {} // Skip editor flag
+                _ => new_args.push(arg.clone()),
             }
-            i += 1;
         }
 
-        // Default to list mode for this read-only implementation
-        if !list_mode {
-            list_mode = true;
-        }
-
-        // Read history from shell history file if available
-        let history = read_history_file();
-
-        if history.is_empty() {
-            return Ok(Value::List(vec![]));
-        }
-
-        // Determine range
-        let len = history.len() as i32;
-        let start = first.unwrap_or(-16).max(-len);
-        let end = last.unwrap_or(-1).max(-len);
-
-        // Convert negative indices to positive
-        let start_idx = if start < 0 { (len + start) as usize } else { (start - 1) as usize };
-        let end_idx = if end < 0 { (len + end) as usize } else { (end - 1) as usize };
-
-        let start_idx = start_idx.min(history.len() - 1);
-        let end_idx = end_idx.min(history.len() - 1);
-
-        let (start_idx, end_idx) = if start_idx <= end_idx {
-            (start_idx, end_idx)
+        if list_mode || args.is_empty() {
+            // Delegate to history command
+            let history = HistoryCommand;
+            history.execute(&new_args, ctx)
         } else {
-            (end_idx, start_idx)
-        };
-
-        let mut entries: Vec<Value> = history[start_idx..=end_idx]
-            .iter()
-            .enumerate()
-            .map(|(i, cmd)| {
-                if suppress_numbers {
-                    Value::String(cmd.clone())
-                } else {
-                    Value::Record(vec![
-                        ("num".to_string(), Value::Int((start_idx + i + 1) as i64)),
-                        ("command".to_string(), Value::String(cmd.clone())),
-                    ])
-                }
+            Ok(Value::Error {
+                code: 1,
+                message: "fc: only list mode (-l) is supported".to_string(),
             })
-            .collect();
-
-        if reverse {
-            entries.reverse();
         }
-
-        Ok(Value::List(entries))
     }
 }
 
-/// Read history from the shell history file.
-fn read_history_file() -> Vec<String> {
-    // Try common history file locations
-    let home = std::env::var("HOME").unwrap_or_default();
-
-    let history_files = [
-        format!("{}/.nexus_history", home),
-        format!("{}/.bash_history", home),
-        format!("{}/.zsh_history", home),
-    ];
-
-    for path in &history_files {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let entries: Vec<String> = content
-                .lines()
-                .filter(|line| !line.is_empty())
-                .filter(|line| !line.starts_with(':')) // Skip zsh timestamps
-                .map(|s| {
-                    // Handle zsh extended history format
-                    if let Some(idx) = s.find(';') {
-                        s[idx + 1..].to_string()
-                    } else {
-                        s.to_string()
-                    }
-                })
-                .collect();
-
-            if !entries.is_empty() {
-                return entries;
-            }
-        }
+/// Format duration in human-readable form.
+fn format_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let minutes = ms / 60_000;
+        let seconds = (ms % 60_000) / 1000;
+        format!("{}m{}s", minutes, seconds)
     }
-
-    Vec::new()
 }
 
-/// Parse history content into entries (exported for testing).
-fn parse_history_content(content: &str) -> Vec<String> {
-    content
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with(':')) // Skip zsh timestamps
-        .map(|s| {
-            // Handle zsh extended history format
-            if let Some(idx) = s.find(';') {
-                s[idx + 1..].to_string()
-            } else {
-                s.to_string()
-            }
-        })
-        .collect()
+/// Format timestamp as relative time.
+fn format_relative_time(timestamp: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let diff = now.signed_duration_since(timestamp);
+
+    if diff.num_seconds() < 60 {
+        "just now".to_string()
+    } else if diff.num_minutes() < 60 {
+        format!("{}m ago", diff.num_minutes())
+    } else if diff.num_hours() < 24 {
+        format!("{}h ago", diff.num_hours())
+    } else if diff.num_days() < 7 {
+        format!("{}d ago", diff.num_days())
+    } else {
+        timestamp.format("%Y-%m-%d").to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_utils::test_helpers::TestContext;
 
     #[test]
-    fn test_fc_command_name() {
-        let cmd = FcCommand;
-        assert_eq!(cmd.name(), "fc");
+    fn test_format_duration() {
+        assert_eq!(format_duration(50), "50ms");
+        assert_eq!(format_duration(1500), "1.5s");
+        assert_eq!(format_duration(65000), "1m5s");
     }
 
     #[test]
-    fn test_fc_list_mode() {
-        let cmd = FcCommand;
-        let mut test_ctx = TestContext::new_default();
-
-        // This will try to read history from files, which may or may not exist
-        let result = cmd
-            .execute(&["-l".to_string()], &mut test_ctx.ctx())
-            .unwrap();
-
-        match result {
-            Value::List(_) => {} // Success - may be empty or have entries
-            _ => panic!("Expected List"),
-        }
-    }
-
-    #[test]
-    fn test_fc_s_not_supported() {
-        let cmd = FcCommand;
-        let mut test_ctx = TestContext::new_default();
-
-        let result = cmd.execute(&["-s".to_string()], &mut test_ctx.ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not supported"));
-    }
-
-    #[test]
-    fn test_parse_history_simple() {
-        let content = "ls -la\ncd /tmp\necho hello\n";
-        let entries = parse_history_content(content);
-
-        assert_eq!(entries, vec!["ls -la", "cd /tmp", "echo hello"]);
-    }
-
-    #[test]
-    fn test_parse_history_skip_empty_lines() {
-        let content = "ls\n\ncd\n\n\npwd\n";
-        let entries = parse_history_content(content);
-
-        assert_eq!(entries, vec!["ls", "cd", "pwd"]);
-    }
-
-    #[test]
-    fn test_parse_history_skip_zsh_timestamps() {
-        let content = ": 1234567890:0;ls -la\n: 1234567891:0;cd /tmp\necho hello\n";
-        let entries = parse_history_content(content);
-
-        // Lines starting with ':' are filtered out
-        assert_eq!(entries, vec!["echo hello"]);
-    }
-
-    #[test]
-    fn test_parse_history_zsh_extended_format() {
-        let content = "1234567890;ls -la\n1234567891;cd /tmp\n";
-        let entries = parse_history_content(content);
-
-        // Text after ';' is the command
-        assert_eq!(entries, vec!["ls -la", "cd /tmp"]);
+    fn test_history_command_name() {
+        let cmd = HistoryCommand;
+        assert_eq!(cmd.name(), "history");
     }
 }
