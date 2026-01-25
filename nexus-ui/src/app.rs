@@ -19,6 +19,7 @@ use crate::claude_panel::{ClaudePanel, ClaudePanelMessage, ClaudeOutputWrapper};
 
 use crate::glyph_cache::get_cell_metrics;
 use crate::pty::PtyHandle;
+use crate::widgets::table::{interactive_table, TableSort};
 use crate::widgets::terminal_shader::TerminalShader;
 
 // ============================================================================
@@ -51,6 +52,8 @@ pub struct Block {
     pub version: u64,
     /// Native command output (structured data, not terminal output).
     pub native_output: Option<Value>,
+    /// Sort state for table output.
+    pub table_sort: TableSort,
 }
 
 impl Block {
@@ -66,6 +69,7 @@ impl Block {
             duration_ms: None,
             version: 0,
             native_output: None,
+            table_sort: TableSort::new(),
         }
     }
 
@@ -132,6 +136,10 @@ pub enum Message {
     KernelEvent(ShellEvent),
     /// Claude panel message.
     ClaudePanel(ClaudePanelMessage),
+    /// Sort table by column in a specific block.
+    TableSort(BlockId, usize),
+    /// User clicked a cell in a table (for semantic actions).
+    TableCellClick(BlockId, usize, usize, Value),
 }
 
 /// Global keyboard shortcuts.
@@ -456,6 +464,21 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
         }
         Message::ClaudePanel(msg) => {
             return state.claude_panel.update(msg).map(Message::ClaudePanel);
+        }
+        Message::TableSort(block_id, column_index) => {
+            // Toggle sort on the specified column
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.table_sort.toggle(column_index);
+                    block.version += 1; // Trigger redraw
+                }
+            }
+        }
+        Message::TableCellClick(block_id, row, col, value) => {
+            // Handle semantic click on a table cell
+            // For now, just log it - we'll add context menus later
+            tracing::debug!("Cell clicked: block={:?}, row={}, col={}, value={:?}", block_id, row, col, value);
+            // TODO: Open context menu or perform default action based on value type
         }
         Message::KeyPressed(key, modifiers) => {
             if let Focus::Block(block_id) = state.focus {
@@ -1149,7 +1172,7 @@ fn view_block(block: &Block, font_size: f32) -> Element<'_, Message> {
         column![].into()
     } else if let Some(value) = &block.native_output {
         // Render structured value from native command
-        render_value(value, font_size)
+        render_value(value, block.id, &block.table_sort, font_size)
     } else {
         // Terminal output - only show cursor for running commands
         // For RUNNING blocks: use viewport-only grid (O(1) extraction)
@@ -1176,7 +1199,12 @@ fn view_block(block: &Block, font_size: f32) -> Element<'_, Message> {
 }
 
 /// Render a structured Value from a native command.
-fn render_value(value: &Value, font_size: f32) -> Element<'static, Message> {
+fn render_value<'a>(
+    value: &'a Value,
+    block_id: BlockId,
+    table_sort: &'a TableSort,
+    font_size: f32,
+) -> Element<'a, Message> {
     use nexus_api::FileEntry;
 
     match value {
@@ -1211,7 +1239,17 @@ fn render_value(value: &Value, font_size: f32) -> Element<'static, Message> {
             }
         }
 
-        Value::Table { columns, rows } => render_table(columns, rows, font_size),
+        Value::Table { columns, rows } => {
+            // Use interactive table with sortable headers
+            interactive_table(
+                columns,
+                rows,
+                table_sort,
+                font_size,
+                move |col_idx| Message::TableSort(block_id, col_idx),
+                None::<fn(usize, usize, &Value) -> Message>,
+            )
+        }
 
         Value::FileEntry(entry) => {
             render_file_list(&[entry.as_ref()], font_size)
@@ -1256,63 +1294,6 @@ fn render_file_list(entries: &[&nexus_api::FileEntry], font_size: f32) -> Elemen
                 .into()
         })
         .collect();
-
-    Column::with_children(lines).spacing(0).into()
-}
-
-/// Render a table (for ls -l style output).
-fn render_table(
-    columns: &[String],
-    rows: &[Vec<Value>],
-    font_size: f32,
-) -> Element<'static, Message> {
-    // Calculate column widths
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(cell.to_text().len());
-            }
-        }
-    }
-
-    // Build rows
-    let mut lines: Vec<Element<Message>> = Vec::new();
-
-    for row in rows {
-        let mut line = String::new();
-        for (i, cell) in row.iter().enumerate() {
-            let cell_text = cell.to_text();
-            let width = widths.get(i).copied().unwrap_or(0);
-
-            // Right-align numbers, left-align text
-            let formatted = match cell {
-                Value::Int(_) | Value::Float(_) => format!("{:>width$}", cell_text, width = width),
-                _ => format!("{:<width$}", cell_text, width = width),
-            };
-            line.push_str(&formatted);
-            line.push_str("  "); // Column spacing
-        }
-
-        // Color the last column (filename) based on content
-        let name_color = if line.starts_with('d') {
-            iced::Color::from_rgb(0.4, 0.6, 1.0) // Blue for directories
-        } else if line.contains(" -> ") {
-            iced::Color::from_rgb(0.4, 0.9, 0.9) // Cyan for symlinks
-        } else if line.contains('x') {
-            iced::Color::from_rgb(0.4, 0.9, 0.4) // Green for executables
-        } else {
-            iced::Color::from_rgb(0.8, 0.8, 0.8) // Default
-        };
-
-        lines.push(
-            text(line.trim_end().to_string())
-                .size(font_size)
-                .color(name_color)
-                .font(iced::Font::MONOSPACE)
-                .into(),
-        );
-    }
 
     Column::with_children(lines).spacing(0).into()
 }
