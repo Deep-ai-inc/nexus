@@ -1043,96 +1043,27 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
         return Task::none();
     }
 
-    // Parse command to get name and args
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    let cmd_name = parts.first().map(|s| *s).unwrap_or("");
-
-    // Check if command contains a pipe - if so, we need the kernel to parse the pipeline
-    let has_pipe = trimmed.contains('|');
-
-    // Check for native (in-process) command - but only if not a pipeline
-    // Pipelines need to go through the kernel for proper parsing and execution
-    if !has_pipe && state.commands.contains(cmd_name) {
-        return execute_native_command(state, block_id, &trimmed, cmd_name, &parts[1..]);
-    }
-
-    // External command or pipeline - execute via kernel
+    // All commands go through kernel now - this ensures outputs are stored
+    // in kernel state for $_ / pipeline continuation
     execute_kernel_command(state, block_id, command)
 }
 
-/// Execute a native (in-process) command and return immediately.
-fn execute_native_command(
-    state: &mut Nexus,
-    block_id: BlockId,
-    full_command: &str,
-    cmd_name: &str,
-    args: &[&str],
-) -> Task<Message> {
-    use nexus_kernel::commands::CommandContext;
-    use nexus_api::ShellEvent;
-
-    // Create block
-    let mut block = Block::new(block_id, full_command.to_string());
-    block.parser = TerminalParser::new(state.terminal_size.0, state.terminal_size.1);
-    let block_idx = state.blocks.len();
-
-    // Get the command
-    let native_cmd = state.commands.get(cmd_name).expect("command exists");
-
-    // Create a minimal shell state for the command
-    let mut shell_state = nexus_kernel::ShellState::from_cwd(
-        std::path::PathBuf::from(&state.cwd)
-    );
-
-    // Create a dummy event sender (we don't use kernel events in UI yet)
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<ShellEvent>(16);
-
-    // Execute the command
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let mut ctx = CommandContext {
-        state: &mut shell_state,
-        events: &event_tx,
-        block_id,
-        stdin: None,
-    };
-
-    let start = std::time::Instant::now();
-    let result = native_cmd.execute(&args, &mut ctx);
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    match result {
-        Ok(value) => {
-            block.native_output = Some(value);
-            block.state = BlockState::Success;
-            block.duration_ms = Some(duration_ms);
-            state.last_exit_code = Some(0);
-        }
-        Err(e) => {
-            block.parser.feed(format!("error: {}\n", e).as_bytes());
-            block.state = BlockState::Failed(1);
-            block.duration_ms = Some(duration_ms);
-            state.last_exit_code = Some(1);
-        }
-    }
-
-    state.blocks.push(block);
-    state.block_index.insert(block_id, block_idx);
-    state.focus = Focus::Input; // Native commands complete immediately
-
-    // Scroll to bottom
-    scrollable::snap_to(
-        scrollable::Id::new(HISTORY_SCROLLABLE),
-        scrollable::RelativeOffset::END,
-    )
-}
-
-/// Execute a command via the kernel (handles pipelines with native commands).
+/// Execute a command via the kernel (handles pipelines and native commands).
 fn execute_kernel_command(state: &mut Nexus, block_id: BlockId, command: String) -> Task<Message> {
-    // Check if this is a pipeline - if so, use kernel
+    // Check if this is a pipeline or native command - if so, use kernel
     let has_pipe = command.contains('|');
+    let first_word = command.split_whitespace().next().unwrap_or("");
+    let is_native = state.commands.contains(first_word);
 
-    if has_pipe {
-        // Pipeline execution via kernel
+    if has_pipe || is_native {
+        // Create block for kernel command
+        let mut block = Block::new(block_id, command.clone());
+        block.parser = TerminalParser::new(state.terminal_size.0, state.terminal_size.1);
+        let block_idx = state.blocks.len();
+        state.blocks.push(block);
+        state.block_index.insert(block_id, block_idx);
+
+        // Pipeline/native execution via kernel
         // The kernel will emit events that we'll receive via the subscription
         let kernel = state.kernel.clone();
         let cwd = state.cwd.clone();
