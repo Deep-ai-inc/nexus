@@ -1,134 +1,113 @@
 # Nexus
 
-**A modern shell where the interpreter, data pipeline, and GUI are one unified system.**
+**A terminal that fixes what's broken.**
 
-Nexus inverts the Unix philosophy: instead of small text-processing tools composed via pipes, we absorb core utilities (git, curl, ls, ps, etc.) into the shell itself. Commands return structured data. The terminal understands that data. Everything clicks together.
+The command line is the bedrock of modern computing, yet it relies on protocols designed for hardware that hasn't existed for decades. Escape codes from the 1970s. Keybindings that conflict with every other application. Copy/paste that's a security risk. No images, no discoverability, no progress bars.
 
-## The Vision
+Nexus removes decades of accumulated friction by unifying the shell, terminal, and GUI into one system.
 
-### Interactive Data Exploration
-- `ls -l` returns a Table → click column headers to sort, type to filter, resize columns
-- `ps aux` → click a row to expand details, right-click PID → Kill
-- Nested records expand/collapse like a JSON viewer
-- Pagination that actually works (not `| less`)
+## The Problems We're Solving
 
-### Semantic Actions
-- File paths are clickable → Open, Reveal in Finder, Copy Path
-- URLs open in browser
-- Git commits → Checkout, Cherry-pick, Show Diff
-- Error messages → Jump to file:line in editor
+### Legacy Baggage
 
-### Output Transformation Without Re-running
-- Command finished? Re-sort, re-filter, export as JSON/CSV from the UI
-- `| grep foo` at a new prompt pipes from the previous output instantly
-- Copy a table → pastes as proper TSV/CSV
+| Problem | How Nexus Fixes It |
+|---------|-------------------|
+| **Escape Sequence Hell** — Parsing ANSI codes feels like 1970s programming | Commands return structured data. The UI renders it directly. No escape codes to parse or generate. |
+| **Inconsistent Keybindings** — Ctrl+C kills here, copies there | Native GUI app. Standard keybindings work. Ctrl+C copies text. Process interruption is separate. |
+| **The TERM Variable** — Apps break if this magic string is wrong | We control the terminal emulation. It's always correct. You never think about it. |
+| **Unicode Chaos** — Emojis break layouts, cursors drift | Modern text layout engine. Character widths calculated correctly. No drift. |
+| **Copy/Paste Friction** — Shift-click, invisible newlines, security risks | Native clipboard. Tables copy as TSV. Pasted newlines don't auto-execute. |
 
-### Rich Visualizations
-- `du | chart pie` → actual pie chart, not ASCII art
-- `history | chart timeline` → visual command history
-- Real progress bars, sparklines, inline images
+### User Experience
 
-### AI That Understands Structure
-- "Find the largest files" operates on the actual Table, not parsing text
-- AI sees `{name: "foo.rs", size: 1024, modified: ...}` not `-rw-r--r-- 1024 foo.rs`
-- Smarter suggestions because it knows the data types
+| Problem | How Nexus Fixes It |
+|---------|-------------------|
+| **No Discoverability** — Staring at a blank void | Command palette (Cmd+K). Inline help. Contextual suggestions. Browsable command list. |
+| **Poor Mouse Support** — Which layer am I scrolling? | It's a GUI. Click to select. Right-click for actions. Drag to resize. Scroll works everywhere. |
+| **Text Reflow Chaos** — Resize window, text scrambles | We control layout. Tables resize intelligently. Text wraps correctly. |
+| **No Images or Media** — Leave terminal to see a chart | Images render inline. Charts are native. Media is a first-class data type. |
+| **Config File Theming** — Edit text files to change fonts | Native settings. Pick fonts from a list. Live preview. Drag and drop. |
 
-### Blocks as Objects
-- Re-run a block with different args
-- Collapse/expand output
-- Name and reference outputs from previous commands
-- Potentially undo destructive commands (we know what they did)
+### Shell Interaction
 
-## Philosophy: Absorbed Utilities
+| Problem | How Nexus Fixes It |
+|---------|-------------------|
+| **Dangerous Globs** — Typo deletes wrong files, no undo | Preview matches before executing: "These 15 files will be affected." |
+| **The Sudo Trap** — Permission denied, retype everything | Detect the error, offer "Re-run with sudo?" One click. |
+| **Argument Anarchy** — `-f`, `--file`, `f`, all different | Native commands use consistent `--flag` style. Help shown inline. |
+| **Silent Commands** — Is `cp` frozen or working? | Built-in progress indicators. Spinners. Status in the UI. |
+| **History Amnesia** — Limited, unsearchable, lost between tabs | SQLite-backed. Infinite. Full-text search. Synced across all sessions. |
 
-Traditional shells spawn external processes and parse their text output. Nexus absorbs commonly-used tools as **native commands** that return structured data:
+### Modern Workflows
 
-| Traditional | Nexus Native | Returns |
-|-------------|--------------|---------|
-| `/usr/bin/ls` | `ls` | `Table { name, size, modified, permissions, ... }` |
-| `/usr/bin/git status` | `git status` | `Record { branch, staged, unstaged, untracked }` |
-| `/usr/bin/curl` | `http GET url` | `Record { status, headers, body }` (parsed JSON if applicable) |
-| `/usr/bin/ps` | `ps` | `Table { pid, name, cpu, memory, ... }` |
-| `/usr/bin/find` | `find` | `List<Path>` with metadata |
-| `/usr/bin/docker ps` | `docker ps` | `Table { id, image, status, ports, ... }` |
+| Problem | How Nexus Fixes It |
+|---------|-------------------|
+| **Buffer Limits** — 10,000 lines of logs, terminal remembers 1,000 | Everything persisted. Scroll back forever. Search all output. |
+| **Dumb Autocomplete** — Suggests files when you need git branches | Context-aware. Knows the command, suggests relevant completions. |
+| **Accessibility Gaps** — Screen readers can't parse ncurses | Native GUI with proper accessibility APIs. Works with assistive tech. |
 
-This isn't about reimplementing everything - it's about **owning the data**. When `git log` returns actual commit objects, the UI can render them richly, offer contextual actions, and pipe them meaningfully to other commands.
+## How It Works
 
-External commands still work. They just produce bytes/text like they always have.
-
-## Syntax: POSIX-Compatible, Secretly Upgraded
-
-Nexus looks and feels like bash. No new language to learn.
+Nexus looks like a normal terminal. Bash-compatible syntax. Your muscle memory works.
 
 ```bash
-# Normal commands work
+# Everything you know still works
 ls -la
 cd ~/projects
-echo "hello world"
+grep -r "TODO" .
+git status
 
-# Pipes work, but data is structured underneath
-ls | grep ".rs" | head -5
+# But data is structured underneath
+ls | sort size | head 5    # Actually sorting by size, not text
 
-# Start a line with | to continue from previous output (no re-execution)
+# Previous output is remembered
 ls -la
-| grep ".rs"
-| sort size
-
-# Everything else: variables, loops, redirects, globs, tilde expansion
-for f in *.txt; do echo $f; done
-cat ~/.config/nexus/config.toml > backup.toml
+| grep ".rs"               # Pipes from previous output instantly
+| wc -l                    # No re-execution needed
 ```
 
-The structured data is invisible until you want it. The UI reveals it through sorting, filtering, clicking, and rich rendering.
-
-## Quick Start
-
-```bash
-cargo build
-cargo run -p nexus-ui --release
-```
+The difference is invisible until you need it:
+- Click a column header to sort
+- Right-click a file path → Open, Copy, Reveal in Finder
+- Right-click a PID → Kill Process
+- Resize the window, tables reflow properly
+- Scroll back through yesterday's session
 
 ## Architecture
 
 ```
 nexus/
-├── nexus-kernel/     # Shell interpreter: parser, evaluator, process management
-│   ├── parser/       # Bash-compatible parser (tree-sitter)
-│   ├── eval/         # AST walker, expansion (tilde, glob, brace)
-│   ├── commands/     # Native commands (ls, git, http, ps, ...)
-│   └── process/      # PTY for external commands
-├── nexus-ui/         # Terminal GUI (Iced framework)
-│   ├── app.rs        # Main application, event loop
-│   ├── block.rs      # Command blocks with rich output rendering
-│   └── components/   # Tables, records, charts, semantic renderers
-├── nexus-api/        # Shared types: Value, ShellEvent, etc.
-└── nexus-term/       # ANSI parsing for legacy command output
+├── nexus-kernel/     # Shell interpreter (bash-compatible parser, evaluator)
+├── nexus-ui/         # Native GUI (Iced framework)
+├── nexus-api/        # Structured data types (Value, Events)
+└── nexus-term/       # Legacy command support (PTY, ANSI parsing)
 ```
 
-## Current Status
+**Native commands** (ls, git, ps, etc.) return structured data (`Value` types).
+**Legacy commands** run in a PTY with proper terminal emulation.
+**The UI** renders both seamlessly.
+
+## Status
 
 **Working:**
-- Bash-compatible parsing (pipes, lists, loops, subshells)
+- Bash-compatible parsing (pipes, loops, redirects, subshells)
 - 65+ native commands with structured output
-- Tilde expansion (`~`, `~/path`, `~user`)
-- Glob expansion (`*.rs`, `file?.txt`, `[a-z]*`)
-- PTY for external/legacy commands
+- Tilde expansion, glob expansion
+- PTY for external commands
 - Terminal emulation for TUI apps (vim, htop)
+- Output persistence and `|` continuation
 
-**Next:**
-- Clickable/interactive table rendering
-- Semantic actions (right-click paths, URLs, PIDs)
-- `| continuation` syntax for instant re-filtering
-- Native `git` commands with structured output
-- Native `http` command
+**In Progress:**
+- Interactive table rendering (click to sort/filter)
+- Semantic actions (right-click context menus)
+- Native git commands
+- Session persistence (SQLite)
 
-## Development
+## Quick Start
 
 ```bash
-cargo test              # Run tests (170+)
-cargo clippy            # Lint
-cargo fmt               # Format
-RUST_LOG=debug cargo run -p nexus-ui  # Debug logging
+cargo build --release
+cargo run -p nexus-ui --release
 ```
 
 ## License

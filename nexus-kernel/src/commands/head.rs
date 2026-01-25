@@ -113,6 +113,10 @@ fn head_value(value: Value, count: usize) -> Value {
                 rows: rows.into_iter().take(count).collect(),
             }
         }
+        Value::Record(entries) => {
+            // Take first N entries from the record
+            Value::Record(entries.into_iter().take(count).collect())
+        }
         Value::String(s) => {
             // Take first N lines
             let lines: Vec<&str> = s.lines().take(count).collect();

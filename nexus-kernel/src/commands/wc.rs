@@ -172,6 +172,21 @@ fn wc_value(value: Value, opts: &WcOptions) -> Value {
                 Value::Int(rows.len() as i64)
             }
         }
+        Value::Record(entries) => {
+            // For records, count entries as lines
+            if opts.lines && !opts.words && !opts.chars && !opts.bytes {
+                Value::Int(entries.len() as i64)
+            } else {
+                // Convert to text (key=value lines) and count
+                let text = entries
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v.to_text()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let counts = count_string(&text, opts);
+                format_counts(&counts, opts)
+            }
+        }
         Value::String(s) => {
             let counts = count_string(&s, opts);
             format_counts(&counts, opts)

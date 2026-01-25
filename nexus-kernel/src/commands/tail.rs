@@ -105,6 +105,11 @@ fn tail_value(value: Value, count: usize) -> Value {
                 rows: rows.into_iter().skip(skip).collect(),
             }
         }
+        Value::Record(entries) => {
+            let len = entries.len();
+            let skip = len.saturating_sub(count);
+            Value::Record(entries.into_iter().skip(skip).collect())
+        }
         Value::String(s) => {
             let lines: Vec<&str> = s.lines().collect();
             let len = lines.len();
