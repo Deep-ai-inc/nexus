@@ -58,10 +58,11 @@ fn execute_simple(
 ) -> anyhow::Result<i32> {
     // Expand the command name and arguments
     let name = expand::expand_word_to_string(&Word::Literal(cmd.name.clone()), state);
+    // Use expand_word_to_strings to handle glob expansion (*.txt -> multiple files)
     let args: Vec<String> = cmd
         .args
         .iter()
-        .map(|w| expand::expand_word_to_string(w, state))
+        .flat_map(|w| expand::expand_word_to_strings(w, state))
         .collect();
 
     // Apply any command-specific environment assignments
@@ -277,12 +278,12 @@ fn execute_native_pipeline(
             continue;
         };
 
-        // Expand command name and args
+        // Expand command name and args (with glob expansion)
         let name = expand::expand_word_to_string(&Word::Literal(simple.name.clone()), state);
         let args: Vec<String> = simple
             .args
             .iter()
-            .map(|w| expand::expand_word_to_string(w, state))
+            .flat_map(|w| expand::expand_word_to_strings(w, state))
             .collect();
 
         if let Some(native_cmd) = commands.get(&name) {
@@ -485,10 +486,11 @@ fn execute_for(
 ) -> anyhow::Result<i32> {
     let mut last_exit = 0;
 
+    // Expand items with glob expansion (e.g., for f in *.rs)
     let items: Vec<String> = for_stmt
         .items
         .iter()
-        .map(|w| expand::expand_word_to_string(w, state))
+        .flat_map(|w| expand::expand_word_to_strings(w, state))
         .collect();
 
     for item in items {

@@ -3,13 +3,219 @@
 use crate::parser::Word;
 use crate::ShellState;
 
-/// Expand a word to a string.
+/// Expand a word to a string (no glob expansion).
 pub fn expand_word_to_string(word: &Word, state: &ShellState) -> String {
     match word {
         Word::Literal(s) => expand_literal(s, state),
         Word::Variable(name) => expand_variable(name, state),
         Word::CommandSubstitution(cmd) => expand_command_substitution(cmd, state),
     }
+}
+
+/// Expand a word to potentially multiple strings (with glob expansion).
+///
+/// This is the full POSIX expansion including pathname expansion (globbing).
+/// Use this for command arguments where `*.txt` should expand to multiple files.
+pub fn expand_word_to_strings(word: &Word, state: &ShellState) -> Vec<String> {
+    let expanded = expand_word_to_string(word, state);
+
+    // If noglob is set, don't expand globs
+    if state.options.noglob {
+        return vec![expanded];
+    }
+
+    // Check if the expanded string contains glob metacharacters
+    if !contains_glob_chars(&expanded) {
+        return vec![expanded];
+    }
+
+    // Perform pathname expansion
+    let matches = expand_glob(&expanded, state);
+
+    if matches.is_empty() {
+        // No matches - return the original pattern (POSIX behavior)
+        vec![expanded]
+    } else {
+        matches
+    }
+}
+
+/// Check if a string contains glob metacharacters.
+fn contains_glob_chars(s: &str) -> bool {
+    // Don't treat * or ? inside quotes as globs
+    // This is a simplification - proper handling would track quote state
+    s.chars().any(|c| c == '*' || c == '?' || c == '[')
+}
+
+/// Expand a glob pattern to matching paths.
+fn expand_glob(pattern: &str, state: &ShellState) -> Vec<String> {
+    // Split pattern into directory part and filename part
+    let (dir_part, file_pattern) = if let Some(pos) = pattern.rfind('/') {
+        let dir = &pattern[..=pos];
+        let file = &pattern[pos + 1..];
+        (dir.to_string(), file.to_string())
+    } else {
+        (".".to_string(), pattern.to_string())
+    };
+
+    // Resolve the directory relative to cwd
+    let search_dir = if dir_part == "." {
+        state.cwd.clone()
+    } else if dir_part.starts_with('/') {
+        std::path::PathBuf::from(&dir_part)
+    } else {
+        state.cwd.join(&dir_part)
+    };
+
+    // If the directory doesn't exist, no matches
+    if !search_dir.is_dir() {
+        return vec![];
+    }
+
+    // Read directory and match entries
+    let mut matches: Vec<String> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&search_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            // Skip hidden files unless pattern starts with .
+            if name.starts_with('.') && !file_pattern.starts_with('.') {
+                continue;
+            }
+
+            if glob_match(&file_pattern, &name) {
+                let full_path = if dir_part == "." {
+                    name
+                } else {
+                    format!("{}{}", dir_part, name)
+                };
+                matches.push(full_path);
+            }
+        }
+    }
+
+    // Sort matches alphabetically (POSIX requirement)
+    matches.sort();
+    matches
+}
+
+/// Match a filename against a glob pattern.
+///
+/// Supports:
+/// - `*` matches any sequence of characters
+/// - `?` matches any single character
+/// - `[abc]` matches any character in the set
+/// - `[a-z]` matches any character in the range
+/// - `[!abc]` or `[^abc]` matches any character not in the set
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let name_chars: Vec<char> = name.chars().collect();
+    glob_match_impl(&pattern_chars, &name_chars, 0, 0)
+}
+
+fn glob_match_impl(pattern: &[char], name: &[char], mut pi: usize, mut ni: usize) -> bool {
+    while pi < pattern.len() || ni < name.len() {
+        if pi < pattern.len() {
+            match pattern[pi] {
+                '*' => {
+                    // Try matching zero or more characters
+                    // First, skip consecutive *'s
+                    while pi < pattern.len() && pattern[pi] == '*' {
+                        pi += 1;
+                    }
+                    // If * is at end of pattern, it matches everything
+                    if pi == pattern.len() {
+                        return true;
+                    }
+                    // Try matching * against increasingly longer substrings
+                    while ni <= name.len() {
+                        if glob_match_impl(pattern, name, pi, ni) {
+                            return true;
+                        }
+                        ni += 1;
+                    }
+                    return false;
+                }
+                '?' => {
+                    // Must have a character to match
+                    if ni >= name.len() {
+                        return false;
+                    }
+                    pi += 1;
+                    ni += 1;
+                }
+                '[' => {
+                    // Character class
+                    if ni >= name.len() {
+                        return false;
+                    }
+                    let (matched, new_pi) = match_char_class(&pattern[pi..], name[ni]);
+                    if !matched {
+                        return false;
+                    }
+                    pi += new_pi;
+                    ni += 1;
+                }
+                c => {
+                    // Literal character
+                    if ni >= name.len() || name[ni] != c {
+                        return false;
+                    }
+                    pi += 1;
+                    ni += 1;
+                }
+            }
+        } else {
+            // Pattern exhausted but name has more characters
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a character class like [abc] or [a-z] or [!abc].
+/// Returns (matched, chars_consumed_from_pattern).
+fn match_char_class(pattern: &[char], c: char) -> (bool, usize) {
+    if pattern.is_empty() || pattern[0] != '[' {
+        return (false, 0);
+    }
+
+    let mut i = 1;
+    let negated = if i < pattern.len() && (pattern[i] == '!' || pattern[i] == '^') {
+        i += 1;
+        true
+    } else {
+        false
+    };
+
+    let mut matched = false;
+
+    while i < pattern.len() && pattern[i] != ']' {
+        if i + 2 < pattern.len() && pattern[i + 1] == '-' && pattern[i + 2] != ']' {
+            // Range like a-z
+            let start = pattern[i];
+            let end = pattern[i + 2];
+            if c >= start && c <= end {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            // Single character
+            if pattern[i] == c {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+
+    // Skip closing ]
+    if i < pattern.len() && pattern[i] == ']' {
+        i += 1;
+    }
+
+    let result = if negated { !matched } else { matched };
+    (result, i)
 }
 
 /// Expand a literal string, handling embedded variables and escapes.
@@ -436,5 +642,71 @@ mod tests {
         assert_eq!(expand_variable("0", &state), "nexus");
         assert_eq!(expand_variable("PWD", &state), "/tmp");
         assert_eq!(expand_variable("HOME", &state), "/home/testuser");
+    }
+
+    // Glob matching tests
+    #[test]
+    fn test_glob_match_star() {
+        assert!(glob_match("*.rs", "foo.rs"));
+        assert!(glob_match("*.rs", "bar.rs"));
+        assert!(!glob_match("*.rs", "foo.txt"));
+        assert!(glob_match("foo*", "foobar"));
+        assert!(glob_match("*bar", "foobar"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("**", "anything"));
+    }
+
+    #[test]
+    fn test_glob_match_question() {
+        assert!(glob_match("f?o", "foo"));
+        assert!(glob_match("f??", "foo"));
+        assert!(!glob_match("f?o", "fooo"));
+        assert!(!glob_match("f?", "foo"));
+    }
+
+    #[test]
+    fn test_glob_match_char_class() {
+        assert!(glob_match("[abc]", "a"));
+        assert!(glob_match("[abc]", "b"));
+        assert!(!glob_match("[abc]", "d"));
+        assert!(glob_match("[a-z]", "m"));
+        assert!(!glob_match("[a-z]", "M"));
+        assert!(glob_match("[!abc]", "d"));
+        assert!(!glob_match("[!abc]", "a"));
+    }
+
+    #[test]
+    fn test_glob_match_combined() {
+        assert!(glob_match("*.t?t", "file.txt"));
+        assert!(glob_match("*.t?t", "file.tst"));
+        assert!(!glob_match("*.t?t", "file.text"));
+        assert!(glob_match("[a-z]*.rs", "foo.rs"));
+        assert!(!glob_match("[a-z]*.rs", "123.rs"));
+    }
+
+    #[test]
+    fn test_contains_glob_chars() {
+        assert!(contains_glob_chars("*.rs"));
+        assert!(contains_glob_chars("file?.txt"));
+        assert!(contains_glob_chars("[abc]"));
+        assert!(!contains_glob_chars("file.txt"));
+        assert!(!contains_glob_chars("path/to/file"));
+    }
+
+    #[test]
+    fn test_expand_glob_no_glob() {
+        let state = make_state();
+        // No glob chars - should return as-is
+        let result = expand_word_to_strings(&Word::Literal("file.txt".to_string()), &state);
+        assert_eq!(result, vec!["file.txt"]);
+    }
+
+    #[test]
+    fn test_expand_glob_noglob_option() {
+        let mut state = make_state();
+        state.options.noglob = true;
+        // With noglob set, should return pattern as-is
+        let result = expand_word_to_strings(&Word::Literal("*.txt".to_string()), &state);
+        assert_eq!(result, vec!["*.txt"]);
     }
 }
