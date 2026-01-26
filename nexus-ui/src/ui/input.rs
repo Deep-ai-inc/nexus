@@ -7,23 +7,27 @@ use nexus_kernel::CompletionKind;
 
 use crate::blocks::InputMode;
 use crate::msg::{InputMessage, Message, TerminalMessage};
-use crate::state::Nexus;
+use crate::state::InputState;
 use crate::utils::{format_relative_time, shorten_path};
 
 /// Render the input area (prompt, input field, and any popups).
-pub fn view_input(state: &Nexus) -> Element<'_, Message> {
-    let font_size = state.window.font_size;
-
+pub fn view_input<'a>(
+    input: &'a InputState,
+    font_size: f32,
+    cwd: &'a str,
+    last_exit_code: Option<i32>,
+    permission_denied_command: Option<&'a str>,
+) -> Element<'a, Message> {
     // Cornflower blue for path
     let path_color = iced::Color::from_rgb8(100, 149, 237);
     // Green for success, red for failure
-    let prompt_color = match state.terminal.last_exit_code {
+    let prompt_color = match last_exit_code {
         Some(code) if code != 0 => iced::Color::from_rgb8(220, 50, 50), // Red
         _ => iced::Color::from_rgb8(50, 205, 50),                       // Lime green
     };
 
     // Shorten path (replace home with ~)
-    let display_path = shorten_path(&state.terminal.cwd);
+    let display_path = shorten_path(cwd);
 
     let path_text = text(format!("{} ", display_path))
         .size(font_size)
@@ -31,7 +35,7 @@ pub fn view_input(state: &Nexus) -> Element<'_, Message> {
         .font(iced::Font::MONOSPACE);
 
     // Mode indicator - shows SHELL or AGENT mode
-    let (mode_label, mode_color) = match state.input.mode {
+    let (mode_label, mode_color) = match input.mode {
         InputMode::Shell => ("$", prompt_color),
         InputMode::Agent => ("?", iced::Color::from_rgb(0.5, 0.6, 1.0)),
     };
@@ -41,7 +45,7 @@ pub fn view_input(state: &Nexus) -> Element<'_, Message> {
         .color(mode_color)
         .font(iced::Font::MONOSPACE);
 
-    let input = text_input("", &state.input.buffer)
+    let input_field = text_input("", &input.buffer)
         .on_input(|s| Message::Input(InputMessage::Changed(s)))
         .on_submit(Message::Input(InputMessage::Submit))
         .padding(0)
@@ -59,16 +63,15 @@ pub fn view_input(state: &Nexus) -> Element<'_, Message> {
         })
         .font(iced::Font::MONOSPACE);
 
-    let input_row = row![path_text, prompt, input]
+    let input_row = row![path_text, prompt, input_field]
         .spacing(0)
         .align_y(iced::Alignment::Center);
 
     // Display attachments if any (Mathematica-style rich input)
-    let attachments_view: Option<Element<'_, Message>> = if state.input.attachments.is_empty() {
+    let attachments_view: Option<Element<'_, Message>> = if input.attachments.is_empty() {
         None
     } else {
-        let attachment_items: Vec<Element<'_, Message>> = state
-            .input
+        let attachment_items: Vec<Element<'_, Message>> = input
             .attachments
             .iter()
             .enumerate()
@@ -155,18 +158,18 @@ pub fn view_input(state: &Nexus) -> Element<'_, Message> {
     };
 
     // Show history search popup if active
-    if state.input.search_active {
-        return view_history_search(state, input_row);
+    if input.search_active {
+        return view_history_search(input, font_size, input_row);
     }
 
     // Show permission denied prompt if applicable
-    if let Some(ref cmd) = state.terminal.permission_denied_command {
-        return view_permission_denied_prompt(state, cmd, input_row);
+    if let Some(cmd) = permission_denied_command {
+        return view_permission_denied_prompt(font_size, cmd, input_row);
     }
 
     // Show completion popup if visible
-    if state.input.completion_visible && !state.input.completions.is_empty() {
-        return view_completion_popup(state, input_row, attachments_view);
+    if input.completion_visible && !input.completions.is_empty() {
+        return view_completion_popup(input, font_size, input_row, attachments_view);
     }
 
     if let Some(attachments) = attachments_view {
@@ -178,17 +181,16 @@ pub fn view_input(state: &Nexus) -> Element<'_, Message> {
 
 /// Render the history search popup.
 fn view_history_search<'a>(
-    state: &'a Nexus,
+    input: &'a InputState,
+    font_size: f32,
     input_row: iced::widget::Row<'a, Message>,
 ) -> Element<'a, Message> {
-    let font_size = state.window.font_size;
-
     let search_label = text("(reverse-i-search)")
         .size(font_size * 0.9)
         .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
         .font(iced::Font::MONOSPACE);
 
-    let search_input = text_input("type to search...", &state.input.search_query)
+    let search_input = text_input("type to search...", &input.search_query)
         .on_input(|s| Message::Input(InputMessage::HistorySearchChanged(s)))
         .padding([4, 8])
         .size(font_size)
@@ -211,14 +213,13 @@ fn view_history_search<'a>(
         .align_y(iced::Alignment::Center);
 
     // Build result items
-    let result_items: Vec<Element<Message>> = state
-        .input
+    let result_items: Vec<Element<Message>> = input
         .search_results
         .iter()
         .enumerate()
         .take(10)
         .map(|(i, entry)| {
-            let is_selected = i == state.input.search_index;
+            let is_selected = i == input.search_index;
             let bg_color = if is_selected {
                 iced::Color::from_rgb(0.2, 0.4, 0.6)
             } else {
@@ -293,11 +294,10 @@ fn view_history_search<'a>(
 
 /// Render the permission denied prompt.
 fn view_permission_denied_prompt<'a>(
-    state: &'a Nexus,
+    font_size: f32,
     cmd: &str,
     input_row: iced::widget::Row<'a, Message>,
 ) -> Element<'a, Message> {
-    let font_size = state.window.font_size;
 
     let warning_icon = text("⚠️").size(font_size);
     let message = text("Permission denied")
@@ -371,20 +371,18 @@ fn view_permission_denied_prompt<'a>(
 
 /// Render the completion popup.
 fn view_completion_popup<'a>(
-    state: &'a Nexus,
+    input: &'a InputState,
+    font_size: f32,
     input_row: iced::widget::Row<'a, Message>,
     attachments_view: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let font_size = state.window.font_size;
-
-    let completion_items: Vec<Element<Message>> = state
-        .input
+    let completion_items: Vec<Element<Message>> = input
         .completions
         .iter()
         .enumerate()
         .take(10) // Show max 10 items
         .map(|(i, completion)| {
-            let is_selected = i == state.input.completion_index;
+            let is_selected = i == input.completion_index;
             let bg_color = if is_selected {
                 iced::Color::from_rgb(0.2, 0.4, 0.6)
             } else {

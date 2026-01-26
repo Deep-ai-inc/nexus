@@ -44,7 +44,8 @@ pub fn run() -> iced::Result {
 fn update(state: &mut Nexus, message: Message) -> Task<Message> {
     match message {
         Message::Input(msg) => {
-            let result = handlers::input::update(state, msg);
+            let result =
+                handlers::input::update(&mut state.input, &state.terminal.kernel, msg);
             let action_tasks = process_actions(state, result.actions);
             Task::batch([result.task, action_tasks])
         }
@@ -63,58 +64,17 @@ fn process_actions(state: &mut Nexus, actions: Vec<Action>) -> Task<Message> {
     for action in actions {
         match action {
             Action::ExecuteCommand(cmd) => {
-                // Store attachments in kernel state before execution
-                if !state.input.attachments.is_empty() {
-                    if let Ok(mut kernel) = state.terminal.kernel.try_lock() {
-                        let value = if state.input.attachments.len() == 1 {
-                            state.input.attachments[0].clone()
-                        } else {
-                            nexus_api::Value::List(state.input.attachments.clone())
-                        };
-                        kernel.state_mut().set_var_value("ATTACHMENT", value);
-                    }
-                }
-                state.input.attachments.clear();
-
-                // Record in history
-                let trimmed = cmd.trim();
-                if !trimmed.is_empty() {
-                    if state.input.history.last().map(|s| s.as_str()) != Some(trimmed) {
-                        state.input.history.push(trimmed.to_string());
-                        if state.input.history.len() > 1000 {
-                            state.input.history.remove(0);
-                        }
-                    }
-                }
-
-                // Execute through terminal handler
+                transfer_attachments_to_kernel(state);
+                state.input.push_history(cmd.trim());
                 tasks.push(handlers::terminal::execute(state, cmd));
             }
             Action::SpawnAgentQuery(query) => {
-                // Store attachments
-                if !state.input.attachments.is_empty() {
-                    if let Ok(mut kernel) = state.terminal.kernel.try_lock() {
-                        let value = if state.input.attachments.len() == 1 {
-                            state.input.attachments[0].clone()
-                        } else {
-                            nexus_api::Value::List(state.input.attachments.clone())
-                        };
-                        kernel.state_mut().set_var_value("ATTACHMENT", value);
-                    }
-                }
-                state.input.attachments.clear();
-
-                // Spawn agent query
+                transfer_attachments_to_kernel(state);
                 tasks.push(handlers::agent::spawn_query(state, query));
             }
             Action::ClearAll => {
-                use std::sync::atomic::Ordering;
-                state.agent.cancel_flag.store(true, Ordering::SeqCst);
-                state.terminal.blocks.clear();
-                state.terminal.block_index.clear();
-                state.agent.blocks.clear();
-                state.agent.block_index.clear();
-                state.agent.active_block = None;
+                state.agent.reset();
+                state.terminal.reset();
             }
             Action::FocusInput => {
                 state.terminal.focus = Focus::Input;
@@ -123,6 +83,22 @@ fn process_actions(state: &mut Nexus, actions: Vec<Action>) -> Task<Message> {
     }
 
     Task::batch(tasks)
+}
+
+/// Transfer pending attachments from input to kernel state.
+fn transfer_attachments_to_kernel(state: &mut Nexus) {
+    if state.input.attachments.is_empty() {
+        return;
+    }
+    if let Ok(mut kernel) = state.terminal.kernel.try_lock() {
+        let value = if state.input.attachments.len() == 1 {
+            state.input.attachments[0].clone()
+        } else {
+            nexus_api::Value::List(state.input.attachments.clone())
+        };
+        kernel.state_mut().set_var_value("ATTACHMENT", value);
+    }
+    state.input.clear_attachments();
 }
 
 /// Handle the render tick (VSync-aligned frame).
@@ -186,7 +162,13 @@ fn view(state: &Nexus) -> Element<'_, Message> {
     });
 
     // Input line
-    let input_line = container(view_input(state))
+    let input_line = container(view_input(
+        &state.input,
+        state.window.font_size,
+        &state.terminal.cwd,
+        state.terminal.last_exit_code,
+        state.terminal.permission_denied_command.as_deref(),
+    ))
         .padding([8, 15])
         .width(Length::Fill);
 

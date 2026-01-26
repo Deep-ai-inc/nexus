@@ -62,6 +62,29 @@ pub struct InputState {
     pub before_event: String,
 }
 
+impl InputState {
+    /// Add a command to history if it's not a duplicate of the last entry.
+    /// Maintains max history size of 1000 entries.
+    pub fn push_history(&mut self, command: &str) {
+        if self.history.last().map(|s| s.as_str()) != Some(command) {
+            self.history.push(command.to_string());
+            if self.history.len() > 1000 {
+                self.history.remove(0);
+            }
+        }
+    }
+
+    /// Clear pending attachments.
+    pub fn clear_attachments(&mut self) {
+        self.attachments.clear();
+    }
+
+    /// Take attachments, returning them and clearing the internal list.
+    pub fn take_attachments(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.attachments)
+    }
+}
+
 impl Default for InputState {
     fn default() -> Self {
         Self {
@@ -156,6 +179,13 @@ impl TerminalState {
         }
     }
 
+    /// Reset terminal state, clearing all blocks.
+    /// Used by ClearAll action.
+    pub fn reset(&mut self) {
+        self.blocks.clear();
+        self.block_index.clear();
+    }
+
     /// Apply terminal resize to all blocks and PTYs.
     pub fn apply_resize(&mut self, cols: u16, rows: u16) {
         for block in &mut self.blocks {
@@ -230,6 +260,16 @@ impl AgentState {
         let idx = self.blocks.len();
         self.block_index.insert(id, idx);
         self.blocks.push(block);
+    }
+
+    /// Reset agent state, cancelling any active agent and clearing blocks.
+    /// Used by ClearAll action.
+    pub fn reset(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.blocks.clear();
+        self.block_index.clear();
+        self.active_block = None;
     }
 }
 

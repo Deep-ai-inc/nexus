@@ -14,7 +14,7 @@ use nexus_kernel::{Completion, Kernel};
 
 use crate::blocks::InputMode;
 use crate::msg::{Action, InputMessage, Message};
-use crate::state::{InputState, Nexus};
+use crate::state::InputState;
 
 /// Result of processing an input message.
 pub struct InputResult {
@@ -49,39 +49,34 @@ impl InputResult {
 }
 
 /// Update the input domain state.
+/// Takes only InputState and a read-only kernel reference for completion.
 /// Returns task and any cross-domain actions needed.
-pub fn update(state: &mut Nexus, msg: InputMessage) -> InputResult {
+pub fn update(
+    input: &mut InputState,
+    kernel: &Arc<Mutex<Kernel>>,
+    msg: InputMessage,
+) -> InputResult {
     match msg {
         // Pure input operations
-        InputMessage::Changed(val) => changed(&mut state.input, val),
-        InputMessage::ToggleMode => toggle_mode(&mut state.input),
-        InputMessage::CancelCompletion => cancel_completion(&mut state.input),
-        InputMessage::PasteImage(d, w, h) => paste_image(&mut state.input, d, w, h),
-        InputMessage::RemoveAttachment(idx) => remove_attachment(&mut state.input, idx),
-        InputMessage::HistoryKey(key, mods) => history_key(&mut state.input, key, mods),
+        InputMessage::Changed(val) => changed(input, val),
+        InputMessage::ToggleMode => toggle_mode(input),
+        InputMessage::CancelCompletion => cancel_completion(input),
+        InputMessage::PasteImage(d, w, h) => paste_image(input, d, w, h),
+        InputMessage::RemoveAttachment(idx) => remove_attachment(input, idx),
+        InputMessage::HistoryKey(key, mods) => history_key(input, key, mods),
 
         // Operations needing kernel access
-        InputMessage::TabCompletion => {
-            completion_tab(&mut state.input, &state.terminal.kernel)
-        }
-        InputMessage::SelectCompletion(idx) => select_completion(&mut state.input, idx),
+        InputMessage::TabCompletion => completion_tab(input, kernel),
+        InputMessage::SelectCompletion(idx) => select_completion(input, idx),
 
         // History search (needs kernel)
-        InputMessage::HistorySearchStart => {
-            super::history::start(&mut state.input, &state.terminal.kernel)
-        }
-        InputMessage::HistorySearchChanged(q) => {
-            super::history::search(&mut state.input, &state.terminal.kernel, q)
-        }
-        InputMessage::HistorySearchSelect(i) => {
-            super::history::select(&mut state.input, i)
-        }
-        InputMessage::HistorySearchCancel => {
-            super::history::cancel(&mut state.input)
-        }
+        InputMessage::HistorySearchStart => super::history::start(input, kernel),
+        InputMessage::HistorySearchChanged(q) => super::history::search(input, kernel, q),
+        InputMessage::HistorySearchSelect(i) => super::history::select(input, i),
+        InputMessage::HistorySearchCancel => super::history::cancel(input),
 
         // Cross-domain: submit command
-        InputMessage::Submit => submit(&mut state.input),
+        InputMessage::Submit => submit(input),
     }
 }
 
@@ -275,7 +270,11 @@ fn submit(input: &mut InputState) -> InputResult {
 
 /// Handle keys when the input field is focused.
 /// Called from the window handler, returns InputMessage to process.
-pub fn handle_focus_key(input: &mut InputState, key: Key, modifiers: Modifiers) -> Option<InputMessage> {
+pub fn handle_focus_key(
+    input: &mut InputState,
+    key: Key,
+    modifiers: Modifiers,
+) -> Option<InputMessage> {
     // History search mode takes priority
     if input.search_active {
         match &key {
