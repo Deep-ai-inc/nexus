@@ -17,6 +17,8 @@ pub enum Command {
     If(IfStatement),
     While(WhileStatement),
     For(ForStatement),
+    Function(FunctionDef),
+    Case(CaseStatement),
 }
 
 /// A simple command: name, arguments, redirections.
@@ -120,4 +122,25 @@ pub struct ForStatement {
     pub variable: String,
     pub items: Vec<Word>,
     pub body: Vec<Command>,
+}
+
+/// A function definition: name() { body }
+#[derive(Debug, Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    pub body: Vec<Command>,
+}
+
+/// A case statement: case word in pattern) commands ;; ... esac
+#[derive(Debug, Clone)]
+pub struct CaseStatement {
+    pub word: Word,
+    pub cases: Vec<CaseItem>,
+}
+
+/// A single case item: pattern) commands ;;
+#[derive(Debug, Clone)]
+pub struct CaseItem {
+    pub patterns: Vec<String>,
+    pub commands: Vec<Command>,
 }

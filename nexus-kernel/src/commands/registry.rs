@@ -24,6 +24,10 @@ use super::grep::GrepCommand;
 use super::hash::HashCommand;
 use super::head::HeadCommand;
 use super::history::{FcCommand, HistoryCommand};
+use super::iterators::{
+    AllCommand, AnyCommand, EachCommand, FilterCommand, GroupByCommand, MapCommand, ReduceCommand,
+    WhereCommand,
+};
 use super::jobs::{BgCommand, FgCommand, JobsCommand, WaitCommand};
 use super::json::{FromJsonCommand, GetCommand, ToJsonCommand};
 use super::links::{LinkCommand, LnCommand, UnlinkCommand};
@@ -127,6 +131,16 @@ impl CommandRegistry {
         registry.register(CompactCommand);
         registry.register(ReverseCommand);
         registry.register(EnumerateCommand);
+
+        // Iterators (next-gen structured data commands)
+        registry.register(EachCommand);
+        registry.register(MapCommand);
+        registry.register(FilterCommand);
+        registry.register(WhereCommand);
+        registry.register(ReduceCommand);
+        registry.register(AnyCommand);
+        registry.register(AllCommand);
+        registry.register(GroupByCommand);
 
         // Random/sequence
         registry.register(ShufCommand);

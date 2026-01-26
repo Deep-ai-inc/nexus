@@ -14,10 +14,12 @@ use std::time::Instant;
 
 use tokio::sync::broadcast::Sender;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{execvp, fork, ForkResult, Pid};
+use nix::unistd::{close, dup2, execvp, fork, ForkResult, Pid};
+use nix::fcntl::{open, OFlag};
+use nix::sys::stat::Mode;
 use nexus_api::{BlockId, ShellEvent};
 
-use crate::parser::{Command, Redirect};
+use crate::parser::{Command, Redirect, RedirectOp};
 use crate::ShellState;
 
 /// Handle for a spawned process.
@@ -32,7 +34,7 @@ pub fn spawn(
     cwd: &Path,
     env: &HashMap<String, String>,
     env_overrides: &[(String, String)],
-    _redirects: &[Redirect],
+    redirects: &[Redirect],
 ) -> anyhow::Result<ProcessHandle> {
     // Create a PTY for interactive processes
     let pty = pty::open_pty()?;
@@ -60,7 +62,10 @@ pub fn spawn(
             }
 
             // Apply redirections
-            // TODO: Implement redirect handling
+            if let Err(e) = apply_redirects(redirects) {
+                eprintln!("redirect error: {}", e);
+                std::process::exit(1);
+            }
 
             // Convert argv to CStrings
             let argv_cstr: Vec<CString> = argv
@@ -84,6 +89,68 @@ pub fn spawn(
             })
         }
     }
+}
+
+/// Apply file redirections to the current process.
+/// This should be called in the child process after fork, before exec.
+fn apply_redirects(redirects: &[Redirect]) -> anyhow::Result<()> {
+    for redirect in redirects {
+        match redirect.op {
+            RedirectOp::Write => {
+                // fd > file - open file for writing (truncate)
+                let flags = OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC;
+                let mode = Mode::from_bits_truncate(0o644);
+                let fd = open(redirect.target.as_str(), flags, mode)?;
+                dup2(fd, redirect.fd)?;
+                close(fd)?;
+            }
+            RedirectOp::Append => {
+                // fd >> file - open file for appending
+                let flags = OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND;
+                let mode = Mode::from_bits_truncate(0o644);
+                let fd = open(redirect.target.as_str(), flags, mode)?;
+                dup2(fd, redirect.fd)?;
+                close(fd)?;
+            }
+            RedirectOp::Read => {
+                // fd < file - open file for reading
+                let flags = OFlag::O_RDONLY;
+                let mode = Mode::empty();
+                let fd = open(redirect.target.as_str(), flags, mode)?;
+                dup2(fd, redirect.fd)?;
+                close(fd)?;
+            }
+            RedirectOp::DupWrite => {
+                // fd>&target - duplicate target fd to fd
+                // e.g., 2>&1 means dup2(1, 2) - duplicate fd 1 to fd 2
+                let target_fd: i32 = redirect.target.parse().unwrap_or(-1);
+                if target_fd == -1 {
+                    // Special case: >&- means close
+                    if redirect.target == "-" {
+                        close(redirect.fd)?;
+                    } else {
+                        anyhow::bail!("invalid fd for >&: {}", redirect.target);
+                    }
+                } else {
+                    dup2(target_fd, redirect.fd)?;
+                }
+            }
+            RedirectOp::DupRead => {
+                // fd<&target - duplicate target fd to fd for reading
+                let target_fd: i32 = redirect.target.parse().unwrap_or(-1);
+                if target_fd == -1 {
+                    if redirect.target == "-" {
+                        close(redirect.fd)?;
+                    } else {
+                        anyhow::bail!("invalid fd for <&: {}", redirect.target);
+                    }
+                } else {
+                    dup2(target_fd, redirect.fd)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Wait for a process to complete, emitting events for output.

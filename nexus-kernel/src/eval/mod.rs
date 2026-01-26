@@ -14,7 +14,7 @@ use crate::process;
 use crate::state::{get_or_create_block_id, ShellState};
 
 pub use builtins::is_builtin;
-use builtins::{BREAK_EXIT_CODE, CONTINUE_EXIT_CODE};
+use builtins::{BREAK_EXIT_CODE, CONTINUE_EXIT_CODE, RETURN_EXIT_CODE};
 
 /// Check if an exit code represents a break signal.
 fn is_break(exit_code: i32) -> Option<u32> {
@@ -98,6 +98,8 @@ fn execute_command(
         Command::If(if_stmt) => execute_if(state, if_stmt, events, commands, block_id),
         Command::While(while_stmt) => execute_while(state, while_stmt, events, commands, block_id),
         Command::For(for_stmt) => execute_for(state, for_stmt, events, commands, block_id),
+        Command::Function(func_def) => execute_function_def(state, func_def),
+        Command::Case(case_stmt) => execute_case(state, case_stmt, events, commands, block_id),
     }
 }
 
@@ -133,6 +135,11 @@ fn execute_simple(
     // Check for builtins (shell-specific: cd, export, etc.)
     if let Some(exit_code) = builtins::try_builtin(&name, &args, state, events, commands)? {
         return Ok(exit_code);
+    }
+
+    // Check for user-defined functions
+    if let Some(func_def) = state.get_function(&name).cloned() {
+        return execute_function_call(state, &func_def, &args, events, commands, block_id);
     }
 
     // Check for native commands (in-process: ls, cat, etc.)
@@ -650,4 +657,112 @@ fn execute_for(
     }
 
     Ok(last_exit)
+}
+
+/// Define a function (store it in state).
+fn execute_function_def(state: &mut ShellState, func_def: &FunctionDef) -> anyhow::Result<i32> {
+    state.define_function(func_def.name.clone(), func_def.clone());
+    Ok(0)
+}
+
+/// Execute a function call.
+fn execute_function_call(
+    state: &mut ShellState,
+    func_def: &FunctionDef,
+    args: &[String],
+    events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
+    block_id: Option<BlockId>,
+) -> anyhow::Result<i32> {
+    // Save old positional parameters
+    let old_params = std::mem::take(&mut state.positional_params);
+
+    // Set new positional parameters from function arguments
+    state.positional_params = args.to_vec();
+
+    // Enter a new local scope
+    state.push_scope();
+
+    let mut last_exit = 0;
+
+    // Execute function body
+    for cmd in &func_def.body {
+        last_exit = execute_command(state, cmd, events, commands, block_id)?;
+
+        // Handle return builtin (exit code >= RETURN_EXIT_CODE)
+        if last_exit >= RETURN_EXIT_CODE {
+            last_exit = last_exit - RETURN_EXIT_CODE;
+            break;
+        }
+    }
+
+    // Exit local scope (restore local variables)
+    state.pop_scope();
+
+    // Restore old positional parameters
+    state.positional_params = old_params;
+
+    Ok(last_exit)
+}
+
+/// Execute a case statement.
+fn execute_case(
+    state: &mut ShellState,
+    case_stmt: &CaseStatement,
+    events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
+    block_id: Option<BlockId>,
+) -> anyhow::Result<i32> {
+    // Expand the word to match against
+    let word = expand::expand_word_to_string(&case_stmt.word, state);
+
+    let mut last_exit = 0;
+
+    // Find matching case
+    for case_item in &case_stmt.cases {
+        let matches = case_item.patterns.iter().any(|pattern| {
+            // Expand pattern (handles variables, etc.)
+            let expanded_pattern = expand::expand_tilde(pattern, state);
+            pattern_matches(&word, &expanded_pattern)
+        });
+
+        if matches {
+            // Execute commands for this case
+            for cmd in &case_item.commands {
+                last_exit = execute_command(state, cmd, events, commands, block_id)?;
+            }
+            break; // Only execute first matching case (unless ;& is used, but we don't support that yet)
+        }
+    }
+
+    Ok(last_exit)
+}
+
+/// Check if a word matches a shell pattern (glob-style).
+fn pattern_matches(word: &str, pattern: &str) -> bool {
+    // Handle special case: * matches everything
+    if pattern == "*" {
+        return true;
+    }
+
+    // Convert shell pattern to regex
+    let regex_pattern = pattern
+        .chars()
+        .map(|c| match c {
+            '*' => ".*".to_string(),
+            '?' => ".".to_string(),
+            '[' | ']' => c.to_string(), // Character classes pass through
+            '.' | '+' | '^' | '$' | '(' | ')' | '{' | '}' | '|' | '\\' => {
+                format!("\\{}", c)
+            }
+            _ => c.to_string(),
+        })
+        .collect::<String>();
+
+    // Anchor the pattern
+    let anchored = format!("^{}$", regex_pattern);
+
+    regex::Regex::new(&anchored)
+        .map(|re| re.is_match(word))
+        .unwrap_or(false)
 }

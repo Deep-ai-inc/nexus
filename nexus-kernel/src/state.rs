@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nexus_api::{BlockId, Value};
 
+use crate::parser::FunctionDef;
 use crate::process::Job;
 
 /// Stored output from a command block.
@@ -91,6 +92,13 @@ pub struct ShellState {
     /// Cached command paths (for hash builtin).
     pub command_hash: HashMap<String, PathBuf>,
 
+    /// Shell functions (name -> definition).
+    pub functions: HashMap<String, FunctionDef>,
+
+    /// Local variable scope stack (for function calls).
+    /// Each entry is a set of local variable names for that scope.
+    local_scopes: Vec<HashMap<String, String>>,
+
     // === Persistent Memory (Year 3000 Terminal) ===
     /// Last command output - accessible via $_ or $prev
     pub last_output: Option<Value>,
@@ -149,6 +157,8 @@ impl ShellState {
             options: ShellOptions::default(),
             traps: HashMap::new(),
             command_hash: HashMap::new(),
+            functions: HashMap::new(),
+            local_scopes: Vec::new(),
             last_output: None,
             block_outputs: VecDeque::new(),
             max_block_outputs: 100, // Keep last 100 outputs
@@ -175,6 +185,8 @@ impl ShellState {
             options: ShellOptions::default(),
             traps: HashMap::new(),
             command_hash: HashMap::new(),
+            functions: HashMap::new(),
+            local_scopes: Vec::new(),
             last_output: None,
             block_outputs: VecDeque::new(),
             max_block_outputs: 100,
@@ -273,6 +285,74 @@ impl ShellState {
             .iter()
             .find(|o| o.id == block_id)
             .map(|o| &o.value)
+    }
+
+    // === Function Methods ===
+
+    /// Define a function.
+    pub fn define_function(&mut self, name: String, def: FunctionDef) {
+        self.functions.insert(name, def);
+    }
+
+    /// Get a function definition.
+    pub fn get_function(&self, name: &str) -> Option<&FunctionDef> {
+        self.functions.get(name)
+    }
+
+    /// Unset a function.
+    pub fn unset_function(&mut self, name: &str) {
+        self.functions.remove(name);
+    }
+
+    // === Local Variable Scope Methods ===
+
+    /// Enter a new local scope (for function calls).
+    pub fn push_scope(&mut self) {
+        self.local_scopes.push(HashMap::new());
+    }
+
+    /// Exit the current local scope (restore old values).
+    pub fn pop_scope(&mut self) {
+        if let Some(scope) = self.local_scopes.pop() {
+            // Remove all local variables from this scope
+            for (name, old_value) in scope {
+                if old_value.is_empty() {
+                    // Variable didn't exist before, remove it
+                    self.vars.remove(&name);
+                } else {
+                    // Restore old value
+                    self.vars.insert(name, old_value);
+                }
+            }
+        }
+    }
+
+    /// Declare a local variable (only valid inside a function).
+    /// Returns true if successful, false if not in a function.
+    pub fn declare_local(&mut self, name: impl Into<String>, value: impl Into<String>) -> bool {
+        let name = name.into();
+        let value = value.into();
+
+        if self.local_scopes.is_empty() {
+            // Not in a function - local does nothing (or could error)
+            return false;
+        }
+
+        // Save the old value (or empty string if didn't exist) in the current scope
+        let old_value = self.vars.get(&name).cloned().unwrap_or_default();
+        if let Some(scope) = self.local_scopes.last_mut() {
+            // Only save if we haven't already saved this variable in this scope
+            scope.entry(name.clone()).or_insert(old_value);
+        }
+
+        // Set the new value
+        self.vars.insert(name, value);
+        true
+    }
+
+    /// Check if we're currently inside a function (for return builtin).
+    pub fn in_function(&self) -> bool {
+        !self.local_scopes.is_empty()
     }
 }
 

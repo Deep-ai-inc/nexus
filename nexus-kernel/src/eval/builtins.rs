@@ -42,6 +42,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "getopts"
             | "trap"
             | "exec"
+            | "local"
     )
 }
 
@@ -77,6 +78,8 @@ pub fn try_builtin(
         "break" => Ok(Some(builtin_break(args)?)),
         "continue" => Ok(Some(builtin_continue(args)?)),
         "return" => Ok(Some(builtin_return(args)?)),
+        // Variable scoping
+        "local" => Ok(Some(builtin_local(args, state)?)),
         _ => Ok(None),
     }
 }
@@ -1025,8 +1028,8 @@ fn builtin_exec(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> 
 
 // Special exit codes for control flow (high values to avoid conflicts)
 pub const BREAK_EXIT_CODE: i32 = 256;
-pub const CONTINUE_EXIT_CODE: i32 = 257;
-pub const RETURN_EXIT_CODE_BASE: i32 = 258;
+pub const CONTINUE_EXIT_CODE: i32 = 356; // Allow for break levels
+pub const RETURN_EXIT_CODE: i32 = 456;   // Base for return codes
 
 fn builtin_break(args: &[String]) -> anyhow::Result<i32> {
     let n: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -1052,5 +1055,23 @@ fn builtin_return(args: &[String]) -> anyhow::Result<i32> {
     let code: i32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     // Signal a return with the specified code
     // The evaluator needs to handle this specially for functions/sourced scripts
-    Ok(RETURN_EXIT_CODE_BASE + code)
+    Ok(RETURN_EXIT_CODE + code)
+}
+
+fn builtin_local(args: &[String], state: &mut ShellState) -> anyhow::Result<i32> {
+    if !state.in_function() {
+        eprintln!("local: can only be used in a function");
+        return Ok(1);
+    }
+
+    for arg in args {
+        if let Some((name, value)) = arg.split_once('=') {
+            state.declare_local(name.to_string(), value.to_string());
+        } else {
+            // Declare local with empty value
+            state.declare_local(arg.to_string(), String::new());
+        }
+    }
+
+    Ok(0)
 }

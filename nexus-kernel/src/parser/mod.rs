@@ -115,6 +115,14 @@ fn build_command(node: &Node, source: &str) -> Result<Option<Command>, ShellErro
             let for_stmt = build_for_statement(node, source)?;
             Ok(Some(Command::For(for_stmt)))
         }
+        "function_definition" => {
+            let func_def = build_function_definition(node, source)?;
+            Ok(Some(Command::Function(func_def)))
+        }
+        "case_statement" => {
+            let case_stmt = build_case_statement(node, source)?;
+            Ok(Some(Command::Case(case_stmt)))
+        }
         "comment" | "\n" => Ok(None),
         _ => {
             // Unknown node type - log and skip
@@ -432,6 +440,98 @@ fn build_for_statement(node: &Node, source: &str) -> Result<ForStatement, ShellE
         items,
         body,
     })
+}
+
+fn build_function_definition(node: &Node, source: &str) -> Result<FunctionDef, ShellError> {
+    let mut name = String::new();
+    let mut body = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "word" | "function_name" => {
+                if name.is_empty() {
+                    name = node_text(&child, source);
+                }
+            }
+            "compound_statement" => {
+                // Parse the body inside { }
+                let mut body_cursor = child.walk();
+                for body_child in child.children(&mut body_cursor) {
+                    if let Some(cmd) = build_command(&body_child, source)? {
+                        body.push(cmd);
+                    }
+                }
+            }
+            "subshell" => {
+                // Some functions use ( ) instead of { }
+                let mut body_cursor = child.walk();
+                for body_child in child.children(&mut body_cursor) {
+                    if let Some(cmd) = build_command(&body_child, source)? {
+                        body.push(cmd);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(FunctionDef { name, body })
+}
+
+fn build_case_statement(node: &Node, source: &str) -> Result<CaseStatement, ShellError> {
+    let mut word = Word::Literal(String::new());
+    let mut cases = Vec::new();
+    let mut in_word = false;
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "case" => in_word = true,
+            "in" => in_word = false,
+            "word" | "string" | "simple_expansion" | "expansion" if in_word => {
+                word = if child.kind() == "simple_expansion" || child.kind() == "expansion" {
+                    Word::Variable(extract_variable_name(&child, source))
+                } else {
+                    Word::Literal(node_text(&child, source))
+                };
+            }
+            "case_item" => {
+                let case_item = build_case_item(&child, source)?;
+                cases.push(case_item);
+            }
+            "esac" => break,
+            _ => {}
+        }
+    }
+
+    Ok(CaseStatement { word, cases })
+}
+
+fn build_case_item(node: &Node, source: &str) -> Result<CaseItem, ShellError> {
+    let mut patterns = Vec::new();
+    let mut commands = Vec::new();
+    let mut in_pattern = true;
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "word" | "extglob_pattern" if in_pattern => {
+                patterns.push(node_text(&child, source));
+            }
+            "|" => {} // Pattern separator, continue collecting patterns
+            ")" => in_pattern = false,
+            ";;" | ";&" | ";;&" => break,
+            _ if !in_pattern => {
+                if let Some(cmd) = build_command(&child, source)? {
+                    commands.push(cmd);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CaseItem { patterns, commands })
 }
 
 fn node_text(node: &Node, source: &str) -> String {

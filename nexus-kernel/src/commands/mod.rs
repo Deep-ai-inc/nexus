@@ -17,6 +17,7 @@ mod grep;
 mod hash;
 mod head;
 mod history;
+mod iterators;
 mod jobs;
 mod json;
 mod links;

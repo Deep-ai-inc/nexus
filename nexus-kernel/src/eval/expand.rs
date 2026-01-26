@@ -1060,7 +1060,16 @@ fn expand_variable(name: &str, state: &ShellState) -> String {
 
 /// Parse parameter expansion like ${var:-default}.
 fn parse_parameter_expansion(name: &str) -> Option<(String, String)> {
-    for pattern in &[":-", ":=", ":+", ":?", "-", "=", "+", "?", "#", "##", "%", "%%"] {
+    // Handle ${#var} - string length (special case, # at start)
+    if name.starts_with('#') && !name.starts_with("##") {
+        let var = &name[1..];
+        if !var.is_empty() && !var.contains(':') && !var.contains('-') && !var.contains('+') {
+            return Some((var.to_string(), "#".to_string()));
+        }
+    }
+
+    // Check for modifiers in order of longest first to avoid partial matches
+    for pattern in &[":-", ":=", ":+", ":?", "##", "%%", "-", "=", "+", "?", "#", "%"] {
         if let Some(pos) = name.find(pattern) {
             let var = name[..pos].to_string();
             let modifier = name[pos..].to_string();
@@ -1074,12 +1083,38 @@ fn parse_parameter_expansion(name: &str) -> Option<(String, String)> {
 fn apply_parameter_expansion(var: &str, modifier: &str, state: &ShellState) -> String {
     let value = state.get_var(var);
 
+    // Handle ${#var} - string length
+    if modifier == "#" {
+        return value.map(|v| v.len().to_string()).unwrap_or_else(|| "0".to_string());
+    }
+
     if modifier.starts_with(":-") {
         // Use default if unset or null
         let default = &modifier[2..];
         match value {
             Some(v) if !v.is_empty() => v.to_string(),
             _ => default.to_string(),
+        }
+    } else if modifier.starts_with(":?") {
+        // Error if unset or null
+        let error_msg = &modifier[2..];
+        match value {
+            Some(v) if !v.is_empty() => v.to_string(),
+            _ => {
+                // In a real shell this would exit, but we just return empty and log
+                eprintln!("{}: {}", var, if error_msg.is_empty() { "parameter null or not set" } else { error_msg });
+                String::new()
+            }
+        }
+    } else if modifier.starts_with("?") {
+        // Error if unset
+        let error_msg = &modifier[1..];
+        match value {
+            Some(v) => v.to_string(),
+            None => {
+                eprintln!("{}: {}", var, if error_msg.is_empty() { "parameter not set" } else { error_msg });
+                String::new()
+            }
         }
     } else if modifier.starts_with("-") {
         // Use default if unset
@@ -1104,17 +1139,17 @@ fn apply_parameter_expansion(var: &str, modifier: &str, state: &ShellState) -> S
         // Use alternative if set
         let alt = &modifier[1..];
         value.map(|_| alt.to_string()).unwrap_or_default()
+    } else if modifier.starts_with("##") {
+        // Remove longest prefix pattern (check ## before #!)
+        let pattern = &modifier[2..];
+        value
+            .map(|v| remove_prefix(v, pattern, true))
+            .unwrap_or_default()
     } else if modifier.starts_with("#") {
         // Remove shortest prefix pattern
         let pattern = &modifier[1..];
         value
             .map(|v| remove_prefix(v, pattern, false))
-            .unwrap_or_default()
-    } else if modifier.starts_with("##") {
-        // Remove longest prefix pattern
-        let pattern = &modifier[2..];
-        value
-            .map(|v| remove_prefix(v, pattern, true))
             .unwrap_or_default()
     } else if modifier.starts_with("%%") {
         // Remove longest suffix pattern
@@ -1134,44 +1169,97 @@ fn apply_parameter_expansion(var: &str, modifier: &str, state: &ShellState) -> S
 }
 
 /// Remove prefix matching pattern.
+/// Supports patterns like `*/` (match up to and including /) and literal prefixes.
 fn remove_prefix(s: &str, pattern: &str, longest: bool) -> String {
-    // Simplified glob matching - just handle * at the end
-    if pattern.ends_with('*') {
-        let prefix = &pattern[..pattern.len() - 1];
-        if s.starts_with(prefix) {
-            if longest {
-                // Find longest match
-                for i in (prefix.len()..=s.len()).rev() {
-                    if s[..i].starts_with(prefix) {
-                        return s[i..].to_string();
-                    }
-                }
-            }
-            return s[prefix.len()..].to_string();
+    // Handle patterns with * (e.g., "*/" means match anything up to /)
+    if let Some(star_pos) = pattern.find('*') {
+        let before_star = &pattern[..star_pos];
+        let after_star = &pattern[star_pos + 1..];
+
+        // The string must start with before_star (if any)
+        if !before_star.is_empty() && !s.starts_with(before_star) {
+            return s.to_string();
         }
-    } else if s.starts_with(pattern) {
+
+        // Find all positions where after_star matches (starting after before_star)
+        let start_search = before_star.len();
+        let mut matches = Vec::new();
+
+        // Special case: if after_star is empty, * matches everything
+        if after_star.is_empty() {
+            // Return the whole string for longest, empty for shortest
+            if longest {
+                return String::new();
+            } else {
+                return s[start_search..].to_string();
+            }
+        }
+
+        // Find all occurrences of after_star
+        for i in start_search..=s.len() {
+            if s[i..].starts_with(after_star) {
+                matches.push(i + after_star.len());
+            }
+        }
+
+        if matches.is_empty() {
+            return s.to_string();
+        }
+
+        // Return based on shortest/longest match
+        if longest {
+            let pos = *matches.last().unwrap();
+            return s[pos..].to_string();
+        } else {
+            let pos = *matches.first().unwrap();
+            return s[pos..].to_string();
+        }
+    }
+
+    // No glob - literal prefix match
+    if s.starts_with(pattern) {
         return s[pattern.len()..].to_string();
     }
     s.to_string()
 }
 
 /// Remove suffix matching pattern.
+/// Supports patterns like `.*` (match anything starting with .) and literal suffixes.
 fn remove_suffix(s: &str, pattern: &str, longest: bool) -> String {
-    // Simplified glob matching - just handle * at the beginning
-    if pattern.starts_with('*') {
-        let suffix = &pattern[1..];
-        if s.ends_with(suffix) {
-            if longest {
-                // Find longest match
-                for i in 0..=(s.len() - suffix.len()) {
-                    if s[i..].ends_with(suffix) {
-                        return s[..i].to_string();
-                    }
+    // Handle patterns with * (e.g., ".*" means match . followed by anything)
+    if let Some(star_pos) = pattern.find('*') {
+        let before_star = &pattern[..star_pos];
+        let after_star = &pattern[star_pos + 1..];
+
+        // Find all positions where before_star matches (working backwards from end)
+        let mut matches = Vec::new();
+        for (i, _) in s.char_indices() {
+            // Check if before_star matches at position i
+            if s[i..].starts_with(before_star) {
+                // For suffix removal with *, everything after before_star should match
+                // Check that after_star is at the end (or empty)
+                if after_star.is_empty() || s.ends_with(after_star) {
+                    matches.push(i);
                 }
             }
-            return s[..s.len() - suffix.len()].to_string();
         }
-    } else if s.ends_with(pattern) {
+
+        if matches.is_empty() {
+            return s.to_string();
+        }
+
+        // Return based on shortest/longest match
+        if longest {
+            let pos = *matches.first().unwrap(); // Longest = earliest position
+            return s[..pos].to_string();
+        } else {
+            let pos = *matches.last().unwrap(); // Shortest = latest position
+            return s[..pos].to_string();
+        }
+    }
+
+    // No glob - literal suffix match
+    if s.ends_with(pattern) {
         return s[..s.len() - pattern.len()].to_string();
     }
     s.to_string()
@@ -1183,7 +1271,7 @@ fn remove_suffix(s: &str, pattern: &str, longest: bool) -> String {
 /// - `~` or `~/path` → $HOME or $HOME/path
 /// - `~+` or `~+/path` → $PWD or $PWD/path
 /// - `~-` or `~-/path` → $OLDPWD or $OLDPWD/path
-fn expand_tilde(s: &str, state: &ShellState) -> String {
+pub fn expand_tilde(s: &str, state: &ShellState) -> String {
     if !s.starts_with('~') {
         return s.to_string();
     }
@@ -1613,5 +1701,101 @@ mod tests {
 
         let result = expand_literal("$((n * 2))", &state);
         assert_eq!(result, "10");
+    }
+
+    // ========================================================================
+    // Parameter expansion tests
+    // ========================================================================
+
+    #[test]
+    fn test_param_default_colon_minus() {
+        let mut state = make_state();
+        // ${var:-default} - use default if unset or empty
+        assert_eq!(expand_variable("UNSET:-fallback", &state), "fallback");
+
+        state.set_var("EMPTY".to_string(), "".to_string());
+        assert_eq!(expand_variable("EMPTY:-fallback", &state), "fallback");
+
+        state.set_var("SET".to_string(), "value".to_string());
+        assert_eq!(expand_variable("SET:-fallback", &state), "value");
+    }
+
+    #[test]
+    fn test_param_default_minus() {
+        let mut state = make_state();
+        // ${var-default} - use default only if unset (empty is OK)
+        assert_eq!(expand_variable("UNSET-fallback", &state), "fallback");
+
+        state.set_var("EMPTY".to_string(), "".to_string());
+        assert_eq!(expand_variable("EMPTY-fallback", &state), ""); // Empty is set
+
+        state.set_var("SET".to_string(), "value".to_string());
+        assert_eq!(expand_variable("SET-fallback", &state), "value");
+    }
+
+    #[test]
+    fn test_param_alternate_colon_plus() {
+        let mut state = make_state();
+        // ${var:+alternate} - use alternate if set and non-empty
+        assert_eq!(expand_variable("UNSET:+alt", &state), "");
+
+        state.set_var("EMPTY".to_string(), "".to_string());
+        assert_eq!(expand_variable("EMPTY:+alt", &state), "");
+
+        state.set_var("SET".to_string(), "value".to_string());
+        assert_eq!(expand_variable("SET:+alt", &state), "alt");
+    }
+
+    #[test]
+    fn test_param_alternate_plus() {
+        let mut state = make_state();
+        // ${var+alternate} - use alternate if set (even if empty)
+        assert_eq!(expand_variable("UNSET+alt", &state), "");
+
+        state.set_var("EMPTY".to_string(), "".to_string());
+        assert_eq!(expand_variable("EMPTY+alt", &state), "alt"); // Empty counts as set
+
+        state.set_var("SET".to_string(), "value".to_string());
+        assert_eq!(expand_variable("SET+alt", &state), "alt");
+    }
+
+    #[test]
+    fn test_param_length() {
+        let mut state = make_state();
+        // ${#var} - string length
+        assert_eq!(expand_variable("#UNSET", &state), "0");
+
+        state.set_var("EMPTY".to_string(), "".to_string());
+        assert_eq!(expand_variable("#EMPTY", &state), "0");
+
+        state.set_var("HELLO".to_string(), "hello".to_string());
+        assert_eq!(expand_variable("#HELLO", &state), "5");
+
+        state.set_var("LONG".to_string(), "hello world".to_string());
+        assert_eq!(expand_variable("#LONG", &state), "11");
+    }
+
+    #[test]
+    fn test_param_remove_prefix() {
+        let mut state = make_state();
+        state.set_var("PATH".to_string(), "/home/user/file.txt".to_string());
+
+        // ${var#pattern} - remove shortest prefix
+        assert_eq!(expand_variable("PATH#*/", &state), "home/user/file.txt");
+
+        // ${var##pattern} - remove longest prefix
+        assert_eq!(expand_variable("PATH##*/", &state), "file.txt");
+    }
+
+    #[test]
+    fn test_param_remove_suffix() {
+        let mut state = make_state();
+        state.set_var("FILE".to_string(), "document.tar.gz".to_string());
+
+        // ${var%pattern} - remove shortest suffix
+        assert_eq!(expand_variable("FILE%.*", &state), "document.tar");
+
+        // ${var%%pattern} - remove longest suffix
+        assert_eq!(expand_variable("FILE%%.*", &state), "document");
     }
 }
