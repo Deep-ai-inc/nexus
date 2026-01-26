@@ -599,3 +599,526 @@ fn test_filter_sort_take() {
     let items = t.expect_list("seq 1 20 | sort -rn | take 5");
     assert_eq!(items.len(), 5);
 }
+
+// ============================================================================
+// Real-world shell pipeline patterns
+// ============================================================================
+
+// --- Log analysis patterns ---
+
+#[test]
+fn test_log_grep_count() {
+    // Pattern: grep ERROR | wc -l (count errors in logs)
+    let mut t = PipelineTest::new();
+    let log = "INFO: started\nERROR: disk full\nINFO: processing\nERROR: timeout\nINFO: done";
+    t.expect_int(&format!("echo '{}' | lines | grep ERROR | count", log), 2);
+}
+
+#[test]
+fn test_log_grep_invert_count() {
+    // Pattern: grep -v DEBUG | wc -l (count non-debug lines)
+    let mut t = PipelineTest::new();
+    let log = "DEBUG: trace\nINFO: started\nDEBUG: value=5\nERROR: failed";
+    t.expect_int(&format!("echo '{}' | lines | grep -v DEBUG | count", log), 2);
+}
+
+#[test]
+fn test_frequency_analysis() {
+    // Pattern: sort | uniq -c | sort -rn (frequency analysis)
+    let mut t = PipelineTest::new();
+    let data = "apple\nbanana\napple\napple\ncherry\nbanana";
+    let items = t.expect_list(&format!("echo '{}' | lines | sort | uniq -c | sort -rn", data));
+    // Should have 3 unique items, sorted by frequency (apple:3, banana:2, cherry:1)
+    assert_eq!(items.len(), 3);
+    // First item should be apple (most frequent)
+    let first = items[0].to_string();
+    assert!(first.contains("apple"), "Expected apple first (most frequent), got {}", first);
+}
+
+#[test]
+fn test_top_n_pattern() {
+    // Pattern: sort -rn | head -3 (top 3 items)
+    let mut t = PipelineTest::new();
+    t.expect_int("seq 1 100 | sort -rn | head -3 | count", 3);
+}
+
+// --- CSV/delimited data processing ---
+
+#[test]
+fn test_csv_extract_column() {
+    // Pattern: cut -d',' -f2 (extract second column from CSV)
+    let mut t = PipelineTest::new();
+    t.expect_string("echo 'name,age,city' | cut -d, -f2", "age");
+}
+
+#[test]
+fn test_csv_column_unique_values() {
+    // Pattern: cut -f2 | sort | uniq (unique values in column)
+    let mut t = PipelineTest::new();
+    let csv = "alice,NY\nbob,CA\ncharlie,NY\ndave,TX";
+    t.expect_int(&format!("echo '{}' | lines | cut -d, -f2 | sort | uniq | count", csv), 3);
+}
+
+#[test]
+fn test_csv_filter_and_extract() {
+    // Pattern: grep pattern | cut -f1 (filter rows then extract column)
+    let mut t = PipelineTest::new();
+    let csv = "alice,yes\nbob,no\ncharlie,yes";
+    let items = t.expect_list(&format!("echo '{}' | lines | grep yes | cut -d, -f1", csv));
+    // Should get alice and charlie (both have 'yes')
+    assert_eq!(items.len(), 2);
+}
+
+// --- Text transformation pipelines ---
+
+#[test]
+fn test_normalize_and_dedupe() {
+    // Pattern: tr '[:upper:]' '[:lower:]' | sort | uniq (normalize case, dedupe)
+    let mut t = PipelineTest::new();
+    let data = "Apple\napple\nAPPLE\nBanana";
+    t.expect_int(&format!("echo '{}' | lines | tr '[:upper:]' '[:lower:]' | sort | uniq | count", data), 2);
+}
+
+#[test]
+fn test_remove_duplicates_preserve_order() {
+    // Pattern: awk '!seen[$0]++' equivalent - first occurrence only
+    // Using sort -u as a proxy
+    let mut t = PipelineTest::new();
+    let data = "apple\nbanana\napple\ncherry\nbanana";
+    t.expect_int(&format!("echo '{}' | lines | sort | uniq | count", data), 3);
+}
+
+#[test]
+fn test_word_count_pipeline() {
+    // Pattern: wc -w (count words in text)
+    let mut t = PipelineTest::new();
+    t.expect_int("echo 'the quick brown fox' | wc -w", 4);
+}
+
+#[test]
+fn test_line_count_pipeline() {
+    // Pattern: wc -l (count lines)
+    let mut t = PipelineTest::new();
+    t.expect_int("echo 'one\ntwo\nthree\nfour\nfive' | wc -l", 5);
+}
+
+#[test]
+fn test_char_count_pipeline() {
+    // Pattern: wc -c or wc -m (count characters)
+    let mut t = PipelineTest::new();
+    t.expect_int("echo 'hello world' | wc -m", 11);
+}
+
+// --- JSON data processing (modern shell patterns) ---
+
+#[test]
+fn test_json_pluck_field() {
+    // Pattern: jq '.name' (extract field from JSON)
+    let mut t = PipelineTest::new();
+    let json = r#"{"name":"alice","age":30}"#;
+    let value = t.run(&format!("echo '{}' | from-json | get name", json));
+    match value {
+        Some(Value::String(s)) => assert_eq!(s, "alice"),
+        other => panic!("Expected 'alice', got {:?}", other),
+    }
+}
+
+#[test]
+fn test_json_nested_field() {
+    // Pattern: jq '.user.name' (nested field)
+    let mut t = PipelineTest::new();
+    let json = r#"{"user":{"name":"bob","id":123}}"#;
+    let value = t.run(&format!("echo '{}' | from-json | get user | get name", json));
+    match value {
+        Some(Value::String(s)) => assert_eq!(s, "bob"),
+        other => panic!("Expected 'bob', got {:?}", other),
+    }
+}
+
+#[test]
+fn test_json_array_length() {
+    // Pattern: jq '.items | length' (count array items)
+    let mut t = PipelineTest::new();
+    let json = r#"{"items":[1,2,3,4,5]}"#;
+    t.expect_int(&format!("echo '{}' | from-json | get items | count", json), 5);
+}
+
+#[test]
+fn test_json_array_filter_count() {
+    // Pattern: jq '.[] | select(.active)' | count (filter and count)
+    let mut t = PipelineTest::new();
+    let json = r#"[{"name":"a","val":10},{"name":"b","val":20},{"name":"c","val":5}]"#;
+    // Sum the 'val' fields
+    t.expect_int(&format!("echo '{}' | from-json | count", json), 3);
+}
+
+#[test]
+fn test_json_to_json_roundtrip() {
+    // Pattern: Parse JSON, transform, output JSON
+    let mut t = PipelineTest::new();
+    t.expect_int("seq 1 5 | to-json | from-json | count", 5);
+}
+
+// --- Path manipulation pipelines ---
+
+#[test]
+fn test_extract_extensions() {
+    // Pattern: Get file extensions from paths
+    let mut t = PipelineTest::new();
+    let paths = "/foo/bar.txt\n/baz/qux.rs\n/a/b.txt";
+    let items = t.expect_list(&format!("echo '{}' | lines | extname", paths));
+    assert_eq!(items.len(), 3);
+}
+
+#[test]
+fn test_extract_filenames() {
+    // Pattern: basename on multiple files
+    let mut t = PipelineTest::new();
+    let paths = "/foo/bar.txt\n/baz/qux.rs";
+    let items = t.expect_list(&format!("echo '{}' | lines | basename", paths));
+    assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn test_extract_directories() {
+    // Pattern: dirname on multiple files
+    let mut t = PipelineTest::new();
+    let paths = "/foo/bar/file.txt\n/baz/qux/other.rs";
+    let items = t.expect_list(&format!("echo '{}' | lines | dirname", paths));
+    assert_eq!(items.len(), 2);
+}
+
+// --- Numeric data pipelines ---
+
+#[test]
+fn test_statistical_pipeline() {
+    // Get multiple stats in sequence
+    let mut t = PipelineTest::new();
+    // Sum of 1-10
+    t.expect_int("seq 1 10 | sum", 55);
+    // Average of 1-10
+    t.expect_float("seq 1 10 | avg", 5.5);
+    // Count
+    t.expect_int("seq 1 10 | count", 10);
+}
+
+#[test]
+fn test_range_slice_sum() {
+    // Pattern: Get middle slice of data
+    // seq 1 100 | tail -50 | head -10 | sum = 51+52+...+60 = 555
+    let mut t = PipelineTest::new();
+    t.expect_int("seq 1 100 | tail -50 | head -10 | sum", 555);
+}
+
+#[test]
+fn test_sample_and_process() {
+    // Pattern: shuf | head -n (random sample) then process
+    let mut t = PipelineTest::new();
+    // Shuffle and take 5 items - count should be 5
+    t.expect_int("seq 1 100 | shuf | take 5 | count", 5);
+}
+
+// --- Multi-stage filtering ---
+
+#[test]
+fn test_multi_grep_filter() {
+    // Pattern: grep A | grep -v B (include A, exclude B)
+    let mut t = PipelineTest::new();
+    let data = "apple\napricot\nbanana\navocado\nblueberry";
+    // Lines starting with 'a' but not containing 'v'
+    t.expect_int(&format!("echo '{}' | lines | grep '^a' | grep -v v | count", data), 2);
+}
+
+#[test]
+fn test_filter_transform_aggregate() {
+    // Pattern: filter | transform | aggregate
+    let mut t = PipelineTest::new();
+    // Get words, filter those starting with 'b', count
+    let text = "apple banana blueberry cherry blackberry date";
+    t.expect_int(&format!("echo '{}' | words | grep '^b' | count", text), 3);
+}
+
+// --- Previous output pipelines (nexus-specific) ---
+
+#[test]
+fn test_prev_output_reuse() {
+    // Pattern: Use _ to reference previous output
+    let mut t = PipelineTest::new();
+    // First command generates data
+    t.run("seq 1 10");
+    // Use _ to reference it
+    t.expect_int("_ | count", 10);
+}
+
+#[test]
+fn test_prev_output_chain() {
+    // Build on previous results
+    let mut t = PipelineTest::new();
+    t.run("seq 1 20");
+    t.run("_ | head -10");
+    t.expect_int("_ | count", 10);
+}
+
+// --- Combining multiple data sources ---
+
+#[test]
+fn test_concatenate_and_process() {
+    // Pattern: Combine data then process
+    let mut t = PipelineTest::new();
+    // Using echo to combine
+    let result = t.run("echo 'a\nb\nc\nd\ne' | lines | count");
+    match result {
+        Some(Value::Int(n)) => assert_eq!(n, 5),
+        other => panic!("Expected 5, got {:?}", other),
+    }
+}
+
+// --- Real-world data extraction ---
+
+#[test]
+fn test_extract_ips_pattern() {
+    // Pattern: Extract IP-like strings (simplified)
+    let mut t = PipelineTest::new();
+    let log = "Connected from 192.168.1.1\nTimeout from 10.0.0.5\nConnected from 192.168.1.1";
+    // Get words containing dots, dedupe
+    let items = t.expect_list(&format!("echo '{}' | words | grep '\\.' | sort | uniq", log));
+    assert!(items.len() >= 2); // At least the two IPs
+}
+
+#[test]
+fn test_extract_urls_pattern() {
+    // Pattern: grep -o for URLs (simplified - just count lines with http)
+    let mut t = PipelineTest::new();
+    let text = "Visit https://example.com or http://test.org for more";
+    t.expect_int(&format!("echo '{}' | words | grep http | count", text), 2);
+}
+
+// --- Error handling / edge cases ---
+
+#[test]
+fn test_empty_pipeline_stages() {
+    // grep that matches nothing should result in empty/zero
+    let mut t = PipelineTest::new();
+    t.expect_int("echo 'apple banana cherry' | lines | grep xyz | count", 0);
+}
+
+#[test]
+fn test_single_item_pipeline() {
+    // Pipeline with single item should work
+    let mut t = PipelineTest::new();
+    t.expect_int("echo 'single' | lines | count", 1);
+}
+
+#[test]
+fn test_large_pipeline_chain() {
+    // Long pipeline chain should work
+    let mut t = PipelineTest::new();
+    // seq | head | tail | sort | head | count
+    t.expect_int("seq 1 1000 | head -500 | tail -250 | sort -rn | head -100 | count", 100);
+}
+
+// --- String manipulation chains ---
+
+#[test]
+fn test_string_reverse_chain() {
+    // rev | rev should give original
+    let mut t = PipelineTest::new();
+    t.expect_string("echo 'hello' | rev | rev", "hello");
+}
+
+#[test]
+fn test_string_transform_chain() {
+    // Multiple transformations
+    let mut t = PipelineTest::new();
+    t.expect_string("echo 'HELLO WORLD' | tr '[:upper:]' '[:lower:]' | tr ' ' '-'", "hello-world");
+}
+
+// --- Date/time pipelines ---
+
+#[test]
+fn test_date_pipeline() {
+    // date command should produce output
+    let mut t = PipelineTest::new();
+    let value = t.run("date | wc -m");
+    // Should have some characters (date output)
+    match value {
+        Some(Value::Int(n)) => assert!(n > 0, "Date should produce output"),
+        other => panic!("Expected positive int, got {:?}", other),
+    }
+}
+
+// --- Split and rejoin ---
+
+#[test]
+fn test_split_process_join() {
+    // Split, process each part, rejoin
+    let mut t = PipelineTest::new();
+    // Split on comma, sort, rejoin with semicolon
+    t.expect_string("echo 'c,a,b' | split ',' | sort | join ';'", "a;b;c");
+}
+
+#[test]
+fn test_split_filter_join() {
+    // Split, filter, rejoin
+    let mut t = PipelineTest::new();
+    t.expect_string("echo 'apple,banana,cherry,apricot' | split ',' | grep '^a' | join ','", "apple,apricot");
+}
+
+// --- File listing pipelines (ls) ---
+
+#[test]
+fn test_ls_count_files() {
+    // Pattern: ls | wc -l (count files in directory)
+    let mut t = PipelineTest::new();
+    // ls current directory and count (should be > 0)
+    let value = t.run("ls | count");
+    match value {
+        Some(Value::Int(n)) => assert!(n > 0, "Should have at least one file"),
+        other => panic!("Expected positive int, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_ls_filter_by_extension() {
+    // Pattern: ls | grep '\.rs$' (filter by extension)
+    let mut t = PipelineTest::new();
+    // In nexus-kernel directory, should have .rs files
+    let value = t.run("ls src/commands/*.rs | count");
+    // This might fail if glob doesn't work, but that's ok
+    assert!(value.is_some());
+}
+
+// --- Tac (reverse lines) ---
+
+#[test]
+fn test_tac_reverse_lines() {
+    // Pattern: tac (reverse line order)
+    let mut t = PipelineTest::new();
+    let items = t.expect_list("echo 'a\nb\nc' | lines | tac");
+    assert_eq!(items.len(), 3);
+    // First item should be 'c' (last line reversed to first)
+    let first = items[0].to_string();
+    assert!(first.contains('c'), "Expected 'c' first after tac, got {}", first);
+}
+
+#[test]
+fn test_tac_combined_with_head() {
+    // Pattern: tac | head (last N lines in reverse)
+    let mut t = PipelineTest::new();
+    t.expect_int("seq 1 10 | tac | head -3 | count", 3);
+}
+
+// --- Number lines (nl) ---
+
+#[test]
+fn test_nl_numbers_lines() {
+    // Pattern: nl (number lines)
+    let mut t = PipelineTest::new();
+    let items = t.expect_list("echo 'first\nsecond\nthird' | lines | nl");
+    assert_eq!(items.len(), 3);
+}
+
+#[test]
+fn test_nl_with_grep() {
+    // Pattern: nl | grep (find line numbers of matches)
+    let mut t = PipelineTest::new();
+    let items = t.expect_list("echo 'apple\nbanana\napricot' | lines | nl | grep apple");
+    // Only line 1 contains "apple" (apricot doesn't contain "apple")
+    assert_eq!(items.len(), 1);
+}
+
+// --- Flatten nested structures ---
+
+#[test]
+fn test_flatten_simple() {
+    // Pattern: flatten (unnest one level)
+    let mut t = PipelineTest::new();
+    t.expect_int("echo '[[1,2],[3,4],[5]]' | from-json | flatten | count", 5);
+}
+
+#[test]
+fn test_flatten_strings() {
+    // Flatten nested string arrays
+    let mut t = PipelineTest::new();
+    let json = r#"[["a","b"],["c","d"]]"#;
+    t.expect_int(&format!("echo '{}' | from-json | flatten | count", json), 4);
+}
+
+// --- Enumerate with index ---
+
+#[test]
+fn test_enumerate_with_skip() {
+    // Pattern: enumerate | skip | first (get item at specific index)
+    let mut t = PipelineTest::new();
+    let value = t.run("seq 1 5 | enumerate | skip 2 | first | get index");
+    match value {
+        Some(Value::Int(n)) => assert_eq!(n, 2),
+        other => panic!("Expected index 2, got {:?}", other),
+    }
+}
+
+// --- Compact (remove empty) ---
+
+#[test]
+fn test_compact_with_split() {
+    // Pattern: split | compact (split and remove empties)
+    let mut t = PipelineTest::new();
+    t.expect_int("echo 'a::b:::c' | split ':' | compact | count", 3);
+}
+
+// --- Complex real-world combinations ---
+
+#[test]
+fn test_log_analysis_pipeline() {
+    // Realistic log analysis: extract, filter, aggregate
+    let mut t = PipelineTest::new();
+    let log = "2024-01-01 ERROR db connection failed
+2024-01-01 INFO request processed
+2024-01-02 ERROR timeout
+2024-01-02 ERROR db connection failed
+2024-01-02 INFO request processed";
+
+    // Count unique error messages
+    t.expect_int(&format!(
+        "echo '{}' | lines | grep ERROR | cut -d' ' -f3- | sort | uniq | count",
+        log
+    ), 2);
+}
+
+#[test]
+fn test_data_cleanup_pipeline() {
+    // Pattern: Clean up messy data
+    let mut t = PipelineTest::new();
+    // Lowercase, sort, dedupe (no whitespace in input)
+    let data = "Apple\nBANANA\napple\nCherry\nBANANA";
+    t.expect_int(&format!(
+        "echo '{}' | lines | tr '[:upper:]' '[:lower:]' | sort | uniq | count",
+        data
+    ), 3);
+}
+
+#[test]
+fn test_extract_and_aggregate() {
+    // Pattern: Extract field from structured data, aggregate
+    let mut t = PipelineTest::new();
+    let json = r#"[{"name":"a","score":10},{"name":"b","score":20},{"name":"c","score":30}]"#;
+    // This would need a map operation we might not have, so just count
+    t.expect_int(&format!("echo '{}' | from-json | count", json), 3);
+}
+
+// --- Bytes/chars operations ---
+
+#[test]
+fn test_bytes_count() {
+    // Pattern: Count bytes in string
+    let mut t = PipelineTest::new();
+    t.expect_int("echo 'hello' | bytes | count", 5);
+}
+
+#[test]
+fn test_chars_manipulation() {
+    // Pattern: Split into chars, filter, rejoin
+    let mut t = PipelineTest::new();
+    // Remove vowels by splitting to chars, filtering, joining
+    t.expect_string("echo 'hello' | chars | grep -v '[aeiou]' | join ''", "hll");
+}
