@@ -27,6 +27,7 @@ pub fn is_builtin(name: &str) -> bool {
             | ":"
             | "test"
             | "["
+            | "[["
             | "alias"
             | "unalias"
             | "source"
@@ -62,6 +63,7 @@ pub fn try_builtin(
         "set" => Ok(Some(builtin_set(args, state)?)),
         ":" => Ok(Some(0)),
         "test" | "[" => Ok(Some(builtin_test(args)?)),
+        "[[" => Ok(Some(builtin_extended_test(args)?)),
         "source" | "." => Ok(Some(builtin_source(args, state, events, commands)?)),
         "eval" => Ok(Some(builtin_eval(args, state, events, commands)?)),
         "readonly" => Ok(Some(builtin_readonly(args, state)?)),
@@ -389,6 +391,300 @@ fn builtin_test(args: &[String]) -> anyhow::Result<i32> {
     }
 
     Ok(1)
+}
+
+/// Extended test builtin [[.
+/// Supports pattern matching, regex, and logical operators inside brackets.
+fn builtin_extended_test(args: &[String]) -> anyhow::Result<i32> {
+    // Remove trailing ]] if present
+    let args: Vec<&str> = args
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|&s| s != "]]")
+        .collect();
+
+    if args.is_empty() {
+        return Ok(1);
+    }
+
+    // Handle logical operators && and ||
+    // Find the first && or || not inside parentheses
+    let mut paren_depth = 0;
+    for (i, &arg) in args.iter().enumerate() {
+        if arg == "(" {
+            paren_depth += 1;
+        } else if arg == ")" {
+            paren_depth -= 1;
+        } else if paren_depth == 0 {
+            if arg == "&&" {
+                let left_result = builtin_extended_test(
+                    args[..i].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice()
+                )?;
+                if left_result != 0 {
+                    return Ok(1); // Short-circuit
+                }
+                return builtin_extended_test(
+                    args[i+1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice()
+                );
+            }
+            if arg == "||" {
+                let left_result = builtin_extended_test(
+                    args[..i].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice()
+                )?;
+                if left_result == 0 {
+                    return Ok(0); // Short-circuit
+                }
+                return builtin_extended_test(
+                    args[i+1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice()
+                );
+            }
+        }
+    }
+
+    // Handle parentheses for grouping
+    if args.first() == Some(&"(") && args.last() == Some(&")") {
+        return builtin_extended_test(
+            args[1..args.len()-1].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice()
+        );
+    }
+
+    // Single argument: true if non-empty
+    if args.len() == 1 {
+        return Ok(if args[0].is_empty() { 1 } else { 0 });
+    }
+
+    // Two arguments: unary operators or negation
+    if args.len() == 2 {
+        let op = args[0];
+        let val = args[1];
+
+        return Ok(match op {
+            "-n" => if !val.is_empty() { 0 } else { 1 },
+            "-z" => if val.is_empty() { 0 } else { 1 },
+            "-e" | "-a" => if PathBuf::from(val).exists() { 0 } else { 1 },
+            "-f" => if PathBuf::from(val).is_file() { 0 } else { 1 },
+            "-d" => if PathBuf::from(val).is_dir() { 0 } else { 1 },
+            "-r" => if PathBuf::from(val).exists() { 0 } else { 1 },
+            "-w" => if PathBuf::from(val).exists() { 0 } else { 1 },
+            "-x" => if PathBuf::from(val).exists() { 0 } else { 1 },
+            "-L" | "-h" => if PathBuf::from(val).is_symlink() { 0 } else { 1 },
+            "-s" => {
+                if let Ok(meta) = std::fs::metadata(val) {
+                    if meta.len() > 0 { 0 } else { 1 }
+                } else {
+                    1
+                }
+            }
+            "-v" => {
+                // -v VAR: true if variable is set
+                // Note: we don't have access to state here, simplified to always false
+                1
+            }
+            "!" => builtin_extended_test(args[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())
+                .map(|code| if code == 0 { 1 } else { 0 })?,
+            _ => 1,
+        });
+    }
+
+    // Three arguments: binary operators
+    if args.len() == 3 {
+        let left = args[0];
+        let op = args[1];
+        let right = args[2];
+
+        return Ok(match op {
+            // String comparison
+            "=" | "==" => {
+                // Pattern matching in [[: right side can be a glob pattern
+                if extended_pattern_match(left, right) { 0 } else { 1 }
+            }
+            "!=" => {
+                if !extended_pattern_match(left, right) { 0 } else { 1 }
+            }
+            // Regex matching
+            "=~" => {
+                if let Ok(re) = regex::Regex::new(right) {
+                    if re.is_match(left) { 0 } else { 1 }
+                } else {
+                    1 // Invalid regex
+                }
+            }
+            // String ordering
+            "<" => if left < right { 0 } else { 1 },
+            ">" => if left > right { 0 } else { 1 },
+            // Numeric comparison
+            "-eq" => {
+                let l: i64 = left.parse().unwrap_or(0);
+                let r: i64 = right.parse().unwrap_or(0);
+                if l == r { 0 } else { 1 }
+            }
+            "-ne" => {
+                let l: i64 = left.parse().unwrap_or(0);
+                let r: i64 = right.parse().unwrap_or(0);
+                if l != r { 0 } else { 1 }
+            }
+            "-lt" => {
+                let l: i64 = left.parse().unwrap_or(0);
+                let r: i64 = right.parse().unwrap_or(0);
+                if l < r { 0 } else { 1 }
+            }
+            "-le" => {
+                let l: i64 = left.parse().unwrap_or(0);
+                let r: i64 = right.parse().unwrap_or(0);
+                if l <= r { 0 } else { 1 }
+            }
+            "-gt" => {
+                let l: i64 = left.parse().unwrap_or(0);
+                let r: i64 = right.parse().unwrap_or(0);
+                if l > r { 0 } else { 1 }
+            }
+            "-ge" => {
+                let l: i64 = left.parse().unwrap_or(0);
+                let r: i64 = right.parse().unwrap_or(0);
+                if l >= r { 0 } else { 1 }
+            }
+            "-nt" => {
+                let left_time = std::fs::metadata(left).and_then(|m| m.modified()).ok();
+                let right_time = std::fs::metadata(right).and_then(|m| m.modified()).ok();
+                match (left_time, right_time) {
+                    (Some(l), Some(r)) => if l > r { 0 } else { 1 },
+                    _ => 1,
+                }
+            }
+            "-ot" => {
+                let left_time = std::fs::metadata(left).and_then(|m| m.modified()).ok();
+                let right_time = std::fs::metadata(right).and_then(|m| m.modified()).ok();
+                match (left_time, right_time) {
+                    (Some(l), Some(r)) => if l < r { 0 } else { 1 },
+                    _ => 1,
+                }
+            }
+            _ => 1,
+        });
+    }
+
+    // Handle negation with more than 2 args
+    if !args.is_empty() && args[0] == "!" {
+        return builtin_extended_test(
+            args[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice()
+        ).map(|code| if code == 0 { 1 } else { 0 });
+    }
+
+    Ok(1)
+}
+
+/// Pattern matching for [[ == ]] operator.
+/// Supports shell glob patterns: *, ?, [...]
+fn extended_pattern_match(s: &str, pattern: &str) -> bool {
+    // Check for glob chars
+    if !pattern.chars().any(|c| c == '*' || c == '?' || c == '[') {
+        return s == pattern;
+    }
+
+    // Simple glob matching
+    glob_match_str(s, pattern)
+}
+
+/// Simple glob matching for pattern strings.
+fn glob_match_str(s: &str, pattern: &str) -> bool {
+    let s_chars: Vec<char> = s.chars().collect();
+    let p_chars: Vec<char> = pattern.chars().collect();
+    glob_match_impl(&s_chars, &p_chars, 0, 0)
+}
+
+fn glob_match_impl(s: &[char], p: &[char], mut si: usize, mut pi: usize) -> bool {
+    while pi < p.len() || si < s.len() {
+        if pi < p.len() {
+            match p[pi] {
+                '*' => {
+                    // Skip consecutive stars
+                    while pi < p.len() && p[pi] == '*' {
+                        pi += 1;
+                    }
+                    // * at end matches everything
+                    if pi == p.len() {
+                        return true;
+                    }
+                    // Try matching * against 0 or more chars
+                    while si <= s.len() {
+                        if glob_match_impl(s, p, si, pi) {
+                            return true;
+                        }
+                        si += 1;
+                    }
+                    return false;
+                }
+                '?' => {
+                    if si >= s.len() {
+                        return false;
+                    }
+                    si += 1;
+                    pi += 1;
+                }
+                '[' => {
+                    if si >= s.len() {
+                        return false;
+                    }
+                    let (matched, consumed) = match_char_class(&p[pi..], s[si]);
+                    if !matched {
+                        return false;
+                    }
+                    si += 1;
+                    pi += consumed;
+                }
+                c => {
+                    if si >= s.len() || s[si] != c {
+                        return false;
+                    }
+                    si += 1;
+                    pi += 1;
+                }
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a character class like [abc] or [a-z] or [!abc].
+fn match_char_class(pattern: &[char], c: char) -> (bool, usize) {
+    if pattern.is_empty() || pattern[0] != '[' {
+        return (false, 0);
+    }
+
+    let mut i = 1;
+    let negated = if i < pattern.len() && (pattern[i] == '!' || pattern[i] == '^') {
+        i += 1;
+        true
+    } else {
+        false
+    };
+
+    let mut matched = false;
+
+    while i < pattern.len() && pattern[i] != ']' {
+        if i + 2 < pattern.len() && pattern[i + 1] == '-' && pattern[i + 2] != ']' {
+            let start = pattern[i];
+            let end = pattern[i + 2];
+            if c >= start && c <= end {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if pattern[i] == c {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+
+    if i < pattern.len() && pattern[i] == ']' {
+        i += 1;
+    }
+
+    let result = if negated { !matched } else { matched };
+    (result, i)
 }
 
 fn builtin_source(

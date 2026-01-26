@@ -123,6 +123,11 @@ fn build_command(node: &Node, source: &str) -> Result<Option<Command>, ShellErro
             let case_stmt = build_case_statement(node, source)?;
             Ok(Some(Command::Case(case_stmt)))
         }
+        "test_command" => {
+            // [ expr ] or [[ expr ]] - convert to SimpleCommand
+            let simple = build_test_command(node, source)?;
+            Ok(Some(Command::Simple(simple)))
+        }
         "comment" | "\n" => Ok(None),
         _ => {
             // Unknown node type - log and skip
@@ -289,7 +294,7 @@ fn build_redirect(node: &Node, source: &str) -> Result<Option<Redirect>, ShellEr
             "<" => op = Some(RedirectOp::Read),
             ">&" => op = Some(RedirectOp::DupWrite),
             "<&" => op = Some(RedirectOp::DupRead),
-            "word" | "string" => {
+            "word" | "string" | "number" => {
                 target = Some(node_text(&child, source));
             }
             _ => {}
@@ -322,14 +327,14 @@ fn build_assignment(node: &Node, source: &str) -> Result<Assignment, ShellError>
 }
 
 fn build_if_statement(node: &Node, source: &str) -> Result<IfStatement, ShellError> {
-    // Simplified if statement parsing
     let mut condition = Vec::new();
     let mut then_branch = Vec::new();
-    let mut else_branch = Vec::new();
+    let mut elif_clauses: Vec<Node> = Vec::new();
+    let mut final_else: Option<Vec<Command>> = None;
     let mut in_condition = false;
     let mut in_then = false;
-    let mut in_else = false;
 
+    // First pass: collect all parts
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -338,14 +343,13 @@ fn build_if_statement(node: &Node, source: &str) -> Result<IfStatement, ShellErr
                 in_condition = false;
                 in_then = true;
             }
-            "else" => {
+            "elif_clause" => {
+                elif_clauses.push(child);
                 in_then = false;
-                in_else = true;
             }
-            "elif" => {
-                // Treat elif as nested if in else
+            "else_clause" => {
+                final_else = Some(build_else_clause(&child, source)?);
                 in_then = false;
-                in_else = true;
             }
             "fi" => break,
             _ => {
@@ -354,8 +358,52 @@ fn build_if_statement(node: &Node, source: &str) -> Result<IfStatement, ShellErr
                         condition.push(cmd);
                     } else if in_then {
                         then_branch.push(cmd);
-                    } else if in_else {
-                        else_branch.push(cmd);
+                    }
+                }
+            }
+        }
+    }
+
+    // Build the else branch by chaining elif clauses
+    // Work backwards: start with final_else, then wrap each elif around it
+    let mut else_branch = final_else;
+
+    for elif_node in elif_clauses.into_iter().rev() {
+        let elif_if = build_elif_clause_with_else(&elif_node, source, else_branch)?;
+        else_branch = Some(vec![Command::If(elif_if)]);
+    }
+
+    Ok(IfStatement {
+        condition,
+        then_branch,
+        else_branch,
+    })
+}
+
+fn build_elif_clause_with_else(
+    node: &Node,
+    source: &str,
+    else_branch: Option<Vec<Command>>,
+) -> Result<IfStatement, ShellError> {
+    let mut condition = Vec::new();
+    let mut then_branch = Vec::new();
+    let mut in_condition = false;
+    let mut in_then = false;
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "elif" => in_condition = true,
+            "then" => {
+                in_condition = false;
+                in_then = true;
+            }
+            _ => {
+                if let Some(cmd) = build_command(&child, source)? {
+                    if in_condition {
+                        condition.push(cmd);
+                    } else if in_then {
+                        then_branch.push(cmd);
                     }
                 }
             }
@@ -365,35 +413,126 @@ fn build_if_statement(node: &Node, source: &str) -> Result<IfStatement, ShellErr
     Ok(IfStatement {
         condition,
         then_branch,
-        else_branch: if else_branch.is_empty() {
-            None
-        } else {
-            Some(else_branch)
-        },
+        else_branch,
     })
+}
+
+fn build_else_clause(node: &Node, source: &str) -> Result<Vec<Command>, ShellError> {
+    let mut commands = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "else" => continue,
+            _ => {
+                if let Some(cmd) = build_command(&child, source)? {
+                    commands.push(cmd);
+                }
+            }
+        }
+    }
+
+    Ok(commands)
+}
+
+fn build_test_command(node: &Node, source: &str) -> Result<SimpleCommand, ShellError> {
+    // Convert [ expr ] or [[ expr ]] to a SimpleCommand
+    // The command name is "[" and args are the expression tokens plus "]"
+    let mut args = Vec::new();
+    let mut name = "[".to_string();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "[" => name = "[".to_string(),
+            "[[" => name = "[[".to_string(),
+            "]" | "]]" => {
+                // Closing bracket is added as final argument
+                args.push(Word::Literal(child.kind().to_string()));
+            }
+            "binary_expression" | "unary_expression" | "string" | "word" | "number" => {
+                // Extract all parts of the expression
+                extract_test_expression(&child, source, &mut args);
+            }
+            "simple_expansion" | "expansion" => {
+                args.push(Word::Variable(extract_variable_name(&child, source)));
+            }
+            "test_operator" => {
+                args.push(Word::Literal(node_text(&child, source)));
+            }
+            _ => {
+                // For any other child, try to extract its text
+                let text = node_text(&child, source).trim().to_string();
+                if !text.is_empty() && text != "[" && text != "]" {
+                    args.push(Word::Literal(text));
+                }
+            }
+        }
+    }
+
+    Ok(SimpleCommand {
+        name,
+        args,
+        redirects: Vec::new(),
+        env_assignments: Vec::new(),
+    })
+}
+
+fn extract_test_expression(node: &Node, source: &str, args: &mut Vec<Word>) {
+    // Recursively extract parts of test expressions
+    match node.kind() {
+        "binary_expression" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_test_expression(&child, source, args);
+            }
+        }
+        "unary_expression" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_test_expression(&child, source, args);
+            }
+        }
+        "simple_expansion" | "expansion" => {
+            args.push(Word::Variable(extract_variable_name(node, source)));
+        }
+        "test_operator" | "=" | "!=" | "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge"
+        | "-z" | "-n" | "-f" | "-d" | "-e" | "-r" | "-w" | "-x" | "-s" => {
+            args.push(Word::Literal(node_text(node, source)));
+        }
+        "string" | "word" | "number" | "raw_string" => {
+            args.push(Word::Literal(node_text(node, source)));
+        }
+        _ => {
+            // For operators and other tokens, add them directly
+            let text = node_text(node, source).trim().to_string();
+            if !text.is_empty() {
+                args.push(Word::Literal(text));
+            }
+        }
+    }
 }
 
 fn build_while_statement(node: &Node, source: &str) -> Result<WhileStatement, ShellError> {
     let mut condition = Vec::new();
     let mut body = Vec::new();
     let mut in_condition = false;
-    let mut in_body = false;
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
             "while" | "until" => in_condition = true,
-            "do" => {
+            "do_group" => {
                 in_condition = false;
-                in_body = true;
+                body = build_do_group(&child, source)?;
             }
-            "done" => break,
+            "do" | "done" | ";" => {
+                in_condition = false;
+            }
             _ => {
-                if let Some(cmd) = build_command(&child, source)? {
-                    if in_condition {
+                if in_condition {
+                    if let Some(cmd) = build_command(&child, source)? {
                         condition.push(cmd);
-                    } else if in_body {
-                        body.push(cmd);
                     }
                 }
             }
@@ -408,7 +547,6 @@ fn build_for_statement(node: &Node, source: &str) -> Result<ForStatement, ShellE
     let mut items = Vec::new();
     let mut body = Vec::new();
     let mut in_items = false;
-    let mut in_body = false;
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -417,21 +555,30 @@ fn build_for_statement(node: &Node, source: &str) -> Result<ForStatement, ShellE
                 variable = node_text(&child, source);
             }
             "in" => in_items = true,
-            "do" => {
+            "do_group" => {
+                // Parse body from do_group
                 in_items = false;
-                in_body = true;
+                body = build_do_group(&child, source)?;
             }
-            "done" => break,
-            "word" if in_items => {
+            "word" | "number" | "string" | "raw_string" if in_items => {
                 items.push(Word::Literal(node_text(&child, source)));
             }
-            _ => {
-                if in_body {
-                    if let Some(cmd) = build_command(&child, source)? {
-                        body.push(cmd);
-                    }
-                }
+            "simple_expansion" | "expansion" if in_items => {
+                items.push(Word::Variable(extract_variable_name(&child, source)));
             }
+            "concatenation" if in_items => {
+                // Handle concatenated items
+                items.push(Word::Literal(node_text(&child, source)));
+            }
+            "brace_expression" if in_items => {
+                // Brace expansion like {1..5} or {a,b,c}
+                items.push(Word::Literal(node_text(&child, source)));
+            }
+            ";" | "do" | "done" => {
+                // Skip these tokens
+                in_items = false;
+            }
+            _ => {}
         }
     }
 
@@ -440,6 +587,24 @@ fn build_for_statement(node: &Node, source: &str) -> Result<ForStatement, ShellE
         items,
         body,
     })
+}
+
+fn build_do_group(node: &Node, source: &str) -> Result<Vec<Command>, ShellError> {
+    let mut commands = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "do" | "done" | ";" => continue,
+            _ => {
+                if let Some(cmd) = build_command(&child, source)? {
+                    commands.push(cmd);
+                }
+            }
+        }
+    }
+
+    Ok(commands)
 }
 
 fn build_function_definition(node: &Node, source: &str) -> Result<FunctionDef, ShellError> {
@@ -573,4 +738,169 @@ mod tests {
             panic!("Expected pipeline");
         }
     }
+
+    #[test]
+    fn test_stdout_redirect() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("echo hello > output.txt").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Simple(cmd) = &ast.commands[0] {
+            assert_eq!(cmd.name, "echo");
+            assert_eq!(cmd.redirects.len(), 1);
+            assert_eq!(cmd.redirects[0].fd, 1);
+            assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+            assert_eq!(cmd.redirects[0].target, "output.txt");
+        } else {
+            panic!("Expected simple command");
+        }
+    }
+
+    #[test]
+    fn test_stderr_redirect() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("cmd 2> error.txt").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Simple(cmd) = &ast.commands[0] {
+            assert_eq!(cmd.name, "cmd");
+            assert_eq!(cmd.redirects.len(), 1);
+            assert_eq!(cmd.redirects[0].fd, 2);
+            assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+            assert_eq!(cmd.redirects[0].target, "error.txt");
+        } else {
+            panic!("Expected simple command");
+        }
+    }
+
+    #[test]
+    fn test_fd_duplication() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("cmd > out.txt 2>&1").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Simple(cmd) = &ast.commands[0] {
+            assert_eq!(cmd.name, "cmd");
+            assert_eq!(cmd.redirects.len(), 2, "Expected 2 redirects, got: {:?}", cmd.redirects);
+
+            // First redirect: > out.txt
+            assert_eq!(cmd.redirects[0].fd, 1);
+            assert_eq!(cmd.redirects[0].op, RedirectOp::Write);
+            assert_eq!(cmd.redirects[0].target, "out.txt");
+
+            // Second redirect: 2>&1
+            assert_eq!(cmd.redirects[1].fd, 2);
+            assert_eq!(cmd.redirects[1].op, RedirectOp::DupWrite);
+            assert_eq!(cmd.redirects[1].target, "1");
+        } else {
+            panic!("Expected simple command");
+        }
+    }
+
+    #[test]
+    fn test_input_redirect() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("cat < input.txt").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Simple(cmd) = &ast.commands[0] {
+            assert_eq!(cmd.name, "cat");
+            assert_eq!(cmd.redirects.len(), 1);
+            assert_eq!(cmd.redirects[0].fd, 0);
+            assert_eq!(cmd.redirects[0].op, RedirectOp::Read);
+            assert_eq!(cmd.redirects[0].target, "input.txt");
+        } else {
+            panic!("Expected simple command");
+        }
+    }
+
+    #[test]
+    fn test_elif_parsing() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("if [ $x = 1 ]; then echo one; elif [ $x = 2 ]; then echo two; else echo other; fi").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::If(if_stmt) = &ast.commands[0] {
+            // Main condition should be [ $x = 1 ]
+            assert_eq!(if_stmt.condition.len(), 1, "Expected 1 condition command");
+            if let Command::Simple(cond) = &if_stmt.condition[0] {
+                assert_eq!(cond.name, "[");
+                eprintln!("Main condition args: {:?}", cond.args);
+            }
+
+            // Then branch should be echo one
+            assert_eq!(if_stmt.then_branch.len(), 1, "Expected 1 then command");
+
+            // Else branch should be a nested if (for elif)
+            assert!(if_stmt.else_branch.is_some(), "Expected else branch");
+            let else_branch = if_stmt.else_branch.as_ref().unwrap();
+            assert_eq!(else_branch.len(), 1, "Expected 1 command in else branch (nested if)");
+
+            if let Command::If(nested_if) = &else_branch[0] {
+                // Nested if condition should be [ $x = 2 ]
+                assert_eq!(nested_if.condition.len(), 1, "Expected 1 condition in elif");
+                if let Command::Simple(elif_cond) = &nested_if.condition[0] {
+                    assert_eq!(elif_cond.name, "[");
+                    eprintln!("Elif condition args: {:?}", elif_cond.args);
+                    // Should have: $x, =, 2, ]
+                    assert!(elif_cond.args.len() >= 3, "Expected at least 3 args in elif condition");
+                }
+
+                // Nested else should be echo other
+                assert!(nested_if.else_branch.is_some(), "Expected else in elif");
+            } else {
+                panic!("Expected nested If in else branch for elif");
+            }
+        } else {
+            panic!("Expected If statement");
+        }
+    }
+
+    #[test]
+    fn test_for_parsing() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("for x in a b c; do echo $x; done").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::For(for_stmt) = &ast.commands[0] {
+            assert_eq!(for_stmt.variable, "x");
+            eprintln!("For items: {:?}", for_stmt.items);
+            assert_eq!(for_stmt.items.len(), 3, "Expected 3 items");
+            assert_eq!(for_stmt.body.len(), 1, "Expected 1 command in body");
+        } else {
+            panic!("Expected For statement");
+        }
+    }
+
+    #[test]
+    fn test_for_numbers_parsing() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("for n in 1 2 3 4 5; do true; done").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::For(for_stmt) = &ast.commands[0] {
+            assert_eq!(for_stmt.variable, "n");
+            assert_eq!(for_stmt.items.len(), 5, "Expected 5 items");
+        } else {
+            panic!("Expected For statement");
+        }
+    }
+
+    #[test]
+    fn test_for_brace_expansion_parsing() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("for i in {1..5}; do echo $i; done").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::For(for_stmt) = &ast.commands[0] {
+            assert_eq!(for_stmt.variable, "i");
+            eprintln!("Brace expansion items: {:?}", for_stmt.items);
+            // Should have 1 item: {1..5} which will be expanded later
+            assert_eq!(for_stmt.items.len(), 1, "Expected 1 item (brace expr)");
+            assert_eq!(for_stmt.items[0].as_literal(), Some("{1..5}"));
+        } else {
+            panic!("Expected For statement");
+        }
+    }
+
 }
