@@ -197,7 +197,11 @@ pub fn cancel(state: &mut Nexus) -> Task<Message> {
 }
 
 /// Spawn an agent query task.
-pub fn spawn_query(state: &mut Nexus, query: String) -> Task<Message> {
+pub fn spawn_query(
+    state: &mut Nexus,
+    query: String,
+    attachments: Vec<nexus_api::Value>,
+) -> Task<Message> {
     // Build shell context
     let shell_context = build_shell_context(
         &state.terminal.cwd,
@@ -223,7 +227,9 @@ pub fn spawn_query(state: &mut Nexus, query: String) -> Task<Message> {
     let cwd = PathBuf::from(&state.terminal.cwd);
 
     tokio::spawn(async move {
-        if let Err(e) = spawn_agent_task(agent_tx, cancel_flag, contextualized_query, cwd).await {
+        if let Err(e) =
+            spawn_agent_task(agent_tx, cancel_flag, contextualized_query, cwd, attachments).await
+        {
             tracing::error!("Agent task failed: {}", e);
         }
     });

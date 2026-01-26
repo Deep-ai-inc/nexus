@@ -25,10 +25,12 @@ pub async fn spawn_agent_task(
     cancel_flag: Arc<AtomicBool>,
     query: String,
     working_dir: PathBuf,
+    attachments: Vec<nexus_api::Value>,
 ) -> anyhow::Result<()> {
     use nexus_agent::{Agent, AgentComponents, SessionConfig};
     use nexus_executor::DefaultCommandExecutor;
     use nexus_llm::factory::create_llm_client_from_model;
+    use nexus_llm::ContentBlock;
 
     // Try to detect which model to use based on environment
     let model_name = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
@@ -89,8 +91,49 @@ pub async fn spawn_agent_task(
         return Ok(());
     }
 
+    // Build user message with text and any image attachments
+    tracing::info!(
+        "spawn_agent_task: {} attachments received",
+        attachments.len()
+    );
+
+    let message = if attachments.is_empty() {
+        nexus_llm::Message::new_user(query)
+    } else {
+        // Convert attachments to content blocks
+        let mut content_blocks = Vec::new();
+
+        // Add images first
+        for attachment in &attachments {
+            if let nexus_api::Value::Media {
+                data,
+                content_type,
+                ..
+            } = attachment
+            {
+                tracing::info!(
+                    "Adding image attachment: {} ({} bytes)",
+                    content_type,
+                    data.len()
+                );
+                if content_type.starts_with("image/") {
+                    content_blocks.push(ContentBlock::new_image(content_type, data));
+                }
+            }
+        }
+
+        // Add the text query
+        content_blocks.push(ContentBlock::new_text(query));
+
+        tracing::info!(
+            "Built message with {} content blocks",
+            content_blocks.len()
+        );
+        nexus_llm::Message::new_user_content(content_blocks)
+    };
+
     // Add the user message
-    if let Err(e) = agent.append_message(nexus_llm::Message::new_user(query)) {
+    if let Err(e) = agent.append_message(message) {
         let _ = event_tx.send(AgentEvent::Error(format!("Failed to add message: {}", e)));
         return Ok(());
     }

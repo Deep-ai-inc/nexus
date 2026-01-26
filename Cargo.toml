@@ -64,6 +64,8 @@ alacritty_terminal = "0.25"
 iced = { version = "0.13", default-features = false, features = ["tokio", "advanced", "wgpu", "lazy", "image"] }
 cosmic-text = "0.12"
 arboard = "3.4"  # Cross-platform clipboard
+dirs = "5.0"  # Platform-specific directories (home, config, etc.)
+urlencoding = "2.1"  # URL encoding/decoding for file:// URLs
 fontdue = "0.9"  # Fast font rasterization for glyph atlas
 bytemuck = { version = "1.14", features = ["derive"] }  # Safe transmutes for GPU buffers
 wgpu = "23.0"  # GPU access (same version Iced uses)

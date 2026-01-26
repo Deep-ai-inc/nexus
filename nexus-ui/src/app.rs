@@ -69,8 +69,13 @@ fn process_actions(state: &mut Nexus, actions: Vec<Action>) -> Task<Message> {
                 tasks.push(handlers::terminal::execute(state, cmd));
             }
             Action::SpawnAgentQuery(query) => {
-                transfer_attachments_to_kernel(state);
-                tasks.push(handlers::agent::spawn_query(state, query));
+                // Take attachments directly for agent (no kernel variable needed)
+                let attachments = state.input.take_attachments();
+                tracing::info!(
+                    "SpawnAgentQuery: taking {} attachments from input",
+                    attachments.len()
+                );
+                tasks.push(handlers::agent::spawn_query(state, query, attachments));
             }
             Action::ClearAll => {
                 state.agent.reset();

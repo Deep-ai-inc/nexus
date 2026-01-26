@@ -105,6 +105,24 @@ impl DefaultMessageConverter {
     fn convert_messages_with_cache(&self, messages: Vec<Message>) -> Vec<AnthropicMessage> {
         let cache_positions = self.get_cache_marker_positions(&messages);
 
+        // Log image blocks being sent to API
+        for (i, msg) in messages.iter().enumerate() {
+            if let MessageContent::Structured(blocks) = &msg.content {
+                for (j, block) in blocks.iter().enumerate() {
+                    if let ContentBlock::Image { media_type, data, .. } = block {
+                        tracing::info!(
+                            "Anthropic API: msg[{}] block[{}] = image {} ({} base64 chars, first 100: {}...)",
+                            i,
+                            j,
+                            media_type,
+                            data.len(),
+                            &data[..data.len().min(100)]
+                        );
+                    }
+                }
+            }
+        }
+
         messages
             .into_iter()
             .enumerate()
@@ -224,7 +242,31 @@ impl DefaultMessageConverter {
 impl MessageConverter for DefaultMessageConverter {
     fn convert_messages(&mut self, messages: Vec<Message>) -> Result<Vec<serde_json::Value>> {
         let anthropic_messages = self.convert_messages_with_cache(messages);
-        Ok(vec![serde_json::to_value(anthropic_messages)?])
+        let json_value = serde_json::to_value(&anthropic_messages)?;
+
+        // Debug: log the JSON structure for messages with images
+        if let Some(msgs) = json_value.as_array() {
+            for msg in msgs {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("image") {
+                            // Print structure without the full base64 data
+                            let mut debug_block = block.clone();
+                            if let Some(source) = debug_block.get_mut("source") {
+                                if let Some(data) = source.get_mut("data") {
+                                    if let Some(s) = data.as_str() {
+                                        *data = serde_json::json!(format!("<{} chars>", s.len()));
+                                    }
+                                }
+                            }
+                            tracing::info!("Anthropic image block JSON: {}", debug_block);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(vec![json_value])
     }
 }
 

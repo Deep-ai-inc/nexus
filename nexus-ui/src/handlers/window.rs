@@ -12,6 +12,76 @@ use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, LINE_HEIGHT_FACTOR};
 use crate::msg::{GlobalShortcut, InputMessage, Message, WindowMessage, ZoomDirection};
 use crate::state::Nexus;
 
+/// Try to paste an image file from clipboard file list.
+/// Detects image type by file content (magic bytes), not extension.
+fn try_paste_image_file(clipboard: &mut arboard::Clipboard) -> Option<Task<Message>> {
+    // Use arboard's native file list API
+    let files = match clipboard.get().file_list() {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::debug!("No file list in clipboard: {}", e);
+            return None;
+        }
+    };
+
+    tracing::debug!("Clipboard contains {} files", files.len());
+
+    // Try each file - detect image by content, not extension
+    for path in files {
+        tracing::debug!("Trying to paste file: {:?}", path);
+
+        if !path.exists() {
+            tracing::debug!("File does not exist: {:?}", path);
+            continue;
+        }
+        if !path.is_file() {
+            tracing::debug!("Path is not a file: {:?}", path);
+            continue;
+        }
+
+        // Read file and try to decode as image (auto-detects format by magic bytes)
+        let file_data = match std::fs::read(&path) {
+            Ok(data) => {
+                tracing::debug!("Read {} bytes from {:?}", data.len(), path);
+                data
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read file {:?}: {}", path, e);
+                continue;
+            }
+        };
+
+        // image::load_from_memory detects format from file header, not extension
+        let img = match image::load_from_memory(&file_data) {
+            Ok(img) => img,
+            Err(e) => {
+                tracing::debug!("Not an image file {:?}: {}", path, e);
+                continue;
+            }
+        };
+
+        let width = img.width();
+        let height = img.height();
+        tracing::info!("Pasting image {}x{} from {:?}", width, height, path);
+
+        // Convert to PNG for consistent handling
+        let mut png_data = Vec::new();
+        if let Err(e) = img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png,
+        ) {
+            tracing::warn!("Failed to encode image as PNG: {}", e);
+            continue;
+        }
+
+        return Some(Task::done(Message::Input(InputMessage::PasteImage(
+            png_data, width, height,
+        ))));
+    }
+
+    None
+}
+
 /// Update the window domain state.
 pub fn update(state: &mut Nexus, msg: WindowMessage) -> Task<Message> {
     match msg {
@@ -178,7 +248,12 @@ pub fn global_shortcut(state: &mut Nexus, shortcut: GlobalShortcut) -> Task<Mess
         }
         GlobalShortcut::Paste => {
             if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                // Try image first
+                // First check if clipboard text is an image file path
+                if let Some(task) = try_paste_image_file(&mut clipboard) {
+                    return task;
+                }
+
+                // Try clipboard image data (e.g., from screenshot or copied image content)
                 if let Ok(img) = clipboard.get_image() {
                     let width = img.width as u32;
                     let height = img.height as u32;
