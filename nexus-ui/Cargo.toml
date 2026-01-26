@@ -8,9 +8,11 @@ name = "nexus"
 path = "src/main.rs"
 
 [dependencies]
+nexus-agent = { workspace = true }
 nexus-api = { workspace = true }
-nexus-claude = { workspace = true }
+nexus-executor = { workspace = true }
 nexus-kernel = { workspace = true }
+nexus-llm = { workspace = true }
 nexus-pump = { workspace = true }
 nexus-term = { workspace = true }
 serde = { workspace = true }
@@ -20,9 +22,12 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+async-trait = "0.1"
+chrono = { workspace = true }
 iced = { workspace = true }
 portable-pty = { workspace = true }
 arboard = { workspace = true }  # Clipboard support
+image = { workspace = true }  # Image processing for clipboard images
 fontdue = { workspace = true }  # Glyph rasterization for GPU atlas
 bytemuck = { workspace = true }  # Safe transmutes for GPU buffers
 wgpu = { workspace = true }  # GPU access for custom shaders

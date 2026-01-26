@@ -7,8 +7,7 @@ members = [
     "nexus-ui",
     "nexus-api",
     "nexus-providers",
-    "nexus-claude",
-    # New crates from code-assistant
+    # Agent crates (from code-assistant)
     "nexus-llm",
     "nexus-sandbox",
     "nexus-web",
@@ -50,6 +49,9 @@ git2 = "0.19"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+# Image processing
+image = "0.25"
+
 # Pump dependencies
 memmap2 = "0.9"
 
@@ -68,7 +70,6 @@ wgpu = "23.0"  # GPU access (same version Iced uses)
 
 # Internal crates
 nexus-api = { path = "nexus-api" }
-nexus-claude = { path = "nexus-claude" }
 nexus-kernel = { path = "nexus-kernel" }
 nexus-pump = { path = "nexus-pump" }
 nexus-term = { path = "nexus-term" }

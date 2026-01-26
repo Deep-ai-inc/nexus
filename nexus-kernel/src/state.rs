@@ -53,8 +53,12 @@ pub struct ShellState {
     /// Environment variables (exported to child processes).
     pub env: HashMap<String, String>,
 
-    /// Shell variables (not exported).
+    /// Shell variables (not exported) - string values for bash compatibility.
     pub vars: HashMap<String, String>,
+
+    /// Rich variables - hold any Value type (images, tables, etc.).
+    /// These are Nexus-specific and support Mathematica-style value passing.
+    pub rich_vars: HashMap<String, Value>,
 
     /// Current working directory.
     pub cwd: PathBuf,
@@ -145,6 +149,7 @@ impl ShellState {
         Ok(Self {
             env,
             vars: HashMap::new(),
+            rich_vars: HashMap::new(),
             cwd,
             jobs: Vec::new(),
             next_job_id: 1,
@@ -173,6 +178,7 @@ impl ShellState {
         Self {
             env,
             vars: HashMap::new(),
+            rich_vars: HashMap::new(),
             cwd,
             jobs: Vec::new(),
             next_job_id: 1,
@@ -208,7 +214,8 @@ impl ShellState {
         self.env.remove(key);
     }
 
-    /// Get a shell variable (checks vars first, then env).
+    /// Get a shell variable as string (checks vars first, then env).
+    /// For rich variables, converts to text representation.
     pub fn get_var(&self, key: &str) -> Option<&str> {
         self.vars
             .get(key)
@@ -216,9 +223,59 @@ impl ShellState {
             .or_else(|| self.get_env(key))
     }
 
-    /// Set a shell variable (not exported).
+    /// Get a shell variable as a Value.
+    /// Checks rich_vars first (returns the Value directly),
+    /// then falls back to string vars (wrapped in Value::String).
+    pub fn get_var_value(&self, key: &str) -> Option<Value> {
+        // Check rich variables first
+        if let Some(value) = self.rich_vars.get(key) {
+            return Some(value.clone());
+        }
+        // Fall back to string variables
+        if let Some(s) = self.vars.get(key) {
+            return Some(Value::String(s.clone()));
+        }
+        // Finally check environment
+        if let Some(s) = self.env.get(key) {
+            return Some(Value::String(s.clone()));
+        }
+        None
+    }
+
+    /// Set a shell variable (not exported) - string value.
     pub fn set_var(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.vars.insert(key.into(), value.into());
+        let key = key.into();
+        // Remove from rich_vars if it exists there
+        self.rich_vars.remove(&key);
+        self.vars.insert(key, value.into());
+    }
+
+    /// Set a shell variable to a rich Value.
+    /// For simple strings, stores in vars. For complex types, stores in rich_vars.
+    pub fn set_var_value(&mut self, key: impl Into<String>, value: Value) {
+        let key = key.into();
+        match value {
+            Value::String(s) => {
+                // Simple string - store in regular vars for bash compatibility
+                self.rich_vars.remove(&key);
+                self.vars.insert(key, s);
+            }
+            Value::Int(n) => {
+                // Store integers as strings for bash compatibility
+                self.rich_vars.remove(&key);
+                self.vars.insert(key, n.to_string());
+            }
+            _ => {
+                // Complex value - store in rich_vars
+                self.vars.remove(&key);
+                self.rich_vars.insert(key, value);
+            }
+        }
+    }
+
+    /// Check if a variable holds a rich (non-string) value.
+    pub fn is_rich_var(&self, key: &str) -> bool {
+        self.rich_vars.contains_key(key)
     }
 
     /// Change the working directory.

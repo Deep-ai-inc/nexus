@@ -1,6 +1,8 @@
 //! Main Nexus application using Iced's Elm architecture.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,14 +13,15 @@ use iced::{event, Element, Event, Length, Subscription, Task, Theme};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_api::{BlockId, BlockState, OutputFormat, ShellEvent, Value};
-use nexus_claude::ReaderMessage as ClaudeReaderMessage;
 use nexus_kernel::{CommandRegistry, Completion, CompletionKind, HistoryEntry, Kernel};
 use nexus_term::TerminalParser;
 
-use crate::claude_panel::{ClaudePanel, ClaudePanelMessage, ClaudeOutputWrapper};
-
+use crate::agent_adapter::{AgentEvent, IcedAgentUI, PermissionResponse};
+use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest, ToolStatus};
+use crate::agent_widgets::{view_agent_block, AgentWidgetMessage};
 use crate::glyph_cache::get_cell_metrics;
 use crate::pty::PtyHandle;
+use crate::shell_context::build_shell_context;
 use crate::widgets::job_indicator::{job_status_bar, VisualJob, VisualJobState};
 use crate::widgets::table::{interactive_table, TableSort};
 use crate::widgets::terminal_shader::TerminalShader;
@@ -36,6 +39,37 @@ pub const CHAR_WIDTH_RATIO: f32 = 0.607; // ~8.5/14.0, conservative for anti-ali
 
 /// Scrollable ID for auto-scrolling.
 const HISTORY_SCROLLABLE: &str = "history";
+
+/// Unified block type - either a shell command or agent conversation.
+#[derive(Debug)]
+pub enum UnifiedBlock {
+    Shell(Block),
+    Agent(AgentBlock),
+}
+
+impl UnifiedBlock {
+    /// Get the block ID for ordering.
+    pub fn id(&self) -> BlockId {
+        match self {
+            UnifiedBlock::Shell(b) => b.id,
+            UnifiedBlock::Agent(b) => b.id,
+        }
+    }
+
+    /// Check if the block is still running/active.
+    pub fn is_running(&self) -> bool {
+        match self {
+            UnifiedBlock::Shell(b) => b.is_running(),
+            UnifiedBlock::Agent(b) => b.is_running(),
+        }
+    }
+}
+
+/// Reference to a unified block for view rendering (avoids cloning).
+enum UnifiedBlockRef<'a> {
+    Shell(&'a Block),
+    Agent(&'a AgentBlock),
+}
 
 /// A command block containing input and output.
 #[derive(Debug)]
@@ -113,6 +147,16 @@ pub enum Focus {
     Block(BlockId),
 }
 
+/// Input mode - determines how commands are processed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum InputMode {
+    /// Normal shell mode - commands are executed by the kernel.
+    #[default]
+    Shell,
+    /// Agent mode - input is sent to the AI agent.
+    Agent,
+}
+
 /// Messages for the Nexus application.
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -141,8 +185,6 @@ pub enum Message {
     NextFrame(Instant),
     /// Kernel event (from pipeline execution).
     KernelEvent(ShellEvent),
-    /// Claude panel message.
-    ClaudePanel(ClaudePanelMessage),
     /// Sort table by column in a specific block.
     TableSort(BlockId, usize),
     /// User clicked a cell in a table (for semantic actions).
@@ -171,6 +213,18 @@ pub enum Message {
     RunSuggestedCommand(String),
     /// Dismiss the command not found prompt.
     DismissCommandNotFound,
+    /// Toggle between Shell and Agent input modes.
+    ToggleInputMode,
+    /// An image was pasted from clipboard (Mathematica-style rich input).
+    ImagePasted(Vec<u8>, u32, u32), // (data, width, height)
+    /// Remove an attachment from the input.
+    RemoveAttachment(usize),
+    /// Agent event received from the agent adapter.
+    AgentEvent(AgentEvent),
+    /// Agent widget interaction (toggle, permission response, etc.)
+    AgentWidget(AgentWidgetMessage),
+    /// Cancel the current agent operation.
+    CancelAgent,
 }
 
 /// Global keyboard shortcuts.
@@ -248,8 +302,6 @@ pub struct Nexus {
     kernel: Arc<Mutex<Kernel>>,
     /// Receiver for kernel events (shared with subscription).
     kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
-    /// Claude panel for native Claude Code UI.
-    claude_panel: ClaudePanel,
     /// Visual jobs for the status bar.
     visual_jobs: Vec<VisualJob>,
     /// Tab completion state.
@@ -272,6 +324,24 @@ pub struct Nexus {
     permission_denied_command: Option<String>,
     /// Command not found info (original command, suggestions).
     command_not_found: Option<(String, Vec<String>)>,
+    /// Current input mode (Shell or Agent).
+    input_mode: InputMode,
+    /// Pending attachments (images/files) for the current command (Mathematica-style).
+    attachments: Vec<nexus_api::Value>,
+    /// Agent conversation blocks.
+    agent_blocks: Vec<AgentBlock>,
+    /// Agent block index by ID for O(1) lookup.
+    agent_block_index: HashMap<BlockId, usize>,
+    /// Currently active agent block (receiving events).
+    active_agent_block: Option<BlockId>,
+    /// Channel for agent events (receiver shared with subscription).
+    agent_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
+    /// Channel for agent events (sender given to agent adapter).
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    /// Channel for permission responses.
+    permission_tx: Option<mpsc::UnboundedSender<(String, PermissionResponse)>>,
+    /// Cancel flag for agent tasks.
+    agent_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +410,9 @@ impl Default for Nexus {
         // Create kernel for pipeline execution
         let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
 
+        // Create agent event channel
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
+
         // Load command history from SQLite (kernel's store)
         let command_history = kernel
             .store()
@@ -377,9 +450,6 @@ impl Default for Nexus {
             commands: CommandRegistry::new(),
             kernel: Arc::new(Mutex::new(kernel)),
             kernel_rx: Arc::new(Mutex::new(kernel_rx)),
-            claude_panel: ClaudePanel::new(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            ),
             visual_jobs: Vec::new(),
             completions: Vec::new(),
             completion_index: 0,
@@ -391,6 +461,15 @@ impl Default for Nexus {
             history_search_index: 0,
             permission_denied_command: None,
             command_not_found: None,
+            input_mode: InputMode::default(),
+            attachments: Vec::new(),
+            agent_blocks: Vec::new(),
+            agent_block_index: HashMap::new(),
+            active_agent_block: None,
+            agent_rx: Arc::new(Mutex::new(agent_rx)),
+            agent_tx,
+            permission_tx: None,
+            agent_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -501,6 +580,179 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             state.command_not_found = None;
             return Task::none();
         }
+        Message::ToggleInputMode => {
+            state.input_mode = match state.input_mode {
+                InputMode::Shell => InputMode::Agent,
+                InputMode::Agent => InputMode::Shell,
+            };
+            return Task::none();
+        }
+        Message::ImagePasted(data, width, height) => {
+            // Add the pasted image as an attachment (Mathematica-style rich input)
+            let metadata = nexus_api::MediaMetadata {
+                width: Some(width),
+                height: Some(height),
+                duration_secs: None,
+                filename: None,
+                size: Some(data.len() as u64),
+            };
+            state.attachments.push(nexus_api::Value::Media {
+                data,
+                content_type: "image/png".to_string(),
+                metadata,
+            });
+            return Task::none();
+        }
+        Message::RemoveAttachment(index) => {
+            if index < state.attachments.len() {
+                state.attachments.remove(index);
+            }
+            return Task::none();
+        }
+        Message::AgentEvent(event) => {
+            // Mark dirty to ensure UI updates
+            state.is_dirty = true;
+
+            // Handle events from the agent adapter
+            if let Some(block_id) = state.active_agent_block {
+                if let Some(idx) = state.agent_block_index.get(&block_id) {
+                    if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                        match event {
+                            AgentEvent::Started { .. } => {
+                                block.state = AgentBlockState::Streaming;
+                            }
+                            AgentEvent::ResponseText(text) => {
+                                block.append_response(&text);
+                            }
+                            AgentEvent::ThinkingText(text) => {
+                                block.append_thinking(&text);
+                            }
+                            AgentEvent::ToolStarted { id, name } => {
+                                block.start_tool(id, name);
+                            }
+                            AgentEvent::ToolParameter { tool_id, name, value } => {
+                                block.add_tool_parameter(&tool_id, name, value);
+                            }
+                            AgentEvent::ToolOutput { tool_id, chunk } => {
+                                block.append_tool_output(&tool_id, &chunk);
+                            }
+                            AgentEvent::ToolEnded { .. } => {
+                                // Tool ended, wait for status update
+                            }
+                            AgentEvent::ToolStatus { id, status, message, output } => {
+                                block.update_tool_status(&id, status, message, output);
+                            }
+                            AgentEvent::ImageAdded { media_type, data } => {
+                                block.add_image(media_type, data);
+                            }
+                            AgentEvent::PermissionRequested {
+                                id,
+                                tool_name,
+                                tool_id,
+                                description,
+                                action,
+                                working_dir,
+                            } => {
+                                block.request_permission(PermissionRequest {
+                                    id,
+                                    tool_name,
+                                    tool_id,
+                                    description,
+                                    action,
+                                    working_dir,
+                                });
+                            }
+                            AgentEvent::Finished { .. } => {
+                                block.complete();
+                                // Keep active_agent_block set - ToolStatus events may arrive after Finished
+                                // It will be cleared when a new agent query starts
+                            }
+                            AgentEvent::Cancelled { .. } => {
+                                block.fail("Cancelled".to_string());
+                                state.active_agent_block = None;
+                            }
+                            AgentEvent::Error(err) => {
+                                block.fail(err);
+                                state.active_agent_block = None;
+                            }
+                        }
+                    }
+                }
+            }
+            return scrollable::snap_to(
+                scrollable::Id::new(HISTORY_SCROLLABLE),
+                scrollable::RelativeOffset::END,
+            );
+        }
+        Message::AgentWidget(widget_msg) => {
+            match widget_msg {
+                AgentWidgetMessage::ToggleThinking(block_id) => {
+                    if let Some(idx) = state.agent_block_index.get(&block_id) {
+                        if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                            block.toggle_thinking();
+                        }
+                    }
+                }
+                AgentWidgetMessage::ToggleTool(block_id, tool_id) => {
+                    if let Some(idx) = state.agent_block_index.get(&block_id) {
+                        if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                            block.toggle_tool(&tool_id);
+                        }
+                    }
+                }
+                AgentWidgetMessage::PermissionGranted(block_id, perm_id) => {
+                    if let Some(idx) = state.agent_block_index.get(&block_id) {
+                        if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                            block.clear_permission();
+                        }
+                    }
+                    // Send response to permission mediator
+                    if let Some(ref tx) = state.permission_tx {
+                        let _ = tx.send((perm_id, PermissionResponse::GrantedOnce));
+                    }
+                }
+                AgentWidgetMessage::PermissionGrantedSession(block_id, perm_id) => {
+                    if let Some(idx) = state.agent_block_index.get(&block_id) {
+                        if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                            block.clear_permission();
+                        }
+                    }
+                    if let Some(ref tx) = state.permission_tx {
+                        let _ = tx.send((perm_id, PermissionResponse::GrantedSession));
+                    }
+                }
+                AgentWidgetMessage::PermissionDenied(block_id, perm_id) => {
+                    if let Some(idx) = state.agent_block_index.get(&block_id) {
+                        if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                            block.clear_permission();
+                            block.fail("Permission denied".to_string());
+                        }
+                    }
+                    if let Some(ref tx) = state.permission_tx {
+                        let _ = tx.send((perm_id, PermissionResponse::Denied));
+                    }
+                    state.active_agent_block = None;
+                }
+                AgentWidgetMessage::CopyText(text) => {
+                    // Copy text to clipboard
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(&text);
+                    }
+                }
+            }
+            return Task::none();
+        }
+        Message::CancelAgent => {
+            if let Some(block_id) = state.active_agent_block {
+                if let Some(idx) = state.agent_block_index.get(&block_id) {
+                    if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                        block.fail("Cancelled by user".to_string());
+                    }
+                }
+                state.active_agent_block = None;
+            }
+            return Task::none();
+        }
         Message::InputChanged(value) => {
             // Suppress input if a Cmd shortcut just fired (prevents typing shortcut char)
             if state.suppress_next_input {
@@ -519,10 +771,95 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
             state.focus = Focus::Input;
         }
         Message::Submit => {
-            if !state.input.trim().is_empty() {
+            let input = state.input.trim();
+            if !input.is_empty() {
+                // Check for one-shot agent prefix: "? " or "ai "
+                let (is_agent_query, query) = if input.starts_with("? ") {
+                    (true, input.strip_prefix("? ").unwrap().to_string())
+                } else if input.starts_with("ai ") {
+                    (true, input.strip_prefix("ai ").unwrap().to_string())
+                } else {
+                    (state.input_mode == InputMode::Agent, input.to_string())
+                };
+
                 let command = state.input.clone();
                 state.input.clear();
-                return execute_command(state, command);
+
+                // Store attachments in kernel state before execution (Mathematica-style)
+                // They'll be accessible via $ATTACHMENT variable
+                if !state.attachments.is_empty() {
+                    if let Ok(mut kernel) = state.kernel.try_lock() {
+                        // Store as a list if multiple, or single value if one
+                        let value = if state.attachments.len() == 1 {
+                            state.attachments[0].clone()
+                        } else {
+                            nexus_api::Value::List(state.attachments.clone())
+                        };
+                        kernel.state_mut().set_var_value("ATTACHMENT", value);
+                    }
+                }
+                // Clear attachments from UI
+                state.attachments.clear();
+
+                if is_agent_query {
+                    // Build shell context for agent (append-only semantics)
+                    // Context goes in user message, not system prompt, to preserve prefix caching
+                    let shell_context = build_shell_context(
+                        &state.cwd,
+                        &state.blocks,
+                        &state.command_history,
+                    );
+
+                    // Combine context with user query for the agent
+                    let contextualized_query = format!("{}{}", shell_context, query);
+
+                    // Log the contextualized query for development
+                    tracing::info!("Agent query: {}", query);
+
+                    // Create an agent block to show the query and receive responses
+                    let block_id = BlockId(state.next_block_id);
+                    state.next_block_id += 1;
+
+                    let agent_block = AgentBlock::new(block_id, query.clone());
+
+                    let idx = state.agent_blocks.len();
+                    state.agent_block_index.insert(block_id, idx);
+                    state.agent_blocks.push(agent_block);
+                    state.active_agent_block = Some(block_id);
+
+                    // Reset cancel flag for new agent task
+                    state.agent_cancel.store(false, Ordering::SeqCst);
+
+                    // Spawn actual agent task
+                    let agent_tx = state.agent_tx.clone();
+                    let cancel_flag = state.agent_cancel.clone();
+                    let cwd = PathBuf::from(&state.cwd);
+
+                    tokio::spawn(async move {
+                        if let Err(e) = spawn_agent_task(
+                            agent_tx,
+                            cancel_flag,
+                            contextualized_query,
+                            cwd,
+                        ).await {
+                            tracing::error!("Agent task failed: {}", e);
+                        }
+                    });
+
+                    // Mark block as streaming
+                    if let Some(idx) = state.agent_block_index.get(&block_id) {
+                        if let Some(block) = state.agent_blocks.get_mut(*idx) {
+                            block.state = AgentBlockState::Streaming;
+                        }
+                    }
+
+                    return scrollable::snap_to(
+                        scrollable::Id::new(HISTORY_SCROLLABLE),
+                        scrollable::RelativeOffset::END,
+                    );
+                } else {
+                    return execute_command(state, command);
+                }
             }
         }
         Message::PtyOutput(block_id, data) => {
@@ -671,10 +1008,8 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                         scrollable::RelativeOffset::END,
                     );
                 }
-                ShellEvent::OpenClaudePanel { initial_prompt, cwd } => {
-                    // Update Claude panel cwd and open it
-                    state.claude_panel = ClaudePanel::new(cwd);
-                    let _ = state.claude_panel.open(initial_prompt);
+                ShellEvent::OpenClaudePanel { initial_prompt: _, cwd: _ } => {
+                    // TODO: Integrate with nexus-agent when agent mode is fully implemented
                 }
                 ShellEvent::JobStateChanged { job_id, state: job_state } => {
                     // Update visual jobs
@@ -712,9 +1047,6 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 }
                 _ => {}
             }
-        }
-        Message::ClaudePanel(msg) => {
-            return state.claude_panel.update(msg).map(Message::ClaudePanel);
         }
         Message::TableSort(block_id, column_index) => {
             // Toggle sort on the specified column
@@ -789,6 +1121,7 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                                 "=" | "+" => Some(update(state, Message::Zoom(ZoomDirection::In))),
                                 "-" => Some(update(state, Message::Zoom(ZoomDirection::Out))),
                                 "0" => Some(update(state, Message::Zoom(ZoomDirection::Reset))),
+                                "." => Some(update(state, Message::ToggleInputMode)),
                                 _ => None,
                             };
                             if let Some(task) = task {
@@ -950,8 +1283,15 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
 
             match shortcut {
                 GlobalShortcut::ClearScreen => {
+                    // Cancel any running agent task
+                    state.agent_cancel.store(true, Ordering::SeqCst);
+                    // Clear shell blocks
                     state.blocks.clear();
                     state.block_index.clear();
+                    // Clear agent blocks
+                    state.agent_blocks.clear();
+                    state.agent_block_index.clear();
+                    state.active_agent_block = None;
                 }
                 GlobalShortcut::CloseWindow | GlobalShortcut::Quit => {
                     return iced::exit();
@@ -964,6 +1304,32 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 }
                 GlobalShortcut::Paste => {
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        // Try to get image first (Mathematica-style rich input)
+                        if let Ok(img) = clipboard.get_image() {
+                            // Convert ImageData to PNG bytes
+                            let width = img.width as u32;
+                            let height = img.height as u32;
+
+                            // Create PNG from raw RGBA data
+                            let mut png_data = Vec::new();
+                            {
+                                use image::{ImageBuffer, RgbaImage};
+                                let img_buf: RgbaImage = ImageBuffer::from_raw(
+                                    width, height, img.bytes.into_owned()
+                                ).unwrap_or_else(|| ImageBuffer::new(1, 1));
+
+                                img_buf.write_to(
+                                    &mut std::io::Cursor::new(&mut png_data),
+                                    image::ImageFormat::Png
+                                ).ok();
+                            }
+
+                            if !png_data.is_empty() {
+                                return update(state, Message::ImagePasted(png_data, width, height));
+                            }
+                        }
+
+                        // Fall back to text paste
                         if let Ok(text) = clipboard.get_text() {
                             state.input.push_str(&text);
                         }
@@ -1174,18 +1540,124 @@ fn key_to_bytes(key: &Key, modifiers: &Modifiers) -> Option<Vec<u8>> {
     }
 }
 
-fn view(state: &Nexus) -> Element<'_, Message> {
-    // If Claude panel is visible, show it
-    if state.claude_panel.is_visible() {
-        return state.claude_panel.view(state.font_size).map(Message::ClaudePanel);
+// ============================================================================
+// Agent Task Spawning
+// ============================================================================
+
+/// No-op persistence for agent state (we don't persist agent sessions yet).
+struct NoopPersistence;
+
+impl nexus_agent::agent::persistence::AgentStatePersistence for NoopPersistence {
+    fn save_agent_state(&mut self, _state: nexus_agent::SessionState) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Spawn an agent task to process a query.
+async fn spawn_agent_task(
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
+    cancel_flag: Arc<AtomicBool>,
+    query: String,
+    working_dir: PathBuf,
+) -> anyhow::Result<()> {
+    use nexus_agent::{Agent, AgentComponents, SessionConfig};
+    use nexus_executor::DefaultCommandExecutor;
+    use nexus_llm::factory::create_llm_client_from_model;
+
+    // Try to detect which model to use based on environment
+    let model_name = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        "claude-sonnet"
+    } else if std::env::var("OPENAI_API_KEY").is_ok() {
+        "gpt-4o"
+    } else {
+        // Send error event if no API key is configured
+        let _ = event_tx.send(AgentEvent::Error(
+            "No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable.".to_string()
+        ));
+        return Ok(());
+    };
+
+    tracing::info!("Creating LLM client for model: {}", model_name);
+
+    // Create LLM provider
+    let llm_provider = match create_llm_client_from_model(model_name, None, false, None).await {
+        Ok(provider) => provider,
+        Err(e) => {
+            let _ = event_tx.send(AgentEvent::Error(format!("Failed to create LLM client: {}", e)));
+            return Ok(());
+        }
+    };
+
+    // Create components with cancel flag connected to UI
+    let ui = Arc::new(IcedAgentUI::with_cancel_flag(event_tx.clone(), cancel_flag));
+
+    let components = AgentComponents {
+        llm_provider,
+        project_manager: Box::new(nexus_agent::config::DefaultProjectManager::new()),
+        command_executor: Box::new(DefaultCommandExecutor),
+        ui,
+        state_persistence: Box::new(NoopPersistence),
+        permission_handler: None, // TODO: Add permission handling
+        sub_agent_runner: None,
+    };
+
+    // Create session config
+    let session_config = SessionConfig {
+        init_path: Some(working_dir),
+        ..Default::default()
+    };
+
+    // Create and run agent
+    let mut agent = Agent::new(components, session_config);
+
+    // Initialize project context
+    if let Err(e) = agent.init_project_context() {
+        let _ = event_tx.send(AgentEvent::Error(format!("Failed to init project context: {}", e)));
+        return Ok(());
     }
 
-    // Build all blocks
+    // Add the user message
+    if let Err(e) = agent.append_message(nexus_llm::Message::new_user(query)) {
+        let _ = event_tx.send(AgentEvent::Error(format!("Failed to add message: {}", e)));
+        return Ok(());
+    }
+
+    // Run the agent iteration
+    if let Err(e) = agent.run_single_iteration().await {
+        let _ = event_tx.send(AgentEvent::Error(format!("Agent error: {}", e)));
+    }
+
+    Ok(())
+}
+
+fn view(state: &Nexus) -> Element<'_, Message> {
+    // Build all blocks - interleaved by BlockId for proper chronological ordering
     let font_size = state.font_size;
-    let content_elements: Vec<Element<Message>> = state
-        .blocks
-        .iter()
-        .map(|block| view_block(block, font_size))
+
+    // Collect unified blocks with their IDs for sorting
+    let mut unified: Vec<(BlockId, UnifiedBlockRef)> = Vec::with_capacity(
+        state.blocks.len() + state.agent_blocks.len()
+    );
+
+    for block in &state.blocks {
+        unified.push((block.id, UnifiedBlockRef::Shell(block)));
+    }
+    for block in &state.agent_blocks {
+        unified.push((block.id, UnifiedBlockRef::Agent(block)));
+    }
+
+    // Sort by BlockId (ascending) - gives chronological order
+    unified.sort_by_key(|(id, _)| id.0);
+
+    // Render in order
+    let content_elements: Vec<Element<Message>> = unified
+        .into_iter()
+        .map(|(_, block_ref)| match block_ref {
+            UnifiedBlockRef::Shell(block) => view_block(block, font_size),
+            UnifiedBlockRef::Agent(block) => {
+                view_agent_block(block, font_size).map(Message::AgentWidget)
+            }
+        })
         .collect();
 
     // Scrollable area for command history with ID for auto-scroll
@@ -1225,12 +1697,8 @@ fn subscription(state: &Nexus) -> Subscription<Message> {
     let mut subscriptions = vec![
         pty_subscription(state.pty_rx.clone()),
         kernel_subscription(state.kernel_rx.clone()),
+        agent_subscription(state.agent_rx.clone()),
     ];
-
-    // Add Claude panel subscription if active
-    if let Some(rx) = state.claude_panel.event_receiver() {
-        subscriptions.push(claude_subscription(rx));
-    }
 
     // Listen for all events with window ID - focus-dependent routing happens in update()
     subscriptions.push(
@@ -1311,37 +1779,21 @@ fn pty_subscription(
     )
 }
 
-/// Async subscription that awaits Claude panel events.
-fn claude_subscription(
-    rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ClaudeReaderMessage>>>,
+/// Async subscription that awaits agent events.
+fn agent_subscription(
+    rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
 ) -> Subscription<Message> {
-    struct ClaudeSubscription;
+    struct AgentSubscription;
 
     Subscription::run_with_id(
-        std::any::TypeId::of::<ClaudeSubscription>(),
+        std::any::TypeId::of::<AgentSubscription>(),
         stream::unfold(rx, |rx| async move {
             let event = {
                 let mut guard = rx.lock().await;
                 guard.recv().await
             };
 
-            match event {
-                Some(ClaudeReaderMessage::Output(claude_output)) => {
-                    let msg = Message::ClaudePanel(ClaudePanelMessage::ClaudeOutput(
-                        ClaudeOutputWrapper(Arc::new(claude_output)),
-                    ));
-                    Some((msg, rx))
-                }
-                Some(ClaudeReaderMessage::Closed) => {
-                    let msg = Message::ClaudePanel(ClaudePanelMessage::ProcessClosed);
-                    Some((msg, rx))
-                }
-                Some(ClaudeReaderMessage::Error(e)) => {
-                    let msg = Message::ClaudePanel(ClaudePanelMessage::ProcessError(e));
-                    Some((msg, rx))
-                }
-                None => None,
-            }
+            event.map(|agent_event| (Message::AgentEvent(agent_event), rx))
         }),
     )
 }
@@ -1369,8 +1821,15 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
 
     // Handle built-in commands
     if trimmed == "clear" {
+        // Cancel any running agent task
+        state.agent_cancel.store(true, Ordering::SeqCst);
+        // Clear shell blocks
         state.blocks.clear();
         state.block_index.clear();
+        // Clear agent blocks
+        state.agent_blocks.clear();
+        state.agent_block_index.clear();
+        state.active_agent_block = None;
         return Task::none();
     }
 
@@ -1390,19 +1849,6 @@ fn execute_command(state: &mut Nexus, command: String) -> Task<Message> {
                 let _ = std::env::set_current_dir(&canonical);
             }
         }
-        return Task::none();
-    }
-
-    // Handle claude command - opens Claude panel directly
-    if trimmed == "claude" || trimmed.starts_with("claude ") {
-        let initial_prompt = if trimmed == "claude" {
-            None
-        } else {
-            Some(trimmed.strip_prefix("claude ").unwrap_or("").to_string())
-        };
-        let cwd = std::path::PathBuf::from(&state.cwd);
-        state.claude_panel = ClaudePanel::new(cwd);
-        let _ = state.claude_panel.open(initial_prompt);
         return Task::none();
     }
 
@@ -1801,9 +2247,15 @@ fn view_input(state: &Nexus) -> Element<'_, Message> {
         .color(path_color)
         .font(iced::Font::MONOSPACE);
 
-    let prompt = text("$ ")
+    // Mode indicator - shows SHELL or AGENT mode
+    let (mode_label, mode_color) = match state.input_mode {
+        InputMode::Shell => ("$", prompt_color),
+        InputMode::Agent => ("?", iced::Color::from_rgb(0.5, 0.6, 1.0)),
+    };
+
+    let prompt = text(format!("{} ", mode_label))
         .size(state.font_size)
-        .color(prompt_color)
+        .color(mode_color)
         .font(iced::Font::MONOSPACE);
 
     let input = text_input("", &state.input)
@@ -1827,6 +2279,84 @@ fn view_input(state: &Nexus) -> Element<'_, Message> {
     let input_row = row![path_text, prompt, input]
         .spacing(0)
         .align_y(iced::Alignment::Center);
+
+    // Display attachments if any (Mathematica-style rich input)
+    let attachments_view: Option<Element<'_, Message>> = if state.attachments.is_empty() {
+        None
+    } else {
+        let attachment_items: Vec<Element<'_, Message>> = state.attachments
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                match value {
+                    nexus_api::Value::Media { data, content_type, metadata } => {
+                        let is_image = content_type.starts_with("image/");
+                        let label = if is_image {
+                            format!(
+                                "Image {}x{}",
+                                metadata.width.unwrap_or(0),
+                                metadata.height.unwrap_or(0)
+                            )
+                        } else {
+                            metadata.filename.clone().unwrap_or_else(|| "File".to_string())
+                        };
+
+                        // Small thumbnail for images, icon for others
+                        let preview: Element<'_, Message> = if is_image {
+                            // Create thumbnail preview
+                            let handle = iced::widget::image::Handle::from_bytes(data.clone());
+                            iced::widget::image(handle)
+                                .width(Length::Fixed(60.0))
+                                .height(Length::Fixed(60.0))
+                                .into()
+                        } else {
+                            // File icon placeholder
+                            text("📎")
+                                .size(24.0)
+                                .into()
+                        };
+
+                        let remove_btn = iced::widget::button(
+                            text("×").size(14.0).color(iced::Color::WHITE)
+                        )
+                            .on_press(Message::RemoveAttachment(i))
+                            .padding(2)
+                            .style(|_theme, _status| iced::widget::button::Style {
+                                background: Some(iced::Background::Color(iced::Color::from_rgb(0.6, 0.2, 0.2))),
+                                text_color: iced::Color::WHITE,
+                                border: iced::Border {
+                                    radius: 10.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+
+                        let attachment_card = container(
+                            column![
+                                row![preview, remove_btn].spacing(4).align_y(iced::Alignment::Start),
+                                text(label).size(state.font_size * 0.7).color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                            ].spacing(2).align_x(iced::Alignment::Center)
+                        )
+                            .padding(4)
+                            .style(|_| container::Style {
+                                background: Some(iced::Background::Color(iced::Color::from_rgb(0.15, 0.15, 0.18))),
+                                border: iced::Border {
+                                    radius: 4.0.into(),
+                                    width: 1.0,
+                                    color: iced::Color::from_rgb(0.3, 0.3, 0.35),
+                                },
+                                ..Default::default()
+                            });
+
+                        attachment_card.into()
+                    }
+                    _ => text("?").into(),
+                }
+            })
+            .collect();
+
+        Some(row(attachment_items).spacing(8).into())
+    };
 
     // Show history search popup if active
     if state.history_search_active {
@@ -2078,7 +2608,13 @@ fn view_input(state: &Nexus) -> Element<'_, Message> {
         })
         .padding(4);
 
-        column![popup, input_row].spacing(4).into()
+        if let Some(attachments) = attachments_view {
+            column![attachments, popup, input_row].spacing(4).into()
+        } else {
+            column![popup, input_row].spacing(4).into()
+        }
+    } else if let Some(attachments) = attachments_view {
+        column![attachments, input_row].spacing(4).into()
     } else {
         input_row.into()
     }

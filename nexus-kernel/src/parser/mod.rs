@@ -312,18 +312,62 @@ fn build_redirect(node: &Node, source: &str) -> Result<Option<Redirect>, ShellEr
 }
 
 fn build_assignment(node: &Node, source: &str) -> Result<Assignment, ShellError> {
-    let text = node_text(node, source);
-    if let Some((name, value)) = text.split_once('=') {
-        Ok(Assignment {
-            name: name.to_string(),
-            value: Word::Literal(value.to_string()),
-        })
-    } else {
-        Err(ShellError::Syntax(format!(
-            "invalid assignment: {}",
-            text
-        )))
+    let mut name = String::new();
+    let mut value_word = Word::Literal(String::new());
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "variable_name" => {
+                name = node_text(&child, source);
+            }
+            "command_substitution" => {
+                value_word = Word::CommandSubstitution(node_text(&child, source));
+            }
+            "simple_expansion" | "expansion" => {
+                value_word = Word::Variable(extract_variable_name(&child, source));
+            }
+            "string" | "word" | "raw_string" | "number" | "concatenation" => {
+                // Check if the text looks like a command substitution
+                let text = node_text(&child, source);
+                if text.starts_with("$(") && text.ends_with(")") {
+                    value_word = Word::CommandSubstitution(text);
+                } else if text.starts_with('$') {
+                    value_word = Word::Variable(text.trim_start_matches('$').to_string());
+                } else {
+                    value_word = Word::Literal(text);
+                }
+            }
+            "=" => {} // Skip the equals sign
+            _ => {}
+        }
     }
+
+    // Fallback: if we didn't find a variable_name child, use the old method
+    if name.is_empty() {
+        let text = node_text(node, source);
+        if let Some((n, v)) = text.split_once('=') {
+            name = n.to_string();
+            // Check if value looks like a command substitution
+            if v.starts_with("$(") && v.ends_with(")") {
+                value_word = Word::CommandSubstitution(v.to_string());
+            } else if v.starts_with('$') {
+                value_word = Word::Variable(v.trim_start_matches('$').to_string());
+            } else {
+                value_word = Word::Literal(v.to_string());
+            }
+        } else {
+            return Err(ShellError::Syntax(format!(
+                "invalid assignment: {}",
+                text
+            )));
+        }
+    }
+
+    Ok(Assignment {
+        name,
+        value: value_word,
+    })
 }
 
 fn build_if_statement(node: &Node, source: &str) -> Result<IfStatement, ShellError> {
@@ -900,6 +944,44 @@ mod tests {
             assert_eq!(for_stmt.items[0].as_literal(), Some("{1..5}"));
         } else {
             panic!("Expected For statement");
+        }
+    }
+
+    #[test]
+    fn test_assignment_with_command_substitution() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("x=$(echo hello)").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Assignment(assignment) = &ast.commands[0] {
+            assert_eq!(assignment.name, "x");
+            // The value should be parsed as a CommandSubstitution, not a Literal
+            if let Word::CommandSubstitution(cmd) = &assignment.value {
+                assert!(cmd.contains("echo"), "Expected command substitution to contain 'echo', got: {}", cmd);
+            } else {
+                panic!("Expected CommandSubstitution, got {:?}", assignment.value);
+            }
+        } else {
+            panic!("Expected Assignment, got {:?}", ast.commands[0]);
+        }
+    }
+
+    #[test]
+    fn test_assignment_with_variable() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("x=$y").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Assignment(assignment) = &ast.commands[0] {
+            assert_eq!(assignment.name, "x");
+            // The value should be parsed as a Variable
+            if let Word::Variable(var) = &assignment.value {
+                assert_eq!(var, "y");
+            } else {
+                panic!("Expected Variable, got {:?}", assignment.value);
+            }
+        } else {
+            panic!("Expected Assignment");
         }
     }
 

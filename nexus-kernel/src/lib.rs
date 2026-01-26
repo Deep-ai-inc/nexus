@@ -6,8 +6,10 @@
 //! - State management
 //! - In-process commands (ls, cat, etc.)
 //! - Persistence (SQLite-backed history and sessions)
+//! - Tab completion
 
 pub mod commands;
+pub mod completion;
 pub mod eval;
 pub mod parser;
 pub mod persistence;
@@ -17,9 +19,10 @@ mod error;
 mod state;
 
 pub use commands::CommandRegistry;
+pub use completion::{Completion, CompletionEngine, CompletionKind};
 pub use error::ShellError;
 pub use parser::Parser;
-pub use persistence::Store;
+pub use persistence::{HistoryEntry, Store};
 pub use state::{ShellState, TrapAction};
 
 use nexus_api::ShellEvent;
@@ -163,6 +166,35 @@ impl Kernel {
     /// Check if there's a previous output available for pipeline continuation.
     pub fn has_previous_output(&self) -> bool {
         self.state.last_output.is_some()
+    }
+
+    /// Get completions for the given input at the cursor position.
+    ///
+    /// Returns (completions, start_offset) where start_offset is the position
+    /// where the completed word starts.
+    pub fn complete(&self, input: &str, cursor: usize) -> (Vec<Completion>, usize) {
+        let engine = CompletionEngine::new(&self.state, &self.commands);
+        engine.complete(input, cursor)
+    }
+
+    /// Search command history using full-text search.
+    ///
+    /// Returns matching history entries, most recent first.
+    pub fn search_history(&self, query: &str, limit: usize) -> Vec<persistence::HistoryEntry> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.search_history(query, limit).ok())
+            .unwrap_or_default()
+    }
+
+    /// Get recent command history.
+    ///
+    /// Returns the most recent commands, newest first.
+    pub fn get_recent_history(&self, limit: usize) -> Vec<persistence::HistoryEntry> {
+        self.store
+            .as_ref()
+            .and_then(|store| store.get_recent_history(limit).ok())
+            .unwrap_or_default()
     }
 }
 

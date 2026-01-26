@@ -1,0 +1,80 @@
+[package]
+name = "nexus-agent"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "nexus_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexus-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Internal nexus crates
+nexus-executor = { path = "../nexus-executor" }
+nexus-fs = { path = "../nexus-fs" }
+nexus-llm = { path = "../nexus-llm" }
+nexus-sandbox = { path = "../nexus-sandbox" }
+nexus-web = { path = "../nexus-web" }
+
+# File operations
+glob = "0.3"
+ignore = "0.4"
+walkdir = "2.5"
+percent-encoding = "2.3"
+
+# Async runtime
+tokio.workspace = true
+futures = "0.3"
+tempfile = "3.23"
+
+# JSON (de)serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+async-trait = "0.1"
+dotenv = "0.15"
+dirs = "5.0"
+md5 = "0.7.0"
+
+# Date and time
+chrono.workspace = true
+
+# File content inspection
+unicode-segmentation = "1.12.0"
+rand.workspace = true
+
+# Diff visualization
+similar = { version = "2.7.0", features = ["inline"] }
+async-channel = "2.5.0"
+
+# Base64 encoding for images
+base64 = "0.22"
+
+# Image processing
+image = "0.25"
+
+# System prompts embedding
+rust-embed = { version = "8.9", features = ["include-exclude"] }
+
+# Agent Client Protocol
+agent-client-protocol = { version = "0.9", features = ["unstable"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+axum = "0.7"
+bytes = "1.10"

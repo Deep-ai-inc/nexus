@@ -1,0 +1,145 @@
+//! AI Core client for Anthropic (Claude) API
+//!
+//! This client wraps the Anthropic client with AI Core authentication.
+
+use crate::{
+    anthropic::{AnthropicClient, AuthProvider, DefaultMessageConverter, RequestCustomizer},
+    auth::TokenManager,
+    types::*,
+    LLMProvider, StreamingCallback,
+};
+use anyhow::Result;
+use async_trait::async_trait;
+use serde_json::Value;
+use std::sync::Arc;
+
+/// AI Core authentication provider using TokenManager
+pub struct AiCoreAuthProvider {
+    token_manager: Arc<TokenManager>,
+}
+
+impl AiCoreAuthProvider {
+    pub fn new(token_manager: Arc<TokenManager>) -> Self {
+        Self { token_manager }
+    }
+}
+
+#[async_trait]
+impl AuthProvider for AiCoreAuthProvider {
+    async fn get_auth_headers(&self) -> Result<Vec<(String, String)>> {
+        let token = self.token_manager.get_valid_token().await?;
+        Ok(vec![(
+            "Authorization".to_string(),
+            format!("Bearer {token}"),
+        )])
+    }
+}
+
+/// AI Core request customizer for Anthropic API
+pub struct AiCoreAnthropicRequestCustomizer;
+
+impl RequestCustomizer for AiCoreAnthropicRequestCustomizer {
+    fn customize_request(&self, request: &mut serde_json::Value) -> Result<()> {
+        if let Value::Object(map) = request {
+            // Remove stream and model fields after URL routing is done
+            map.remove("stream");
+            map.remove("model");
+            // Add anthropic_version for AiCore
+            map.insert(
+                "anthropic_version".to_string(),
+                Value::String("bedrock-2023-05-31".to_string()),
+            );
+        }
+        Ok(())
+    }
+
+    fn get_additional_headers(&self) -> Vec<(String, String)> {
+        vec![
+            ("AI-Resource-Group".to_string(), "default".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            (
+                "anthropic-beta".to_string(),
+                "output-128k-2025-02-19".to_string(),
+            ),
+        ]
+    }
+
+    fn customize_url(&self, base_url: &str, streaming: bool) -> String {
+        if streaming {
+            format!("{base_url}/invoke-with-response-stream")
+        } else {
+            format!("{base_url}/invoke")
+        }
+    }
+}
+
+/// AI Core client for Anthropic (Claude) models
+pub struct AiCoreAnthropicClient {
+    anthropic_client: AnthropicClient,
+    custom_config: Option<serde_json::Value>,
+}
+
+impl AiCoreAnthropicClient {
+    fn create_anthropic_client(
+        token_manager: Arc<TokenManager>,
+        base_url: String,
+    ) -> AnthropicClient {
+        let auth_provider = Box::new(AiCoreAuthProvider::new(token_manager));
+        let request_customizer = Box::new(AiCoreAnthropicRequestCustomizer);
+        let message_converter = Box::new(DefaultMessageConverter::new());
+
+        AnthropicClient::with_customization(
+            "ignored".to_string(), // Default model, can be overridden
+            base_url,
+            auth_provider,
+            request_customizer,
+            message_converter,
+        )
+    }
+
+    pub fn new(token_manager: Arc<TokenManager>, base_url: String) -> Self {
+        let anthropic_client = Self::create_anthropic_client(token_manager, base_url);
+        Self {
+            anthropic_client,
+            custom_config: None,
+        }
+    }
+
+    /// Create a new client with recording capability
+    pub fn new_with_recorder<P: AsRef<std::path::Path>>(
+        token_manager: Arc<TokenManager>,
+        base_url: String,
+        recording_path: P,
+    ) -> Self {
+        let anthropic_client =
+            Self::create_anthropic_client(token_manager, base_url).with_recorder(recording_path);
+
+        Self {
+            anthropic_client,
+            custom_config: None,
+        }
+    }
+
+    /// Set custom model configuration to be merged into API requests
+    pub fn with_custom_config(mut self, custom_config: serde_json::Value) -> Self {
+        self.anthropic_client = self
+            .anthropic_client
+            .with_custom_config(custom_config.clone());
+        self.custom_config = Some(custom_config);
+        self
+    }
+}
+
+#[async_trait]
+impl LLMProvider for AiCoreAnthropicClient {
+    async fn send_message(
+        &mut self,
+        request: LLMRequest,
+        streaming_callback: Option<&StreamingCallback>,
+    ) -> Result<LLMResponse> {
+        // Delegate to the wrapped AnthropicClient
+        self.anthropic_client
+            .send_message(request, streaming_callback)
+            .await
+    }
+}

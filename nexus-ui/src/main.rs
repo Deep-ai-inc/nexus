@@ -2,12 +2,15 @@
 //!
 //! Main entry point for the Iced-based GUI.
 
+mod agent_adapter;
+mod agent_block;
+mod agent_widgets;
 mod app;
-mod claude_panel;
 mod glyph_cache;
-mod widgets;
-mod theme;
 mod pty;
+mod shell_context;
+mod theme;
+mod widgets;
 
 use tracing_subscriber::EnvFilter;
 

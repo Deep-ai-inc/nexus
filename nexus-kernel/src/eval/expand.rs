@@ -11,6 +11,74 @@
 
 use crate::parser::Word;
 use crate::ShellState;
+use nexus_api::Value;
+
+/// Expand a word to a Value, preserving rich types.
+///
+/// This is the Mathematica-style expansion that preserves non-string values
+/// like images, tables, etc. when passing through pipelines.
+///
+/// Use this for native command piping where rich values should be preserved.
+pub fn expand_word_to_value(word: &Word, state: &ShellState) -> Value {
+    match word {
+        Word::Literal(s) => {
+            // Literals expand to strings
+            Value::String(expand_literal(s, state))
+        }
+        Word::Variable(name) => {
+            // Check if it's a rich variable
+            expand_variable_to_value(name, state)
+        }
+        Word::CommandSubstitution(cmd) => {
+            // Command substitution - for now returns string, but could be enhanced
+            // to capture rich values from subshell execution
+            Value::String(expand_command_substitution(cmd, state))
+        }
+    }
+}
+
+/// Expand a variable to its Value representation.
+/// Returns the rich Value if it's a rich variable, otherwise Value::String.
+fn expand_variable_to_value(name: &str, state: &ShellState) -> Value {
+    // Handle special variables (always strings)
+    match name {
+        "?" => return Value::Int(state.last_exit_code as i64),
+        "$" => return Value::Int(std::process::id() as i64),
+        "!" => {
+            return state
+                .last_bg_pid
+                .map(|p| Value::Int(p as i64))
+                .unwrap_or(Value::Unit);
+        }
+        "0" => return Value::String("nexus".to_string()),
+        "PWD" => return Value::String(state.cwd.to_string_lossy().to_string()),
+        "HOME" => {
+            return Value::String(
+                state.get_env("HOME").unwrap_or_default().to_string()
+            );
+        }
+        // $_ or $prev - returns the last output (rich value!)
+        "_" | "prev" => {
+            return state.get_last_output().cloned().unwrap_or(Value::Unit);
+        }
+        _ => {}
+    }
+
+    // Check for $_N references (recent outputs)
+    if name.starts_with('_') {
+        if let Ok(n) = name[1..].parse::<usize>() {
+            return state.get_output_by_index(n).cloned().unwrap_or(Value::Unit);
+        }
+    }
+
+    // Check if it's a parameter expansion (${var:-default} etc)
+    if let Some((var, modifier)) = parse_parameter_expansion(name) {
+        return Value::String(apply_parameter_expansion(&var, &modifier, state));
+    }
+
+    // Use get_var_value which checks rich_vars first
+    state.get_var_value(name).unwrap_or(Value::Unit)
+}
 
 /// Expand a word to a string (no glob expansion).
 pub fn expand_word_to_string(word: &Word, state: &ShellState) -> String {
@@ -102,12 +170,43 @@ pub fn expand_braces(s: &str) -> Vec<String> {
 
 /// Find the first top-level brace expression in a string.
 /// Returns (start_index, end_index, content_between_braces).
+/// Skips over quoted content (single and double quotes) since brace expansion
+/// should not apply to quoted strings.
 fn find_brace_expr(s: &str) -> Option<(usize, usize, &str)> {
     let bytes = s.as_bytes();
     let mut depth = 0;
     let mut start_idx = None;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut i = 0;
 
-    for (i, &b) in bytes.iter().enumerate() {
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Handle escape sequences
+        if b == b'\\' && i + 1 < bytes.len() {
+            i += 2; // Skip escaped character
+            continue;
+        }
+
+        // Track quote state
+        if b == b'\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            i += 1;
+            continue;
+        }
+
+        // Skip brace handling when inside quotes
+        if in_single_quote || in_double_quote {
+            i += 1;
+            continue;
+        }
+
         match b {
             b'{' => {
                 if depth == 0 {
@@ -116,27 +215,44 @@ fn find_brace_expr(s: &str) -> Option<(usize, usize, &str)> {
                 depth += 1;
             }
             b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(start) = start_idx {
-                        let content = &s[start + 1..i];
-                        // Only treat as brace expansion if it contains , or ..
-                        if content.contains(',') || content.contains("..") {
-                            return Some((start, i, content));
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(start) = start_idx {
+                            let content = &s[start + 1..i];
+                            // Only treat as brace expansion if it contains , or ..
+                            // AND doesn't look like JSON (has unquoted : which is JSON field separator)
+                            if (content.contains(',') || content.contains(".."))
+                                && !looks_like_json(content)
+                            {
+                                return Some((start, i, content));
+                            }
+                            // Otherwise, not a brace expansion - continue looking
+                            start_idx = None;
                         }
-                        // Otherwise, not a brace expansion - continue looking
-                        start_idx = None;
                     }
                 }
             }
-            b'\\' => {
-                // Skip escaped character (simplified - doesn't handle all cases)
-            }
             _ => {}
         }
+        i += 1;
     }
 
     None
+}
+
+/// Check if content looks like JSON (has quoted keys followed by colons).
+/// This helps avoid treating JSON objects as brace expansion.
+fn looks_like_json(content: &str) -> bool {
+    // JSON typically has patterns like "key": or 'key':
+    // Simple heuristic: if we see a quote followed by : it's likely JSON
+    let bytes = content.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if (bytes[i] == b'"' || bytes[i] == b'\'') && bytes[i + 1] == b':' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse the content of a brace expression.

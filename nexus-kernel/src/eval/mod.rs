@@ -3,6 +3,9 @@
 mod builtins;
 mod expand;
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+
 use nexus_api::{ShellEvent, Value};
 use tokio::sync::broadcast::Sender;
 
@@ -94,7 +97,7 @@ fn execute_command(
         Command::Pipeline(pipeline) => execute_pipeline(state, pipeline, events, commands, block_id),
         Command::List(list) => execute_list(state, list, events, commands, block_id),
         Command::Subshell(subshell) => execute_subshell(state, subshell, events, commands, block_id),
-        Command::Assignment(assignment) => execute_assignment(state, assignment),
+        Command::Assignment(assignment) => execute_assignment(state, assignment, events, commands, block_id),
         Command::If(if_stmt) => execute_if(state, if_stmt, events, commands, block_id),
         Command::While(while_stmt) => execute_while(state, while_stmt, events, commands, block_id),
         Command::For(for_stmt) => execute_for(state, for_stmt, events, commands, block_id),
@@ -144,7 +147,7 @@ fn execute_simple(
 
     // Check for native commands (in-process: ls, cat, etc.)
     if let Some(native_cmd) = commands.get(&name) {
-        return execute_native(state, native_cmd, &args, events, block_id);
+        return execute_native(state, native_cmd, &args, &cmd.redirects, events, block_id);
     }
 
     // External command - spawn a process via PTY (legacy)
@@ -156,6 +159,7 @@ fn execute_native(
     state: &mut ShellState,
     cmd: &dyn crate::commands::NexusCommand,
     args: &[String],
+    redirects: &[Redirect],
     events: &Sender<ShellEvent>,
     external_block_id: Option<BlockId>,
 ) -> anyhow::Result<i32> {
@@ -173,12 +177,53 @@ fn execute_native(
 
     let start = std::time::Instant::now();
 
+    // Check for stdout redirect (fd 1)
+    let stdout_redirect = redirects.iter().find(|r| r.fd == 1);
+
+    // Check for stderr redirect (fd 2)
+    // Handle 2>&1 (DupWrite) by pointing stderr to the same destination as stdout
+    let stderr_redirect = redirects.iter().find(|r| r.fd == 2);
+    let stderr_to_stdout = stderr_redirect
+        .map(|r| r.op == RedirectOp::DupWrite && r.target == "1")
+        .unwrap_or(false);
+
+    // Check for stdin redirect (fd 0, Read)
+    let stdin_redirect = redirects.iter().find(|r| r.fd == 0 && r.op == RedirectOp::Read);
+
+    // Handle input redirection: read file content as stdin
+    let stdin_value = if let Some(redirect) = stdin_redirect {
+        let target_path = expand::expand_tilde(&redirect.target, state);
+        let resolved = if std::path::Path::new(&target_path).is_absolute() {
+            std::path::PathBuf::from(&target_path)
+        } else {
+            state.cwd.join(&target_path)
+        };
+
+        match std::fs::read_to_string(&resolved) {
+            Ok(content) => Some(Value::String(content)),
+            Err(e) => {
+                let _ = events.send(ShellEvent::StderrChunk {
+                    block_id,
+                    data: format!("{}: {}: {}\n", cmd.name(), target_path, e).into_bytes(),
+                });
+                let _ = events.send(ShellEvent::CommandFinished {
+                    block_id,
+                    exit_code: 1,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+                return Ok(1);
+            }
+        }
+    } else {
+        None
+    };
+
     // Create command context
     let mut ctx = CommandContext {
         state,
         events,
         block_id,
-        stdin: None, // TODO: piped input support
+        stdin: stdin_value,
     };
 
     // Execute the command
@@ -195,11 +240,67 @@ fn execute_native(
                 ctx.state.store_output(block_id, command_str.clone(), value.clone());
             }
 
-            // Emit structured output
-            let _ = events.send(ShellEvent::CommandOutput {
-                block_id,
-                value: value.clone(),
-            });
+            // Handle stdout redirect if present
+            if let Some(redirect) = stdout_redirect {
+                let text = value.to_text();
+                let target_path = expand::expand_tilde(&redirect.target, ctx.state);
+
+                let file_result = match redirect.op {
+                    RedirectOp::Write => File::create(&target_path),
+                    RedirectOp::Append => OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&target_path),
+                    _ => {
+                        // Unsupported redirect op for stdout
+                        let _ = events.send(ShellEvent::StderrChunk {
+                            block_id,
+                            data: format!("Unsupported redirect operator\n").into_bytes(),
+                        });
+                        let _ = events.send(ShellEvent::CommandFinished {
+                            block_id,
+                            exit_code: 1,
+                            duration_ms,
+                        });
+                        return Ok(1);
+                    }
+                };
+
+                match file_result {
+                    Ok(mut file) => {
+                        if let Err(e) = writeln!(file, "{}", text) {
+                            let _ = events.send(ShellEvent::StderrChunk {
+                                block_id,
+                                data: format!("{}: {}\n", cmd.name(), e).into_bytes(),
+                            });
+                            let _ = events.send(ShellEvent::CommandFinished {
+                                block_id,
+                                exit_code: 1,
+                                duration_ms,
+                            });
+                            return Ok(1);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = events.send(ShellEvent::StderrChunk {
+                            block_id,
+                            data: format!("{}: {}: {}\n", cmd.name(), target_path, e).into_bytes(),
+                        });
+                        let _ = events.send(ShellEvent::CommandFinished {
+                            block_id,
+                            exit_code: 1,
+                            duration_ms,
+                        });
+                        return Ok(1);
+                    }
+                }
+            } else {
+                // No redirect - emit structured output to UI
+                let _ = events.send(ShellEvent::CommandOutput {
+                    block_id,
+                    value: value.clone(),
+                });
+            }
 
             // Emit command finished
             let _ = events.send(ShellEvent::CommandFinished {
@@ -211,11 +312,83 @@ fn execute_native(
             Ok(0)
         }
         Err(e) => {
-            // Emit error as stderr
-            let _ = events.send(ShellEvent::StderrChunk {
-                block_id,
-                data: format!("{}: {}\n", cmd.name(), e).into_bytes(),
-            });
+            let error_msg = format!("{}: {}\n", cmd.name(), e);
+
+            // Handle stderr redirect
+            // Priority: 2>&1 (stderr to stdout destination) > 2>file > default (UI)
+            if stderr_to_stdout {
+                // 2>&1: stderr goes wherever stdout goes
+                if let Some(redirect) = stdout_redirect {
+                    // stdout is redirected to file, so stderr also goes there
+                    let target_path = expand::expand_tilde(&redirect.target, ctx.state);
+                    let file_result = match redirect.op {
+                        RedirectOp::Write => OpenOptions::new()
+                            .create(true)
+                            .append(true) // Append since stdout may have already written
+                            .open(&target_path),
+                        RedirectOp::Append => OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&target_path),
+                        _ => {
+                            let _ = events.send(ShellEvent::StderrChunk {
+                                block_id,
+                                data: error_msg.into_bytes(),
+                            });
+                            let _ = events.send(ShellEvent::CommandFinished {
+                                block_id,
+                                exit_code: 1,
+                                duration_ms,
+                            });
+                            return Ok(1);
+                        }
+                    };
+                    if let Ok(mut file) = file_result {
+                        let _ = write!(file, "{}", error_msg);
+                    }
+                } else {
+                    // stdout goes to UI, so stderr also goes to UI
+                    let _ = events.send(ShellEvent::StderrChunk {
+                        block_id,
+                        data: error_msg.into_bytes(),
+                    });
+                }
+            } else if let Some(redirect) = stderr_redirect {
+                // Direct stderr redirect (2>file)
+                let target_path = expand::expand_tilde(&redirect.target, ctx.state);
+
+                let file_result = match redirect.op {
+                    RedirectOp::Write => File::create(&target_path),
+                    RedirectOp::Append => OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&target_path),
+                    _ => {
+                        // Unsupported redirect op for stderr - emit to UI
+                        let _ = events.send(ShellEvent::StderrChunk {
+                            block_id,
+                            data: error_msg.into_bytes(),
+                        });
+                        let _ = events.send(ShellEvent::CommandFinished {
+                            block_id,
+                            exit_code: 1,
+                            duration_ms,
+                        });
+                        return Ok(1);
+                    }
+                };
+
+                if let Ok(mut file) = file_result {
+                    let _ = write!(file, "{}", error_msg);
+                }
+                // If file open failed, silently ignore (like shell behavior)
+            } else {
+                // No redirect - emit error to UI
+                let _ = events.send(ShellEvent::StderrChunk {
+                    block_id,
+                    data: error_msg.into_bytes(),
+                });
+            }
 
             let _ = events.send(ShellEvent::CommandFinished {
                 block_id,
@@ -518,9 +691,46 @@ fn execute_subshell(
 }
 
 /// Execute a variable assignment.
-fn execute_assignment(state: &mut ShellState, assignment: &Assignment) -> anyhow::Result<i32> {
-    let value = expand::expand_word_to_string(&assignment.value, state);
-    state.set_var(assignment.name.clone(), value);
+fn execute_assignment(
+    state: &mut ShellState,
+    assignment: &Assignment,
+    events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
+    _block_id: Option<BlockId>,
+) -> anyhow::Result<i32> {
+    // Check if the RHS is a command substitution - if so, execute it through our
+    // evaluator to capture rich Value output (Mathematica-style)
+    if let Word::CommandSubstitution(cmd_str) = &assignment.value {
+        // Parse the inner command
+        let inner = cmd_str
+            .trim_start_matches("$(")
+            .trim_end_matches(')')
+            .trim_start_matches('`')
+            .trim_end_matches('`');
+
+        // Parse and execute through our evaluator
+        if let Ok(mut parser) = crate::parser::Parser::new() {
+            if let Ok(ast) = parser.parse(inner) {
+                // Execute the command - this will store output in state.last_output
+                let exit_code = execute(state, &ast, events, commands)?;
+
+                // Get the captured output value
+                if let Some(value) = state.get_last_output().cloned() {
+                    state.set_var_value(assignment.name.clone(), value);
+                } else {
+                    // No output - store empty string
+                    state.set_var_value(assignment.name.clone(), Value::String(String::new()));
+                }
+
+                return Ok(exit_code);
+            }
+        }
+        // If parsing fails, fall through to string expansion
+    }
+
+    // Use Value-based expansion to preserve rich types for other word types
+    let value = expand::expand_word_to_value(&assignment.value, state);
+    state.set_var_value(assignment.name.clone(), value);
     Ok(0)
 }
 
