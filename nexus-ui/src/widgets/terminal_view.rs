@@ -10,7 +10,7 @@ use iced::{Color, Element, Length, Rectangle, Size, Theme};
 
 use nexus_term::{Color as TermColor, TerminalGrid};
 
-use crate::app::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
+use crate::constants::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
 
 /// A widget that renders a terminal grid.
 /// Uses Rc<TerminalGrid> for cheap cloning - the grid is cached in the parser.

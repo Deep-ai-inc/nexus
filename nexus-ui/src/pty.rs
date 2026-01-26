@@ -8,7 +8,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use tokio::sync::mpsc;
 
 use nexus_api::BlockId;
-use crate::app::PtyEvent;
+use crate::blocks::PtyEvent;
 
 /// Handle to a running PTY process.
 pub struct PtyHandle {

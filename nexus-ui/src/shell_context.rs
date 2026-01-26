@@ -10,7 +10,7 @@
 //! - Last command output (serialized for LLM)
 //! - Recent command history
 
-use crate::app::Block;
+use crate::blocks::Block;
 use nexus_api::BlockState;
 use nexus_term::TerminalGrid;
 use std::rc::Rc;
@@ -148,7 +148,7 @@ fn extract_text_from_grid(grid: &Rc<TerminalGrid>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Block;
+    use crate::blocks::Block;
     use nexus_api::{BlockId, Value};
 
     fn make_test_block(id: u64, command: &str, state: BlockState, native_output: Option<Value>) -> Block {
