@@ -113,7 +113,9 @@ pub enum AgentMessage {
     Event(AgentEvent),
     /// Agent widget interaction (toggle, permission response, etc.)
     Widget(AgentWidgetMessage),
-    /// Cancel the current agent operation.
+    /// Interrupt the current agent (Escape key). Preserves partial response.
+    Interrupt,
+    /// Cancel the current agent operation (hard stop).
     Cancel,
 }
 

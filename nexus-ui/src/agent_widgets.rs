@@ -479,6 +479,7 @@ fn view_status<'a>(block: &'a AgentBlock, font_size: f32) -> Element<'a, AgentWi
         AgentBlockState::Completed => ("Completed", colors::TOOL_SUCCESS),
         AgentBlockState::Failed(err) => (err.as_str(), colors::TOOL_ERROR),
         AgentBlockState::AwaitingPermission => ("Awaiting permission...", colors::PERMISSION_BORDER),
+        AgentBlockState::Interrupted => ("Interrupted", colors::MUTED),
     };
 
     let mut status = Row::new().spacing(8);

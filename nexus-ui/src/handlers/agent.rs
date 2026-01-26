@@ -22,6 +22,7 @@ pub fn update(state: &mut Nexus, msg: AgentMessage) -> Task<Message> {
     match msg {
         AgentMessage::Event(evt) => handle_event(state, evt),
         AgentMessage::Widget(widget_msg) => handle_widget(state, widget_msg),
+        AgentMessage::Interrupt => interrupt(state),
         AgentMessage::Cancel => cancel(state),
     }
 }
@@ -92,11 +93,14 @@ pub fn handle_event(state: &mut Nexus, event: AgentEvent) -> Task<Message> {
                             working_dir,
                         });
                     }
-                    AgentEvent::Finished { .. } => {
+                    AgentEvent::Finished { messages, .. } => {
                         block.complete();
+                        agent.conversation = messages;
+                        agent.active_block = None;
                     }
-                    AgentEvent::Cancelled { .. } => {
-                        block.fail("Cancelled".to_string());
+                    AgentEvent::Interrupted { messages, .. } => {
+                        block.state = AgentBlockState::Interrupted;
+                        agent.conversation = messages;
                         agent.active_block = None;
                     }
                     AgentEvent::Error(err) => {
@@ -181,7 +185,22 @@ pub fn handle_widget(state: &mut Nexus, widget_msg: AgentWidgetMessage) -> Task<
 // Agent Control
 // =============================================================================
 
-/// Cancel the current agent operation.
+/// Interrupt the current agent (Escape key). Preserves partial response.
+/// Agent will send HistorySnapshot before exiting, preserving conversation.
+pub fn interrupt(state: &mut Nexus) -> Task<Message> {
+    let agent = &mut state.agent;
+
+    // Only interrupt if there's an active agent
+    if agent.active_block.is_some() {
+        // Set cancel flag - agent will detect this and send Interrupted event
+        agent.cancel_flag.store(true, Ordering::SeqCst);
+        // Note: Don't clear active_block here - let the Interrupted event do it
+        // so we get the conversation history first
+    }
+    Task::none()
+}
+
+/// Cancel the current agent operation (hard stop, no history preservation).
 pub fn cancel(state: &mut Nexus) -> Task<Message> {
     let agent = &mut state.agent;
 
@@ -191,6 +210,7 @@ pub fn cancel(state: &mut Nexus) -> Task<Message> {
                 block.fail("Cancelled by user".to_string());
             }
         }
+        agent.cancel_flag.store(true, Ordering::SeqCst);
         agent.active_block = None;
     }
     Task::none()
@@ -202,15 +222,28 @@ pub fn spawn_query(
     query: String,
     attachments: Vec<nexus_api::Value>,
 ) -> Task<Message> {
-    // Build shell context
-    let shell_context = build_shell_context(
-        &state.terminal.cwd,
-        &state.terminal.blocks,
-        &state.input.history,
-    );
+    // Build query with context
+    let is_continuation = !state.agent.conversation.is_empty();
+    let current_cwd = &state.terminal.cwd;
 
-    let contextualized_query = format!("{}{}", shell_context, query);
-    tracing::info!("Agent query: {}", query);
+    let contextualized_query = if is_continuation {
+        // Continuation: just inject current CWD so agent knows if user moved
+        format!("[CWD: {}]\n{}", current_cwd, query)
+    } else {
+        // New conversation: full shell context (history, files, etc.)
+        let shell_context = build_shell_context(
+            current_cwd,
+            &state.terminal.blocks,
+            &state.input.history,
+        );
+        format!("{}{}", shell_context, query)
+    };
+    tracing::info!(
+        "Agent query (continuation={}, cwd={}): {}",
+        is_continuation,
+        current_cwd,
+        query
+    );
 
     // Create block with shared ID counter
     let block_id = state.terminal.next_id();
@@ -221,14 +254,24 @@ pub fn spawn_query(
     // Reset cancel flag
     state.agent.cancel_flag.store(false, Ordering::SeqCst);
 
+    // Clone prior conversation for the task
+    let prior_messages = state.agent.conversation.clone();
+
     // Spawn agent task
     let agent_tx = state.agent.event_tx.clone();
     let cancel_flag = state.agent.cancel_flag.clone();
     let cwd = PathBuf::from(&state.terminal.cwd);
 
     tokio::spawn(async move {
-        if let Err(e) =
-            spawn_agent_task(agent_tx, cancel_flag, contextualized_query, cwd, attachments).await
+        if let Err(e) = spawn_agent_task(
+            agent_tx,
+            cancel_flag,
+            contextualized_query,
+            cwd,
+            attachments,
+            prior_messages,
+        )
+        .await
         {
             tracing::error!("Agent task failed: {}", e);
         }

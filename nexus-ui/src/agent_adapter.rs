@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use nexus_agent::ui::{DisplayFragment, ToolStatus as AgentToolStatus, UiEvent, UIError, UserInterface};
+use nexus_llm::Message as LlmMessage;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -46,10 +47,16 @@ pub enum AgentEvent {
         action: String,
         working_dir: Option<String>,
     },
-    /// Agent finished processing.
-    Finished { request_id: u64 },
-    /// Agent was cancelled.
-    Cancelled { request_id: u64 },
+    /// Agent finished processing - includes conversation history for continuity.
+    Finished {
+        request_id: u64,
+        messages: Vec<LlmMessage>,
+    },
+    /// Agent was interrupted (Escape) - includes conversation history for continuity.
+    Interrupted {
+        request_id: u64,
+        messages: Vec<LlmMessage>,
+    },
     /// Agent encountered an error.
     Error(String),
 }
@@ -123,13 +130,12 @@ impl UserInterface for IcedAgentUI {
             UiEvent::StreamingStarted(request_id) => {
                 self.send(AgentEvent::Started { request_id });
             }
-            UiEvent::StreamingStopped { id, cancelled, error } => {
+            UiEvent::StreamingStopped { id: _, cancelled: _, error } => {
+                // Only send error events here. Finished/Interrupted events are sent
+                // by spawn_agent_task after run_single_iteration completes, since
+                // that's when we have access to the full message history.
                 if let Some(err) = error {
                     self.send(AgentEvent::Error(err));
-                } else if cancelled {
-                    self.send(AgentEvent::Cancelled { request_id: id });
-                } else {
-                    self.send(AgentEvent::Finished { request_id: id });
                 }
             }
             UiEvent::StartTool { name, id } => {

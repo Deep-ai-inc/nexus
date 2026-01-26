@@ -1,11 +1,12 @@
 //! Agent system for AI assistant integration.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use iced::futures::stream;
 use iced::Subscription;
+use nexus_llm::Message as LlmMessage;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::agent_adapter::{AgentEvent, IcedAgentUI};
@@ -20,12 +21,14 @@ impl nexus_agent::agent::persistence::AgentStatePersistence for NoopPersistence 
 }
 
 /// Spawn an agent task to process a query.
+/// `prior_messages` contains conversation history from previous queries for continuity.
 pub async fn spawn_agent_task(
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     cancel_flag: Arc<AtomicBool>,
     query: String,
     working_dir: PathBuf,
     attachments: Vec<nexus_api::Value>,
+    prior_messages: Vec<LlmMessage>,
 ) -> anyhow::Result<()> {
     use nexus_agent::{Agent, AgentComponents, SessionConfig};
     use nexus_executor::DefaultCommandExecutor;
@@ -61,7 +64,7 @@ pub async fn spawn_agent_task(
     };
 
     // Create components with cancel flag connected to UI
-    let ui = Arc::new(IcedAgentUI::with_cancel_flag(event_tx.clone(), cancel_flag));
+    let ui = Arc::new(IcedAgentUI::with_cancel_flag(event_tx.clone(), cancel_flag.clone()));
 
     let components = AgentComponents {
         llm_provider,
@@ -89,6 +92,19 @@ pub async fn spawn_agent_task(
             e
         )));
         return Ok(());
+    }
+
+    // Restore prior conversation history
+    if !prior_messages.is_empty() {
+        tracing::info!(
+            "Restoring {} prior messages for conversation continuity",
+            prior_messages.len()
+        );
+        for msg in prior_messages {
+            if let Err(e) = agent.append_message(msg) {
+                tracing::warn!("Failed to restore message: {}", e);
+            }
+        }
     }
 
     // Build user message with text and any image attachments
@@ -139,10 +155,27 @@ pub async fn spawn_agent_task(
     }
 
     // Run the agent iteration
-    if let Err(e) = agent.run_single_iteration().await {
-        let _ = event_tx.send(AgentEvent::Error(format!("Agent error: {}", e)));
-    }
+    let result = agent.run_single_iteration().await;
 
+    // Capture state for the completion event
+    let messages: Vec<LlmMessage> = agent.message_history().to_vec();
+    let was_interrupted = cancel_flag.load(Ordering::Relaxed);
+
+    // Determine outcome
+    let event = match result {
+        Ok(()) if was_interrupted => AgentEvent::Interrupted { request_id: 0, messages },
+        Ok(()) => AgentEvent::Finished { request_id: 0, messages },
+        Err(e) => {
+            let err_str = e.to_string();
+            if was_interrupted || err_str.contains("cancelled") {
+                AgentEvent::Interrupted { request_id: 0, messages }
+            } else {
+                AgentEvent::Error(format!("Agent error: {}", e))
+            }
+        }
+    };
+
+    let _ = event_tx.send(event);
     Ok(())
 }
 

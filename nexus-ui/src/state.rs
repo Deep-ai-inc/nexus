@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_api::{BlockId, ShellEvent, Value};
 use nexus_kernel::{CommandRegistry, Completion, HistoryEntry, Kernel};
+use nexus_llm::Message as LlmMessage;
 
 use crate::agent_adapter::{AgentEvent, PermissionResponse};
 use crate::agent_block::AgentBlock;
@@ -236,6 +237,8 @@ pub struct AgentState {
     pub cancel_flag: Arc<AtomicBool>,
     /// Is there new agent output that hasn't been rendered yet?
     pub is_dirty: bool,
+    /// Conversation history (persists across agent queries for continuity).
+    pub conversation: Vec<LlmMessage>,
 }
 
 impl AgentState {
@@ -251,6 +254,7 @@ impl AgentState {
             permission_tx: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             is_dirty: false,
+            conversation: Vec::new(),
         }
     }
 
@@ -270,6 +274,7 @@ impl AgentState {
         self.blocks.clear();
         self.block_index.clear();
         self.active_block = None;
+        self.conversation.clear();
     }
 }
 

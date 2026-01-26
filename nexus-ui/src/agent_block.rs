@@ -74,6 +74,8 @@ pub enum AgentBlockState {
     Failed(String),
     /// Waiting for user permission.
     AwaitingPermission,
+    /// User interrupted (Escape). Partial response preserved.
+    Interrupted,
 }
 
 /// A permission request from the agent.
