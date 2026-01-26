@@ -223,6 +223,20 @@ fn grep_value(value: Value, opts: &GrepOptions) -> Value {
                 Value::String(lines.join("\n"))
             }
         }
+        Value::Media { data, .. } => {
+            // Treat media as bytes, grep through lines (lossy UTF-8)
+            let s = String::from_utf8_lossy(&data);
+            let lines: Vec<&str> = s
+                .lines()
+                .filter(|line| opts.matches(line))
+                .collect();
+
+            if opts.count {
+                Value::Int(lines.len() as i64)
+            } else {
+                Value::String(lines.join("\n"))
+            }
+        }
         other => {
             if opts.matches(&other.to_text()) {
                 other

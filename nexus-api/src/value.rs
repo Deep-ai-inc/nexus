@@ -402,6 +402,27 @@ impl Value {
         }
     }
 
+    /// Extract raw bytes from the value.
+    /// For Media/Bytes, returns the raw data.
+    /// For String/other types, returns UTF-8 encoded text representation.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Value::Bytes(b) => b.clone(),
+            Value::Media { data, .. } => data.clone(),
+            _ => self.to_text().into_bytes(),
+        }
+    }
+
+    /// Get the byte length of the value's data.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Value::Bytes(b) => b.len(),
+            Value::Media { data, .. } => data.len(),
+            Value::String(s) => s.len(),
+            _ => self.to_text().len(),
+        }
+    }
+
     /// Convert value to text for legacy interop (piping to external commands).
     pub fn to_text(&self) -> String {
         let mut buf = String::new();

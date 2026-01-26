@@ -128,6 +128,12 @@ fn head_value(value: Value, count: usize) -> Value {
             let lines: Vec<&str> = s.lines().take(count).collect();
             Value::String(lines.join("\n"))
         }
+        Value::Media { data, .. } => {
+            // Treat media as bytes, take first N lines (lossy UTF-8)
+            let s = String::from_utf8_lossy(&data);
+            let lines: Vec<&str> = s.lines().take(count).collect();
+            Value::String(lines.join("\n"))
+        }
         // For scalar values, just pass through
         other => other,
     }

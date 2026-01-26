@@ -200,6 +200,17 @@ fn wc_value(value: Value, opts: &WcOptions) -> Value {
                 format_counts(&counts, opts)
             }
         }
+        Value::Media { data, .. } => {
+            // Treat media as raw bytes
+            if opts.bytes && !opts.lines && !opts.words && !opts.chars {
+                Value::Int(data.len() as i64)
+            } else {
+                // For lines/words/chars, try to interpret as text (lossy)
+                let s = String::from_utf8_lossy(&data);
+                let counts = count_string(&s, opts);
+                format_counts(&counts, opts)
+            }
+        }
         _ => Value::Int(0),
     }
 }

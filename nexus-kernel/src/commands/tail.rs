@@ -123,6 +123,14 @@ fn tail_value(value: Value, count: usize) -> Value {
             let skip = len.saturating_sub(count);
             Value::String(lines.into_iter().skip(skip).collect::<Vec<_>>().join("\n"))
         }
+        Value::Media { data, .. } => {
+            // Treat media as bytes, take last N lines (lossy UTF-8)
+            let s = String::from_utf8_lossy(&data);
+            let lines: Vec<&str> = s.lines().collect();
+            let len = lines.len();
+            let skip = len.saturating_sub(count);
+            Value::String(lines.into_iter().skip(skip).collect::<Vec<_>>().join("\n"))
+        }
         other => other,
     }
 }
