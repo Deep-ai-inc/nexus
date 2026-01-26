@@ -19,6 +19,7 @@ use crate::claude_panel::{ClaudePanel, ClaudePanelMessage, ClaudeOutputWrapper};
 
 use crate::glyph_cache::get_cell_metrics;
 use crate::pty::PtyHandle;
+use crate::widgets::job_indicator::{job_status_bar, VisualJob, VisualJobState};
 use crate::widgets::table::{interactive_table, TableSort};
 use crate::widgets::terminal_shader::TerminalShader;
 
@@ -140,6 +141,8 @@ pub enum Message {
     TableSort(BlockId, usize),
     /// User clicked a cell in a table (for semantic actions).
     TableCellClick(BlockId, usize, usize, Value),
+    /// User clicked a job in the status bar.
+    JobClicked(u32),
 }
 
 /// Global keyboard shortcuts.
@@ -219,6 +222,8 @@ pub struct Nexus {
     kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
     /// Claude panel for native Claude Code UI.
     claude_panel: ClaudePanel,
+    /// Visual jobs for the status bar.
+    visual_jobs: Vec<VisualJob>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +332,7 @@ impl Default for Nexus {
             claude_panel: ClaudePanel::new(
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
             ),
+            visual_jobs: Vec::new(),
         }
     }
 }
@@ -471,6 +477,40 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                     // Update Claude panel cwd and open it
                     state.claude_panel = ClaudePanel::new(cwd);
                     let _ = state.claude_panel.open(initial_prompt);
+                }
+                ShellEvent::JobStateChanged { job_id, state: job_state } => {
+                    // Update visual jobs
+                    match job_state {
+                        nexus_api::JobState::Running => {
+                            // Add or update job
+                            if let Some(job) = state.visual_jobs.iter_mut().find(|j| j.id == job_id) {
+                                job.state = VisualJobState::Running;
+                            } else {
+                                // New job - we don't have the command here, use placeholder
+                                state.visual_jobs.push(VisualJob::new(
+                                    job_id,
+                                    format!("Job {}", job_id),
+                                    VisualJobState::Running,
+                                ));
+                            }
+                        }
+                        nexus_api::JobState::Stopped => {
+                            // Add or update job as stopped
+                            if let Some(job) = state.visual_jobs.iter_mut().find(|j| j.id == job_id) {
+                                job.state = VisualJobState::Stopped;
+                            } else {
+                                state.visual_jobs.push(VisualJob::new(
+                                    job_id,
+                                    format!("Job {}", job_id),
+                                    VisualJobState::Stopped,
+                                ));
+                            }
+                        }
+                        nexus_api::JobState::Done(_) => {
+                            // Remove completed job
+                            state.visual_jobs.retain(|j| j.id != job_id);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -712,6 +752,12 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 );
             }
         }
+        Message::JobClicked(job_id) => {
+            // Bring job to foreground by executing 'fg %N'
+            let command = format!("fg %{}", job_id);
+            state.input.clear();
+            return execute_command(state, command);
+        }
         Message::InputKey(key, _modifiers) => {
             match &key {
                 Key::Named(keyboard::key::Named::ArrowUp) => {
@@ -873,12 +919,15 @@ fn view(state: &Nexus) -> Element<'_, Message> {
     .id(scrollable::Id::new(HISTORY_SCROLLABLE))
     .height(Length::Fill);
 
+    // Job status bar (only visible when jobs exist)
+    let jobs_bar = job_status_bar(&state.visual_jobs, font_size, Message::JobClicked);
+
     // Input line always visible at bottom
     let input_line = container(view_input(state))
         .padding([8, 15])
         .width(Length::Fill);
 
-    let content = column![history, input_line].spacing(0);
+    let content = column![history, jobs_bar, input_line].spacing(0);
 
     let result = container(content)
         .width(Length::Fill)

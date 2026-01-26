@@ -14,6 +14,44 @@ use crate::process;
 use crate::state::{get_or_create_block_id, ShellState};
 
 pub use builtins::is_builtin;
+use builtins::{BREAK_EXIT_CODE, CONTINUE_EXIT_CODE};
+
+/// Check if an exit code represents a break signal.
+fn is_break(exit_code: i32) -> Option<u32> {
+    if exit_code >= BREAK_EXIT_CODE && exit_code < CONTINUE_EXIT_CODE {
+        Some((exit_code - BREAK_EXIT_CODE + 1) as u32)
+    } else {
+        None
+    }
+}
+
+/// Check if an exit code represents a continue signal.
+fn is_continue(exit_code: i32) -> Option<u32> {
+    if exit_code >= CONTINUE_EXIT_CODE && exit_code < CONTINUE_EXIT_CODE + 100 {
+        Some((exit_code - CONTINUE_EXIT_CODE + 1) as u32)
+    } else {
+        None
+    }
+}
+
+/// Decrement a break/continue level and return the new exit code.
+fn decrement_level(exit_code: i32) -> i32 {
+    if let Some(level) = is_break(exit_code) {
+        if level > 1 {
+            BREAK_EXIT_CODE + level as i32 - 2
+        } else {
+            0 // Break consumed at this level
+        }
+    } else if let Some(level) = is_continue(exit_code) {
+        if level > 1 {
+            CONTINUE_EXIT_CODE + level as i32 - 2
+        } else {
+            0 // Continue consumed at this level
+        }
+    } else {
+        exit_code
+    }
+}
 
 /// Execute an AST and return the final exit code.
 pub fn execute(
@@ -522,7 +560,7 @@ fn execute_while(
 ) -> anyhow::Result<i32> {
     let mut last_exit = 0;
 
-    loop {
+    'outer: loop {
         // Execute condition
         let mut condition_exit = 0;
         for cmd in &while_stmt.condition {
@@ -536,6 +574,28 @@ fn execute_while(
         // Execute body
         for cmd in &while_stmt.body {
             last_exit = execute_command(state, cmd, events, commands, block_id)?;
+
+            // Handle break
+            if let Some(level) = is_break(last_exit) {
+                if level == 1 {
+                    last_exit = 0;
+                    break 'outer;
+                } else {
+                    // Propagate break to outer loop
+                    return Ok(decrement_level(last_exit));
+                }
+            }
+
+            // Handle continue
+            if let Some(level) = is_continue(last_exit) {
+                if level == 1 {
+                    last_exit = 0;
+                    continue 'outer;
+                } else {
+                    // Propagate continue to outer loop
+                    return Ok(decrement_level(last_exit));
+                }
+            }
         }
     }
 
@@ -552,18 +612,40 @@ fn execute_for(
 ) -> anyhow::Result<i32> {
     let mut last_exit = 0;
 
-    // Expand items with glob expansion (e.g., for f in *.rs)
+    // Expand items with glob and brace expansion (e.g., for f in *.rs, for i in {1..10})
     let items: Vec<String> = for_stmt
         .items
         .iter()
         .flat_map(|w| expand::expand_word_to_strings(w, state))
         .collect();
 
-    for item in items {
+    'outer: for item in items {
         state.set_var(for_stmt.variable.clone(), item);
 
         for cmd in &for_stmt.body {
             last_exit = execute_command(state, cmd, events, commands, block_id)?;
+
+            // Handle break
+            if let Some(level) = is_break(last_exit) {
+                if level == 1 {
+                    last_exit = 0;
+                    break 'outer;
+                } else {
+                    // Propagate break to outer loop
+                    return Ok(decrement_level(last_exit));
+                }
+            }
+
+            // Handle continue
+            if let Some(level) = is_continue(last_exit) {
+                if level == 1 {
+                    last_exit = 0;
+                    continue 'outer;
+                } else {
+                    // Propagate continue to outer loop
+                    return Ok(decrement_level(last_exit));
+                }
+            }
         }
     }
 

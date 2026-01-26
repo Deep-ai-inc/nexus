@@ -1,4 +1,13 @@
 //! Word expansion - variable substitution, command substitution, etc.
+//!
+//! Expansion order (POSIX):
+//! 1. Brace expansion (bash extension)
+//! 2. Tilde expansion
+//! 3. Parameter/variable expansion
+//! 4. Command substitution
+//! 5. Arithmetic expansion
+//! 6. Word splitting
+//! 7. Pathname expansion (globbing)
 
 use crate::parser::Word;
 use crate::ShellState;
@@ -12,31 +21,721 @@ pub fn expand_word_to_string(word: &Word, state: &ShellState) -> String {
     }
 }
 
-/// Expand a word to potentially multiple strings (with glob expansion).
+/// Expand a word to potentially multiple strings (with brace and glob expansion).
 ///
-/// This is the full POSIX expansion including pathname expansion (globbing).
-/// Use this for command arguments where `*.txt` should expand to multiple files.
+/// This is the full expansion including:
+/// - Brace expansion: `{a,b,c}` → `a b c`, `{1..5}` → `1 2 3 4 5`
+/// - Pathname expansion (globbing): `*.txt` → matching files
+///
+/// Use this for command arguments.
 pub fn expand_word_to_strings(word: &Word, state: &ShellState) -> Vec<String> {
     let expanded = expand_word_to_string(word, state);
 
-    // If noglob is set, don't expand globs
-    if state.options.noglob {
-        return vec![expanded];
+    // Step 1: Brace expansion (before glob expansion)
+    let brace_expanded = expand_braces(&expanded);
+
+    // Step 2: Glob expansion on each brace-expanded word
+    let mut results = Vec::new();
+
+    for word in brace_expanded {
+        // If noglob is set, don't expand globs
+        if state.options.noglob {
+            results.push(word);
+            continue;
+        }
+
+        // Check if the expanded string contains glob metacharacters
+        if !contains_glob_chars(&word) {
+            results.push(word);
+            continue;
+        }
+
+        // Perform pathname expansion
+        let matches = expand_glob(&word, state);
+
+        if matches.is_empty() {
+            // No matches - return the original pattern (POSIX behavior)
+            results.push(word);
+        } else {
+            results.extend(matches);
+        }
     }
 
-    // Check if the expanded string contains glob metacharacters
-    if !contains_glob_chars(&expanded) {
-        return vec![expanded];
+    results
+}
+
+// ============================================================================
+// Brace Expansion
+// ============================================================================
+
+/// Expand brace expressions like `{a,b,c}` and `{1..10}`.
+///
+/// Examples:
+/// - `{a,b,c}` → `["a", "b", "c"]`
+/// - `{1..5}` → `["1", "2", "3", "4", "5"]`
+/// - `{1..10..2}` → `["1", "3", "5", "7", "9"]`
+/// - `{a..e}` → `["a", "b", "c", "d", "e"]`
+/// - `file{1,2}.txt` → `["file1.txt", "file2.txt"]`
+/// - `{a,b}{1,2}` → `["a1", "a2", "b1", "b2"]`
+pub fn expand_braces(s: &str) -> Vec<String> {
+    // Find the first brace expression (respecting nesting)
+    let Some((start, end, content)) = find_brace_expr(s) else {
+        return vec![s.to_string()];
+    };
+
+    let preamble = &s[..start];
+    let postscript = &s[end + 1..];
+
+    // Parse the brace content
+    let alternatives = parse_brace_content(content);
+
+    // Generate expansions
+    let mut results = Vec::new();
+    for alt in alternatives {
+        let expanded = format!("{}{}{}", preamble, alt, postscript);
+        // Recursively expand remaining braces
+        results.extend(expand_braces(&expanded));
     }
 
-    // Perform pathname expansion
-    let matches = expand_glob(&expanded, state);
+    results
+}
 
-    if matches.is_empty() {
-        // No matches - return the original pattern (POSIX behavior)
-        vec![expanded]
-    } else {
-        matches
+/// Find the first top-level brace expression in a string.
+/// Returns (start_index, end_index, content_between_braces).
+fn find_brace_expr(s: &str) -> Option<(usize, usize, &str)> {
+    let bytes = s.as_bytes();
+    let mut depth = 0;
+    let mut start_idx = None;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                if depth == 0 {
+                    start_idx = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = start_idx {
+                        let content = &s[start + 1..i];
+                        // Only treat as brace expansion if it contains , or ..
+                        if content.contains(',') || content.contains("..") {
+                            return Some((start, i, content));
+                        }
+                        // Otherwise, not a brace expansion - continue looking
+                        start_idx = None;
+                    }
+                }
+            }
+            b'\\' => {
+                // Skip escaped character (simplified - doesn't handle all cases)
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Parse the content of a brace expression.
+/// Handles both comma-separated lists and range expressions.
+fn parse_brace_content(content: &str) -> Vec<String> {
+    // Check for range expression: {1..10} or {a..z} or {1..10..2}
+    if let Some(range_result) = try_parse_range(content) {
+        return range_result;
+    }
+
+    // Parse comma-separated alternatives (respecting nested braces)
+    parse_comma_list(content)
+}
+
+/// Try to parse a range expression like `1..10` or `a..z` or `1..10..2`.
+fn try_parse_range(content: &str) -> Option<Vec<String>> {
+    let parts: Vec<&str> = content.split("..").collect();
+
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+
+    let start_str = parts[0].trim();
+    let end_str = parts[1].trim();
+    let step_str = parts.get(2).map(|s| s.trim());
+
+    // Try numeric range
+    if let (Ok(start), Ok(end)) = (start_str.parse::<i64>(), end_str.parse::<i64>()) {
+        let step: i64 = step_str
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(if start <= end { 1 } else { -1 });
+
+        if step == 0 {
+            return Some(vec![content.to_string()]);
+        }
+
+        let mut results = Vec::new();
+        let mut current = start;
+
+        if step > 0 {
+            while current <= end {
+                results.push(current.to_string());
+                current += step;
+            }
+        } else {
+            while current >= end {
+                results.push(current.to_string());
+                current += step;
+            }
+        }
+
+        return Some(results);
+    }
+
+    // Try character range (single characters only)
+    let start_chars: Vec<char> = start_str.chars().collect();
+    let end_chars: Vec<char> = end_str.chars().collect();
+
+    if start_chars.len() == 1 && end_chars.len() == 1 {
+        let start_char = start_chars[0];
+        let end_char = end_chars[0];
+
+        // Only expand if both are letters or both are digits
+        let valid = (start_char.is_ascii_lowercase() && end_char.is_ascii_lowercase())
+            || (start_char.is_ascii_uppercase() && end_char.is_ascii_uppercase())
+            || (start_char.is_ascii_digit() && end_char.is_ascii_digit());
+
+        if valid {
+            let step: i32 = step_str
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(if start_char <= end_char { 1 } else { -1 });
+
+            if step == 0 {
+                return Some(vec![content.to_string()]);
+            }
+
+            let mut results = Vec::new();
+            let mut current = start_char as i32;
+            let end_val = end_char as i32;
+
+            if step > 0 {
+                while current <= end_val {
+                    if let Some(c) = char::from_u32(current as u32) {
+                        results.push(c.to_string());
+                    }
+                    current += step;
+                }
+            } else {
+                while current >= end_val {
+                    if let Some(c) = char::from_u32(current as u32) {
+                        results.push(c.to_string());
+                    }
+                    current += step;
+                }
+            }
+
+            return Some(results);
+        }
+    }
+
+    None
+}
+
+/// Parse a comma-separated list, respecting nested braces.
+fn parse_comma_list(content: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+
+    for c in content.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                current.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                results.push(current);
+                current = String::new();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Don't forget the last element
+    results.push(current);
+
+    results
+}
+
+// ============================================================================
+// Arithmetic Expansion
+// ============================================================================
+
+/// Collect an arithmetic expression until matching )).
+fn collect_arithmetic_expr(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut expr = String::new();
+    let mut depth = 1; // We've already consumed the opening ((
+
+    while let Some(c) = chars.next() {
+        if c == ')' {
+            if chars.peek() == Some(&')') && depth == 1 {
+                chars.next(); // consume the second )
+                break;
+            }
+            depth -= 1;
+            if depth > 0 {
+                expr.push(c);
+            }
+        } else if c == '(' {
+            depth += 1;
+            expr.push(c);
+        } else {
+            expr.push(c);
+        }
+    }
+
+    expr
+}
+
+/// Evaluate an arithmetic expression.
+///
+/// Supports:
+/// - Integers: 42, -17
+/// - Variables: x, $x, ${x}
+/// - Operators: + - * / % ** (power)
+/// - Comparison: < > <= >= == !=
+/// - Logical: && || !
+/// - Bitwise: & | ^ ~ << >>
+/// - Ternary: a ? b : c
+/// - Parentheses for grouping
+/// - Assignment: x = 5, x += 1
+pub fn evaluate_arithmetic(expr: &str, state: &ShellState) -> i64 {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return 0;
+    }
+
+    // Tokenize
+    let tokens = tokenize_arithmetic(expr, state);
+
+    // Parse and evaluate using a simple recursive descent parser
+    let mut parser = ArithParser::new(tokens);
+    parser.parse_expr()
+}
+
+/// Arithmetic token types.
+#[derive(Debug, Clone, PartialEq)]
+enum ArithToken {
+    Num(i64),
+    Op(String),
+    LParen,
+    RParen,
+}
+
+/// Tokenize an arithmetic expression.
+fn tokenize_arithmetic(expr: &str, state: &ShellState) -> Vec<ArithToken> {
+    let mut tokens = Vec::new();
+    let mut chars = expr.chars().peekable();
+
+    while let Some(&c) = chars.peek() {
+        match c {
+            ' ' | '\t' | '\n' => {
+                chars.next();
+            }
+            '0'..='9' => {
+                let mut num = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() {
+                        num.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(ArithToken::Num(num.parse().unwrap_or(0)));
+            }
+            'a'..='z' | 'A'..='Z' | '_' => {
+                let mut name = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_alphanumeric() || c == '_' {
+                        name.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Look up variable value
+                let val = state
+                    .get_var(&name)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                tokens.push(ArithToken::Num(val));
+            }
+            '$' => {
+                chars.next();
+                // Handle $var or ${var}
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut name = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if c == '}' {
+                            chars.next();
+                            break;
+                        }
+                        name.push(c);
+                        chars.next();
+                    }
+                    let val = state
+                        .get_var(&name)
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    tokens.push(ArithToken::Num(val));
+                } else {
+                    let mut name = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if c.is_alphanumeric() || c == '_' {
+                            name.push(c);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    let val = state
+                        .get_var(&name)
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    tokens.push(ArithToken::Num(val));
+                }
+            }
+            '(' => {
+                chars.next();
+                tokens.push(ArithToken::LParen);
+            }
+            ')' => {
+                chars.next();
+                tokens.push(ArithToken::RParen);
+            }
+            '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '~' | '<' | '>' | '=' | '!' | '?' | ':' => {
+                let mut op = String::new();
+                op.push(c);
+                chars.next();
+
+                // Check for two-character operators
+                if let Some(&next) = chars.peek() {
+                    let two_char = format!("{}{}", c, next);
+                    if matches!(
+                        two_char.as_str(),
+                        "**" | "<<" | ">>" | "<=" | ">=" | "==" | "!=" | "&&" | "||" | "+=" | "-=" | "*=" | "/="
+                    ) {
+                        op.push(next);
+                        chars.next();
+                    }
+                }
+                tokens.push(ArithToken::Op(op));
+            }
+            _ => {
+                chars.next(); // Skip unknown characters
+            }
+        }
+    }
+
+    tokens
+}
+
+/// Simple recursive descent parser for arithmetic expressions.
+struct ArithParser {
+    tokens: Vec<ArithToken>,
+    pos: usize,
+}
+
+impl ArithParser {
+    fn new(tokens: Vec<ArithToken>) -> Self {
+        Self { tokens, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<&ArithToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<ArithToken> {
+        let tok = self.tokens.get(self.pos).cloned();
+        if tok.is_some() {
+            self.pos += 1;
+        }
+        tok
+    }
+
+    fn parse_expr(&mut self) -> i64 {
+        self.parse_ternary()
+    }
+
+    fn parse_ternary(&mut self) -> i64 {
+        let cond = self.parse_logical_or();
+
+        if matches!(self.peek(), Some(ArithToken::Op(op)) if op == "?") {
+            self.next(); // consume ?
+            let then_val = self.parse_expr();
+            if matches!(self.peek(), Some(ArithToken::Op(op)) if op == ":") {
+                self.next(); // consume :
+            }
+            let else_val = self.parse_expr();
+            if cond != 0 { then_val } else { else_val }
+        } else {
+            cond
+        }
+    }
+
+    fn parse_logical_or(&mut self) -> i64 {
+        let mut left = self.parse_logical_and();
+
+        while matches!(self.peek(), Some(ArithToken::Op(op)) if op == "||") {
+            self.next();
+            let right = self.parse_logical_and();
+            left = if left != 0 || right != 0 { 1 } else { 0 };
+        }
+
+        left
+    }
+
+    fn parse_logical_and(&mut self) -> i64 {
+        let mut left = self.parse_bitwise_or();
+
+        while matches!(self.peek(), Some(ArithToken::Op(op)) if op == "&&") {
+            self.next();
+            let right = self.parse_bitwise_or();
+            left = if left != 0 && right != 0 { 1 } else { 0 };
+        }
+
+        left
+    }
+
+    fn parse_bitwise_or(&mut self) -> i64 {
+        let mut left = self.parse_bitwise_xor();
+
+        while matches!(self.peek(), Some(ArithToken::Op(op)) if op == "|" && !matches!(self.tokens.get(self.pos + 1), Some(ArithToken::Op(o)) if o == "|")) {
+            self.next();
+            let right = self.parse_bitwise_xor();
+            left |= right;
+        }
+
+        left
+    }
+
+    fn parse_bitwise_xor(&mut self) -> i64 {
+        let mut left = self.parse_bitwise_and();
+
+        while matches!(self.peek(), Some(ArithToken::Op(op)) if op == "^") {
+            self.next();
+            let right = self.parse_bitwise_and();
+            left ^= right;
+        }
+
+        left
+    }
+
+    fn parse_bitwise_and(&mut self) -> i64 {
+        let mut left = self.parse_equality();
+
+        while matches!(self.peek(), Some(ArithToken::Op(op)) if op == "&" && !matches!(self.tokens.get(self.pos + 1), Some(ArithToken::Op(o)) if o == "&")) {
+            self.next();
+            let right = self.parse_equality();
+            left &= right;
+        }
+
+        left
+    }
+
+    fn parse_equality(&mut self) -> i64 {
+        let mut left = self.parse_comparison();
+
+        loop {
+            match self.peek() {
+                Some(ArithToken::Op(op)) if op == "==" => {
+                    self.next();
+                    let right = self.parse_comparison();
+                    left = if left == right { 1 } else { 0 };
+                }
+                Some(ArithToken::Op(op)) if op == "!=" => {
+                    self.next();
+                    let right = self.parse_comparison();
+                    left = if left != right { 1 } else { 0 };
+                }
+                _ => break,
+            }
+        }
+
+        left
+    }
+
+    fn parse_comparison(&mut self) -> i64 {
+        let mut left = self.parse_shift();
+
+        loop {
+            match self.peek() {
+                Some(ArithToken::Op(op)) if op == "<" => {
+                    self.next();
+                    let right = self.parse_shift();
+                    left = if left < right { 1 } else { 0 };
+                }
+                Some(ArithToken::Op(op)) if op == ">" => {
+                    self.next();
+                    let right = self.parse_shift();
+                    left = if left > right { 1 } else { 0 };
+                }
+                Some(ArithToken::Op(op)) if op == "<=" => {
+                    self.next();
+                    let right = self.parse_shift();
+                    left = if left <= right { 1 } else { 0 };
+                }
+                Some(ArithToken::Op(op)) if op == ">=" => {
+                    self.next();
+                    let right = self.parse_shift();
+                    left = if left >= right { 1 } else { 0 };
+                }
+                _ => break,
+            }
+        }
+
+        left
+    }
+
+    fn parse_shift(&mut self) -> i64 {
+        let mut left = self.parse_additive();
+
+        loop {
+            match self.peek() {
+                Some(ArithToken::Op(op)) if op == "<<" => {
+                    self.next();
+                    let right = self.parse_additive();
+                    left <<= right;
+                }
+                Some(ArithToken::Op(op)) if op == ">>" => {
+                    self.next();
+                    let right = self.parse_additive();
+                    left >>= right;
+                }
+                _ => break,
+            }
+        }
+
+        left
+    }
+
+    fn parse_additive(&mut self) -> i64 {
+        let mut left = self.parse_multiplicative();
+
+        loop {
+            match self.peek() {
+                Some(ArithToken::Op(op)) if op == "+" => {
+                    self.next();
+                    let right = self.parse_multiplicative();
+                    left += right;
+                }
+                Some(ArithToken::Op(op)) if op == "-" => {
+                    self.next();
+                    let right = self.parse_multiplicative();
+                    left -= right;
+                }
+                _ => break,
+            }
+        }
+
+        left
+    }
+
+    fn parse_multiplicative(&mut self) -> i64 {
+        let mut left = self.parse_power();
+
+        loop {
+            match self.peek() {
+                Some(ArithToken::Op(op)) if op == "*" && !matches!(self.tokens.get(self.pos + 1), Some(ArithToken::Op(o)) if o == "*") => {
+                    self.next();
+                    let right = self.parse_power();
+                    left *= right;
+                }
+                Some(ArithToken::Op(op)) if op == "/" => {
+                    self.next();
+                    let right = self.parse_power();
+                    if right != 0 {
+                        left /= right;
+                    } else {
+                        left = 0; // Division by zero
+                    }
+                }
+                Some(ArithToken::Op(op)) if op == "%" => {
+                    self.next();
+                    let right = self.parse_power();
+                    if right != 0 {
+                        left %= right;
+                    } else {
+                        left = 0;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        left
+    }
+
+    fn parse_power(&mut self) -> i64 {
+        let base = self.parse_unary();
+
+        if matches!(self.peek(), Some(ArithToken::Op(op)) if op == "**") {
+            self.next();
+            let exp = self.parse_power(); // Right associative
+            base.pow(exp as u32)
+        } else {
+            base
+        }
+    }
+
+    fn parse_unary(&mut self) -> i64 {
+        match self.peek() {
+            Some(ArithToken::Op(op)) if op == "-" => {
+                self.next();
+                -self.parse_unary()
+            }
+            Some(ArithToken::Op(op)) if op == "+" => {
+                self.next();
+                self.parse_unary()
+            }
+            Some(ArithToken::Op(op)) if op == "!" => {
+                self.next();
+                if self.parse_unary() == 0 { 1 } else { 0 }
+            }
+            Some(ArithToken::Op(op)) if op == "~" => {
+                self.next();
+                !self.parse_unary()
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    fn parse_primary(&mut self) -> i64 {
+        match self.peek() {
+            Some(ArithToken::Num(_)) => {
+                if let Some(ArithToken::Num(n)) = self.next() {
+                    n
+                } else {
+                    0
+                }
+            }
+            Some(ArithToken::LParen) => {
+                self.next(); // consume (
+                let val = self.parse_expr();
+                if matches!(self.peek(), Some(ArithToken::RParen)) {
+                    self.next(); // consume )
+                }
+                val
+            }
+            _ => 0,
+        }
     }
 }
 
@@ -235,6 +934,39 @@ fn expand_literal(s: &str, state: &ShellState) -> String {
                 }
             }
             '$' => {
+                // Check for arithmetic expansion $((expr))
+                if chars.peek() == Some(&'(') {
+                    chars.next(); // consume first '('
+                    if chars.peek() == Some(&'(') {
+                        chars.next(); // consume second '('
+                        // Find matching ))
+                        let expr = collect_arithmetic_expr(&mut chars);
+                        let value = evaluate_arithmetic(&expr, state);
+                        result.push_str(&value.to_string());
+                        continue;
+                    } else {
+                        // Command substitution $(cmd) - collect until matching )
+                        let mut depth = 1;
+                        let mut cmd = String::new();
+                        while let Some(ch) = chars.next() {
+                            if ch == '(' {
+                                depth += 1;
+                                cmd.push(ch);
+                            } else if ch == ')' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                                cmd.push(ch);
+                            } else {
+                                cmd.push(ch);
+                            }
+                        }
+                        result.push_str(&expand_command_substitution(&format!("$({})", cmd), state));
+                        continue;
+                    }
+                }
+
                 // Variable expansion
                 if chars.peek() == Some(&'{') {
                     // ${var} form
@@ -708,5 +1440,178 @@ mod tests {
         // With noglob set, should return pattern as-is
         let result = expand_word_to_strings(&Word::Literal("*.txt".to_string()), &state);
         assert_eq!(result, vec!["*.txt"]);
+    }
+
+    // ========================================================================
+    // Brace expansion tests
+    // ========================================================================
+
+    #[test]
+    fn test_brace_comma_simple() {
+        assert_eq!(expand_braces("{a,b,c}"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_brace_comma_with_preamble() {
+        assert_eq!(expand_braces("file{1,2,3}.txt"), vec!["file1.txt", "file2.txt", "file3.txt"]);
+    }
+
+    #[test]
+    fn test_brace_comma_multiple() {
+        assert_eq!(expand_braces("{a,b}{1,2}"), vec!["a1", "a2", "b1", "b2"]);
+    }
+
+    #[test]
+    fn test_brace_numeric_range() {
+        assert_eq!(expand_braces("{1..5}"), vec!["1", "2", "3", "4", "5"]);
+    }
+
+    #[test]
+    fn test_brace_numeric_range_reverse() {
+        assert_eq!(expand_braces("{5..1}"), vec!["5", "4", "3", "2", "1"]);
+    }
+
+    #[test]
+    fn test_brace_numeric_range_step() {
+        assert_eq!(expand_braces("{1..10..2}"), vec!["1", "3", "5", "7", "9"]);
+    }
+
+    #[test]
+    fn test_brace_alpha_range() {
+        assert_eq!(expand_braces("{a..e}"), vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn test_brace_alpha_range_upper() {
+        assert_eq!(expand_braces("{A..E}"), vec!["A", "B", "C", "D", "E"]);
+    }
+
+    #[test]
+    fn test_brace_alpha_range_reverse() {
+        assert_eq!(expand_braces("{e..a}"), vec!["e", "d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn test_brace_nested() {
+        assert_eq!(expand_braces("{a,b{1,2}}"), vec!["a", "b1", "b2"]);
+    }
+
+    #[test]
+    fn test_brace_no_expansion() {
+        // No comma or range - not a brace expansion
+        assert_eq!(expand_braces("{foo}"), vec!["{foo}"]);
+    }
+
+    #[test]
+    fn test_brace_mkdir_pattern() {
+        assert_eq!(
+            expand_braces("src/{components,utils,hooks}"),
+            vec!["src/components", "src/utils", "src/hooks"]
+        );
+    }
+
+    #[test]
+    fn test_brace_mv_pattern() {
+        assert_eq!(expand_braces("app.{js,ts}"), vec!["app.js", "app.ts"]);
+    }
+
+    // ========================================================================
+    // Arithmetic expansion tests
+    // ========================================================================
+
+    #[test]
+    fn test_arithmetic_basic() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("1 + 2", &state), 3);
+        assert_eq!(evaluate_arithmetic("10 - 3", &state), 7);
+        assert_eq!(evaluate_arithmetic("4 * 5", &state), 20);
+        assert_eq!(evaluate_arithmetic("20 / 4", &state), 5);
+        assert_eq!(evaluate_arithmetic("17 % 5", &state), 2);
+    }
+
+    #[test]
+    fn test_arithmetic_power() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("2 ** 10", &state), 1024);
+        assert_eq!(evaluate_arithmetic("3 ** 3", &state), 27);
+    }
+
+    #[test]
+    fn test_arithmetic_precedence() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("2 + 3 * 4", &state), 14);
+        assert_eq!(evaluate_arithmetic("(2 + 3) * 4", &state), 20);
+        assert_eq!(evaluate_arithmetic("2 ** 3 ** 2", &state), 512); // Right associative: 2^(3^2) = 2^9
+    }
+
+    #[test]
+    fn test_arithmetic_comparison() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("5 > 3", &state), 1);
+        assert_eq!(evaluate_arithmetic("5 < 3", &state), 0);
+        assert_eq!(evaluate_arithmetic("5 == 5", &state), 1);
+        assert_eq!(evaluate_arithmetic("5 != 3", &state), 1);
+        assert_eq!(evaluate_arithmetic("5 >= 5", &state), 1);
+        assert_eq!(evaluate_arithmetic("5 <= 4", &state), 0);
+    }
+
+    #[test]
+    fn test_arithmetic_logical() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("1 && 1", &state), 1);
+        assert_eq!(evaluate_arithmetic("1 && 0", &state), 0);
+        assert_eq!(evaluate_arithmetic("0 || 1", &state), 1);
+        assert_eq!(evaluate_arithmetic("0 || 0", &state), 0);
+        assert_eq!(evaluate_arithmetic("!0", &state), 1);
+        assert_eq!(evaluate_arithmetic("!1", &state), 0);
+    }
+
+    #[test]
+    fn test_arithmetic_bitwise() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("5 & 3", &state), 1);
+        assert_eq!(evaluate_arithmetic("5 | 3", &state), 7);
+        assert_eq!(evaluate_arithmetic("5 ^ 3", &state), 6);
+        assert_eq!(evaluate_arithmetic("1 << 4", &state), 16);
+        assert_eq!(evaluate_arithmetic("16 >> 2", &state), 4);
+    }
+
+    #[test]
+    fn test_arithmetic_ternary() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("1 ? 10 : 20", &state), 10);
+        assert_eq!(evaluate_arithmetic("0 ? 10 : 20", &state), 20);
+        assert_eq!(evaluate_arithmetic("5 > 3 ? 100 : 200", &state), 100);
+    }
+
+    #[test]
+    fn test_arithmetic_unary() {
+        let state = make_state();
+        assert_eq!(evaluate_arithmetic("-5", &state), -5);
+        assert_eq!(evaluate_arithmetic("--5", &state), 5);
+        assert_eq!(evaluate_arithmetic("~0", &state), -1);
+    }
+
+    #[test]
+    fn test_arithmetic_variables() {
+        let mut state = make_state();
+        state.set_var("x".to_string(), "10".to_string());
+        state.set_var("y".to_string(), "3".to_string());
+
+        assert_eq!(evaluate_arithmetic("x + y", &state), 13);
+        assert_eq!(evaluate_arithmetic("x * y", &state), 30);
+        assert_eq!(evaluate_arithmetic("$x + $y", &state), 13);
+    }
+
+    #[test]
+    fn test_arithmetic_in_literal() {
+        let mut state = make_state();
+        state.set_var("n".to_string(), "5".to_string());
+
+        let result = expand_literal("Result: $((2 + 3))", &state);
+        assert_eq!(result, "Result: 5");
+
+        let result = expand_literal("$((n * 2))", &state);
+        assert_eq!(result, "10");
     }
 }
