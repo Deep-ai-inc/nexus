@@ -161,6 +161,26 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             map.insert("code".to_string(), serde_json::Value::Number((*code).into()));
             serde_json::Value::Object(map)
         }
+        Value::Media { content_type, metadata, data } => {
+            use base64::Engine;
+            let mut map = serde_json::Map::new();
+            map.insert("type".to_string(), serde_json::Value::String("media".to_string()));
+            map.insert("content_type".to_string(), serde_json::Value::String(content_type.clone()));
+            map.insert("size".to_string(), serde_json::Value::Number((data.len() as u64).into()));
+            // Encode data as base64
+            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
+            map.insert("data".to_string(), serde_json::Value::String(b64));
+            if let Some(w) = metadata.width {
+                map.insert("width".to_string(), serde_json::Value::Number(w.into()));
+            }
+            if let Some(h) = metadata.height {
+                map.insert("height".to_string(), serde_json::Value::Number(h.into()));
+            }
+            if let Some(name) = &metadata.filename {
+                map.insert("filename".to_string(), serde_json::Value::String(name.clone()));
+            }
+            serde_json::Value::Object(map)
+        }
     }
 }
 

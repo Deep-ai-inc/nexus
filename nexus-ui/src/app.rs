@@ -12,7 +12,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_api::{BlockId, BlockState, OutputFormat, ShellEvent, Value};
 use nexus_claude::ReaderMessage as ClaudeReaderMessage;
-use nexus_kernel::{CommandRegistry, Kernel};
+use nexus_kernel::{CommandRegistry, Completion, CompletionKind, HistoryEntry, Kernel};
 use nexus_term::TerminalParser;
 
 use crate::claude_panel::{ClaudePanel, ClaudePanelMessage, ClaudeOutputWrapper};
@@ -55,6 +55,10 @@ pub struct Block {
     pub native_output: Option<Value>,
     /// Sort state for table output.
     pub table_sort: TableSort,
+    /// Whether output contained "permission denied".
+    pub has_permission_denied: bool,
+    /// Whether output contained "command not found".
+    pub has_command_not_found: bool,
 }
 
 impl Block {
@@ -71,6 +75,8 @@ impl Block {
             version: 0,
             native_output: None,
             table_sort: TableSort::new(),
+            has_permission_denied: false,
+            has_command_not_found: false,
         }
     }
 
@@ -143,6 +149,28 @@ pub enum Message {
     TableCellClick(BlockId, usize, usize, Value),
     /// User clicked a job in the status bar.
     JobClicked(u32),
+    /// Tab key pressed - trigger completion.
+    TabCompletion,
+    /// Select a completion item.
+    SelectCompletion(usize),
+    /// Cancel completion popup.
+    CancelCompletion,
+    /// Ctrl+R pressed - open history search.
+    HistorySearchStart,
+    /// History search query changed.
+    HistorySearchChanged(String),
+    /// Select a history search result.
+    HistorySearchSelect(usize),
+    /// Cancel history search.
+    HistorySearchCancel,
+    /// Retry last command with sudo (permission denied recovery).
+    RetryWithSudo,
+    /// Dismiss the permission denied prompt.
+    DismissPermissionPrompt,
+    /// Run a suggested command (command not found recovery).
+    RunSuggestedCommand(String),
+    /// Dismiss the command not found prompt.
+    DismissCommandNotFound,
 }
 
 /// Global keyboard shortcuts.
@@ -224,6 +252,26 @@ pub struct Nexus {
     claude_panel: ClaudePanel,
     /// Visual jobs for the status bar.
     visual_jobs: Vec<VisualJob>,
+    /// Tab completion state.
+    completions: Vec<Completion>,
+    /// Selected completion index.
+    completion_index: usize,
+    /// Start position of the word being completed.
+    completion_start: usize,
+    /// Whether completion popup is visible.
+    completion_visible: bool,
+    /// History search active (Ctrl+R mode).
+    history_search_active: bool,
+    /// History search query.
+    history_search_query: String,
+    /// History search results.
+    history_search_results: Vec<HistoryEntry>,
+    /// Selected history search index.
+    history_search_index: usize,
+    /// Command that failed with permission denied (for sudo retry).
+    permission_denied_command: Option<String>,
+    /// Command not found info (original command, suggestions).
+    command_not_found: Option<(String, Vec<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +381,16 @@ impl Default for Nexus {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
             ),
             visual_jobs: Vec::new(),
+            completions: Vec::new(),
+            completion_index: 0,
+            completion_start: 0,
+            completion_visible: false,
+            history_search_active: false,
+            history_search_query: String::new(),
+            history_search_results: Vec::new(),
+            history_search_index: 0,
+            permission_denied_command: None,
+            command_not_found: None,
         }
     }
 }
@@ -349,11 +407,111 @@ pub fn run() -> iced::Result {
 
 fn update(state: &mut Nexus, message: Message) -> Task<Message> {
     match message {
+        Message::TabCompletion => {
+            // Get completions from kernel
+            let kernel = state.kernel.blocking_lock();
+            let cursor = state.input.len(); // Assume cursor at end
+            let (completions, start) = kernel.complete(&state.input, cursor);
+            drop(kernel);
+
+            if completions.len() == 1 {
+                // Single completion: apply immediately
+                let completion = &completions[0];
+                state.input = format!("{}{}", &state.input[..start], completion.text);
+                state.completion_visible = false;
+            } else if !completions.is_empty() {
+                // Multiple completions: show popup
+                state.completions = completions;
+                state.completion_index = 0;
+                state.completion_start = start;
+                state.completion_visible = true;
+            }
+            return Task::none();
+        }
+        Message::SelectCompletion(index) => {
+            if let Some(completion) = state.completions.get(index) {
+                state.input = format!("{}{}", &state.input[..state.completion_start], completion.text);
+            }
+            state.completions.clear();
+            state.completion_visible = false;
+            return Task::none();
+        }
+        Message::CancelCompletion => {
+            state.completions.clear();
+            state.completion_visible = false;
+            return Task::none();
+        }
+        Message::HistorySearchStart => {
+            // Start history search mode with recent history
+            state.history_search_active = true;
+            state.history_search_query.clear();
+            state.history_search_index = 0;
+            // Load recent history initially
+            let kernel = state.kernel.blocking_lock();
+            state.history_search_results = kernel.get_recent_history(50);
+            drop(kernel);
+            return Task::none();
+        }
+        Message::HistorySearchChanged(query) => {
+            state.history_search_query = query.clone();
+            state.history_search_index = 0;
+            // Search history
+            let kernel = state.kernel.blocking_lock();
+            if query.is_empty() {
+                state.history_search_results = kernel.get_recent_history(50);
+            } else {
+                // FTS5 requires proper quoting for search terms
+                let search_query = format!("\"{}\"*", query.replace('"', "\"\""));
+                state.history_search_results = kernel.search_history(&search_query, 50);
+            }
+            drop(kernel);
+            return Task::none();
+        }
+        Message::HistorySearchSelect(index) => {
+            if let Some(entry) = state.history_search_results.get(index) {
+                state.input = entry.command.clone();
+            }
+            state.history_search_active = false;
+            state.history_search_query.clear();
+            state.history_search_results.clear();
+            return Task::none();
+        }
+        Message::HistorySearchCancel => {
+            state.history_search_active = false;
+            state.history_search_query.clear();
+            state.history_search_results.clear();
+            return Task::none();
+        }
+        Message::RetryWithSudo => {
+            if let Some(cmd) = state.permission_denied_command.take() {
+                let sudo_cmd = format!("sudo {}", cmd);
+                return execute_command(state, sudo_cmd);
+            }
+            return Task::none();
+        }
+        Message::DismissPermissionPrompt => {
+            state.permission_denied_command = None;
+            return Task::none();
+        }
+        Message::RunSuggestedCommand(cmd) => {
+            state.command_not_found = None;
+            return execute_command(state, cmd);
+        }
+        Message::DismissCommandNotFound => {
+            state.command_not_found = None;
+            return Task::none();
+        }
         Message::InputChanged(value) => {
             // Suppress input if a Cmd shortcut just fired (prevents typing shortcut char)
             if state.suppress_next_input {
                 state.suppress_next_input = false;
                 return Task::none();
+            }
+
+            // Hide completion popup when input changes
+            if state.completion_visible {
+                state.completions.clear();
+                state.completion_visible = false;
             }
             // Track previous value for ghost character detection
             state.input_before_event = state.input.clone();
@@ -373,6 +531,14 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                 if let Some(block) = state.blocks.get_mut(idx) {
                     block.parser.feed(&data);
                     block.version += 1; // Invalidate lazy cache
+                    // Check for permission denied
+                    if !block.has_permission_denied {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            if text.to_lowercase().contains("permission denied") {
+                                block.has_permission_denied = true;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -395,6 +561,8 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
         }
         Message::PtyExited(block_id, exit_code) => {
             // O(1) lookup via HashMap
+            let mut show_permission_prompt = false;
+            let mut failed_command = None;
             if let Some(&idx) = state.block_index.get(&block_id) {
                 if let Some(block) = state.blocks.get_mut(idx) {
                     block.state = if exit_code == 0 {
@@ -404,12 +572,22 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                     };
                     block.duration_ms = Some(block.started_at.elapsed().as_millis() as u64);
                     block.version += 1;
+                    // Check for permission denied on failed command
+                    if exit_code != 0 && block.has_permission_denied {
+                        show_permission_prompt = true;
+                        failed_command = Some(block.command.clone());
+                    }
                 }
             }
             state.pty_handles.retain(|h| h.block_id != block_id);
 
             // Track last exit code for prompt color
             state.last_exit_code = Some(exit_code);
+
+            // Show permission denied prompt if applicable
+            if show_permission_prompt {
+                state.permission_denied_command = failed_command;
+            }
 
             // If the focused block exited, return focus to input
             if state.focus == Focus::Block(block_id) {
@@ -442,6 +620,14 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                         if let Some(block) = state.blocks.get_mut(idx) {
                             block.parser.feed(&data);
                             block.version += 1;
+                            // Check for permission denied
+                            if !block.has_permission_denied {
+                                if let Ok(text) = std::str::from_utf8(&data) {
+                                    if text.to_lowercase().contains("permission denied") {
+                                        block.has_permission_denied = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     state.is_dirty = true;
@@ -454,6 +640,8 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                     }
                 }
                 ShellEvent::CommandFinished { block_id, exit_code, duration_ms } => {
+                    let mut show_permission_prompt = false;
+                    let mut failed_command = None;
                     if let Some(&idx) = state.block_index.get(&block_id) {
                         if let Some(block) = state.blocks.get_mut(idx) {
                             block.state = if exit_code == 0 {
@@ -463,10 +651,20 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                             };
                             block.duration_ms = Some(duration_ms);
                             block.version += 1;
+                            // Check for permission denied on failed command
+                            if exit_code != 0 && block.has_permission_denied {
+                                show_permission_prompt = true;
+                                failed_command = Some(block.command.clone());
+                            }
                         }
                     }
                     state.last_exit_code = Some(exit_code);
                     state.focus = Focus::Input;
+
+                    // Show permission denied prompt if applicable
+                    if show_permission_prompt {
+                        state.permission_denied_command = failed_command;
+                    }
 
                     return scrollable::snap_to(
                         scrollable::Id::new(HISTORY_SCROLLABLE),
@@ -604,11 +802,26 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                     // Ctrl+C in input clears the line (like traditional shell)
                     if modifiers.control() && matches!(state.focus, Focus::Input) {
                         if let Key::Character(c) = &key {
-                            if c.to_lowercase().as_str() == "c" {
-                                state.input.clear();
-                                state.history_index = None;
-                                state.saved_input.clear();
-                                return Task::none();
+                            match c.to_lowercase().as_str() {
+                                "c" => {
+                                    state.input.clear();
+                                    state.history_index = None;
+                                    state.saved_input.clear();
+                                    state.history_search_active = false;
+                                    state.permission_denied_command = None;
+                                    return Task::none();
+                                }
+                                "r" => {
+                                    // Ctrl+R - start history search
+                                    return update(state, Message::HistorySearchStart);
+                                }
+                                "s" => {
+                                    // Ctrl+S - retry with sudo (if permission denied prompt is shown)
+                                    if state.permission_denied_command.is_some() {
+                                        return update(state, Message::RetryWithSudo);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -616,7 +829,72 @@ fn update(state: &mut Nexus, message: Message) -> Task<Message> {
                     // Focus-dependent key handling
                     match state.focus {
                         Focus::Input => {
-                            // Up/Down for history navigation
+                            // History search mode takes priority
+                            if state.history_search_active {
+                                match &key {
+                                    Key::Named(keyboard::key::Named::Escape) => {
+                                        return update(state, Message::HistorySearchCancel);
+                                    }
+                                    Key::Named(keyboard::key::Named::Enter) => {
+                                        return update(state, Message::HistorySearchSelect(state.history_search_index));
+                                    }
+                                    Key::Named(keyboard::key::Named::ArrowUp) => {
+                                        if state.history_search_index > 0 {
+                                            state.history_search_index -= 1;
+                                        }
+                                        return Task::none();
+                                    }
+                                    Key::Named(keyboard::key::Named::ArrowDown) => {
+                                        if state.history_search_index < state.history_search_results.len().saturating_sub(1) {
+                                            state.history_search_index += 1;
+                                        }
+                                        return Task::none();
+                                    }
+                                    _ => {}
+                                }
+                                // Don't process other keys - let them go to the search input
+                                return Task::none();
+                            }
+
+                            // Tab for completion
+                            if matches!(key, Key::Named(keyboard::key::Named::Tab)) {
+                                if state.completion_visible {
+                                    // Apply selected completion
+                                    return update(state, Message::SelectCompletion(state.completion_index));
+                                } else {
+                                    // Trigger completion
+                                    return update(state, Message::TabCompletion);
+                                }
+                            }
+
+                            // Escape to cancel completion
+                            if matches!(key, Key::Named(keyboard::key::Named::Escape)) && state.completion_visible {
+                                return update(state, Message::CancelCompletion);
+                            }
+
+                            // Arrow keys for completion navigation when popup is visible
+                            if state.completion_visible {
+                                match &key {
+                                    Key::Named(keyboard::key::Named::ArrowUp) => {
+                                        if state.completion_index > 0 {
+                                            state.completion_index -= 1;
+                                        }
+                                        return Task::none();
+                                    }
+                                    Key::Named(keyboard::key::Named::ArrowDown) => {
+                                        if state.completion_index < state.completions.len().saturating_sub(1) {
+                                            state.completion_index += 1;
+                                        }
+                                        return Task::none();
+                                    }
+                                    Key::Named(keyboard::key::Named::Enter) => {
+                                        return update(state, Message::SelectCompletion(state.completion_index));
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            // Up/Down for history navigation (only when completion not visible)
                             match &key {
                                 Key::Named(keyboard::key::Named::ArrowUp) if !modifiers.shift() => {
                                     return update(state, Message::InputKey(key, modifiers));
@@ -1318,6 +1596,10 @@ fn render_value<'a>(
             render_file_list(&[entry.as_ref()], font_size)
         }
 
+        Value::Media { data, content_type, metadata } => {
+            render_media(data, content_type, metadata, font_size)
+        }
+
         // For other types, just render as text
         _ => {
             text(value.to_text())
@@ -1326,6 +1608,147 @@ fn render_value<'a>(
                 .font(iced::Font::MONOSPACE)
                 .into()
         }
+    }
+}
+
+/// Render media content (images, audio, video, documents).
+fn render_media<'a>(
+    data: &'a [u8],
+    content_type: &'a str,
+    metadata: &'a nexus_api::MediaMetadata,
+    font_size: f32,
+) -> Element<'a, Message> {
+    use iced::widget::image;
+
+    // Images: render inline
+    if content_type.starts_with("image/") {
+        let handle = image::Handle::from_bytes(data.to_vec());
+
+        // Determine size - use metadata if available, otherwise default max
+        let (width, height) = match (metadata.width, metadata.height) {
+            (Some(w), Some(h)) => {
+                // Scale down if too large, max 600px width
+                let max_width = 600.0;
+                let max_height = 400.0;
+                let scale = (max_width / w as f32).min(max_height / h as f32).min(1.0);
+                ((w as f32 * scale) as u16, (h as f32 * scale) as u16)
+            }
+            _ => (400, 300), // Default size if dimensions unknown
+        };
+
+        let img = image::Image::new(handle)
+            .width(Length::Fixed(width as f32))
+            .height(Length::Fixed(height as f32));
+
+        let label = if let Some(name) = &metadata.filename {
+            format!("{} ({})", name, content_type)
+        } else {
+            content_type.to_string()
+        };
+
+        column![
+            img,
+            text(label)
+                .size(font_size * 0.9)
+                .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                .font(iced::Font::MONOSPACE)
+        ]
+        .spacing(4)
+        .into()
+    }
+    // Audio: show info placeholder (actual player would need more work)
+    else if content_type.starts_with("audio/") {
+        let duration = metadata.duration_secs
+            .map(|d| format!(" ({:.1}s)", d))
+            .unwrap_or_default();
+        let name = metadata.filename.as_deref().unwrap_or("audio");
+        let size = format_file_size(data.len() as u64);
+
+        column![
+            text(format!("🔊 {}{}", name, duration))
+                .size(font_size)
+                .color(iced::Color::from_rgb(0.5, 0.8, 0.5)),
+            text(format!("{} • {}", content_type, size))
+                .size(font_size * 0.9)
+                .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                .font(iced::Font::MONOSPACE)
+        ]
+        .spacing(2)
+        .into()
+    }
+    // Video: show info placeholder
+    else if content_type.starts_with("video/") {
+        let duration = metadata.duration_secs
+            .map(|d| format!(" ({:.1}s)", d))
+            .unwrap_or_default();
+        let dims = match (metadata.width, metadata.height) {
+            (Some(w), Some(h)) => format!(" {}x{}", w, h),
+            _ => String::new(),
+        };
+        let name = metadata.filename.as_deref().unwrap_or("video");
+        let size = format_file_size(data.len() as u64);
+
+        column![
+            text(format!("🎬 {}{}{}", name, dims, duration))
+                .size(font_size)
+                .color(iced::Color::from_rgb(0.5, 0.7, 0.9)),
+            text(format!("{} • {}", content_type, size))
+                .size(font_size * 0.9)
+                .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                .font(iced::Font::MONOSPACE)
+        ]
+        .spacing(2)
+        .into()
+    }
+    // PDF and other documents
+    else if content_type == "application/pdf" {
+        let name = metadata.filename.as_deref().unwrap_or("document.pdf");
+        let size = format_file_size(data.len() as u64);
+
+        column![
+            text(format!("📄 {}", name))
+                .size(font_size)
+                .color(iced::Color::from_rgb(0.9, 0.6, 0.5)),
+            text(format!("{} • {}", content_type, size))
+                .size(font_size * 0.9)
+                .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                .font(iced::Font::MONOSPACE)
+        ]
+        .spacing(2)
+        .into()
+    }
+    // Generic binary: show type and size
+    else {
+        let name = metadata.filename.as_deref().unwrap_or("file");
+        let size = format_file_size(data.len() as u64);
+
+        column![
+            text(format!("📎 {}", name))
+                .size(font_size)
+                .color(iced::Color::from_rgb(0.7, 0.7, 0.7)),
+            text(format!("{} • {}", content_type, size))
+                .size(font_size * 0.9)
+                .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                .font(iced::Font::MONOSPACE)
+        ]
+        .spacing(2)
+        .into()
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }
 
@@ -1401,10 +1824,264 @@ fn view_input(state: &Nexus) -> Element<'_, Message> {
         })
         .font(iced::Font::MONOSPACE);
 
-    row![path_text, prompt, input]
+    let input_row = row![path_text, prompt, input]
         .spacing(0)
-        .align_y(iced::Alignment::Center)
-        .into()
+        .align_y(iced::Alignment::Center);
+
+    // Show history search popup if active
+    if state.history_search_active {
+        let search_label = text("(reverse-i-search)")
+            .size(state.font_size * 0.9)
+            .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+            .font(iced::Font::MONOSPACE);
+
+        let search_input = text_input("type to search...", &state.history_search_query)
+            .on_input(Message::HistorySearchChanged)
+            .padding([4, 8])
+            .size(state.font_size)
+            .style(|_theme, _status| text_input::Style {
+                background: iced::Background::Color(iced::Color::from_rgb(0.15, 0.15, 0.18)),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    width: 1.0,
+                    color: iced::Color::from_rgb(0.4, 0.6, 0.8),
+                },
+                icon: iced::Color::from_rgb(0.5, 0.5, 0.5),
+                placeholder: iced::Color::from_rgb(0.4, 0.4, 0.4),
+                value: iced::Color::from_rgb(0.9, 0.9, 0.9),
+                selection: iced::Color::from_rgb(0.3, 0.5, 0.8),
+            })
+            .font(iced::Font::MONOSPACE);
+
+        let search_header = row![search_label, search_input]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+        // Build result items
+        let result_items: Vec<Element<Message>> = state
+            .history_search_results
+            .iter()
+            .enumerate()
+            .take(10)
+            .map(|(i, entry)| {
+                let is_selected = i == state.history_search_index;
+                let bg_color = if is_selected {
+                    iced::Color::from_rgb(0.2, 0.4, 0.6)
+                } else {
+                    iced::Color::from_rgb(0.12, 0.12, 0.15)
+                };
+                let text_color = if is_selected {
+                    iced::Color::WHITE
+                } else {
+                    iced::Color::from_rgb(0.8, 0.8, 0.8)
+                };
+                let time_color = iced::Color::from_rgb(0.5, 0.5, 0.5);
+
+                // Format timestamp as relative time
+                let time_str = format_relative_time(&entry.timestamp);
+                let command = entry.command.clone();
+
+                let item_content = row![
+                    text(command)
+                        .size(state.font_size * 0.9)
+                        .color(text_color)
+                        .font(iced::Font::MONOSPACE)
+                        .width(Length::Fill),
+                    text(time_str)
+                        .size(state.font_size * 0.8)
+                        .color(time_color)
+                        .font(iced::Font::MONOSPACE),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center);
+
+                iced::widget::button(item_content)
+                    .on_press(Message::HistorySearchSelect(i))
+                    .padding([6, 10])
+                    .width(Length::Fill)
+                    .style(move |_theme, _status| iced::widget::button::Style {
+                        background: Some(iced::Background::Color(bg_color)),
+                        text_color,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    })
+                    .into()
+            })
+            .collect();
+
+        let results_list: Element<Message> = if result_items.is_empty() {
+            text("No matches found")
+                .size(state.font_size * 0.9)
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.5))
+                .font(iced::Font::MONOSPACE)
+                .into()
+        } else {
+            Column::with_children(result_items).spacing(0).into()
+        };
+
+        let popup = container(
+            column![search_header, results_list].spacing(8)
+        )
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(0.1, 0.1, 0.12))),
+            border: iced::Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: iced::Color::from_rgb(0.3, 0.5, 0.7),
+            },
+            ..Default::default()
+        })
+        .padding(10)
+        .width(Length::Fill);
+
+        return column![popup, input_row].spacing(8).into();
+    }
+
+    // Show permission denied prompt if applicable
+    if let Some(ref cmd) = state.permission_denied_command {
+        let warning_icon = text("⚠️")
+            .size(state.font_size);
+        let message = text("Permission denied")
+            .size(state.font_size * 0.95)
+            .color(iced::Color::from_rgb(1.0, 0.7, 0.3))
+            .font(iced::Font::MONOSPACE);
+        let cmd_text = text(format!("Command: {}", cmd))
+            .size(state.font_size * 0.85)
+            .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+            .font(iced::Font::MONOSPACE);
+
+        let retry_btn = iced::widget::button(
+            text("Retry with sudo")
+                .size(state.font_size * 0.9)
+        )
+        .on_press(Message::RetryWithSudo)
+        .padding([6, 12])
+        .style(|_theme, _status| iced::widget::button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(0.3, 0.5, 0.7))),
+            text_color: iced::Color::WHITE,
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let dismiss_btn = iced::widget::button(
+            text("Dismiss")
+                .size(state.font_size * 0.9)
+        )
+        .on_press(Message::DismissPermissionPrompt)
+        .padding([6, 12])
+        .style(|_theme, _status| iced::widget::button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(0.25, 0.25, 0.28))),
+            text_color: iced::Color::from_rgb(0.8, 0.8, 0.8),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let hotkey_hint = text("Ctrl+S to retry")
+            .size(state.font_size * 0.75)
+            .color(iced::Color::from_rgb(0.5, 0.5, 0.5))
+            .font(iced::Font::MONOSPACE);
+
+        let header = row![warning_icon, message].spacing(8).align_y(iced::Alignment::Center);
+        let buttons = row![retry_btn, dismiss_btn, hotkey_hint]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+
+        let prompt = container(
+            column![header, cmd_text, buttons].spacing(6)
+        )
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(0.15, 0.12, 0.1))),
+            border: iced::Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: iced::Color::from_rgb(0.6, 0.4, 0.2),
+            },
+            ..Default::default()
+        })
+        .padding(10)
+        .width(Length::Fill);
+
+        return column![prompt, input_row].spacing(8).into();
+    }
+
+    // Show completion popup if visible
+    if state.completion_visible && !state.completions.is_empty() {
+        let completion_items: Vec<Element<Message>> = state
+            .completions
+            .iter()
+            .enumerate()
+            .take(10) // Show max 10 items
+            .map(|(i, completion)| {
+                let is_selected = i == state.completion_index;
+                let bg_color = if is_selected {
+                    iced::Color::from_rgb(0.2, 0.4, 0.6)
+                } else {
+                    iced::Color::from_rgb(0.15, 0.15, 0.18)
+                };
+                let text_color = if is_selected {
+                    iced::Color::WHITE
+                } else {
+                    iced::Color::from_rgb(0.8, 0.8, 0.8)
+                };
+
+                let icon = completion.kind.icon();
+                let kind_color = match completion.kind {
+                    CompletionKind::Directory => iced::Color::from_rgb(0.4, 0.7, 1.0),
+                    CompletionKind::Executable | CompletionKind::NativeCommand => iced::Color::from_rgb(0.4, 0.9, 0.4),
+                    CompletionKind::Builtin => iced::Color::from_rgb(1.0, 0.8, 0.4),
+                    CompletionKind::Function => iced::Color::from_rgb(0.8, 0.6, 1.0),
+                    CompletionKind::Variable => iced::Color::from_rgb(1.0, 0.6, 0.6),
+                    _ => text_color,
+                };
+
+                let item_content = row![
+                    text(icon).size(state.font_size * 0.9).color(kind_color),
+                    text(" ").size(state.font_size * 0.9),
+                    text(&completion.text).size(state.font_size * 0.9).color(text_color).font(iced::Font::MONOSPACE),
+                ]
+                .spacing(2)
+                .align_y(iced::Alignment::Center);
+
+                iced::widget::button(item_content)
+                    .on_press(Message::SelectCompletion(i))
+                    .padding([4, 8])
+                    .width(Length::Fill)
+                    .style(move |_theme, _status| iced::widget::button::Style {
+                        background: Some(iced::Background::Color(bg_color)),
+                        text_color,
+                        border: iced::Border::default(),
+                        ..Default::default()
+                    })
+                    .into()
+            })
+            .collect();
+
+        let popup = container(
+            Column::with_children(completion_items)
+                .spacing(0)
+                .width(Length::Fixed(300.0))
+        )
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(0.12, 0.12, 0.15))),
+            border: iced::Border {
+                radius: 4.0.into(),
+                width: 1.0,
+                color: iced::Color::from_rgb(0.3, 0.3, 0.35),
+            },
+            ..Default::default()
+        })
+        .padding(4);
+
+        column![popup, input_row].spacing(4).into()
+    } else {
+        input_row.into()
+    }
 }
 
 /// Shorten a path by replacing home directory with ~.
@@ -1420,4 +2097,25 @@ fn shorten_path(path: &str) -> String {
 
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Format a timestamp as a relative time string.
+fn format_relative_time(timestamp: &chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(timestamp);
+
+    if duration.num_seconds() < 60 {
+        "just now".to_string()
+    } else if duration.num_minutes() < 60 {
+        let mins = duration.num_minutes();
+        format!("{}m ago", mins)
+    } else if duration.num_hours() < 24 {
+        let hours = duration.num_hours();
+        format!("{}h ago", hours)
+    } else if duration.num_days() < 7 {
+        let days = duration.num_days();
+        format!("{}d ago", days)
+    } else {
+        timestamp.format("%b %d").to_string()
+    }
 }

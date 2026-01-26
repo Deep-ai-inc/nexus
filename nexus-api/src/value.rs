@@ -34,6 +34,16 @@ pub enum Value {
     },
 
     // Domain-specific rich types
+    /// Rich media content - images, audio, video, documents, etc.
+    /// The UI renders appropriately based on content_type.
+    Media {
+        /// Raw file data
+        data: Vec<u8>,
+        /// MIME type (e.g., "image/png", "audio/mp3", "application/pdf")
+        content_type: String,
+        /// Optional metadata (dimensions, duration, etc.)
+        metadata: MediaMetadata,
+    },
     /// A filesystem path
     Path(PathBuf),
     /// A file/directory entry with metadata
@@ -68,6 +78,188 @@ pub enum FileType {
     Fifo,
     Socket,
     Unknown,
+}
+
+/// Metadata for media content - dimensions, duration, etc.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MediaMetadata {
+    /// For images/video: width in pixels
+    pub width: Option<u32>,
+    /// For images/video: height in pixels
+    pub height: Option<u32>,
+    /// For audio/video: duration in seconds
+    pub duration_secs: Option<f64>,
+    /// Original filename if known
+    pub filename: Option<String>,
+    /// File size in bytes (redundant with data.len() but useful for display)
+    pub size: Option<u64>,
+}
+
+impl MediaMetadata {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.width = Some(width);
+        self.height = Some(height);
+        self
+    }
+
+    pub fn with_duration(mut self, secs: f64) -> Self {
+        self.duration_secs = Some(secs);
+        self
+    }
+
+    pub fn with_filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+}
+
+/// Detect MIME type from magic bytes.
+pub fn detect_mime_type(data: &[u8]) -> &'static str {
+    if data.len() < 12 {
+        return "application/octet-stream";
+    }
+
+    // Images
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return "image/png";
+    }
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return "image/jpeg";
+    }
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        return "image/gif";
+    }
+    if data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if data.starts_with(b"BM") {
+        return "image/bmp";
+    }
+
+    // Documents
+    if data.starts_with(b"%PDF") {
+        return "application/pdf";
+    }
+    if data.starts_with(&[0x50, 0x4B, 0x03, 0x04]) {
+        // ZIP-based formats - could be docx, xlsx, epub, etc.
+        // Would need deeper inspection, default to zip
+        return "application/zip";
+    }
+
+    // Audio
+    if data.starts_with(b"ID3") || data.starts_with(&[0xFF, 0xFB]) {
+        return "audio/mpeg";
+    }
+    if data.starts_with(b"OggS") {
+        return "audio/ogg";
+    }
+    if data.starts_with(b"RIFF") && data.len() >= 12 && &data[8..12] == b"WAVE" {
+        return "audio/wav";
+    }
+    if data.starts_with(b"fLaC") {
+        return "audio/flac";
+    }
+
+    // Video
+    if data.len() >= 12 && &data[4..12] == b"ftypisom" {
+        return "video/mp4";
+    }
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        return "video/mp4"; // Various MP4 variants
+    }
+    if data.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return "video/webm";
+    }
+
+    // Text/code detection (simple heuristic)
+    if data.starts_with(b"<?xml") || data.starts_with(b"<svg") {
+        return "image/svg+xml";
+    }
+    if data.starts_with(b"<!DOCTYPE html") || data.starts_with(b"<html") {
+        return "text/html";
+    }
+    if data.starts_with(b"{") || data.starts_with(b"[") {
+        // Could be JSON
+        if std::str::from_utf8(data).is_ok() {
+            return "application/json";
+        }
+    }
+
+    // Check if it's valid UTF-8 text
+    if std::str::from_utf8(data).is_ok() {
+        return "text/plain";
+    }
+
+    "application/octet-stream"
+}
+
+/// Get MIME type from file extension.
+pub fn mime_from_extension(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        // Images
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "tiff" | "tif" => "image/tiff",
+
+        // Audio
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
+        "m4a" | "aac" => "audio/aac",
+
+        // Video
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+
+        // Documents
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+
+        // Text/code
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" => "text/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "sh" => "text/x-shellscript",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+
+        // Archives
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+
+        _ => "application/octet-stream",
+    }
 }
 
 impl FileEntry {
@@ -132,7 +324,84 @@ impl FileEntry {
     }
 }
 
+/// Format a byte size into human-readable form.
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
 impl Value {
+    /// Create a media value from raw bytes, auto-detecting MIME type.
+    pub fn media(data: Vec<u8>) -> Self {
+        let content_type = detect_mime_type(&data).to_string();
+        Value::Media {
+            data,
+            content_type,
+            metadata: MediaMetadata::default(),
+        }
+    }
+
+    /// Create a media value with explicit MIME type.
+    pub fn media_with_type(data: Vec<u8>, content_type: impl Into<String>) -> Self {
+        Value::Media {
+            data,
+            content_type: content_type.into(),
+            metadata: MediaMetadata::default(),
+        }
+    }
+
+    /// Create a media value with full metadata.
+    pub fn media_with_metadata(
+        data: Vec<u8>,
+        content_type: impl Into<String>,
+        metadata: MediaMetadata,
+    ) -> Self {
+        Value::Media {
+            data,
+            content_type: content_type.into(),
+            metadata,
+        }
+    }
+
+    /// Check if this value is media content.
+    pub fn is_media(&self) -> bool {
+        matches!(self, Value::Media { .. })
+    }
+
+    /// Check if this is an image (based on content type).
+    pub fn is_image(&self) -> bool {
+        matches!(self, Value::Media { content_type, .. } if content_type.starts_with("image/"))
+    }
+
+    /// Check if this is audio.
+    pub fn is_audio(&self) -> bool {
+        matches!(self, Value::Media { content_type, .. } if content_type.starts_with("audio/"))
+    }
+
+    /// Check if this is video.
+    pub fn is_video(&self) -> bool {
+        matches!(self, Value::Media { content_type, .. } if content_type.starts_with("video/"))
+    }
+
+    /// Get media data and content type if this is media.
+    pub fn as_media(&self) -> Option<(&[u8], &str, &MediaMetadata)> {
+        match self {
+            Value::Media { data, content_type, metadata } => Some((data, content_type, metadata)),
+            _ => None,
+        }
+    }
+
     /// Convert value to text for legacy interop (piping to external commands).
     pub fn to_text(&self) -> String {
         let mut buf = String::new();
@@ -180,6 +449,22 @@ impl Value {
                     }
                     buf.push('\n');
                 }
+            }
+            Value::Media { content_type, metadata, data } => {
+                // Text representation of media
+                let size = metadata.size.unwrap_or(data.len() as u64);
+                let size_str = format_size(size);
+
+                let extra = if let (Some(w), Some(h)) = (metadata.width, metadata.height) {
+                    format!(" {}x{}", w, h)
+                } else if let Some(dur) = metadata.duration_secs {
+                    format!(" {:.1}s", dur)
+                } else {
+                    String::new()
+                };
+
+                let name = metadata.filename.as_deref().unwrap_or("media");
+                buf.push_str(&format!("[{}: {} {}{}]", name, content_type, size_str, extra));
             }
             Value::Path(p) => buf.push_str(&p.to_string_lossy()),
             Value::FileEntry(entry) => {

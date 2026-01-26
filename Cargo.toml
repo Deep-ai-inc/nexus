@@ -8,6 +8,13 @@ members = [
     "nexus-api",
     "nexus-providers",
     "nexus-claude",
+    # New crates from code-assistant
+    "nexus-llm",
+    "nexus-sandbox",
+    "nexus-web",
+    "nexus-executor",
+    "nexus-agent",
+    "nexus-fs",
 ]
 
 [workspace.package]
@@ -34,6 +41,7 @@ tree-sitter-bash = "0.23"
 nix = { version = "0.29", features = ["process", "signal", "term", "fs"] }
 portable-pty = "0.8"
 regex = "1.10"
+base64 = "0.22"
 gethostname = "0.5"
 rand = "0.8"
 filetime = "0.2"
@@ -51,7 +59,7 @@ alacritty_terminal = "0.25"
 # UI dependencies (Iced + WGPU)
 # "lazy" feature enables cached/memoized widget rendering for performance
 # Use wgpu-only (no tiny-skia fallback) to enable Shader widget
-iced = { version = "0.13", default-features = false, features = ["tokio", "advanced", "wgpu", "lazy"] }
+iced = { version = "0.13", default-features = false, features = ["tokio", "advanced", "wgpu", "lazy", "image"] }
 cosmic-text = "0.12"
 arboard = "3.4"  # Cross-platform clipboard
 fontdue = "0.9"  # Fast font rasterization for glyph atlas
@@ -64,3 +72,11 @@ nexus-claude = { path = "nexus-claude" }
 nexus-kernel = { path = "nexus-kernel" }
 nexus-pump = { path = "nexus-pump" }
 nexus-term = { path = "nexus-term" }
+
+# Agent crates (from code-assistant)
+nexus-llm = { path = "nexus-llm" }
+nexus-sandbox = { path = "nexus-sandbox" }
+nexus-web = { path = "nexus-web" }
+nexus-executor = { path = "nexus-executor" }
+nexus-agent = { path = "nexus-agent" }
+nexus-fs = { path = "nexus-fs" }

@@ -1,7 +1,7 @@
 //! The `cat` command - concatenate and display files.
 
 use super::{CommandContext, NexusCommand};
-use nexus_api::Value;
+use nexus_api::{detect_mime_type, mime_from_extension, MediaMetadata, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -73,11 +73,59 @@ impl NexusCommand for CatCommand {
             return Ok(Value::Unit);
         }
 
+        // Single file: can return Media for binary content
+        if opts.files.len() == 1 {
+            let path = &opts.files[0];
+            if path.to_string_lossy() == "-" {
+                return Ok(Value::Unit);
+            }
+
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                ctx.state.cwd.join(path)
+            };
+
+            // Read raw bytes first
+            let data = fs::read(&resolved)
+                .map_err(|e| anyhow::anyhow!("{}: {}", path.display(), e))?;
+
+            // Detect content type
+            let ext = resolved
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let mime_from_ext = mime_from_extension(ext);
+            let mime_from_magic = detect_mime_type(&data);
+
+            // Prefer magic detection, fall back to extension
+            let content_type = if mime_from_magic != "application/octet-stream" {
+                mime_from_magic
+            } else if mime_from_ext != "application/octet-stream" {
+                mime_from_ext
+            } else {
+                mime_from_magic
+            };
+
+            // For text files, use string processing with options
+            if content_type.starts_with("text/") || content_type == "application/json" {
+                let text = String::from_utf8_lossy(&data).to_string();
+                return Ok(process_string(text, &opts));
+            }
+
+            // For binary/media files, return as Media value
+            let metadata = MediaMetadata::new()
+                .with_filename(path.file_name().unwrap_or_default().to_string_lossy())
+                .with_size(data.len() as u64);
+
+            return Ok(Value::media_with_metadata(data, content_type, metadata));
+        }
+
+        // Multiple files: concatenate as text
         let mut all_content = String::new();
 
         for path in &opts.files {
             if path.to_string_lossy() == "-" {
-                // Read from stdin - already handled above
                 continue;
             }
 
