@@ -86,18 +86,19 @@ fn process_actions(state: &mut Nexus, actions: Vec<Action>) -> Task<Message> {
 }
 
 /// Transfer pending attachments from input to kernel state.
+/// Uses blocking lock since dropping user data is worse than a brief block.
 fn transfer_attachments_to_kernel(state: &mut Nexus) {
     if state.input.attachments.is_empty() {
         return;
     }
-    if let Ok(mut kernel) = state.terminal.kernel.try_lock() {
-        let value = if state.input.attachments.len() == 1 {
-            state.input.attachments[0].clone()
-        } else {
-            nexus_api::Value::List(state.input.attachments.clone())
-        };
-        kernel.state_mut().set_var_value("ATTACHMENT", value);
-    }
+    // Block briefly rather than risk dropping user attachments
+    let mut kernel = state.terminal.kernel.blocking_lock();
+    let value = if state.input.attachments.len() == 1 {
+        state.input.attachments[0].clone()
+    } else {
+        nexus_api::Value::List(state.input.attachments.clone())
+    };
+    kernel.state_mut().set_var_value("ATTACHMENT", value);
     state.input.clear_attachments();
 }
 
