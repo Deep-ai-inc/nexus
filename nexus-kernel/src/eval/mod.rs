@@ -137,6 +137,15 @@ fn execute_simple(
 
     // Check for builtins (shell-specific: cd, export, etc.)
     if let Some(exit_code) = builtins::try_builtin(&name, &args, state, events, commands)? {
+        // Emit CommandFinished for builtins when we have a block_id
+        // (This happens when the UI created the block for us)
+        if let Some(id) = block_id {
+            let _ = events.send(ShellEvent::CommandFinished {
+                block_id: id,
+                exit_code,
+                duration_ms: 0, // Builtins are instant
+            });
+        }
         return Ok(exit_code);
     }
 
