@@ -82,11 +82,16 @@ pub fn handle_event(
                 }
             }
 
-            // Ctrl+C in input clears the line
+            // Ctrl+C handling
             if modifiers.control() && matches!(state.terminal.focus, Focus::Input) {
                 if let Key::Character(c) = &key {
                     match c.to_lowercase().as_str() {
                         "c" => {
+                            // If agent is running, interrupt it (like Escape)
+                            if state.agent.active_block.is_some() {
+                                return Task::done(Message::Agent(crate::msg::AgentMessage::Interrupt));
+                            }
+                            // Otherwise clear the input line
                             state.input.clear();
                             state.input.shell_history_index = None;
                             state.input.agent_history_index = None;
