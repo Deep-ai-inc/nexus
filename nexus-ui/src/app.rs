@@ -6,14 +6,14 @@
 
 use std::time::Instant;
 
-use iced::widget::{column, container, mouse_area, scrollable, text_input, Column};
+use iced::widget::{column, container, mouse_area, scrollable, Column};
 use iced::{event, Element, Length, Subscription, Task, Theme};
 
 use nexus_api::BlockId;
 
 use crate::agent_widgets::view_agent_block;
 use crate::blocks::{Focus, UnifiedBlockRef};
-use crate::constants::{HISTORY_SCROLLABLE, INPUT_FIELD};
+use crate::constants::HISTORY_SCROLLABLE;
 use crate::handlers;
 use crate::msg::{Action, AgentMessage, Message, TerminalMessage, WindowMessage};
 use crate::systems::{agent_subscription, kernel_subscription, pty_subscription};
@@ -35,7 +35,7 @@ pub fn run() -> iced::Result {
         .antialiasing(true)
         .run_with(|| {
             // Focus the input field on startup
-            let focus_task = text_input::focus(text_input::Id::new(INPUT_FIELD));
+            let focus_task = iced::widget::focus_next();
             (Nexus::default(), focus_task)
         })
 }
@@ -86,7 +86,7 @@ fn process_actions(state: &mut Nexus, actions: Vec<Action>) -> Task<Message> {
             }
             Action::FocusInput => {
                 state.terminal.focus = Focus::Input;
-                tasks.push(text_input::focus(text_input::Id::new(INPUT_FIELD)));
+                tasks.push(iced::widget::focus_next());
             }
         }
     }
@@ -178,6 +178,7 @@ fn view(state: &Nexus) -> Element<'_, Message> {
         &state.terminal.cwd,
         state.terminal.last_exit_code,
         state.terminal.permission_denied_command.as_deref(),
+        state.terminal.focus.clone(),
     ))
         .padding([8, 15])
         .width(Length::Fill);

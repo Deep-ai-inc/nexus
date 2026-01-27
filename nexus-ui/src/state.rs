@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use iced::widget::text_editor;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_api::{BlockId, ShellEvent, Value};
@@ -29,8 +30,8 @@ use crate::widgets::job_indicator::VisualJob;
 
 /// State for the input area (typing, completion, history search).
 pub struct InputState {
-    /// Current input text.
-    pub buffer: String,
+    /// Current editor content (multi-line support).
+    pub content: text_editor::Content,
     /// Current input mode (Shell or Agent).
     pub mode: InputMode,
     /// Pending attachments (images/files) for rich input.
@@ -69,6 +70,34 @@ pub struct InputState {
 }
 
 impl InputState {
+    /// Get the current input text.
+    pub fn text(&self) -> String {
+        self.content.text()
+    }
+
+    /// Set the input text, moving cursor to end.
+    pub fn set_text(&mut self, text: &str) {
+        self.content = text_editor::Content::with_text(text);
+        // Move cursor to end (shell UX expectation)
+        self.content
+            .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+    }
+
+    /// Clear the input.
+    pub fn clear(&mut self) {
+        self.content = text_editor::Content::new();
+    }
+
+    /// Get the number of lines in the input.
+    pub fn line_count(&self) -> usize {
+        self.content.line_count()
+    }
+
+    /// Get cursor position (line, column) for boundary detection.
+    pub fn cursor_position(&self) -> (usize, usize) {
+        self.content.cursor_position()
+    }
+
     /// Add a shell command to history if it's not a duplicate of the last entry.
     pub fn push_shell_history(&mut self, command: &str) {
         if self.shell_history.last().map(|s| s.as_str()) != Some(command) {
@@ -127,7 +156,7 @@ impl InputState {
 impl Default for InputState {
     fn default() -> Self {
         Self {
-            buffer: String::new(),
+            content: text_editor::Content::new(),
             mode: InputMode::default(),
             attachments: Vec::new(),
             shell_history: Vec::new(),

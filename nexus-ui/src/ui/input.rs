@@ -1,12 +1,13 @@
 //! Input area rendering including completions and popups.
 
-use iced::widget::{button, column, container, row, text, text_input, Column};
+use iced::keyboard::key::Named;
+use iced::keyboard::Key;
+use iced::widget::{button, column, container, row, text, text_editor, text_input, Column};
 use iced::{Element, Length};
 
 use nexus_kernel::CompletionKind;
 
-use crate::blocks::InputMode;
-use crate::constants::INPUT_FIELD;
+use crate::blocks::{Focus, InputMode};
 use crate::msg::{InputMessage, Message, TerminalMessage};
 use crate::state::InputState;
 use crate::utils::{format_relative_time, shorten_path};
@@ -18,7 +19,10 @@ pub fn view_input<'a>(
     cwd: &'a str,
     last_exit_code: Option<i32>,
     permission_denied_command: Option<&'a str>,
+    focus: Focus,
 ) -> Element<'a, Message> {
+    // Check if input should receive keyboard input
+    let input_has_focus = matches!(focus, Focus::Input);
     // Cornflower blue for path
     let path_color = iced::Color::from_rgb8(100, 149, 237);
     // Green for success, red for failure
@@ -30,8 +34,14 @@ pub fn view_input<'a>(
     // Shorten path (replace home with ~)
     let display_path = shorten_path(cwd);
 
+    // Calculate line height for consistent alignment between prompt and editor.
+    // Using the same line_height ensures the prompt "$" aligns with the first line of text.
+    let line_height = font_size * 1.4;
+    let line_height_iced = iced::widget::text::LineHeight::Absolute(line_height.into());
+
     let path_text = text(format!("{} ", display_path))
         .size(font_size)
+        .line_height(line_height_iced)
         .color(path_color)
         .font(iced::Font::MONOSPACE);
 
@@ -43,16 +53,139 @@ pub fn view_input<'a>(
 
     let prompt = text(format!("{} ", mode_label))
         .size(font_size)
+        .line_height(line_height_iced)
         .color(mode_color)
         .font(iced::Font::MONOSPACE);
 
-    let input_field = text_input("", &input.buffer)
-        .id(text_input::Id::new(INPUT_FIELD))
-        .on_input(|s| Message::Input(InputMessage::Changed(s)))
-        .on_submit(Message::Input(InputMessage::Submit))
+    // Dynamic height: grows with content, caps at 10 lines.
+    // Beyond 10 lines, the text_editor scrolls internally (keyboard/mouse wheel).
+    // Note: No visible scrollbar is styled - this matches terminal UX expectations.
+    let editor_height = (input.line_count() as f32 * line_height)
+        .max(line_height)
+        .min(line_height * 10.0);
+
+    // Capture cursor position for history boundary detection.
+    // History navigation (Up/Down) only triggers when cursor is at text boundaries.
+    let (cursor_line, _) = input.cursor_position();
+    let line_count = input.line_count();
+    let is_on_first_line = cursor_line == 0;
+    let is_on_last_line = cursor_line >= line_count.saturating_sub(1);
+
+    // Capture completion state for key binding decisions
+    let completion_visible = input.completion_visible;
+    let completion_index = input.completion_index;
+    let completions_len = input.completions.len();
+
+    let input_field = text_editor(&input.content)
+        .on_action(|action| Message::Input(InputMessage::EditorAction(action)))
+        .key_binding(move |key_press| {
+            // When a PTY block has focus, ignore all keys in the text_editor.
+            // The PTY receives keyboard input through the window event handler.
+            if !input_has_focus {
+                return None;
+            }
+
+            // Ignore Cmd/Ctrl+key combinations - let the window handler process them.
+            // This prevents the editor from inserting characters for shortcuts like Cmd+K.
+            if key_press.modifiers.command() || key_press.modifiers.control() {
+                // Allow Ctrl+C/V/X for clipboard operations (handled by iced internally)
+                // and Ctrl+A for select all, but ignore everything else
+                if let Key::Character(c) = &key_press.key {
+                    match c.to_lowercase().as_str() {
+                        "a" | "c" | "v" | "x" | "z" => {
+                            return text_editor::Binding::from_key_press(key_press);
+                        }
+                        _ => return None, // Ignore other Cmd/Ctrl shortcuts
+                    }
+                }
+                return None;
+            }
+
+            match &key_press.key {
+                Key::Named(Named::Enter) => {
+                    if key_press.modifiers.shift() {
+                        // Shift+Enter: insert newline
+                        Some(text_editor::Binding::Enter)
+                    } else if completion_visible {
+                        // Enter with completion visible: select current completion
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::SelectCompletion(completion_index),
+                        )))
+                    } else {
+                        // Enter: submit command
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::Submit,
+                        )))
+                    }
+                }
+                Key::Named(Named::Escape) if completion_visible => {
+                    // Escape: cancel completion
+                    Some(text_editor::Binding::Custom(Message::Input(
+                        InputMessage::CancelCompletion,
+                    )))
+                }
+                Key::Named(Named::Tab) => {
+                    if key_press.modifiers.shift() {
+                        // Shift+Tab: cycle completion backwards
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::TabCompletionPrev,
+                        )))
+                    } else {
+                        // Tab: trigger/cycle completion forward
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::TabCompletion,
+                        )))
+                    }
+                }
+                Key::Named(Named::ArrowUp) if !key_press.modifiers.shift() => {
+                    if completion_visible && completions_len > 0 {
+                        // Up with completion visible: navigate completion up
+                        let new_index = if completion_index == 0 {
+                            completions_len - 1
+                        } else {
+                            completion_index - 1
+                        };
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::CompletionNavigate(new_index),
+                        )))
+                    } else if is_on_first_line {
+                        // Up on first line: navigate history
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::HistoryKey(key_press.key.clone(), key_press.modifiers),
+                        )))
+                    } else {
+                        text_editor::Binding::from_key_press(key_press)
+                    }
+                }
+                Key::Named(Named::ArrowDown) if !key_press.modifiers.shift() => {
+                    if completion_visible && completions_len > 0 {
+                        // Down with completion visible: navigate completion down
+                        let new_index = if completion_index >= completions_len - 1 {
+                            0
+                        } else {
+                            completion_index + 1
+                        };
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::CompletionNavigate(new_index),
+                        )))
+                    } else if is_on_last_line {
+                        // Down on last line: navigate history
+                        Some(text_editor::Binding::Custom(Message::Input(
+                            InputMessage::HistoryKey(key_press.key.clone(), key_press.modifiers),
+                        )))
+                    } else {
+                        text_editor::Binding::from_key_press(key_press)
+                    }
+                }
+                _ => text_editor::Binding::from_key_press(key_press),
+            }
+        })
+        .height(Length::Fixed(editor_height))
         .padding(0)
         .size(font_size)
-        .style(|_theme, _status| text_input::Style {
+        .line_height(line_height_iced)
+        .font(iced::Font::MONOSPACE)
+        .style(|_theme, _status| text_editor::Style {
             background: iced::Background::Color(iced::Color::TRANSPARENT),
             border: iced::Border {
                 width: 0.0,
@@ -62,12 +195,11 @@ pub fn view_input<'a>(
             placeholder: iced::Color::from_rgb(0.4, 0.4, 0.4),
             value: iced::Color::from_rgb(0.9, 0.9, 0.9),
             selection: iced::Color::from_rgb(0.3, 0.5, 0.8),
-        })
-        .font(iced::Font::MONOSPACE);
+        });
 
     let input_row = row![path_text, prompt, input_field]
         .spacing(0)
-        .align_y(iced::Alignment::Center);
+        .align_y(iced::Alignment::Start);
 
     // Display attachments if any (Mathematica-style rich input)
     let attachments_view: Option<Element<'_, Message>> = if input.attachments.is_empty() {

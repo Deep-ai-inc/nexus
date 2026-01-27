@@ -43,8 +43,13 @@ pub fn search(input: &mut InputState, kernel: &Arc<Mutex<Kernel>>, query: String
 
 /// Select a history search result.
 pub fn select(input: &mut InputState, index: usize) -> InputResult {
-    if let Some(entry) = input.search_results.get(index) {
-        input.buffer = entry.command.clone();
+    // Clone the command before mutating input to avoid borrow conflict
+    let command = input
+        .search_results
+        .get(index)
+        .map(|e| e.command.clone());
+    if let Some(cmd) = command {
+        input.set_text(&cmd);
     }
     input.search_active = false;
     input.search_query.clear();

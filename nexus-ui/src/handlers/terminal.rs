@@ -3,7 +3,7 @@
 //! Handles PTY output, kernel events, and block interactions.
 
 use iced::keyboard::{self, Key, Modifiers};
-use iced::widget::{scrollable, text_input};
+use iced::widget::scrollable;
 use iced::Task;
 
 use nexus_api::{BlockId, BlockState, ShellEvent};
@@ -11,7 +11,7 @@ use nexus_kernel::is_builtin;
 use nexus_term::TerminalParser;
 
 use crate::blocks::{Block, Focus};
-use crate::constants::{HISTORY_SCROLLABLE, INPUT_FIELD};
+use crate::constants::HISTORY_SCROLLABLE;
 use crate::keymap::key_to_bytes;
 use crate::msg::{Message, TerminalMessage};
 use crate::pty::PtyHandle;
@@ -114,15 +114,11 @@ pub fn handle_pty_exited(state: &mut Nexus, block_id: BlockId, exit_code: i32) -
 
     if terminal.focus == Focus::Block(block_id) {
         terminal.focus = Focus::Input;
-        return focus_input();
+        // Text editor already has iced focus; setting focus = Input allows it
+        // to receive keys again (key_binding checks this state).
     }
 
     Task::none()
-}
-
-/// Return a Task that focuses the main input field.
-fn focus_input() -> Task<Message> {
-    text_input::focus(text_input::Id::new(INPUT_FIELD))
 }
 
 /// Handle key press when a PTY block is focused.
@@ -161,7 +157,7 @@ pub fn handle_key(state: &mut Nexus, key: Key, modifiers: Modifiers) -> Task<Mes
             // PTY handle not found (finished block) - Escape returns to input
             if matches!(key, Key::Named(keyboard::key::Named::Escape)) {
                 terminal.focus = Focus::Input;
-                return focus_input();
+                // Text editor already has iced focus
             }
         }
     }
@@ -251,13 +247,11 @@ pub fn handle_kernel_event(state: &mut Nexus, shell_event: ShellEvent) -> Task<M
                 terminal.permission_denied_command = failed_command;
             }
 
-            return Task::batch([
-                focus_input(),
-                scrollable::snap_to(
-                    scrollable::Id::new(HISTORY_SCROLLABLE),
-                    scrollable::RelativeOffset::END,
-                ),
-            ]);
+            // Text editor keeps iced focus; we just need to scroll
+            return scrollable::snap_to(
+                scrollable::Id::new(HISTORY_SCROLLABLE),
+                scrollable::RelativeOffset::END,
+            );
         }
         ShellEvent::OpenClaudePanel { .. } => {}
         ShellEvent::JobStateChanged { job_id, state: job_state } => {
@@ -341,7 +335,7 @@ pub fn dismiss_not_found(state: &mut Nexus) -> Task<Message> {
 /// Bring a background job to foreground.
 pub fn foreground_job(state: &mut Nexus, job_id: u32) -> Task<Message> {
     let command = format!("fg %{}", job_id);
-    state.input.buffer.clear();
+    state.input.clear();
     execute(state, command)
 }
 
@@ -426,14 +420,12 @@ pub fn execute_kernel(state: &mut Nexus, block_id: BlockId, command: String) -> 
     match PtyHandle::spawn_with_size(&command, &cwd, block_id, tx, cols, rows) {
         Ok(handle) => {
             terminal.pty_handles.push(handle);
-            // Blur text input so PTY gets keyboard events
-            return Task::batch([
-                iced::widget::focus_next(),
-                scrollable::snap_to(
-                    scrollable::Id::new(HISTORY_SCROLLABLE),
-                    scrollable::RelativeOffset::END,
-                ),
-            ]);
+            // The text_editor ignores keys when focus is Block (checked in key_binding),
+            // so we don't need to blur it. PTY receives keys through window event handler.
+            return scrollable::snap_to(
+                scrollable::Id::new(HISTORY_SCROLLABLE),
+                scrollable::RelativeOffset::END,
+            );
         }
         Err(e) => {
             tracing::error!("Failed to spawn PTY: {}", e);
@@ -445,7 +437,9 @@ pub fn execute_kernel(state: &mut Nexus, block_id: BlockId, command: String) -> 
                 }
             }
             terminal.focus = Focus::Input;
-            return focus_input();
+            // Text editor already has iced focus; setting focus = Input allows it
+            // to receive keys again (key_binding checks this state).
+            return Task::none();
         }
     }
 }

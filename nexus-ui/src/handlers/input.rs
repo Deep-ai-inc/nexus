@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use iced::keyboard::{self, Key, Modifiers};
+use iced::widget::text_editor;
 use iced::Task;
 use tokio::sync::Mutex;
 
@@ -56,14 +57,14 @@ pub fn update(
     kernel: &Arc<Mutex<Kernel>>,
     msg: InputMessage,
 ) -> InputResult {
-    // Clear suppress_char on any non-Changed message (window has passed)
-    if !matches!(msg, InputMessage::Changed(_)) {
+    // Clear suppress_char on any non-EditorAction message (window has passed)
+    if !matches!(msg, InputMessage::EditorAction(_)) {
         input.suppress_char = None;
     }
 
     match msg {
-        // Pure input operations
-        InputMessage::Changed(val) => changed(input, val),
+        // Editor actions (typing, cursor movement, etc.)
+        InputMessage::EditorAction(action) => editor_action(input, action),
         InputMessage::ToggleMode => toggle_mode(input),
         InputMessage::CancelCompletion => cancel_completion(input),
         InputMessage::PasteImage(d, w, h) => paste_image(input, d, w, h),
@@ -72,7 +73,9 @@ pub fn update(
 
         // Operations needing kernel access
         InputMessage::TabCompletion => completion_tab(input, kernel),
+        InputMessage::TabCompletionPrev => completion_tab_prev(input),
         InputMessage::SelectCompletion(idx) => select_completion(input, idx),
+        InputMessage::CompletionNavigate(idx) => completion_navigate(input, idx),
 
         // History search (needs kernel)
         InputMessage::HistorySearchStart => super::history::start(input, kernel),
@@ -89,28 +92,30 @@ pub fn update(
 // Pure Input Operations
 // =============================================================================
 
-/// Handle input text change. Pure operation on InputState.
-fn changed(input: &mut InputState, value: String) -> InputResult {
+/// Handle editor action (typing, cursor movement, etc.).
+fn editor_action(input: &mut InputState, action: text_editor::Action) -> InputResult {
     // suppress_char catches shortcut characters that arrive AFTER the KeyPressed handler
-    // (the stripping in window.rs catches ones that arrive BEFORE)
-    // Only suppress if the value is exactly buffer + the expected char
+    // Only suppress Edit actions that would insert the expected character
     if let Some(ch) = input.suppress_char.take() {
-        let expected = format!("{}{}", input.buffer, ch);
-        if value == expected {
-            return InputResult::none();
+        if let text_editor::Action::Edit(text_editor::Edit::Insert(c)) = &action {
+            if *c == ch {
+                return InputResult::none();
+            }
         }
         // Didn't match - continue with normal processing
     }
 
-    if input.completion_visible {
-        input.completions.clear();
-        input.completion_visible = false;
+    // Clear completion on edit actions
+    if matches!(action, text_editor::Action::Edit(_)) {
+        if input.completion_visible {
+            input.completions.clear();
+            input.completion_visible = false;
+        }
+        input.before_event = input.text();
     }
-    input.before_event = input.buffer.clone();
-    input.buffer = value;
 
-    // Return action to set focus (cross-domain effect)
-    InputResult::action(Action::FocusInput)
+    input.content.perform(action);
+    InputResult::none()
 }
 
 /// Toggle between Shell and Agent input modes.
@@ -169,7 +174,7 @@ fn history_key(input: &mut InputState, key: Key, _modifiers: Modifiers) -> Input
 
             let new_index = match history_index {
                 None => {
-                    input.saved_input = input.buffer.clone();
+                    input.saved_input = input.text();
                     Some(history_len - 1)
                 }
                 Some(0) => Some(0),
@@ -178,7 +183,8 @@ fn history_key(input: &mut InputState, key: Key, _modifiers: Modifiers) -> Input
 
             input.set_history_index(new_index);
             if let Some(i) = new_index {
-                input.buffer = input.current_history()[i].clone();
+                let text = input.current_history()[i].clone();
+                input.set_text(&text);
             }
         }
         Key::Named(keyboard::key::Named::ArrowDown) => {
@@ -186,12 +192,14 @@ fn history_key(input: &mut InputState, key: Key, _modifiers: Modifiers) -> Input
                 None => {}
                 Some(i) if i >= history_len - 1 => {
                     input.set_history_index(None);
-                    input.buffer = input.saved_input.clone();
+                    let saved = input.saved_input.clone();
+                    input.set_text(&saved);
                     input.saved_input.clear();
                 }
                 Some(i) => {
                     input.set_history_index(Some(i + 1));
-                    input.buffer = input.current_history()[i + 1].clone();
+                    let text = input.current_history()[i + 1].clone();
+                    input.set_text(&text);
                 }
             }
         }
@@ -206,12 +214,31 @@ fn history_key(input: &mut InputState, key: Key, _modifiers: Modifiers) -> Input
 
 /// Handle Tab key for completion.
 fn completion_tab(input: &mut InputState, kernel: &Arc<Mutex<Kernel>>) -> InputResult {
+    // If completion popup is already visible, cycle forward
+    if input.completion_visible && !input.completions.is_empty() {
+        input.completion_index = (input.completion_index + 1) % input.completions.len();
+        return InputResult::none();
+    }
+
     let kernel_guard = kernel.blocking_lock();
-    let cursor = input.buffer.len();
-    let (completions, start) = kernel_guard.complete(&input.buffer, cursor);
+    let text = input.text();
+    let cursor = text.len();
+    let (completions, start) = kernel_guard.complete(&text, cursor);
     drop(kernel_guard);
 
     apply_completions(input, completions, start)
+}
+
+/// Cycle completion backwards (Shift+Tab).
+fn completion_tab_prev(input: &mut InputState) -> InputResult {
+    if input.completion_visible && !input.completions.is_empty() {
+        if input.completion_index == 0 {
+            input.completion_index = input.completions.len() - 1;
+        } else {
+            input.completion_index -= 1;
+        }
+    }
+    InputResult::none()
 }
 
 /// Apply completion results to input state.
@@ -220,9 +247,11 @@ fn apply_completions(
     completions: Vec<Completion>,
     start: usize,
 ) -> InputResult {
+    let text = input.text();
     if completions.len() == 1 {
         let completion = &completions[0];
-        input.buffer = format!("{}{}", &input.buffer[..start], completion.text);
+        let new_text = format!("{}{}", &text[..start], completion.text);
+        input.set_text(&new_text);
         input.completion_visible = false;
     } else if !completions.is_empty() {
         input.completions = completions;
@@ -233,17 +262,23 @@ fn apply_completions(
     InputResult::none()
 }
 
-/// Select a completion from the popup.
+/// Select a completion from the popup (applies it and closes popup).
 fn select_completion(input: &mut InputState, index: usize) -> InputResult {
     if let Some(completion) = input.completions.get(index) {
-        input.buffer = format!(
-            "{}{}",
-            &input.buffer[..input.completion_start],
-            completion.text
-        );
+        let text = input.text();
+        let new_text = format!("{}{}", &text[..input.completion_start], completion.text);
+        input.set_text(&new_text);
     }
     input.completions.clear();
     input.completion_visible = false;
+    InputResult::none()
+}
+
+/// Navigate to a completion item (changes selection without applying).
+fn completion_navigate(input: &mut InputState, index: usize) -> InputResult {
+    if input.completion_visible && index < input.completions.len() {
+        input.completion_index = index;
+    }
     InputResult::none()
 }
 
@@ -254,30 +289,33 @@ fn select_completion(input: &mut InputState, index: usize) -> InputResult {
 /// Submit the current input as a command.
 /// Returns an Action for the coordinator to execute.
 fn submit(input: &mut InputState) -> InputResult {
-    let input_text = input.buffer.trim();
-    if input_text.is_empty() {
+    // Get text and trim to handle any trailing newlines from paste
+    let text = input.text();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return InputResult::none();
     }
 
     // Check for one-shot agent prefix: "? " or "ai "
-    let (is_agent_query, query) = if input_text.starts_with("? ") {
-        (true, input_text.strip_prefix("? ").unwrap().to_string())
-    } else if input_text.starts_with("ai ") {
-        (true, input_text.strip_prefix("ai ").unwrap().to_string())
+    let (is_agent_query, query) = if trimmed.starts_with("? ") {
+        (true, trimmed.strip_prefix("? ").unwrap().to_string())
+    } else if trimmed.starts_with("ai ") {
+        (true, trimmed.strip_prefix("ai ").unwrap().to_string())
     } else {
-        (input.mode == InputMode::Agent, input_text.to_string())
+        (input.mode == InputMode::Agent, trimmed.to_string())
     };
 
-    let command = input.buffer.clone();
+    // Use trimmed text for execution (strips trailing \n from pastes)
+    let command = trimmed.to_string();
 
     // Add to appropriate history based on query type
     if is_agent_query {
         input.push_agent_history(query.trim());
     } else {
-        input.push_shell_history(command.trim());
+        input.push_shell_history(&command);
     }
 
-    input.buffer.clear();
+    input.clear();
     input.shell_history_index = None;
     input.agent_history_index = None;
     input.saved_input.clear();
@@ -296,12 +334,15 @@ fn submit(input: &mut InputState) -> InputResult {
 
 /// Handle keys when the input field is focused.
 /// Called from the window handler, returns InputMessage to process.
+/// Note: Most key handling is now done by text_editor's key_binding.
+/// This function only handles history search mode (special overlay).
 pub fn handle_focus_key(
     input: &mut InputState,
     key: Key,
-    modifiers: Modifiers,
+    _modifiers: Modifiers,
 ) -> Option<InputMessage> {
-    // History search mode takes priority
+    // History search mode takes priority - this is a special overlay mode
+    // where the text_editor is not the primary focus
     if input.search_active {
         match &key {
             Key::Named(keyboard::key::Named::Escape) => {
@@ -326,52 +367,11 @@ pub fn handle_focus_key(
         }
     }
 
-    // Tab for completion
-    if matches!(key, Key::Named(keyboard::key::Named::Tab)) {
-        if input.completion_visible {
-            return Some(InputMessage::SelectCompletion(input.completion_index));
-        } else {
-            return Some(InputMessage::TabCompletion);
-        }
-    }
-
-    // Escape to cancel completion
-    if matches!(key, Key::Named(keyboard::key::Named::Escape)) && input.completion_visible {
-        return Some(InputMessage::CancelCompletion);
-    }
-
-    // Arrow keys for completion navigation
-    if input.completion_visible {
-        match &key {
-            Key::Named(keyboard::key::Named::ArrowUp) => {
-                if input.completion_index > 0 {
-                    input.completion_index -= 1;
-                }
-                return None;
-            }
-            Key::Named(keyboard::key::Named::ArrowDown) => {
-                if input.completion_index < input.completions.len().saturating_sub(1) {
-                    input.completion_index += 1;
-                }
-                return None;
-            }
-            Key::Named(keyboard::key::Named::Enter) => {
-                return Some(InputMessage::SelectCompletion(input.completion_index));
-            }
-            _ => {}
-        }
-    }
-
-    // Up/Down for history navigation
-    match &key {
-        Key::Named(keyboard::key::Named::ArrowUp) if !modifiers.shift() => {
-            return Some(InputMessage::HistoryKey(key, modifiers));
-        }
-        Key::Named(keyboard::key::Named::ArrowDown) if !modifiers.shift() => {
-            return Some(InputMessage::HistoryKey(key, modifiers));
-        }
-        _ => {}
-    }
-
+    // All other key handling is done by text_editor's key_binding:
+    // - Tab for completion
+    // - Escape to cancel completion
+    // - Arrow keys for completion navigation
+    // - Up/Down for history navigation
+    // - Enter for submit/newline
     None
 }

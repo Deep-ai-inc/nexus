@@ -5,11 +5,10 @@
 use std::sync::atomic::Ordering;
 
 use iced::keyboard::{self, Key};
-use iced::widget::text_input;
 use iced::{Event, Task};
 
 use crate::blocks::Focus;
-use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, INPUT_FIELD, LINE_HEIGHT_FACTOR};
+use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, LINE_HEIGHT_FACTOR};
 use crate::msg::{GlobalShortcut, InputMessage, Message, WindowMessage, ZoomDirection};
 use crate::state::Nexus;
 
@@ -28,7 +27,8 @@ pub fn update(state: &mut Nexus, msg: WindowMessage) -> Task<Message> {
                 }
             }
             state.terminal.focus = Focus::Input;
-            text_input::focus(text_input::Id::new(INPUT_FIELD))
+            // Ensure text_editor has iced focus in case user clicked elsewhere
+            iced::widget::focus_next()
         }
     }
 }
@@ -69,11 +69,7 @@ pub fn handle_event(
                                 crate::blocks::InputMode::Shell => crate::blocks::InputMode::Agent,
                                 crate::blocks::InputMode::Agent => crate::blocks::InputMode::Shell,
                             };
-                            // Strip period if TextInput already typed it
-                            let expected = format!("{}.", state.input.before_event);
-                            if state.input.buffer == expected {
-                                state.input.buffer.pop();
-                            }
+                            // Suppress the period character if it arrives after this event
                             state.input.suppress_char = Some('.');
                             return Task::none();
                         }
@@ -91,7 +87,7 @@ pub fn handle_event(
                 if let Key::Character(c) = &key {
                     match c.to_lowercase().as_str() {
                         "c" => {
-                            state.input.buffer.clear();
+                            state.input.clear();
                             state.input.shell_history_index = None;
                             state.input.agent_history_index = None;
                             state.input.saved_input.clear();
@@ -166,21 +162,8 @@ pub fn resize(state: &mut Nexus, width: u32, height: u32) -> Task<Message> {
 
 /// Handle global shortcuts (Cmd+K, Cmd+Q, etc.).
 pub fn global_shortcut(state: &mut Nexus, shortcut: GlobalShortcut) -> Task<Message> {
-    // Strip the shortcut character if text_input just typed it
-    let strip_char = match &shortcut {
-        GlobalShortcut::ClearScreen => Some('k'),
-        GlobalShortcut::CloseWindow => Some('w'),
-        GlobalShortcut::Quit => Some('q'),
-        GlobalShortcut::Copy => Some('c'),
-        GlobalShortcut::Paste => Some('v'),
-    };
-    if let Some(ch) = strip_char {
-        let expected_lower = format!("{}{}", state.input.before_event, ch);
-        let expected_upper = format!("{}{}", state.input.before_event, ch.to_ascii_uppercase());
-        if state.input.buffer == expected_lower || state.input.buffer == expected_upper {
-            state.input.buffer.pop();
-        }
-    }
+    // Note: Character suppression is now handled in the EditorAction handler.
+    // The suppress_char is already set in handle_event before this is called.
 
     match shortcut {
         GlobalShortcut::ClearScreen => {
@@ -198,7 +181,7 @@ pub fn global_shortcut(state: &mut Nexus, shortcut: GlobalShortcut) -> Task<Mess
         }
         GlobalShortcut::Copy => {
             if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                let _ = clipboard.set_text(&state.input.buffer);
+                let _ = clipboard.set_text(&state.input.text());
             }
         }
         GlobalShortcut::Paste => {
@@ -243,19 +226,8 @@ pub fn global_shortcut(state: &mut Nexus, shortcut: GlobalShortcut) -> Task<Mess
 
 /// Handle zoom (font size) changes.
 pub fn zoom(state: &mut Nexus, direction: ZoomDirection) -> Task<Message> {
-    // Strip shortcut character
-    let strip_chars: &[char] = match &direction {
-        ZoomDirection::In => &['=', '+'],
-        ZoomDirection::Out => &['-'],
-        ZoomDirection::Reset => &['0'],
-    };
-    for &ch in strip_chars {
-        let expected = format!("{}{}", state.input.before_event, ch);
-        if state.input.buffer == expected {
-            state.input.buffer.pop();
-            break;
-        }
-    }
+    // Note: Character suppression is now handled in the EditorAction handler.
+    // The suppress_char is already set in handle_event before this is called.
 
     let old_size = state.window.font_size;
     state.window.font_size = match direction {

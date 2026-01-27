@@ -9,6 +9,7 @@
 use std::time::Instant;
 
 use iced::keyboard::{Key, Modifiers};
+use iced::widget::text_editor;
 use iced::Event;
 
 use nexus_api::{BlockId, ShellEvent, Value};
@@ -43,14 +44,18 @@ pub enum Message {
 /// Messages related to text input, completion, and history.
 #[derive(Debug, Clone)]
 pub enum InputMessage {
-    /// Input text changed.
-    Changed(String),
+    /// Editor action (typing, cursor movement, etc.).
+    EditorAction(text_editor::Action),
     /// User submitted a command (Enter key).
     Submit,
-    /// Tab key pressed - trigger completion.
+    /// Tab key pressed - trigger completion (forward).
     TabCompletion,
-    /// Select a completion item by index.
+    /// Shift+Tab pressed - cycle completion backwards.
+    TabCompletionPrev,
+    /// Select a completion item by index (applies the completion).
     SelectCompletion(usize),
+    /// Navigate to a completion item (changes selection without applying).
+    CompletionNavigate(usize),
     /// Cancel completion popup (Escape).
     CancelCompletion,
     /// Arrow key for history navigation.
