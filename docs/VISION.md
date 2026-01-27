@@ -1,10 +1,61 @@
 # Nexus: Solving Terminal Friction
 
-This document tracks the 20 core problems with modern terminals and how Nexus addresses each one.
+This document tracks the core problems with modern terminals and how Nexus addresses each one.
 
 ---
 
-## The Problems
+## Core Architecture
+
+These foundational design choices enable everything else:
+
+### Block-Based Output
+Commands and their output are organized into discrete blocks you can navigate, re-run, copy, or reference. Each block is a first-class UI element with its own state, not just text in a scrollback buffer.
+
+**Status:** ✅ Working. Blocks track command, output, exit code, duration, and can render structured data.
+
+**Implementation:**
+- [x] Commands produce discrete Block objects
+- [x] Blocks can be collapsed/expanded
+- [x] Status indicators (running/success/failed)
+- [x] Kill button for running blocks
+- [ ] Re-run button for completed blocks
+- [ ] Copy block output (text, JSON, or TSV for tables)
+- [ ] Block permalinks/sharing
+
+---
+
+### AI Integration
+Built-in AI that can explain commands, suggest fixes, and act as a coding agent that can edit files while you steer it mid-execution.
+
+**Status:** 🔨 In progress. Agent panel working, tool use implemented.
+
+**Implementation:**
+- [x] Agent panel with streaming responses
+- [x] Tool use (file read/write, bash execution)
+- [x] Interrupt/cancel agent mid-execution
+- [ ] "Explain this error" contextual action
+- [ ] "Fix this" suggestions on command failure
+- [ ] Steer agent while running (persistent input)
+- [ ] Project-specific agent instructions (NEXUS.md)
+
+---
+
+### Modern Input
+Text editor-style input with proper cursor movement, selections, and multi-line editing. Not the traditional readline approach.
+
+**Status:** 🔨 In progress. Basic editing works, multi-line needs work.
+
+**Implementation:**
+- [x] Standard cursor movement (arrows, Cmd+Left/Right)
+- [x] Text selection (Shift+arrows)
+- [ ] Multi-line input with Shift+Enter
+- [ ] Syntax highlighting in input
+- [ ] Bracket matching
+- [ ] History search inline (not modal popup)
+
+---
+
+## The 20 Problems
 
 ### 1. Escape Sequence Hell
 **Pain:** Parsing ANSI codes, stripping colors, writing cursor movements. Feels like 1970s programming.

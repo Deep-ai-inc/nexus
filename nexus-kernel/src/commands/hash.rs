@@ -88,10 +88,7 @@ impl NexusCommand for HashCommand {
         // If no args (after parsing options), display hash table
         if args.is_empty() || (clear && args.len() == 1) {
             if ctx.state.command_hash.is_empty() {
-                return Ok(Value::Table {
-                    columns: vec!["hits".to_string(), "command".to_string()],
-                    rows: vec![],
-                });
+                return Ok(Value::table(vec!["hits", "command"], vec![]));
             }
 
             let rows: Vec<Vec<Value>> = ctx
@@ -106,10 +103,7 @@ impl NexusCommand for HashCommand {
                 })
                 .collect();
 
-            return Ok(Value::Table {
-                columns: vec!["hits".to_string(), "command".to_string()],
-                rows,
-            });
+            return Ok(Value::table(vec!["hits", "command"], rows));
         }
 
         Ok(Value::Unit)
@@ -150,7 +144,8 @@ mod tests {
 
         match result {
             Value::Table { columns, rows } => {
-                assert_eq!(columns, vec!["hits".to_string(), "command".to_string()]);
+                let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(col_names, vec!["hits", "command"]);
                 assert!(rows.is_empty());
             }
             _ => panic!("Expected Table"),

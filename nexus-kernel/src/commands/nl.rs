@@ -161,7 +161,7 @@ fn nl_value(value: Value, opts: &NlOptions) -> Value {
                 line_num += opts.increment;
             }
 
-            let mut new_columns = vec!["#".to_string()];
+            let mut new_columns = vec![nexus_api::TableColumn::new("#")];
             new_columns.extend(columns);
 
             Value::Table {

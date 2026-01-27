@@ -105,14 +105,7 @@ impl NexusCommand for OutputsCommand {
             })
             .collect();
 
-        Ok(Value::Table {
-            columns: vec![
-                "index".to_string(),
-                "command".to_string(),
-                "preview".to_string(),
-            ],
-            rows,
-        })
+        Ok(Value::table(vec!["index", "command", "preview"], rows))
     }
 }
 
@@ -215,7 +208,8 @@ mod tests {
 
         match result {
             Value::Table { columns, rows } => {
-                assert_eq!(columns, vec!["index", "command", "preview"]);
+                let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(col_names, vec!["index", "command", "preview"]);
                 assert!(!rows.is_empty());
             }
             _ => panic!("Expected Table"),

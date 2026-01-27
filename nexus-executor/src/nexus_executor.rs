@@ -176,7 +176,8 @@ pub fn serialize_value_for_llm(value: &nexus_api::Value) -> String {
             }
 
             // Build markdown table
-            let header = format!("| {} |", columns.join(" | "));
+            let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+            let header = format!("| {} |", col_names.join(" | "));
             let sep = format!("|{}|", columns.iter().map(|_| "---").collect::<Vec<_>>().join("|"));
             let rows_str = rows.iter()
                 .map(|row| {

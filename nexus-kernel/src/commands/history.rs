@@ -88,14 +88,6 @@ impl NexusCommand for HistoryCommand {
         };
 
         // Convert to structured output
-        let columns = vec![
-            "id".to_string(),
-            "command".to_string(),
-            "exit".to_string(),
-            "duration".to_string(),
-            "when".to_string(),
-        ];
-
         let rows: Vec<Vec<Value>> = entries
             .iter()
             .map(|entry| {
@@ -111,7 +103,7 @@ impl NexusCommand for HistoryCommand {
             })
             .collect();
 
-        Ok(Value::Table { columns, rows })
+        Ok(Value::table(vec!["id", "command", "exit", "duration", "when"], rows))
     }
 }
 

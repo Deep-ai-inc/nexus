@@ -24,7 +24,7 @@
 //! - `ps axjf` - show process tree
 
 use super::{CommandContext, NexusCommand};
-use nexus_api::{ProcessInfo, ProcessStatus, Value};
+use nexus_api::{ProcessInfo, ProcessStatus, TableColumn, Value};
 use std::collections::HashSet;
 
 #[cfg(unix)]
@@ -326,8 +326,8 @@ fn compare_by_field(a: &ProcessInfo, b: &ProcessInfo, field: &str) -> std::cmp::
     }
 }
 
-fn build_table(processes: &[ProcessInfo], opts: &PsOptions) -> (Vec<String>, Vec<Vec<Value>>) {
-    let columns: Vec<String> = if !opts.custom_format.is_empty() {
+fn build_table(processes: &[ProcessInfo], opts: &PsOptions) -> (Vec<TableColumn>, Vec<Vec<Value>>) {
+    let column_names: Vec<String> = if !opts.custom_format.is_empty() {
         opts.custom_format.iter().map(|s| normalize_column_name(s)).collect()
     } else if opts.long_format {
         vec!["F", "S", "UID", "PID", "PPID", "C", "PRI", "NI", "ADDR", "SZ", "WCHAN", "TTY", "TIME", "CMD"]
@@ -349,10 +349,11 @@ fn build_table(processes: &[ProcessInfo], opts: &PsOptions) -> (Vec<String>, Vec
     let rows: Vec<Vec<Value>> = processes
         .iter()
         .map(|p| {
-            columns.iter().map(|col| format_column(p, col, opts)).collect()
+            column_names.iter().map(|col| format_column(p, col, opts)).collect()
         })
         .collect();
 
+    let columns: Vec<TableColumn> = column_names.into_iter().map(TableColumn::from).collect();
     (columns, rows)
 }
 
@@ -1168,10 +1169,10 @@ mod tests {
 
         match result {
             Value::Table { columns, rows } => {
-                assert!(columns.contains(&"USER".to_string()));
-                assert!(columns.contains(&"PID".to_string()));
-                assert!(columns.contains(&"%CPU".to_string()));
-                assert!(columns.contains(&"COMMAND".to_string()));
+                assert!(columns.iter().any(|c| c.name == "USER"));
+                assert!(columns.iter().any(|c| c.name == "PID"));
+                assert!(columns.iter().any(|c| c.name == "%CPU"));
+                assert!(columns.iter().any(|c| c.name == "COMMAND"));
                 assert!(!rows.is_empty());
             }
             _ => panic!("Expected Table"),
@@ -1187,9 +1188,9 @@ mod tests {
 
         match result {
             Value::Table { columns, .. } => {
-                assert!(columns.contains(&"UID".to_string()));
-                assert!(columns.contains(&"PID".to_string()));
-                assert!(columns.contains(&"PPID".to_string()));
+                assert!(columns.iter().any(|c| c.name == "UID"));
+                assert!(columns.iter().any(|c| c.name == "PID"));
+                assert!(columns.iter().any(|c| c.name == "PPID"));
             }
             _ => panic!("Expected Table"),
         }

@@ -50,9 +50,9 @@ pub enum Value {
     List(Vec<Value>),
     /// Ordered key-value pairs (like a JSON object but preserves insertion order)
     Record(Vec<(String, Value)>),
-    /// Tabular data with named columns
+    /// Tabular data with named columns and optional display format hints
     Table {
-        columns: Vec<String>,
+        columns: Vec<TableColumn>,
         rows: Vec<Vec<Value>>,
     },
 
@@ -132,6 +132,74 @@ pub enum FileType {
     Fifo,
     Socket,
     Unknown,
+}
+
+// =============================================================================
+// Table Column Definition
+// =============================================================================
+
+/// A table column with name and optional display format hint.
+///
+/// The display format is a hint to the renderer - it doesn't change the
+/// underlying data type. This allows sorting/filtering to work on the raw
+/// value while displaying it in a human-friendly format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableColumn {
+    /// Column name (displayed in header)
+    pub name: String,
+    /// Optional display format hint for the renderer
+    pub format: Option<DisplayFormat>,
+}
+
+impl TableColumn {
+    /// Create a simple column with no format hint.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            format: None,
+        }
+    }
+
+    /// Create a column with a display format hint.
+    pub fn with_format(name: impl Into<String>, format: DisplayFormat) -> Self {
+        Self {
+            name: name.into(),
+            format: Some(format),
+        }
+    }
+}
+
+impl From<&str> for TableColumn {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl From<String> for TableColumn {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
+
+/// Display format hints for table columns.
+///
+/// These don't change the underlying data - a size column still stores
+/// `Value::Int(207667)`, but the renderer shows "202.8K" when the hint
+/// is `HumanBytes`. This enables correct sorting while showing friendly output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayFormat {
+    /// Format bytes as human-readable (e.g., 1024 -> "1.0K")
+    HumanBytes,
+    /// Format as percentage with % suffix (e.g., 0.5 -> "50%")
+    Percentage,
+    /// Format Unix timestamp as relative time (e.g., "2 hours ago")
+    RelativeTime,
+    /// Format Unix timestamp as absolute datetime
+    DateTime,
+    /// Format duration in seconds as human-readable (e.g., "2h 30m")
+    Duration,
+    /// Format with octal representation (for permissions)
+    Octal,
 }
 
 // =============================================================================
@@ -621,13 +689,144 @@ fn format_size(bytes: u64) -> String {
     const GB: u64 = MB * 1024;
 
     if bytes >= GB {
-        format!("{:.1}GB", bytes as f64 / GB as f64)
+        format!("{:.1}G", bytes as f64 / GB as f64)
     } else if bytes >= MB {
-        format!("{:.1}MB", bytes as f64 / MB as f64)
+        format!("{:.1}M", bytes as f64 / MB as f64)
     } else if bytes >= KB {
-        format!("{:.1}KB", bytes as f64 / KB as f64)
+        format!("{:.1}K", bytes as f64 / KB as f64)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+/// Format a value according to a display format hint.
+/// This is used by table rendering to show human-friendly output
+/// while keeping the underlying value intact for sorting/filtering.
+pub fn format_value_for_display(value: &Value, format: DisplayFormat) -> String {
+    match format {
+        DisplayFormat::HumanBytes => {
+            let bytes = match value {
+                Value::Int(n) => *n as u64,
+                Value::Float(f) => *f as u64,
+                _ => return value.to_text(),
+            };
+            format_size(bytes)
+        }
+        DisplayFormat::Percentage => {
+            match value {
+                Value::Float(f) => format!("{:.1}%", f),
+                Value::Int(n) => format!("{}%", n),
+                _ => value.to_text(),
+            }
+        }
+        DisplayFormat::RelativeTime => {
+            let timestamp = match value {
+                Value::Int(n) => *n as u64,
+                _ => return value.to_text(),
+            };
+            format_relative_time(timestamp)
+        }
+        DisplayFormat::DateTime => {
+            let timestamp = match value {
+                Value::Int(n) => *n as u64,
+                _ => return value.to_text(),
+            };
+            format_datetime(timestamp)
+        }
+        DisplayFormat::Duration => {
+            let secs = match value {
+                Value::Int(n) => *n as u64,
+                Value::Float(f) => *f as u64,
+                _ => return value.to_text(),
+            };
+            format_duration(secs)
+        }
+        DisplayFormat::Octal => {
+            match value {
+                Value::Int(n) => format!("{:o}", n),
+                _ => value.to_text(),
+            }
+        }
+    }
+}
+
+/// Format a Unix timestamp as relative time (e.g., "2 hours ago").
+fn format_relative_time(timestamp: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if timestamp > now {
+        return "in the future".to_string();
+    }
+
+    let diff = now - timestamp;
+
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        let mins = diff / 60;
+        format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" })
+    } else if diff < 86400 {
+        let hours = diff / 3600;
+        format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
+    } else if diff < 604800 {
+        let days = diff / 86400;
+        format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
+    } else if diff < 2592000 {
+        let weeks = diff / 604800;
+        format!("{} week{} ago", weeks, if weeks == 1 { "" } else { "s" })
+    } else if diff < 31536000 {
+        let months = diff / 2592000;
+        format!("{} month{} ago", months, if months == 1 { "" } else { "s" })
+    } else {
+        let years = diff / 31536000;
+        format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
+    }
+}
+
+/// Format a Unix timestamp as datetime string.
+fn format_datetime(timestamp: u64) -> String {
+    // Simple ISO-like format without external dependencies
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
+    // For now, just return the timestamp - a proper implementation would
+    // use chrono or similar. This is a placeholder that works.
+    format!("{}", timestamp)
+}
+
+/// Format duration in seconds as human-readable.
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        let mins = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{}m", mins)
+        } else {
+            format!("{}m {}s", mins, s)
+        }
+    } else if secs < 86400 {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        if mins == 0 {
+            format!("{}h", hours)
+        } else {
+            format!("{}h {}m", hours, mins)
+        }
+    } else {
+        let days = secs / 86400;
+        let hours = (secs % 86400) / 3600;
+        if hours == 0 {
+            format!("{}d", days)
+        } else {
+            format!("{}d {}h", days, hours)
+        }
     }
 }
 
@@ -749,12 +948,20 @@ impl Value {
             }
             Value::Table { columns, rows } => {
                 // Simple tab-separated output
-                buf.push_str(&columns.join("\t"));
+                let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                buf.push_str(&col_names.join("\t"));
                 buf.push('\n');
                 for row in rows {
                     for (i, cell) in row.iter().enumerate() {
                         if i > 0 {
                             buf.push('\t');
+                        }
+                        // Apply display format if specified
+                        if let Some(col) = columns.get(i) {
+                            if let Some(format) = &col.format {
+                                buf.push_str(&format_value_for_display(cell, *format));
+                                continue;
+                            }
                         }
                         cell.write_text(buf);
                     }
@@ -990,4 +1197,30 @@ impl From<IndexMap<String, Value>> for Value {
     fn from(data: IndexMap<String, Value>) -> Self {
         Value::Structured { kind: None, data }
     }
+}
+
+// =============================================================================
+// Table Helpers
+// =============================================================================
+
+impl Value {
+    /// Create a table with simple string column names (no format hints).
+    /// This is a convenience method for backwards compatibility.
+    pub fn table(columns: Vec<impl Into<String>>, rows: Vec<Vec<Value>>) -> Self {
+        Value::Table {
+            columns: columns.into_iter().map(|c| TableColumn::new(c)).collect(),
+            rows,
+        }
+    }
+
+    /// Create a table with full column definitions (including format hints).
+    pub fn table_with_columns(columns: Vec<TableColumn>, rows: Vec<Vec<Value>>) -> Self {
+        Value::Table { columns, rows }
+    }
+}
+
+/// Convert a slice of strings to TableColumn vector.
+/// Useful for quick migrations from old code.
+pub fn columns_from_strings(names: &[&str]) -> Vec<TableColumn> {
+    names.iter().map(|&s| TableColumn::new(s)).collect()
 }

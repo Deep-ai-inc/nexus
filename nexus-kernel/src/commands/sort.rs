@@ -177,9 +177,9 @@ fn sort_file_entries(items: &mut [Value], opts: &SortOptions) {
         } else if opts.by_time {
             ea.modified.cmp(&eb.modified)
         } else if opts.ignore_case {
-            ea.name.to_lowercase().cmp(&eb.name.to_lowercase())
+            natural_cmp_case_insensitive(&ea.name, &eb.name)
         } else {
-            ea.name.cmp(&eb.name)
+            natural_cmp(&ea.name, &eb.name)
         };
 
         if opts.reverse {
@@ -221,23 +221,152 @@ fn compare_by_field(a: &Value, b: &Value, field: &str, opts: &SortOptions) -> Or
 
 fn compare_values(a: &Value, b: &Value, opts: &SortOptions) -> Ordering {
     match (a, b) {
+        // Numeric types - always compare numerically
         (Value::Int(ia), Value::Int(ib)) => ia.cmp(ib),
         (Value::Float(fa), Value::Float(fb)) => fa.partial_cmp(fb).unwrap_or(Ordering::Equal),
         (Value::Int(ia), Value::Float(fb)) => (*ia as f64).partial_cmp(fb).unwrap_or(Ordering::Equal),
         (Value::Float(fa), Value::Int(ib)) => fa.partial_cmp(&(*ib as f64)).unwrap_or(Ordering::Equal),
+
+        // Strings - smart comparison based on content and options
         (Value::String(sa), Value::String(sb)) => {
             if opts.numeric {
+                // Explicit numeric sort requested
                 let na = sa.trim().parse::<f64>().unwrap_or(f64::MAX);
                 let nb = sb.trim().parse::<f64>().unwrap_or(f64::MAX);
                 na.partial_cmp(&nb).unwrap_or(Ordering::Equal)
             } else if opts.ignore_case {
-                sa.to_lowercase().cmp(&sb.to_lowercase())
+                natural_cmp_case_insensitive(sa, sb)
             } else {
-                sa.cmp(sb)
+                // Default: smart string comparison (numeric if both are numbers, else natural sort)
+                smart_string_cmp(sa, sb)
             }
         }
-        _ => a.to_text().cmp(&b.to_text()),
+
+        // FileEntry - natural sort by name, or by size/time if requested
+        (Value::FileEntry(a), Value::FileEntry(b)) => {
+            if opts.by_size {
+                a.size.cmp(&b.size)
+            } else if opts.by_time {
+                a.modified.cmp(&b.modified)
+            } else {
+                natural_cmp(&a.name, &b.name)
+            }
+        }
+
+        // Process - sort by command name with natural sort
+        (Value::Process(a), Value::Process(b)) => natural_cmp(&a.command, &b.command),
+
+        // GitCommit - sort by date
+        (Value::GitCommit(a), Value::GitCommit(b)) => a.date.cmp(&b.date),
+
+        // Path - natural sort
+        (Value::Path(a), Value::Path(b)) => natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()),
+
+        // Cross-type string/number comparison
+        (Value::String(s), Value::Int(i)) => {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                n.cmp(i)
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Value::Int(i), Value::String(s)) => {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                i.cmp(&n)
+            } else {
+                Ordering::Less
+            }
+        }
+
+        // Fallback: natural sort on text representation
+        _ => natural_cmp(&a.to_text(), &b.to_text()),
     }
+}
+
+/// Smart string comparison: if both are pure numbers, compare numerically.
+/// Otherwise use natural sort.
+fn smart_string_cmp(a: &str, b: &str) -> Ordering {
+    match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+        (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(Ordering::Equal),
+        _ => natural_cmp(a, b),
+    }
+}
+
+/// Natural sort - handles embedded numbers correctly.
+/// "file2" < "file10", "v1.9" < "v1.10"
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let mut a_chars = a.chars().peekable();
+    let mut b_chars = b.chars().peekable();
+
+    loop {
+        match (a_chars.peek(), b_chars.peek()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&ac), Some(&bc)) => {
+                if ac.is_ascii_digit() && bc.is_ascii_digit() {
+                    let a_num = collect_number(&mut a_chars);
+                    let b_num = collect_number(&mut b_chars);
+                    match a_num.cmp(&b_num) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+                match ac.cmp(&bc) {
+                    Ordering::Equal => {
+                        a_chars.next();
+                        b_chars.next();
+                    }
+                    other => return other,
+                }
+            }
+        }
+    }
+}
+
+/// Natural sort with case-insensitive comparison.
+fn natural_cmp_case_insensitive(a: &str, b: &str) -> Ordering {
+    let mut a_chars = a.chars().peekable();
+    let mut b_chars = b.chars().peekable();
+
+    loop {
+        match (a_chars.peek(), b_chars.peek()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&ac), Some(&bc)) => {
+                if ac.is_ascii_digit() && bc.is_ascii_digit() {
+                    let a_num = collect_number(&mut a_chars);
+                    let b_num = collect_number(&mut b_chars);
+                    match a_num.cmp(&b_num) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+                match ac.to_ascii_lowercase().cmp(&bc.to_ascii_lowercase()) {
+                    Ordering::Equal => {
+                        a_chars.next();
+                        b_chars.next();
+                    }
+                    other => return other,
+                }
+            }
+        }
+    }
+}
+
+/// Collect consecutive digits into a number.
+fn collect_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
+    let mut num: u64 = 0;
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            num = num.saturating_mul(10).saturating_add((c as u64) - ('0' as u64));
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    num
 }
 
 #[cfg(test)]
@@ -381,6 +510,135 @@ mod tests {
                     assert_eq!(c.command, "low");
                 }
                 _ => panic!("Expected Process values"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_smart_string_numeric() {
+        // Pure numeric strings should sort numerically even without -n flag
+        let list = Value::List(vec![
+            Value::String("10".to_string()),
+            Value::String("2".to_string()),
+            Value::String("1".to_string()),
+            Value::String("20".to_string()),
+        ]);
+        let opts = SortOptions {
+            reverse: false,
+            numeric: false, // NOT using -n flag
+            by_size: false,
+            by_time: false,
+            ignore_case: false,
+            unique: false,
+            by_field: None,
+        };
+        let result = sort_value(list, &opts);
+        if let Value::List(items) = result {
+            assert_eq!(items[0].to_text(), "1");
+            assert_eq!(items[1].to_text(), "2");
+            assert_eq!(items[2].to_text(), "10");
+            assert_eq!(items[3].to_text(), "20");
+        }
+    }
+
+    #[test]
+    fn test_natural_sort_filenames() {
+        // Natural sort handles embedded numbers: file2 < file10
+        let list = Value::List(vec![
+            Value::String("file10.txt".to_string()),
+            Value::String("file2.txt".to_string()),
+            Value::String("file1.txt".to_string()),
+            Value::String("file20.txt".to_string()),
+        ]);
+        let opts = SortOptions {
+            reverse: false,
+            numeric: false,
+            by_size: false,
+            by_time: false,
+            ignore_case: false,
+            unique: false,
+            by_field: None,
+        };
+        let result = sort_value(list, &opts);
+        if let Value::List(items) = result {
+            assert_eq!(items[0].to_text(), "file1.txt");
+            assert_eq!(items[1].to_text(), "file2.txt");
+            assert_eq!(items[2].to_text(), "file10.txt");
+            assert_eq!(items[3].to_text(), "file20.txt");
+        }
+    }
+
+    #[test]
+    fn test_natural_sort_versions() {
+        // Version-like strings: v1.9 < v1.10
+        let list = Value::List(vec![
+            Value::String("v1.10".to_string()),
+            Value::String("v1.2".to_string()),
+            Value::String("v1.9".to_string()),
+            Value::String("v2.0".to_string()),
+        ]);
+        let opts = SortOptions {
+            reverse: false,
+            numeric: false,
+            by_size: false,
+            by_time: false,
+            ignore_case: false,
+            unique: false,
+            by_field: None,
+        };
+        let result = sort_value(list, &opts);
+        if let Value::List(items) = result {
+            assert_eq!(items[0].to_text(), "v1.2");
+            assert_eq!(items[1].to_text(), "v1.9");
+            assert_eq!(items[2].to_text(), "v1.10");
+            assert_eq!(items[3].to_text(), "v2.0");
+        }
+    }
+
+    #[test]
+    fn test_file_entry_natural_sort() {
+        use nexus_api::{FileEntry, FileType};
+        use std::path::PathBuf;
+
+        fn test_file(name: &str) -> FileEntry {
+            FileEntry {
+                name: name.to_string(),
+                path: PathBuf::from(name),
+                file_type: FileType::File,
+                size: 0,
+                modified: None,
+                accessed: None,
+                created: None,
+                permissions: 0o644,
+                is_hidden: false,
+                is_symlink: false,
+                symlink_target: None,
+            }
+        }
+
+        let list = Value::List(vec![
+            Value::FileEntry(Box::new(test_file("doc10.pdf"))),
+            Value::FileEntry(Box::new(test_file("doc2.pdf"))),
+            Value::FileEntry(Box::new(test_file("doc1.pdf"))),
+        ]);
+        let opts = SortOptions {
+            reverse: false,
+            numeric: false,
+            by_size: false,
+            by_time: false,
+            ignore_case: false,
+            unique: false,
+            by_field: None,
+        };
+        let result = sort_value(list, &opts);
+        if let Value::List(items) = result {
+            match (&items[0], &items[1], &items[2]) {
+                (Value::FileEntry(a), Value::FileEntry(b), Value::FileEntry(c)) => {
+                    assert_eq!(a.name, "doc1.pdf");
+                    assert_eq!(b.name, "doc2.pdf");
+                    assert_eq!(c.name, "doc10.pdf");
+                }
+                _ => panic!("Expected FileEntry values"),
             }
         }
     }

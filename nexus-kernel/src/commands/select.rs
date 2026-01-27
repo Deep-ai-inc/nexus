@@ -143,7 +143,7 @@ fn nth_value(value: Value, index: usize) -> Value {
         Value::Table { columns, rows } => {
             rows.into_iter()
                 .nth(index)
-                .map(|row| Value::Record(columns.into_iter().zip(row).collect()))
+                .map(|row| Value::Record(columns.into_iter().map(|c| c.name).zip(row).collect()))
                 .unwrap_or(Value::Unit)
         }
         Value::String(s) => s
@@ -410,7 +410,7 @@ fn enumerate_value(value: Value) -> Value {
             Value::List(enumerated)
         }
         Value::Table { columns, rows } => {
-            let mut new_columns = vec!["#".to_string()];
+            let mut new_columns = vec![nexus_api::TableColumn::new("#")];
             new_columns.extend(columns);
 
             let new_rows: Vec<Vec<Value>> = rows

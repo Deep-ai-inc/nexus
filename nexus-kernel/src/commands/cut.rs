@@ -143,7 +143,7 @@ fn cut_value(value: Value, opts: &CutOptions) -> Value {
                     opts.fields.iter().map(|i| i.saturating_sub(1)).collect()
                 };
 
-                let new_columns: Vec<String> = selected_indices
+                let new_columns: Vec<nexus_api::TableColumn> = selected_indices
                     .iter()
                     .filter_map(|&i| columns.get(i).cloned())
                     .collect();

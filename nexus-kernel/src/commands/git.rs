@@ -346,15 +346,10 @@ impl NexusCommand for GitBranchCommand {
             ]);
         }
 
-        Ok(Value::Table {
-            columns: vec![
-                "current".to_string(),
-                "name".to_string(),
-                "type".to_string(),
-                "last_commit".to_string(),
-            ],
+        Ok(Value::table(
+            vec!["current", "name", "type", "last_commit"],
             rows,
-        })
+        ))
     }
 }
 
@@ -559,10 +554,10 @@ impl NexusCommand for GitRemoteCommand {
         }
 
         if verbose {
-            Ok(Value::Table {
-                columns: vec!["name".to_string(), "fetch".to_string(), "push".to_string()],
+            Ok(Value::table(
+                vec!["name", "fetch", "push"],
                 rows,
-            })
+            ))
         } else {
             Ok(Value::List(
                 rows.into_iter()
@@ -720,8 +715,8 @@ mod tests {
 
         match result {
             Value::Table { columns, rows } => {
-                assert!(columns.contains(&"name".to_string()));
-                assert!(columns.contains(&"current".to_string()));
+                assert!(columns.iter().any(|c| c.name == "name"));
+                assert!(columns.iter().any(|c| c.name == "current"));
                 // Should have at least main/master branch
                 assert!(!rows.is_empty());
             }

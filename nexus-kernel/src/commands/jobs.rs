@@ -29,15 +29,7 @@ impl NexusCommand for JobsCommand {
         update_job_statuses(ctx);
 
         if ctx.state.jobs.is_empty() {
-            return Ok(Value::Table {
-                columns: vec![
-                    "id".to_string(),
-                    "status".to_string(),
-                    "pid".to_string(),
-                    "command".to_string(),
-                ],
-                rows: vec![],
-            });
+            return Ok(Value::table(vec!["id", "status", "pid", "command"], vec![]));
         }
 
         let mut rows = Vec::new();
@@ -69,18 +61,13 @@ impl NexusCommand for JobsCommand {
             }
         }
 
-        let columns = if show_pids_only {
-            vec!["pid".to_string()]
+        let columns: Vec<&str> = if show_pids_only {
+            vec!["pid"]
         } else {
-            vec![
-                "id".to_string(),
-                "status".to_string(),
-                "pid".to_string(),
-                "command".to_string(),
-            ]
+            vec!["id", "status", "pid", "command"]
         };
 
-        Ok(Value::Table { columns, rows })
+        Ok(Value::table(columns, rows))
     }
 }
 
@@ -377,7 +364,8 @@ mod tests {
 
         match result {
             Value::Table { columns, rows } => {
-                assert_eq!(columns, vec!["id", "status", "pid", "command"]);
+                let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(col_names, vec!["id", "status", "pid", "command"]);
                 assert!(rows.is_empty());
             }
             _ => panic!("Expected Table"),
@@ -397,7 +385,8 @@ mod tests {
 
         match result {
             Value::Table { columns, rows } => {
-                assert_eq!(columns, vec!["id", "status", "pid", "command"]);
+                let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(col_names, vec!["id", "status", "pid", "command"]);
                 // Jobs may have been marked as Done if waitpid fails
                 // Just check we got some rows back
                 assert!(rows.len() <= 2);
@@ -419,7 +408,8 @@ mod tests {
 
         match result {
             Value::Table { columns, rows: _ } => {
-                assert_eq!(columns, vec!["pid"]);
+                let col_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+                assert_eq!(col_names, vec!["pid"]);
             }
             _ => panic!("Expected Table"),
         }

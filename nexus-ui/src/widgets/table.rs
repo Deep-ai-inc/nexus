@@ -7,7 +7,7 @@
 
 use iced::widget::{button, container, text, Column, Row};
 use iced::{Alignment, Background, Border, Color, Element, Padding};
-use nexus_api::Value;
+use nexus_api::{format_value_for_display, TableColumn, Value};
 
 /// Sort state for a table.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -47,8 +47,13 @@ pub enum TableMessage {
 }
 
 /// Render an interactive table with sortable headers.
+///
+/// The table uses `TableColumn` which includes optional display format hints.
+/// These hints control how values are rendered without changing the underlying data,
+/// so sorting always works on the real value (e.g., bytes sort numerically even
+/// when displayed as "202.8K").
 pub fn interactive_table<'a, Message>(
-    columns: &[String],
+    columns: &[TableColumn],
     rows: &[Vec<Value>],
     sort: &TableSort,
     font_size: f32,
@@ -72,12 +77,22 @@ where
         rows.iter().collect::<Vec<_>>()
     };
 
-    // Calculate column widths based on content
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    // Helper to get display text for a cell, applying format hint if present
+    let get_display_text = |cell: &Value, col_idx: usize| -> String {
+        if let Some(col) = columns.get(col_idx) {
+            if let Some(format) = col.format {
+                return format_value_for_display(cell, format);
+            }
+        }
+        cell.to_text()
+    };
+
+    // Calculate column widths based on content (using formatted display)
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.name.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(cell.to_text().len());
+                widths[i] = widths[i].max(get_display_text(cell, i).len());
             }
         }
     }
@@ -86,7 +101,7 @@ where
     let header_cells: Vec<Element<'a, Message>> = columns
         .iter()
         .enumerate()
-        .map(|(i, col_name)| {
+        .map(|(i, col)| {
             // Add sort indicator
             let indicator = if sort.column == Some(i) {
                 if sort.ascending { " ▲" } else { " ▼" }
@@ -94,7 +109,10 @@ where
                 ""
             };
 
-            let label = format!("{}{}", col_name.to_uppercase(), indicator);
+            // Apply same width padding as data cells for alignment
+            let width = widths.get(i).copied().unwrap_or(10);
+            let header_text = format!("{}{}", col.name.to_uppercase(), indicator);
+            let label = format!("{:<width$}", header_text, width = width);
             let on_sort = on_sort.clone();
 
             button(
@@ -138,10 +156,11 @@ where
                 .iter()
                 .enumerate()
                 .map(|(col_idx, cell)| {
-                    let cell_text = cell.to_text();
+                    // Apply display format hint if present
+                    let cell_text = get_display_text(cell, col_idx);
                     let width = widths.get(col_idx).copied().unwrap_or(10);
 
-                    // Right-align numbers, left-align text
+                    // Right-align numbers (even when formatted as human-readable)
                     let formatted = match cell {
                         Value::Int(_) | Value::Float(_) => format!("{:>width$}", cell_text, width = width),
                         _ => format!("{:<width$}", cell_text, width = width),
@@ -206,19 +225,29 @@ where
 
 /// Render a simple (non-interactive) table for when we don't need sorting.
 pub fn simple_table<'a, Message>(
-    columns: &[String],
+    columns: &[TableColumn],
     rows: &[Vec<Value>],
     font_size: f32,
 ) -> Element<'a, Message>
 where
     Message: Clone + 'a,
 {
+    // Helper to get display text with format hint
+    let get_display_text = |cell: &Value, col_idx: usize| -> String {
+        if let Some(col) = columns.get(col_idx) {
+            if let Some(format) = col.format {
+                return format_value_for_display(cell, format);
+            }
+        }
+        cell.to_text()
+    };
+
     // Calculate column widths
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.name.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(cell.to_text().len());
+                widths[i] = widths[i].max(get_display_text(cell, i).len());
             }
         }
     }
@@ -229,7 +258,7 @@ where
         .map(|row| {
             let mut line = String::new();
             for (i, cell) in row.iter().enumerate() {
-                let cell_text = cell.to_text();
+                let cell_text = get_display_text(cell, i);
                 let width = widths.get(i).copied().unwrap_or(0);
 
                 let formatted = match cell {
@@ -253,7 +282,7 @@ where
     Column::with_children(lines).spacing(0).into()
 }
 
-/// Compare two Values for sorting.
+/// Compare two Values for sorting - type-aware with smart string handling.
 fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
@@ -261,20 +290,124 @@ fn compare_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
-        (Some(a), Some(b)) => {
-            // Compare by type, then by value
-            match (a, b) {
-                (Value::Int(a), Value::Int(b)) => a.cmp(b),
-                (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
-                (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
-                (Value::String(a), Value::String(b)) => a.cmp(b),
-                (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-                // For other types, compare string representation
-                _ => a.to_text().cmp(&b.to_text()),
+        (Some(a), Some(b)) => compare_typed_values(a, b),
+    }
+}
+
+/// Type-aware value comparison leveraging rich types.
+fn compare_typed_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (a, b) {
+        // Numeric types - compare numerically
+        (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
+
+        // Strings - try numeric first, then natural sort
+        (Value::String(a), Value::String(b)) => smart_string_cmp(a, b),
+
+        // Booleans
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+
+        // FileEntry - natural sort by name
+        (Value::FileEntry(a), Value::FileEntry(b)) => natural_cmp(&a.name, &b.name),
+
+        // Process - sort by PID
+        (Value::Process(a), Value::Process(b)) => a.pid.cmp(&b.pid),
+
+        // GitCommit - sort by date (most recent first makes sense as default)
+        (Value::GitCommit(a), Value::GitCommit(b)) => b.date.cmp(&a.date),
+
+        // Path - natural sort
+        (Value::Path(a), Value::Path(b)) => natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()),
+
+        // Cross-type: try to compare numerically if both look like numbers
+        (Value::String(s), Value::Int(i)) => {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                n.cmp(i)
+            } else {
+                Ordering::Greater // non-numeric strings after numbers
+            }
+        }
+        (Value::Int(i), Value::String(s)) => {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                i.cmp(&n)
+            } else {
+                Ordering::Less // numbers before non-numeric strings
+            }
+        }
+
+        // Fallback: natural sort on text representation
+        _ => natural_cmp(&a.to_text(), &b.to_text()),
+    }
+}
+
+/// Smart string comparison: if both strings are pure numbers, compare numerically.
+/// Otherwise use natural sort which handles embedded numbers correctly.
+fn smart_string_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    // Try parsing both as numbers first (handles "10" vs "2" correctly)
+    match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+        (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+        _ => natural_cmp(a, b),
+    }
+}
+
+/// Natural sort comparison - handles embedded numbers correctly.
+/// "file2" < "file10", "v1.9" < "v1.10", etc.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut a_chars = a.chars().peekable();
+    let mut b_chars = b.chars().peekable();
+
+    loop {
+        match (a_chars.peek(), b_chars.peek()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&ac), Some(&bc)) => {
+                // Both have digits - compare as numbers
+                if ac.is_ascii_digit() && bc.is_ascii_digit() {
+                    let a_num = collect_number(&mut a_chars);
+                    let b_num = collect_number(&mut b_chars);
+                    match a_num.cmp(&b_num) {
+                        Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+                // Compare characters (case-insensitive, then case-sensitive for ties)
+                let ac_lower = ac.to_ascii_lowercase();
+                let bc_lower = bc.to_ascii_lowercase();
+                match ac_lower.cmp(&bc_lower) {
+                    Ordering::Equal => {
+                        // Same letter - check case, then continue
+                        if ac != bc {
+                            return ac.cmp(&bc); // uppercase before lowercase
+                        }
+                        a_chars.next();
+                        b_chars.next();
+                    }
+                    other => return other,
+                }
             }
         }
     }
+}
+
+/// Collect consecutive digits into a number for natural sort comparison.
+fn collect_number(chars: &mut std::iter::Peekable<std::str::Chars>) -> u64 {
+    let mut num: u64 = 0;
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            num = num.saturating_mul(10).saturating_add((c as u64) - ('0' as u64));
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    num
 }
 
 /// Get color for a cell based on its value.

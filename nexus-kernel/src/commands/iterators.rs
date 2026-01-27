@@ -47,7 +47,7 @@ fn each_value(value: Value, field: Option<&str>) -> Value {
         Value::Table { columns, rows } => {
             if let Some(key) = field {
                 // Get column by name
-                if let Some(col_idx) = columns.iter().position(|c| c == key) {
+                if let Some(col_idx) = columns.iter().position(|c| c.name == key) {
                     let values: Vec<Value> = rows
                         .into_iter()
                         .filter_map(|row| row.into_iter().nth(col_idx))
@@ -63,7 +63,7 @@ fn each_value(value: Value, field: Option<&str>) -> Value {
                     .map(|row| {
                         let entries: Vec<(String, Value)> = columns
                             .iter()
-                            .cloned()
+                            .map(|c| c.name.clone())
                             .zip(row)
                             .collect();
                         Value::Record(entries)
@@ -261,7 +261,7 @@ fn filter_value(value: Value, condition: &Condition) -> Value {
                 .into_iter()
                 .filter(|row| {
                     let record = Value::Record(
-                        columns.iter().cloned().zip(row.iter().cloned()).collect()
+                        columns.iter().map(|c| c.name.clone()).zip(row.iter().cloned()).collect()
                     );
                     matches_condition(&record, condition)
                 })
@@ -433,7 +433,7 @@ fn reduce_value(value: Value, op: &str, field: Option<&str>) -> Value {
         Value::Table { columns, rows } => {
             // If a field is specified, extract that column
             if let Some(key) = field {
-                if let Some(col_idx) = columns.iter().position(|c| c == key) {
+                if let Some(col_idx) = columns.iter().position(|c| c.name == key) {
                     rows.into_iter()
                         .filter_map(|row| row.into_iter().nth(col_idx))
                         .collect()
@@ -548,7 +548,7 @@ fn any_matches(value: &Value, condition: &Condition) -> bool {
         Value::Table { columns, rows } => {
             rows.iter().any(|row| {
                 let record = Value::Record(
-                    columns.iter().cloned().zip(row.iter().cloned()).collect()
+                    columns.iter().map(|c| c.name.clone()).zip(row.iter().cloned()).collect()
                 );
                 matches_condition(&record, condition)
             })
@@ -586,7 +586,7 @@ fn all_match(value: &Value, condition: &Condition) -> bool {
         Value::Table { columns, rows } => {
             rows.iter().all(|row| {
                 let record = Value::Record(
-                    columns.iter().cloned().zip(row.iter().cloned()).collect()
+                    columns.iter().map(|c| c.name.clone()).zip(row.iter().cloned()).collect()
                 );
                 matches_condition(&record, condition)
             })
@@ -648,7 +648,7 @@ fn group_by_value(value: Value, field: &str) -> Value {
         }
         Value::Table { columns, rows } => {
             // Find the column index
-            let col_idx = columns.iter().position(|c| c == field);
+            let col_idx = columns.iter().position(|c| c.name == field);
             if col_idx.is_none() {
                 return Value::Unit;
             }

@@ -137,7 +137,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
                     let map: serde_json::Map<String, serde_json::Value> = columns
                         .iter()
                         .zip(row.iter())
-                        .map(|(col, val)| (col.clone(), value_to_json(val)))
+                        .map(|(col, val)| (col.name.clone(), value_to_json(val)))
                         .collect();
                     serde_json::Value::Object(map)
                 })
@@ -326,7 +326,7 @@ fn get_value(value: Value, key: &str) -> Value {
         }
         Value::Table { columns, rows } => {
             // Get column by name
-            if let Some(col_idx) = columns.iter().position(|c| c == key) {
+            if let Some(col_idx) = columns.iter().position(|c| c.name == key) {
                 let values: Vec<Value> = rows
                     .into_iter()
                     .filter_map(|row| row.into_iter().nth(col_idx))

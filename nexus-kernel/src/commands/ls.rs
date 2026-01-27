@@ -1,7 +1,7 @@
 //! The `ls` command - list directory contents.
 
 use super::{CommandContext, NexusCommand};
-use nexus_api::{FileEntry, Value};
+use nexus_api::{DisplayFormat, FileEntry, TableColumn, Value};
 use std::path::PathBuf;
 
 pub struct LsCommand;
@@ -190,11 +190,17 @@ fn sort_entries(entries: &mut [FileEntry], opts: &LsOptions) {
 }
 
 fn entries_to_table(entries: Vec<FileEntry>, opts: &LsOptions) -> Value {
+    // Build columns with format hints based on options
+    // The -h flag sets HumanBytes format on size column - data stays as Int!
     let columns = vec![
-        "permissions".to_string(),
-        "size".to_string(),
-        "modified".to_string(),
-        "name".to_string(),
+        TableColumn::new("permissions"),
+        if opts.human_readable {
+            TableColumn::with_format("size", DisplayFormat::HumanBytes)
+        } else {
+            TableColumn::new("size")
+        },
+        TableColumn::new("modified"),
+        TableColumn::new("name"),
     ];
 
     let rows: Vec<Vec<Value>> = entries
@@ -202,11 +208,8 @@ fn entries_to_table(entries: Vec<FileEntry>, opts: &LsOptions) -> Value {
         .map(|e| {
             vec![
                 Value::String(format_permissions(e.permissions)),
-                if opts.human_readable {
-                    Value::String(format_size_human(e.size))
-                } else {
-                    Value::Int(e.size as i64)
-                },
+                // Always store raw bytes - formatting happens at render time!
+                Value::Int(e.size as i64),
                 Value::String(format_time(e.modified)),
                 Value::String(format_name(&e)),
             ]

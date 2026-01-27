@@ -105,20 +105,20 @@ impl NexusCommand for WcCommand {
                 return Ok(format_counts(counts, &opts));
             } else {
                 // Multiple files: return table
-                let mut columns = Vec::new();
+                let mut columns: Vec<&str> = Vec::new();
                 if opts.lines {
-                    columns.push("lines".to_string());
+                    columns.push("lines");
                 }
                 if opts.words {
-                    columns.push("words".to_string());
+                    columns.push("words");
                 }
                 if opts.chars {
-                    columns.push("chars".to_string());
+                    columns.push("chars");
                 }
                 if opts.bytes {
-                    columns.push("bytes".to_string());
+                    columns.push("bytes");
                 }
-                columns.push("file".to_string());
+                columns.push("file");
 
                 let rows: Vec<Vec<Value>> = results
                     .iter()
@@ -141,7 +141,7 @@ impl NexusCommand for WcCommand {
                     })
                     .collect();
 
-                return Ok(Value::Table { columns, rows });
+                return Ok(Value::table(columns, rows));
             }
         }
 
