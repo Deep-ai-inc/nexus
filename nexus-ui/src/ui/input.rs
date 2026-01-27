@@ -45,16 +45,50 @@ pub fn view_input<'a>(
         .color(path_color)
         .font(iced::Font::MONOSPACE);
 
-    // Mode indicator - shows SHELL or AGENT mode
-    let (mode_label, mode_color) = match input.mode {
-        InputMode::Shell => ("$", prompt_color),
-        InputMode::Agent => ("?", iced::Color::from_rgb(0.5, 0.6, 1.0)),
+    // Mode toggle button - clickable to switch between Shell and AI modes
+    let (mode_label, mode_bg, mode_text_color, prompt_char, prompt_char_color) = match input.mode {
+        InputMode::Shell => (
+            "SH",
+            iced::Color::from_rgb(0.2, 0.3, 0.2),   // Dark green background
+            iced::Color::from_rgb(0.5, 0.9, 0.5),   // Light green text
+            "$",
+            prompt_color,                           // Exit code color (green/red)
+        ),
+        InputMode::Agent => (
+            "AI",
+            iced::Color::from_rgb(0.25, 0.25, 0.4), // Dark purple background
+            iced::Color::from_rgb(0.7, 0.7, 1.0),   // Light purple text
+            "?",
+            iced::Color::from_rgb(0.7, 0.7, 1.0),   // Purple prompt
+        ),
     };
 
-    let prompt = text(format!("{} ", mode_label))
+    let mode_button = button(
+        text(mode_label)
+            .size(font_size * 0.75)
+            .font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..iced::Font::MONOSPACE
+            })
+            .color(mode_text_color),
+    )
+    .on_press(Message::Input(InputMessage::ToggleMode))
+    .padding([2, 6])
+    .style(move |_, _| button::Style {
+        background: Some(iced::Background::Color(mode_bg)),
+        text_color: mode_text_color,
+        border: iced::Border {
+            radius: 4.0.into(),
+            width: 1.0,
+            color: mode_text_color.scale_alpha(0.3),
+        },
+        ..Default::default()
+    });
+
+    let prompt = text(format!("{} ", prompt_char))
         .size(font_size)
         .line_height(line_height_iced)
-        .color(mode_color)
+        .color(prompt_char_color)
         .font(iced::Font::MONOSPACE);
 
     // Dynamic height: grows with content, caps at 10 lines.
@@ -183,9 +217,9 @@ pub fn view_input<'a>(
             selection: iced::Color::from_rgb(0.3, 0.5, 0.8),
         });
 
-    let input_row = row![path_text, prompt, input_field]
-        .spacing(0)
-        .align_y(iced::Alignment::Start);
+    let input_row = row![mode_button, path_text, prompt, input_field]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
 
     // Display attachments if any (Mathematica-style rich input)
     let attachments_view: Option<Element<'_, Message>> = if input.attachments.is_empty() {
