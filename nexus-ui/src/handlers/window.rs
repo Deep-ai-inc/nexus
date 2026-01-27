@@ -76,7 +76,8 @@ pub fn handle_event(
                     match c.to_lowercase().as_str() {
                         "c" => {
                             state.input.buffer.clear();
-                            state.input.history_index = None;
+                            state.input.shell_history_index = None;
+                            state.input.agent_history_index = None;
                             state.input.saved_input.clear();
                             state.input.search_active = false;
                             state.terminal.permission_denied_command = None;

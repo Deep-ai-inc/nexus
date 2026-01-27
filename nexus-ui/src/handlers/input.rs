@@ -146,40 +146,46 @@ fn remove_attachment(input: &mut InputState, index: usize) -> InputResult {
 }
 
 /// Handle arrow keys for history navigation.
+/// Uses the appropriate history (shell or agent) based on current mode.
 fn history_key(input: &mut InputState, key: Key, _modifiers: Modifiers) -> InputResult {
+    // Get history length and index upfront to avoid borrow issues
+    let history_len = input.current_history().len();
+    let history_index = input.current_history_index();
+
     match &key {
         Key::Named(keyboard::key::Named::ArrowUp) => {
-            if input.history.is_empty() {
+            if history_len == 0 {
                 return InputResult::none();
             }
 
-            match input.history_index {
+            let new_index = match history_index {
                 None => {
                     input.saved_input = input.buffer.clone();
-                    input.history_index = Some(input.history.len() - 1);
+                    Some(history_len - 1)
                 }
-                Some(0) => {}
-                Some(i) => {
-                    input.history_index = Some(i - 1);
-                }
-            }
+                Some(0) => Some(0),
+                Some(i) => Some(i - 1),
+            };
 
-            if let Some(i) = input.history_index {
-                input.buffer = input.history[i].clone();
+            input.set_history_index(new_index);
+            if let Some(i) = new_index {
+                input.buffer = input.current_history()[i].clone();
             }
         }
-        Key::Named(keyboard::key::Named::ArrowDown) => match input.history_index {
-            None => {}
-            Some(i) if i >= input.history.len() - 1 => {
-                input.history_index = None;
-                input.buffer = input.saved_input.clone();
-                input.saved_input.clear();
+        Key::Named(keyboard::key::Named::ArrowDown) => {
+            match history_index {
+                None => {}
+                Some(i) if i >= history_len - 1 => {
+                    input.set_history_index(None);
+                    input.buffer = input.saved_input.clone();
+                    input.saved_input.clear();
+                }
+                Some(i) => {
+                    input.set_history_index(Some(i + 1));
+                    input.buffer = input.current_history()[i + 1].clone();
+                }
             }
-            Some(i) => {
-                input.history_index = Some(i + 1);
-                input.buffer = input.history[i + 1].clone();
-            }
-        },
+        }
         _ => {}
     }
     InputResult::none()
@@ -254,8 +260,17 @@ fn submit(input: &mut InputState) -> InputResult {
     };
 
     let command = input.buffer.clone();
+
+    // Add to appropriate history based on query type
+    if is_agent_query {
+        input.push_agent_history(query.trim());
+    } else {
+        input.push_shell_history(command.trim());
+    }
+
     input.buffer.clear();
-    input.history_index = None;
+    input.shell_history_index = None;
+    input.agent_history_index = None;
     input.saved_input.clear();
 
     // Return action for coordinator

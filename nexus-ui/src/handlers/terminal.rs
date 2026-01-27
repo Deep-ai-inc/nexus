@@ -322,17 +322,9 @@ pub fn foreground_job(state: &mut Nexus, job_id: u32) -> Task<Message> {
 pub fn execute(state: &mut Nexus, command: String) -> Task<Message> {
     let trimmed = command.trim().to_string();
 
-    // Record in history
-    if !trimmed.is_empty() {
-        if state.input.history.last() != Some(&trimmed) {
-            state.input.history.push(trimmed.clone());
-            if state.input.history.len() > 1000 {
-                state.input.history.remove(0);
-            }
-        }
-    }
-
-    state.input.history_index = None;
+    // History is already recorded in submit(), just reset navigation state
+    state.input.shell_history_index = None;
+    state.input.agent_history_index = None;
     state.input.saved_input.clear();
 
     let block_id = state.terminal.next_id();

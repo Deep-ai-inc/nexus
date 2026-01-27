@@ -35,10 +35,14 @@ pub struct InputState {
     pub mode: InputMode,
     /// Pending attachments (images/files) for rich input.
     pub attachments: Vec<Value>,
-    /// Command history for Up/Down navigation.
-    pub history: Vec<String>,
-    /// Current position in history (None = new command being typed).
-    pub history_index: Option<usize>,
+    /// Shell command history for Up/Down navigation.
+    pub shell_history: Vec<String>,
+    /// Current position in shell history (None = new command being typed).
+    pub shell_history_index: Option<usize>,
+    /// Agent query history for Up/Down navigation.
+    pub agent_history: Vec<String>,
+    /// Current position in agent history (None = new query being typed).
+    pub agent_history_index: Option<usize>,
     /// Saved input when browsing history (to restore on Down).
     pub saved_input: String,
     /// Tab completion candidates.
@@ -64,14 +68,47 @@ pub struct InputState {
 }
 
 impl InputState {
-    /// Add a command to history if it's not a duplicate of the last entry.
-    /// Maintains max history size of 1000 entries.
-    pub fn push_history(&mut self, command: &str) {
-        if self.history.last().map(|s| s.as_str()) != Some(command) {
-            self.history.push(command.to_string());
-            if self.history.len() > 1000 {
-                self.history.remove(0);
+    /// Add a shell command to history if it's not a duplicate of the last entry.
+    pub fn push_shell_history(&mut self, command: &str) {
+        if self.shell_history.last().map(|s| s.as_str()) != Some(command) {
+            self.shell_history.push(command.to_string());
+            if self.shell_history.len() > 1000 {
+                self.shell_history.remove(0);
             }
+        }
+    }
+
+    /// Add an agent query to history if it's not a duplicate of the last entry.
+    pub fn push_agent_history(&mut self, query: &str) {
+        if self.agent_history.last().map(|s| s.as_str()) != Some(query) {
+            self.agent_history.push(query.to_string());
+            if self.agent_history.len() > 1000 {
+                self.agent_history.remove(0);
+            }
+        }
+    }
+
+    /// Get the current history based on mode.
+    pub fn current_history(&self) -> &[String] {
+        match self.mode {
+            InputMode::Shell => &self.shell_history,
+            InputMode::Agent => &self.agent_history,
+        }
+    }
+
+    /// Get current history index based on mode.
+    pub fn current_history_index(&self) -> Option<usize> {
+        match self.mode {
+            InputMode::Shell => self.shell_history_index,
+            InputMode::Agent => self.agent_history_index,
+        }
+    }
+
+    /// Set current history index based on mode.
+    pub fn set_history_index(&mut self, index: Option<usize>) {
+        match self.mode {
+            InputMode::Shell => self.shell_history_index = index,
+            InputMode::Agent => self.agent_history_index = index,
         }
     }
 
@@ -92,8 +129,10 @@ impl Default for InputState {
             buffer: String::new(),
             mode: InputMode::default(),
             attachments: Vec::new(),
-            history: Vec::new(),
-            history_index: None,
+            shell_history: Vec::new(),
+            shell_history_index: None,
+            agent_history: Vec::new(),
+            agent_history_index: None,
             saved_input: String::new(),
             completions: Vec::new(),
             completion_index: 0,
@@ -413,7 +452,7 @@ impl Default for Nexus {
             .unwrap_or_default();
 
         let mut input = InputState::default();
-        input.history = command_history;
+        input.shell_history = command_history;
 
         Self {
             input,

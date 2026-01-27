@@ -237,7 +237,7 @@ pub fn spawn_query(
         let shell_context = build_shell_context(
             current_cwd,
             &state.terminal.blocks,
-            &state.input.history,
+            &state.input.shell_history,
         );
         format!("{}{}", shell_context, query)
     };

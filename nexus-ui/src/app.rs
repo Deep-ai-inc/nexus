@@ -65,7 +65,6 @@ fn process_actions(state: &mut Nexus, actions: Vec<Action>) -> Task<Message> {
         match action {
             Action::ExecuteCommand(cmd) => {
                 transfer_attachments_to_kernel(state);
-                state.input.push_history(cmd.trim());
                 tasks.push(handlers::terminal::execute(state, cmd));
             }
             Action::SpawnAgentQuery(query) => {
