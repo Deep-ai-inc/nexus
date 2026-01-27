@@ -21,6 +21,7 @@ mod state;
 pub use commands::CommandRegistry;
 pub use completion::{Completion, CompletionEngine, CompletionKind};
 pub use error::ShellError;
+pub use eval::is_builtin;
 pub use parser::Parser;
 pub use persistence::{HistoryEntry, Store};
 pub use state::{ShellState, TrapAction};

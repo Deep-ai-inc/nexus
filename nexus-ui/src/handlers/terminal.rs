@@ -7,6 +7,7 @@ use iced::widget::{scrollable, text_input};
 use iced::Task;
 
 use nexus_api::{BlockId, BlockState, ShellEvent};
+use nexus_kernel::is_builtin;
 use nexus_term::TerminalParser;
 
 use crate::blocks::{Block, Focus};
@@ -15,7 +16,6 @@ use crate::keymap::key_to_bytes;
 use crate::msg::{Message, TerminalMessage};
 use crate::pty::PtyHandle;
 use crate::state::Nexus;
-use crate::utils::home_dir;
 use crate::widgets::job_indicator::{VisualJob, VisualJobState};
 
 /// Update the terminal domain state.
@@ -289,6 +289,10 @@ pub fn handle_kernel_event(state: &mut Nexus, shell_event: ShellEvent) -> Task<M
                 }
             }
         }
+        ShellEvent::CwdChanged { new, .. } => {
+            terminal.cwd = new.display().to_string();
+            let _ = std::env::set_current_dir(&new);
+        }
         _ => {}
     }
     Task::none()
@@ -364,26 +368,6 @@ pub fn execute(state: &mut Nexus, command: String) -> Task<Message> {
         return Task::none();
     }
 
-    // Handle built-in: cd
-    if command.trim().starts_with("cd ") {
-        let path = command.trim().strip_prefix("cd ").unwrap().trim();
-        let new_path = if path.starts_with('/') {
-            std::path::PathBuf::from(path)
-        } else if path == "~" {
-            home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
-        } else {
-            std::path::PathBuf::from(&state.terminal.cwd).join(path)
-        };
-
-        if let Ok(canonical) = new_path.canonicalize() {
-            if canonical.is_dir() {
-                state.terminal.cwd = canonical.display().to_string();
-                let _ = std::env::set_current_dir(&canonical);
-            }
-        }
-        return Task::none();
-    }
-
     // Execute through kernel or PTY
     execute_kernel(state, block_id, command)
 }
@@ -394,8 +378,9 @@ pub fn execute_kernel(state: &mut Nexus, block_id: BlockId, command: String) -> 
     let has_pipe = command.contains('|');
     let first_word = command.split_whitespace().next().unwrap_or("");
     let is_native = terminal.commands.contains(first_word);
+    let is_shell_builtin = is_builtin(first_word);
 
-    if has_pipe || is_native {
+    if has_pipe || is_native || is_shell_builtin {
         // Create block for kernel command
         let mut block = Block::new(block_id, command.clone());
         block.parser = TerminalParser::new(terminal.terminal_size.0, terminal.terminal_size.1);
