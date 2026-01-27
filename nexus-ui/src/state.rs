@@ -46,8 +46,10 @@ pub struct InputState {
     pub agent_history_index: Option<usize>,
     /// Saved input when browsing history (to restore on Down).
     pub saved_input: String,
-    /// Tab completion candidates.
+    /// Tab completion candidates (filtered view of all_completions).
     pub completions: Vec<Completion>,
+    /// All completion candidates (unfiltered, for backspace recovery).
+    pub all_completions: Vec<Completion>,
     /// Selected completion index.
     pub completion_index: usize,
     /// Start position of the word being completed.
@@ -167,6 +169,7 @@ impl Default for InputState {
             agent_history_index: None,
             saved_input: String::new(),
             completions: Vec::new(),
+            all_completions: Vec::new(),
             completion_index: 0,
             completion_start: 0,
             completion_original_text: String::new(),

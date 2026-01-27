@@ -107,17 +107,58 @@ fn editor_action(input: &mut InputState, action: text_editor::Action) -> InputRe
         // Didn't match - continue with normal processing
     }
 
-    // Clear completion on edit actions
-    if matches!(action, text_editor::Action::Edit(_)) {
-        if input.completion_visible {
-            input.completions.clear();
-            input.completion_visible = false;
-        }
+    let is_edit = matches!(action, text_editor::Action::Edit(_));
+    if is_edit {
         input.before_event = input.text();
     }
 
     input.content.perform(action);
+
+    // Filter completions on edit actions (live filtering as user types)
+    if is_edit && input.completion_visible {
+        filter_completions(input);
+    }
+
     InputResult::none()
+}
+
+/// Filter completions based on current input text.
+/// Called when user types while completion popup is visible.
+fn filter_completions(input: &mut InputState) {
+    let text = input.text();
+    let text = text.trim_end_matches('\n');
+
+    // Get the current prefix being typed (from completion_start to end)
+    let current_prefix = if input.completion_start <= text.len() {
+        &text[input.completion_start..]
+    } else {
+        // Text is shorter than completion_start (user deleted past start), close popup
+        input.completions.clear();
+        input.all_completions.clear();
+        input.completion_visible = false;
+        return;
+    };
+
+    // Filter from all_completions (not the already-filtered list) to support backspace
+    input.completions = input
+        .all_completions
+        .iter()
+        .filter(|c| c.text.starts_with(current_prefix))
+        .cloned()
+        .collect();
+
+    // Update the original text for selection
+    input.completion_original_text = text.to_string();
+
+    // Close popup if no completions match
+    if input.completions.is_empty() {
+        input.completion_visible = false;
+    } else {
+        // Adjust index if it's now out of bounds
+        if input.completion_index >= input.completions.len() {
+            input.completion_index = 0;
+        }
+    }
 }
 
 /// Toggle between Shell and Agent input modes.
@@ -132,6 +173,7 @@ fn toggle_mode(input: &mut InputState) -> InputResult {
 /// Cancel the completion popup.
 fn cancel_completion(input: &mut InputState) -> InputResult {
     input.completions.clear();
+    input.all_completions.clear();
     input.completion_visible = false;
     InputResult::none()
 }
@@ -258,6 +300,7 @@ fn apply_completions(
         input.set_text(&new_text);
         input.completion_visible = false;
     } else if !completions.is_empty() {
+        input.all_completions = completions.clone(); // Store full list for backspace recovery
         input.completions = completions;
         input.completion_index = 0;
         input.completion_start = start;
@@ -279,6 +322,7 @@ fn select_completion(
     let new_text = format!("{}{}", &original_text[..start], completion_text);
     input.set_text(&new_text);
     input.completions.clear();
+    input.all_completions.clear();
     input.completion_visible = false;
     input.completion_original_text.clear();
     InputResult::none()
@@ -414,10 +458,9 @@ pub fn handle_focus_key(
                 return Some(InputMessage::TabCompletion);
             }
             _ => {
-                // Other keys (typing) cancel completion directly and let key pass through
-                input.completion_visible = false;
-                input.completions.clear();
-                return None; // Let key go to text_editor
+                // Let other keys (typing) pass through to text_editor
+                // editor_action will filter completions based on new text
+                return None;
             }
         }
     }

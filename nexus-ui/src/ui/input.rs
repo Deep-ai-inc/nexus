@@ -2,7 +2,7 @@
 
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
-use iced::widget::{button, column, container, mouse_area, row, text, text_editor, text_input, Column};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, text, text_editor, text_input, Column};
 use iced::{Element, Length};
 
 use nexus_kernel::CompletionKind;
@@ -287,15 +287,20 @@ pub fn view_input<'a>(
         return view_permission_denied_prompt(font_size, cmd, input_row);
     }
 
-    // Show completion popup if visible
-    if input.completion_visible && !input.completions.is_empty() {
-        return view_completion_popup(input, font_size, input_row, attachments_view);
-    }
+    // Build popup element (either visible popup or zero-height placeholder)
+    // Using stable tree structure prevents focus loss when popup appears/disappears
+    let popup_element: Element<'_, Message> = if input.completion_visible && !input.completions.is_empty()
+    {
+        build_completion_popup(input, font_size)
+    } else {
+        // Invisible placeholder to maintain tree structure
+        container(column![]).height(Length::Fixed(0.0)).into()
+    };
 
     if let Some(attachments) = attachments_view {
-        column![attachments, input_row].spacing(4).into()
+        column![attachments, popup_element, input_row].spacing(4).into()
     } else {
-        input_row.into()
+        column![popup_element, input_row].spacing(4).into()
     }
 }
 
@@ -489,18 +494,12 @@ fn view_permission_denied_prompt<'a>(
     column![prompt, input_row].spacing(8).into()
 }
 
-/// Render the completion popup.
-fn view_completion_popup<'a>(
-    input: &'a InputState,
-    font_size: f32,
-    input_row: iced::widget::Row<'a, Message>,
-    attachments_view: Option<Element<'a, Message>>,
-) -> Element<'a, Message> {
+/// Build the completion popup widget (just the popup, not the whole view).
+fn build_completion_popup<'a>(input: &'a InputState, font_size: f32) -> Element<'a, Message> {
     let completion_items: Vec<Element<Message>> = input
         .completions
         .iter()
         .enumerate()
-        .take(10) // Show max 10 items
         .map(|(i, completion)| {
             let is_selected = i == input.completion_index;
             let bg_color = if is_selected {
@@ -561,11 +560,40 @@ fn view_completion_popup<'a>(
         })
         .collect();
 
-    let popup = container(
-        Column::with_children(completion_items)
-            .spacing(0)
-            .width(Length::Fixed(300.0)),
+    container(
+        scrollable(
+            Column::with_children(completion_items)
+                .spacing(0)
+                .width(Length::Fixed(300.0)),
+        )
+        .height(Length::Shrink)
+        .style(|_, _| scrollable::Style {
+            container: container::Style::default(),
+            vertical_rail: scrollable::Rail {
+                background: Some(iced::Background::Color(iced::Color::from_rgb(
+                    0.2, 0.2, 0.25,
+                ))),
+                border: iced::Border::default(),
+                scroller: scrollable::Scroller {
+                    color: iced::Color::from_rgb(0.4, 0.4, 0.5),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                },
+            },
+            horizontal_rail: scrollable::Rail {
+                background: None,
+                border: iced::Border::default(),
+                scroller: scrollable::Scroller {
+                    color: iced::Color::TRANSPARENT,
+                    border: iced::Border::default(),
+                },
+            },
+            gap: None,
+        }),
     )
+    .max_height(300.0)
     .style(|_| container::Style {
         background: Some(iced::Background::Color(iced::Color::from_rgb(
             0.12, 0.12, 0.15,
@@ -577,11 +605,6 @@ fn view_completion_popup<'a>(
         },
         ..Default::default()
     })
-    .padding(4);
-
-    if let Some(attachments) = attachments_view {
-        column![attachments, popup, input_row].spacing(4).into()
-    } else {
-        column![popup, input_row].spacing(4).into()
-    }
+    .padding(4)
+    .into()
 }
