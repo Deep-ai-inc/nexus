@@ -246,25 +246,6 @@ fn format_permissions(mode: u32) -> String {
     std::iter::once(file_type).chain(perms).collect()
 }
 
-fn format_size_human(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const TB: u64 = GB * 1024;
-
-    if size >= TB {
-        format!("{:.1}T", size as f64 / TB as f64)
-    } else if size >= GB {
-        format!("{:.1}G", size as f64 / GB as f64)
-    } else if size >= MB {
-        format!("{:.1}M", size as f64 / MB as f64)
-    } else if size >= KB {
-        format!("{:.1}K", size as f64 / KB as f64)
-    } else {
-        format!("{}B", size)
-    }
-}
-
 fn format_time(ts: Option<u64>) -> String {
     match ts {
         Some(secs) => {

@@ -9,6 +9,8 @@ use iced::widget::{button, container, text, Column, Row};
 use iced::{Alignment, Background, Border, Color, Element, Padding};
 use nexus_api::{format_value_for_display, TableColumn, Value};
 
+use crate::constants::CHAR_WIDTH_RATIO;
+
 /// Sort state for a table.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TableSort {
@@ -88,16 +90,23 @@ where
     };
 
     // Calculate column widths based on content (using formatted display)
+    // For multi-line content, use the widest line
     let mut widths: Vec<usize> = columns.iter().map(|c| c.name.len()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(get_display_text(cell, i).len());
+                let text = get_display_text(cell, i);
+                // Find the widest line for multi-line content
+                let max_line_width = text.lines().map(|line| line.len()).max().unwrap_or(0);
+                widths[i] = widths[i].max(max_line_width);
             }
         }
     }
 
-    // Build header row with clickable buttons
+    // Character width for monospace font - add buffer to prevent wrapping
+    let char_width = font_size * CHAR_WIDTH_RATIO + 0.5;
+
+    // Build header row with clickable buttons (using same pixel widths as data)
     let header_cells: Vec<Element<'a, Message>> = columns
         .iter()
         .enumerate()
@@ -109,36 +118,38 @@ where
                 ""
             };
 
-            // Apply same width padding as data cells for alignment
-            let width = widths.get(i).copied().unwrap_or(10);
+            let col_width = widths.get(i).copied().unwrap_or(10);
+            let pixel_width = (col_width as f32 * char_width) + 16.0; // padding buffer
             let header_text = format!("{}{}", col.name.to_uppercase(), indicator);
-            let label = format!("{:<width$}", header_text, width = width);
             let on_sort = on_sort.clone();
 
-            button(
-                text(label)
-                    .size(font_size)
-                    .color(Color::from_rgb(0.6, 0.7, 0.9))
-                    .font(iced::Font::MONOSPACE),
-            )
-            .on_press(on_sort(i))
-            .padding(Padding::from([2, 4]))
-            .style(|_theme, status| {
-                let background = match status {
-                    button::Status::Hovered => Some(Background::Color(Color::from_rgba(0.3, 0.4, 0.6, 0.3))),
-                    button::Status::Pressed => Some(Background::Color(Color::from_rgba(0.3, 0.4, 0.6, 0.5))),
-                    _ => None,
-                };
-                button::Style {
-                    background,
-                    text_color: Color::from_rgb(0.6, 0.7, 0.9),
-                    border: Border {
-                        radius: 2.0.into(),
+            container(
+                button(
+                    text(header_text)
+                        .size(font_size)
+                        .color(Color::from_rgb(0.6, 0.7, 0.9))
+                        .font(iced::Font::MONOSPACE),
+                )
+                .on_press(on_sort(i))
+                .padding(Padding::from([2, 4]))
+                .style(|_theme, status| {
+                    let background = match status {
+                        button::Status::Hovered => Some(Background::Color(Color::from_rgba(0.3, 0.4, 0.6, 0.3))),
+                        button::Status::Pressed => Some(Background::Color(Color::from_rgba(0.3, 0.4, 0.6, 0.5))),
+                        _ => None,
+                    };
+                    button::Style {
+                        background,
+                        text_color: Color::from_rgb(0.6, 0.7, 0.9),
+                        border: Border {
+                            radius: 2.0.into(),
+                            ..Default::default()
+                        },
                         ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            })
+                    }
+                }),
+            )
+            .width(pixel_width)
             .into()
         })
         .collect();
@@ -158,50 +169,57 @@ where
                 .map(|(col_idx, cell)| {
                     // Apply display format hint if present
                     let cell_text = get_display_text(cell, col_idx);
-                    let width = widths.get(col_idx).copied().unwrap_or(10);
-
-                    // Right-align numbers (even when formatted as human-readable)
-                    let formatted = match cell {
-                        Value::Int(_) | Value::Float(_) => format!("{:>width$}", cell_text, width = width),
-                        _ => format!("{:<width$}", cell_text, width = width),
-                    };
+                    let col_width = widths.get(col_idx).copied().unwrap_or(10);
+                    let pixel_width = (col_width as f32 * char_width) + 16.0; // padding buffer
 
                     // Color based on cell type and content
-                    let color = cell_color(cell, &formatted);
+                    let color = cell_color(cell, &cell_text);
+
+                    // Right-align numbers, left-align others
+                    let h_align = match cell {
+                        Value::Int(_) | Value::Float(_) => iced::alignment::Horizontal::Right,
+                        _ => iced::alignment::Horizontal::Left,
+                    };
 
                     // Wrap in button if we have a click handler
                     if let Some(ref on_click) = on_cell_click {
                         let on_click = on_click.clone();
                         let cell_clone = cell.clone();
-                        button(
-                            text(formatted)
-                                .size(font_size)
-                                .color(color)
-                                .font(iced::Font::MONOSPACE),
+                        container(
+                            button(
+                                text(cell_text)
+                                    .size(font_size)
+                                    .color(color)
+                                    .font(iced::Font::MONOSPACE),
+                            )
+                            .on_press(on_click(row_idx, col_idx, &cell_clone))
+                            .padding(Padding::from([1, 4]))
+                            .style(move |_theme, status| {
+                                let background = match status {
+                                    button::Status::Hovered => Some(Background::Color(Color::from_rgba(0.5, 0.5, 0.5, 0.2))),
+                                    _ => None,
+                                };
+                                button::Style {
+                                    background,
+                                    text_color: color,
+                                    border: Border::default(),
+                                    ..Default::default()
+                                }
+                            }),
                         )
-                        .on_press(on_click(row_idx, col_idx, &cell_clone))
-                        .padding(Padding::from([1, 4]))
-                        .style(move |_theme, status| {
-                            let background = match status {
-                                button::Status::Hovered => Some(Background::Color(Color::from_rgba(0.5, 0.5, 0.5, 0.2))),
-                                _ => None,
-                            };
-                            button::Style {
-                                background,
-                                text_color: color,
-                                border: Border::default(),
-                                ..Default::default()
-                            }
-                        })
+                        .width(pixel_width)
+                        .align_x(h_align)
                         .into()
                     } else {
                         container(
-                            text(formatted)
+                            text(cell_text)
                                 .size(font_size)
                                 .color(color)
                                 .font(iced::Font::MONOSPACE),
                         )
+                        .width(pixel_width)
                         .padding(Padding::from([1, 4]))
+                        .align_x(h_align)
                         .into()
                     }
                 })
@@ -209,6 +227,7 @@ where
 
             Row::with_children(cells)
                 .spacing(8)
+                .align_y(Alignment::Start) // Top-align cells for variable row heights
                 .into()
         })
         .collect();

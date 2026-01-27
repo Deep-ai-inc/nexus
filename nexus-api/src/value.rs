@@ -793,7 +793,7 @@ fn format_datetime(timestamp: u64) -> String {
     // Simple ISO-like format without external dependencies
     use std::time::{Duration, UNIX_EPOCH};
 
-    let datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
+    let _datetime = UNIX_EPOCH + Duration::from_secs(timestamp);
     // For now, just return the timestamp - a proper implementation would
     // use chrono or similar. This is a placeholder that works.
     format!("{}", timestamp)

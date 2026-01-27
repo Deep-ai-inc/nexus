@@ -1,7 +1,7 @@
 //! The `find` command - search for files.
 
 use super::{CommandContext, NexusCommand};
-use nexus_api::{FileEntry, FileType, Value};
+use nexus_api::{DisplayFormat, FileEntry, FileType, TableColumn, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -16,6 +16,10 @@ struct FindOptions {
     min_size: Option<u64>,
     max_size: Option<u64>,
     empty: bool,
+    /// Show detailed table output (like -ls)
+    detailed: bool,
+    /// Human-readable sizes
+    human_readable: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -36,6 +40,8 @@ impl FindOptions {
             min_size: None,
             max_size: None,
             empty: false,
+            detailed: false,
+            human_readable: false,
         };
 
         let mut paths = Vec::new();
@@ -97,6 +103,10 @@ impl FindOptions {
                 }
             } else if arg == "-empty" {
                 opts.empty = true;
+            } else if arg == "-ls" || arg == "-l" {
+                opts.detailed = true;
+            } else if arg == "-h" {
+                opts.human_readable = true;
             } else if !arg.starts_with('-') {
                 paths.push(PathBuf::from(arg));
             }
@@ -240,7 +250,7 @@ impl NexusCommand for FindCommand {
     fn execute(&self, args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value> {
         let (opts, paths) = FindOptions::parse(args);
 
-        let mut results: Vec<Value> = Vec::new();
+        let mut entries: Vec<FileEntry> = Vec::new();
 
         for path in paths {
             let resolved = if path.is_absolute() {
@@ -249,18 +259,74 @@ impl NexusCommand for FindCommand {
                 ctx.state.cwd.join(path)
             };
 
-            find_recursive(&resolved, &opts, 0, &mut results)?;
+            find_recursive(&resolved, &opts, 0, &mut entries)?;
         }
 
-        Ok(Value::List(results))
+        if opts.detailed {
+            // Return as table with detailed info
+            let columns = vec![
+                TableColumn::new("type"),
+                TableColumn::new("perms"),
+                if opts.human_readable {
+                    TableColumn::with_format("size", DisplayFormat::HumanBytes)
+                } else {
+                    TableColumn::new("size")
+                },
+                TableColumn::new("modified"),
+                TableColumn::new("path"),
+            ];
+
+            let rows: Vec<Vec<Value>> = entries
+                .into_iter()
+                .map(|e| {
+                    let type_char = match e.file_type {
+                        FileType::Directory => "d",
+                        FileType::File => "-",
+                        FileType::Symlink => "l",
+                        FileType::BlockDevice => "b",
+                        FileType::CharDevice => "c",
+                        FileType::Fifo => "p",
+                        FileType::Socket => "s",
+                        FileType::Unknown => "?",
+                    };
+                    vec![
+                        Value::String(type_char.to_string()),
+                        Value::String(format_permissions(e.permissions)),
+                        Value::Int(e.size as i64),
+                        e.modified.map(|t| Value::Int(t as i64)).unwrap_or(Value::Unit),
+                        Value::String(e.path.to_string_lossy().to_string()),
+                    ]
+                })
+                .collect();
+
+            Ok(Value::Table { columns, rows })
+        } else {
+            // Return as list of FileEntry values (default)
+            Ok(Value::List(entries.into_iter().map(Value::from).collect()))
+        }
     }
+}
+
+fn format_permissions(mode: u32) -> String {
+    let perms = [
+        if mode & 0o400 != 0 { 'r' } else { '-' },
+        if mode & 0o200 != 0 { 'w' } else { '-' },
+        if mode & 0o100 != 0 { 'x' } else { '-' },
+        if mode & 0o040 != 0 { 'r' } else { '-' },
+        if mode & 0o020 != 0 { 'w' } else { '-' },
+        if mode & 0o010 != 0 { 'x' } else { '-' },
+        if mode & 0o004 != 0 { 'r' } else { '-' },
+        if mode & 0o002 != 0 { 'w' } else { '-' },
+        if mode & 0o001 != 0 { 'x' } else { '-' },
+    ];
+    perms.iter().collect()
 }
 
 fn find_recursive(
     path: &PathBuf,
     opts: &FindOptions,
     depth: usize,
-    results: &mut Vec<Value>,
+    results: &mut Vec<FileEntry>,
 ) -> anyhow::Result<()> {
     // Check max depth for recursion
     if let Some(max) = opts.max_depth {
@@ -278,7 +344,7 @@ fn find_recursive(
     let is_dir = entry.file_type == FileType::Directory;
 
     if opts.matches(&entry, depth) {
-        results.push(Value::FileEntry(Box::new(entry)));
+        results.push(entry);
     }
 
     if is_dir {

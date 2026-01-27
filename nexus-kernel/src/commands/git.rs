@@ -224,8 +224,9 @@ impl NexusCommand for GitLogCommand {
     fn execute(&self, args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value> {
         let repo = find_repo(&ctx.state.cwd)?;
 
-        // Parse -n/--max-count argument
+        // Parse arguments
         let mut max_count: usize = 10;
+        let mut table_output = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -241,6 +242,10 @@ impl NexusCommand for GitLogCommand {
                     max_count = arg[2..].parse().unwrap_or(10);
                     i += 1;
                 }
+                "-t" | "--table" | "--oneline" => {
+                    table_output = true;
+                    i += 1;
+                }
                 _ => i += 1,
             }
         }
@@ -248,7 +253,7 @@ impl NexusCommand for GitLogCommand {
         let mut revwalk = repo.revwalk()?;
         revwalk.push_head()?;
 
-        let mut commits: Vec<Value> = Vec::new();
+        let mut commits: Vec<GitCommitInfo> = Vec::new();
 
         for (count, oid) in revwalk.enumerate() {
             if count >= max_count {
@@ -273,7 +278,7 @@ impl NexusCommand for GitLogCommand {
             let subject = lines.next().unwrap_or("").to_string();
             let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
 
-            commits.push(Value::GitCommit(Box::new(GitCommitInfo {
+            commits.push(GitCommitInfo {
                 hash,
                 short_hash,
                 author: author_name,
@@ -281,13 +286,40 @@ impl NexusCommand for GitLogCommand {
                 date: timestamp,
                 message: subject,
                 body: if body.is_empty() { None } else { Some(body) },
-                files_changed: None, // Would need to compute diff
+                files_changed: None,
                 insertions: None,
                 deletions: None,
-            })));
+            });
         }
 
-        Ok(Value::List(commits))
+        if table_output {
+            // Return as table for compact, sortable view
+            use nexus_api::{DisplayFormat, TableColumn};
+
+            let columns = vec![
+                TableColumn::new("hash"),
+                TableColumn::new("author"),
+                TableColumn::with_format("date", DisplayFormat::RelativeTime),
+                TableColumn::new("message"),
+            ];
+
+            let rows: Vec<Vec<Value>> = commits
+                .into_iter()
+                .map(|c| {
+                    vec![
+                        Value::String(c.short_hash),
+                        Value::String(c.author),
+                        Value::Int(c.date as i64),
+                        Value::String(c.message),
+                    ]
+                })
+                .collect();
+
+            Ok(Value::Table { columns, rows })
+        } else {
+            // Return as list of GitCommit values (rich type for UI rendering)
+            Ok(Value::List(commits.into_iter().map(|c| Value::GitCommit(Box::new(c))).collect()))
+        }
     }
 }
 

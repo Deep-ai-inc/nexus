@@ -384,18 +384,47 @@ pub fn execute_kernel(state: &mut Nexus, block_id: BlockId, command: String) -> 
 
         // Pipeline/native execution via kernel
         let kernel = terminal.kernel.clone();
+        let kernel_tx = terminal.kernel_tx.clone();
         let cwd = terminal.cwd.clone();
         let cmd = command.clone();
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let mut kernel = kernel.lock().await;
-                let _ = kernel
-                    .state_mut()
-                    .set_cwd(std::path::PathBuf::from(&cwd));
-                let _ = kernel.execute_with_block_id(&cmd, Some(block_id));
-            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let mut kernel = kernel.lock().await;
+                    let _ = kernel
+                        .state_mut()
+                        .set_cwd(std::path::PathBuf::from(&cwd));
+                    let _ = kernel.execute_with_block_id(&cmd, Some(block_id));
+                });
+            }));
+
+            // If the command panicked, emit error events so UI doesn't hang
+            if let Err(panic_info) = result {
+                let error_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    format!("Command panicked: {}", s)
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    format!("Command panicked: {}", s)
+                } else {
+                    "Command panicked (unknown error)".to_string()
+                };
+
+                tracing::error!("{}", error_msg);
+
+                // Emit stderr with error message
+                let _ = kernel_tx.send(ShellEvent::StderrChunk {
+                    block_id,
+                    data: format!("{}\n", error_msg).into_bytes(),
+                });
+
+                // Emit command finished with error code
+                let _ = kernel_tx.send(ShellEvent::CommandFinished {
+                    block_id,
+                    exit_code: 1,
+                    duration_ms: 0,
+                });
+            }
         });
 
         return scrollable::snap_to(

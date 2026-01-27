@@ -197,6 +197,8 @@ pub struct TerminalState {
     /// Channel for PTY output.
     pub pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
     /// Receiver for PTY events (shared with subscription).
+    /// Event sender for emitting kernel events (used for crash recovery).
+    pub kernel_tx: broadcast::Sender<ShellEvent>,
     pub pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
     /// Current focus state.
     pub focus: Focus,
@@ -222,7 +224,11 @@ pub struct TerminalState {
 
 impl TerminalState {
     /// Create a new terminal state with the given kernel.
-    pub fn new(kernel: Kernel, kernel_rx: broadcast::Receiver<ShellEvent>) -> Self {
+    pub fn new(
+        kernel: Kernel,
+        kernel_tx: broadcast::Sender<ShellEvent>,
+        kernel_rx: broadcast::Receiver<ShellEvent>,
+    ) -> Self {
         let (pty_tx, pty_rx) = mpsc::unbounded_channel();
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -236,6 +242,7 @@ impl TerminalState {
             pty_handles: Vec::new(),
             pty_tx,
             pty_rx: Arc::new(Mutex::new(pty_rx)),
+            kernel_tx,
             focus: Focus::Input,
             terminal_size: (120, 24),
             last_exit_code: None,
@@ -467,6 +474,7 @@ impl Default for Nexus {
     fn default() -> Self {
         // Create kernel for pipeline execution
         let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
+        let kernel_tx = kernel.event_sender().clone();
 
         // Load command history from SQLite
         let command_history = kernel
@@ -486,7 +494,7 @@ impl Default for Nexus {
 
         Self {
             input,
-            terminal: TerminalState::new(kernel, kernel_rx),
+            terminal: TerminalState::new(kernel, kernel_tx, kernel_rx),
             agent: AgentState::new(),
             window: WindowState::default(),
         }

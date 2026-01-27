@@ -13,6 +13,8 @@ use super::claude::ClaudeCommand;
 use super::cmp::CmpCommand;
 use super::cut::CutCommand;
 use super::date::DateCommand;
+use super::df::DfCommand;
+use super::du::DuCommand;
 use super::env::{EnvCommand, ExportCommand, PrintenvCommand, UnsetCommand};
 use super::find::FindCommand;
 use super::fs::{CpCommand, MkdirCommand, MvCommand, RmCommand, RmdirCommand, TouchCommand};
@@ -200,6 +202,10 @@ impl CommandRegistry {
         registry.register(UnameCommand);
         registry.register(UmaskCommand);
         registry.register(CmpCommand);
+
+        // Disk usage
+        registry.register(DuCommand);
+        registry.register(DfCommand);
 
         // Resource/process info
         registry.register(PsCommand);

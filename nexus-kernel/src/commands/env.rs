@@ -15,17 +15,17 @@ impl NexusCommand for EnvCommand {
     }
 
     fn execute(&self, _args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value> {
-        let mut entries: Vec<(String, Value)> = ctx
-            .state
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-            .collect();
+        let mut entries: Vec<(&String, &String)> = ctx.state.env.iter().collect();
 
         // Sort by key for consistent output
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by(|a, b| a.0.cmp(b.0));
 
-        Ok(Value::Record(entries))
+        let rows: Vec<Vec<Value>> = entries
+            .into_iter()
+            .map(|(k, v)| vec![Value::String(k.clone()), Value::String(v.clone())])
+            .collect();
+
+        Ok(Value::table(vec!["name", "value"], rows))
     }
 }
 
@@ -42,14 +42,16 @@ impl NexusCommand for PrintenvCommand {
 
     fn execute(&self, args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value> {
         if args.is_empty() {
-            // Print all variables like env
-            let entries: Vec<Value> = ctx
-                .state
-                .env
-                .iter()
-                .map(|(k, v)| Value::String(format!("{}={}", k, v)))
+            // Print all variables as table (like env)
+            let mut entries: Vec<(&String, &String)> = ctx.state.env.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+
+            let rows: Vec<Vec<Value>> = entries
+                .into_iter()
+                .map(|(k, v)| vec![Value::String(k.clone()), Value::String(v.clone())])
                 .collect();
-            return Ok(Value::List(entries));
+
+            return Ok(Value::table(vec!["name", "value"], rows));
         }
 
         // Print specific variables

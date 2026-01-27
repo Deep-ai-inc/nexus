@@ -318,13 +318,13 @@ mod tests {
     fn test_serialize_table() {
         use nexus_api::Value;
 
-        let table = Value::Table {
-            columns: vec!["Name".to_string(), "Size".to_string()],
-            rows: vec![
+        let table = Value::table(
+            vec!["Name", "Size"],
+            vec![
                 vec![Value::String("file.txt".to_string()), Value::Int(1024)],
                 vec![Value::String("dir".to_string()), Value::Int(4096)],
             ],
-        };
+        );
 
         let output = serialize_value_for_llm(&table);
         assert!(output.contains("| Name | Size |"));

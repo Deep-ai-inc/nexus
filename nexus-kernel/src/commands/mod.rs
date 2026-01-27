@@ -9,6 +9,8 @@ mod claude;
 mod cmp;
 mod cut;
 mod date;
+mod df;
+mod du;
 mod env;
 mod find;
 mod fs;
