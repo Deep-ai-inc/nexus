@@ -403,8 +403,8 @@ impl WindowState {
 
     /// Calculate terminal dimensions based on window size and font metrics.
     pub fn calculate_terminal_size(&self) -> (u16, u16) {
-        let h_padding = 30.0;
-        let v_padding = 80.0;
+        let h_padding = 16.0;  // Minimal horizontal padding
+        let v_padding = 60.0;  // Minimal vertical padding (input line + spacing)
 
         let (width, height) = self.dims;
         let cols = ((width - h_padding) / self.char_width()) as u16;

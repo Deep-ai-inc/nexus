@@ -241,8 +241,8 @@ pub fn zoom(state: &mut Nexus, direction: ZoomDirection) -> Task<Message> {
         let new_char_width = state.window.font_size * CHAR_WIDTH_RATIO;
         let new_line_height = state.window.font_size * LINE_HEIGHT_FACTOR;
 
-        let h_padding = 30.0;
-        let v_padding = 80.0;
+        let h_padding = 16.0;  // Minimal horizontal padding
+        let v_padding = 60.0;  // Minimal vertical padding
 
         let new_width = (cols as f32 * new_char_width) + h_padding;
         let new_height = (rows as f32 * new_line_height) + v_padding;

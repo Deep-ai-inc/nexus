@@ -161,7 +161,7 @@ fn view(state: &Nexus) -> Element<'_, Message> {
     let history = scrollable(
         Column::with_children(content_elements)
             .spacing(4)
-            .padding([10, 15]),
+            .padding([4, 8]),
     )
     .id(scrollable::Id::new(HISTORY_SCROLLABLE))
     .height(Length::Fill);
@@ -180,8 +180,8 @@ fn view(state: &Nexus) -> Element<'_, Message> {
         state.terminal.permission_denied_command.as_deref(),
         state.terminal.focus.clone(),
     ))
-        .padding([8, 15])
-        .width(Length::Fill);
+    .padding([4, 8])
+    .width(Length::Fill);
 
     let content = column![history, jobs_bar, input_line].spacing(0);
 
