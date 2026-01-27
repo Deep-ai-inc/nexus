@@ -3,12 +3,16 @@
 //! These commands use libgit2 directly instead of spawning the git binary,
 //! returning structured data that the UI can render richly.
 //!
+//! The type system provides:
+//! - `GitStatus`: Rich status with branch info, ahead/behind, staged/unstaged files
+//! - `GitCommit`: Commit info with hash, author, message, stats
+//!
 //! Usage: `git <subcommand> [args]`
 //! Supported subcommands: status, log, branch, diff, add, commit, remote, stash
 
 use super::{CommandContext, NexusCommand};
 use git2::{Repository, StatusOptions, DiffOptions, DiffFormat};
-use nexus_api::Value;
+use nexus_api::{GitChangeType, GitCommitInfo, GitFileStatus, GitStatusInfo, Value};
 use std::path::Path;
 
 /// Main git command dispatcher - handles `git <subcommand>` syntax.
@@ -43,6 +47,14 @@ fn find_repo(cwd: &Path) -> anyhow::Result<Repository> {
 }
 
 /// git status - show working tree status
+///
+/// Returns a typed `GitStatusInfo` with:
+/// - Branch name and upstream tracking info
+/// - Staged files with change type
+/// - Unstaged modifications
+/// - Untracked files
+///
+/// The GUI can render this with branch badges, status icons, and staging checkboxes.
 pub struct GitStatusCommand;
 
 impl NexusCommand for GitStatusCommand {
@@ -60,77 +72,148 @@ impl NexusCommand for GitStatusCommand {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "HEAD (detached)".to_string());
 
+        // Get upstream tracking info
+        let (upstream, ahead, behind) = get_upstream_info(&repo, &branch);
+
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
             .recurse_untracked_dirs(true);
 
         let statuses = repo.statuses(Some(&mut opts))?;
 
-        let mut staged: Vec<Value> = Vec::new();
-        let mut unstaged: Vec<Value> = Vec::new();
-        let mut untracked: Vec<Value> = Vec::new();
+        let mut staged: Vec<GitFileStatus> = Vec::new();
+        let mut unstaged: Vec<GitFileStatus> = Vec::new();
+        let mut untracked: Vec<String> = Vec::new();
+        let mut has_conflicts = false;
 
         for entry in statuses.iter() {
             let path = entry.path().unwrap_or("").to_string();
             let status = entry.status();
 
+            // Check for conflicts
+            if status.is_conflicted() {
+                has_conflicts = true;
+                staged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Unmerged,
+                    orig_path: None,
+                });
+                continue;
+            }
+
             // Staged changes (index)
             if status.is_index_new() {
-                staged.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path.clone())),
-                    ("status".to_string(), Value::String("new".to_string())),
-                ]));
+                staged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Added,
+                    orig_path: None,
+                });
             } else if status.is_index_modified() {
-                staged.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path.clone())),
-                    ("status".to_string(), Value::String("modified".to_string())),
-                ]));
+                staged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Modified,
+                    orig_path: None,
+                });
             } else if status.is_index_deleted() {
-                staged.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path.clone())),
-                    ("status".to_string(), Value::String("deleted".to_string())),
-                ]));
+                staged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Deleted,
+                    orig_path: None,
+                });
             } else if status.is_index_renamed() {
-                staged.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path.clone())),
-                    ("status".to_string(), Value::String("renamed".to_string())),
-                ]));
+                staged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Renamed,
+                    orig_path: None,
+                });
             }
 
             // Unstaged changes (working tree)
             if status.is_wt_modified() {
-                unstaged.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path.clone())),
-                    ("status".to_string(), Value::String("modified".to_string())),
-                ]));
+                unstaged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Modified,
+                    orig_path: None,
+                });
             } else if status.is_wt_deleted() {
-                unstaged.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path.clone())),
-                    ("status".to_string(), Value::String("deleted".to_string())),
-                ]));
+                unstaged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Deleted,
+                    orig_path: None,
+                });
             } else if status.is_wt_renamed() {
-                unstaged.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path.clone())),
-                    ("status".to_string(), Value::String("renamed".to_string())),
-                ]));
+                unstaged.push(GitFileStatus {
+                    path: path.clone(),
+                    status: GitChangeType::Renamed,
+                    orig_path: None,
+                });
             }
 
             // Untracked files
             if status.is_wt_new() {
-                untracked.push(Value::String(path));
+                untracked.push(path);
             }
         }
 
-        Ok(Value::Record(vec![
-            ("branch".to_string(), Value::String(branch)),
-            ("staged".to_string(), Value::List(staged)),
-            ("unstaged".to_string(), Value::List(unstaged)),
-            ("untracked".to_string(), Value::List(untracked)),
-        ]))
+        Ok(Value::GitStatus(Box::new(GitStatusInfo {
+            branch,
+            upstream,
+            ahead,
+            behind,
+            staged,
+            unstaged,
+            untracked,
+            has_conflicts,
+        })))
     }
 }
 
+/// Get upstream tracking info for a branch.
+fn get_upstream_info(repo: &Repository, branch_name: &str) -> (Option<String>, u32, u32) {
+    let branch = match repo.find_branch(branch_name, git2::BranchType::Local) {
+        Ok(b) => b,
+        Err(_) => return (None, 0, 0),
+    };
+
+    let upstream = match branch.upstream() {
+        Ok(u) => u,
+        Err(_) => return (None, 0, 0),
+    };
+
+    let upstream_name = upstream
+        .name()
+        .ok()
+        .flatten()
+        .map(|s| s.to_string());
+
+    // Get ahead/behind counts
+    let local_oid = match branch.get().peel_to_commit() {
+        Ok(c) => c.id(),
+        Err(_) => return (upstream_name, 0, 0),
+    };
+
+    let upstream_oid = match upstream.get().peel_to_commit() {
+        Ok(c) => c.id(),
+        Err(_) => return (upstream_name, 0, 0),
+    };
+
+    let (ahead, behind) = match repo.graph_ahead_behind(local_oid, upstream_oid) {
+        Ok((a, b)) => (a as u32, b as u32),
+        Err(_) => (0, 0),
+    };
+
+    (upstream_name, ahead, behind)
+}
+
 /// git log - show commit history
+///
+/// Returns a list of typed `GitCommitInfo` values with:
+/// - Hash (full and short)
+/// - Author name and email
+/// - Commit date
+/// - Message (subject and body)
+///
+/// The GUI can render clickable hashes, author avatars, and relative timestamps.
 pub struct GitLogCommand;
 
 impl NexusCommand for GitLogCommand {
@@ -165,7 +248,7 @@ impl NexusCommand for GitLogCommand {
         let mut revwalk = repo.revwalk()?;
         revwalk.push_head()?;
 
-        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut commits: Vec<Value> = Vec::new();
 
         for (count, oid) in revwalk.enumerate() {
             if count >= max_count {
@@ -176,35 +259,35 @@ impl NexusCommand for GitLogCommand {
             let commit = repo.find_commit(oid)?;
 
             let hash = oid.to_string();
-            let short_hash = &hash[..7.min(hash.len())];
+            let short_hash = hash[..7.min(hash.len())].to_string();
 
             let author = commit.author();
             let author_name = author.name().unwrap_or("Unknown").to_string();
-            let _author_email = author.email().unwrap_or("").to_string();
+            let author_email = author.email().unwrap_or("").to_string();
 
             let time = commit.time();
-            let timestamp = time.seconds();
+            let timestamp = time.seconds() as u64;
 
             let message = commit.message().unwrap_or("").to_string();
-            let subject = message.lines().next().unwrap_or("").to_string();
+            let mut lines = message.lines();
+            let subject = lines.next().unwrap_or("").to_string();
+            let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
 
-            rows.push(vec![
-                Value::String(short_hash.to_string()),
-                Value::String(author_name),
-                Value::Int(timestamp),
-                Value::String(subject),
-            ]);
+            commits.push(Value::GitCommit(Box::new(GitCommitInfo {
+                hash,
+                short_hash,
+                author: author_name,
+                author_email,
+                date: timestamp,
+                message: subject,
+                body: if body.is_empty() { None } else { Some(body) },
+                files_changed: None, // Would need to compute diff
+                insertions: None,
+                deletions: None,
+            })));
         }
 
-        Ok(Value::Table {
-            columns: vec![
-                "hash".to_string(),
-                "author".to_string(),
-                "date".to_string(),
-                "message".to_string(),
-            ],
-            rows,
-        })
+        Ok(Value::List(commits))
     }
 }
 
@@ -573,11 +656,12 @@ mod tests {
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
 
         match result {
-            Value::Record(fields) => {
-                let branch = fields.iter().find(|(k, _)| k == "branch");
-                assert!(branch.is_some());
+            Value::GitStatus(status) => {
+                assert!(!status.branch.is_empty());
+                assert!(status.staged.is_empty());
+                assert!(status.unstaged.is_empty());
             }
-            _ => panic!("Expected Record"),
+            _ => panic!("Expected GitStatus"),
         }
     }
 
@@ -594,18 +678,11 @@ mod tests {
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
 
         match result {
-            Value::Record(fields) => {
-                let untracked = fields.iter()
-                    .find(|(k, _)| k == "untracked")
-                    .map(|(_, v)| v);
-
-                if let Some(Value::List(files)) = untracked {
-                    assert!(!files.is_empty());
-                } else {
-                    panic!("Expected untracked list");
-                }
+            Value::GitStatus(status) => {
+                assert!(!status.untracked.is_empty());
+                assert!(status.untracked.iter().any(|f| f.contains("new_file.txt")));
             }
-            _ => panic!("Expected Record"),
+            _ => panic!("Expected GitStatus"),
         }
     }
 
@@ -618,11 +695,18 @@ mod tests {
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
 
         match result {
-            Value::Table { columns, rows } => {
-                assert_eq!(columns, vec!["hash", "author", "date", "message"]);
-                assert!(!rows.is_empty());
+            Value::List(commits) => {
+                assert!(!commits.is_empty());
+                // First commit should be a GitCommit
+                match &commits[0] {
+                    Value::GitCommit(c) => {
+                        assert!(!c.hash.is_empty());
+                        assert!(!c.author.is_empty());
+                    }
+                    _ => panic!("Expected GitCommit in list"),
+                }
             }
-            _ => panic!("Expected Table"),
+            _ => panic!("Expected List of GitCommit"),
         }
     }
 

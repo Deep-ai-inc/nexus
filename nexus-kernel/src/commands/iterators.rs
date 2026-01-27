@@ -84,22 +84,9 @@ fn each_value(value: Value, field: Option<&str>) -> Value {
 }
 
 fn extract_field(value: &Value, key: &str) -> Option<Value> {
-    match value {
-        Value::Record(entries) => {
-            entries.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        }
-        Value::FileEntry(entry) => {
-            match key {
-                "name" => Some(Value::String(entry.name.clone())),
-                "path" => Some(Value::Path(entry.path.clone())),
-                "size" => Some(Value::Int(entry.size as i64)),
-                "is_dir" => Some(Value::Bool(entry.file_type == nexus_api::FileType::Directory)),
-                "modified" => entry.modified.map(|m| Value::Int(m as i64)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
+    // Use the unified get_field method which handles all typed values
+    // (Record, FileEntry, Process, GitStatus, GitCommit, Structured)
+    value.get_field(key)
 }
 
 // ============================================================================

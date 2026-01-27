@@ -28,6 +28,7 @@ mod path;
 mod perms;
 mod prev;
 mod printf;
+mod ps;
 mod registry;
 mod rev;
 mod select;

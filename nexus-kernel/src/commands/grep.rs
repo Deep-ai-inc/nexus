@@ -1,10 +1,63 @@
 //! The `grep` command - search for patterns.
+//!
+//! Grep preserves typed data - filtering a list of Process values returns
+//! Process values, not strings. The searchable text is extracted from
+//! relevant fields (command for Process, path for FileEntry, etc).
 
 use super::{CommandContext, NexusCommand};
 use nexus_api::Value;
 use regex::Regex;
 use std::fs;
 use std::path::PathBuf;
+
+/// Extract searchable text from a typed value.
+/// This is used by grep to match against typed data while preserving the type.
+fn get_searchable_text(value: &Value) -> String {
+    match value {
+        // For files, search the name
+        Value::FileEntry(entry) => entry.name.clone(),
+
+        // For processes, search command and args (most useful for filtering)
+        Value::Process(proc) => {
+            if proc.args.is_empty() {
+                format!("{} {}", proc.user, proc.command)
+            } else {
+                format!("{} {} {}", proc.user, proc.command, proc.args.join(" "))
+            }
+        }
+
+        // For git status, search branch and file paths
+        Value::GitStatus(status) => {
+            let mut parts = vec![status.branch.clone()];
+            parts.extend(status.staged.iter().map(|f| f.path.clone()));
+            parts.extend(status.unstaged.iter().map(|f| f.path.clone()));
+            parts.extend(status.untracked.clone());
+            parts.join(" ")
+        }
+
+        // For git commits, search hash, author, and message
+        Value::GitCommit(commit) => {
+            format!("{} {} {} {}", commit.short_hash, commit.hash, commit.author, commit.message)
+        }
+
+        // For structured data, search all string values
+        Value::Structured { data, .. } => {
+            data.values()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        // For strings, use directly
+        Value::String(s) => s.clone(),
+
+        // Fallback to text representation
+        other => other.to_text(),
+    }
+}
 
 pub struct GrepCommand;
 
@@ -169,17 +222,15 @@ fn grep_value(value: Value, opts: &GrepOptions) -> Value {
                 .into_iter()
                 .enumerate()
                 .filter_map(|(i, item)| {
-                    let text = match &item {
-                        Value::FileEntry(entry) => entry.name.clone(),
-                        Value::String(s) => s.clone(),
-                        other => other.to_text(),
-                    };
+                    // Extract searchable text from typed values
+                    // This preserves the original type while matching on relevant fields
+                    let text = get_searchable_text(&item);
 
                     if opts.matches(&text) {
                         if opts.line_numbers {
                             Some(Value::String(format!("{}:{}", i + 1, text)))
                         } else {
-                            Some(item)
+                            Some(item) // Return original typed value!
                         }
                     } else {
                         None
@@ -316,5 +367,130 @@ mod tests {
         };
         let result = grep_value(list, &opts);
         assert_eq!(result, Value::Int(3));
+    }
+
+    #[test]
+    fn test_grep_preserves_typed_process_values() {
+        use nexus_api::{ProcessInfo, ProcessStatus};
+
+        // Create a list of Process values
+        let processes = Value::List(vec![
+            Value::Process(Box::new(ProcessInfo {
+                pid: 1234,
+                ppid: 1,
+                user: "root".to_string(),
+                command: "node".to_string(),
+                args: vec!["server.js".to_string()],
+                cpu_percent: 50.0,
+                mem_bytes: 1024 * 1024,
+                mem_percent: 1.0,
+                status: ProcessStatus::Running,
+                started: None,
+            })),
+            Value::Process(Box::new(ProcessInfo {
+                pid: 5678,
+                ppid: 1,
+                user: "www".to_string(),
+                command: "python".to_string(),
+                args: vec!["app.py".to_string()],
+                cpu_percent: 10.0,
+                mem_bytes: 512 * 1024,
+                mem_percent: 0.5,
+                status: ProcessStatus::Running,
+                started: None,
+            })),
+        ]);
+
+        let opts = GrepOptions {
+            pattern: Some("node".to_string()),
+            invert: false,
+            ignore_case: false,
+            count: false,
+            line_numbers: false,
+            only_matching: false,
+            fixed_string: false,
+            files: vec![],
+        };
+
+        let result = grep_value(processes, &opts);
+
+        // Should return a List with one Process value (not a string!)
+        match result {
+            Value::List(items) => {
+                assert_eq!(items.len(), 1);
+                // Verify it's still a Process, not converted to String
+                match &items[0] {
+                    Value::Process(p) => {
+                        assert_eq!(p.pid, 1234);
+                        assert_eq!(p.command, "node");
+                    }
+                    _ => panic!("Expected Process variant, got {:?}", items[0].type_name()),
+                }
+            }
+            _ => panic!("Expected List"),
+        }
+    }
+
+    #[test]
+    fn test_grep_preserves_file_entry_values() {
+        use nexus_api::{FileEntry, FileType};
+        use std::path::PathBuf;
+
+        let files = Value::List(vec![
+            Value::FileEntry(Box::new(FileEntry {
+                name: "main.rs".to_string(),
+                path: PathBuf::from("/src/main.rs"),
+                file_type: FileType::File,
+                size: 1000,
+                modified: None,
+                accessed: None,
+                created: None,
+                permissions: 0o644,
+                is_hidden: false,
+                is_symlink: false,
+                symlink_target: None,
+            })),
+            Value::FileEntry(Box::new(FileEntry {
+                name: "lib.rs".to_string(),
+                path: PathBuf::from("/src/lib.rs"),
+                file_type: FileType::File,
+                size: 500,
+                modified: None,
+                accessed: None,
+                created: None,
+                permissions: 0o644,
+                is_hidden: false,
+                is_symlink: false,
+                symlink_target: None,
+            })),
+        ]);
+
+        let opts = GrepOptions {
+            pattern: Some("main".to_string()),
+            invert: false,
+            ignore_case: false,
+            count: false,
+            line_numbers: false,
+            only_matching: false,
+            fixed_string: false,
+            files: vec![],
+        };
+
+        let result = grep_value(files, &opts);
+
+        match result {
+            Value::List(items) => {
+                assert_eq!(items.len(), 1);
+                // Verify it's still a FileEntry
+                match &items[0] {
+                    Value::FileEntry(f) => {
+                        assert_eq!(f.name, "main.rs");
+                        assert_eq!(f.size, 1000); // Typed field preserved!
+                    }
+                    _ => panic!("Expected FileEntry variant"),
+                }
+            }
+            _ => panic!("Expected List"),
+        }
     }
 }

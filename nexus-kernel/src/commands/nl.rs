@@ -141,8 +141,8 @@ impl NexusCommand for NlCommand {
 fn nl_value(value: Value, opts: &NlOptions) -> Value {
     match value {
         Value::List(items) => {
-            let lines: Vec<String> = items.into_iter().map(|v| v.to_text()).collect();
-            number_lines(&lines, opts)
+            // Preserve typed values with line numbers
+            number_typed_items(items, opts)
         }
         Value::String(s) => {
             let lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
@@ -175,6 +175,38 @@ fn nl_value(value: Value, opts: &NlOptions) -> Value {
             number_lines(&lines, opts)
         }
     }
+}
+
+/// Number typed items while preserving their original types
+fn number_typed_items(items: Vec<Value>, opts: &NlOptions) -> Value {
+    let mut result = Vec::new();
+    let mut line_num = opts.starting_line;
+
+    for item in items {
+        let text = item.to_text();
+        let should_number = match opts.body_numbering {
+            NumberingStyle::All => true,
+            NumberingStyle::NonEmpty => !text.trim().is_empty(),
+            NumberingStyle::None => false,
+        };
+
+        if should_number {
+            // Return a record with line number and original typed value
+            result.push(Value::Record(vec![
+                ("line".to_string(), Value::Int(line_num)),
+                ("value".to_string(), item),
+            ]));
+            line_num += opts.increment;
+        } else {
+            // No line number, but still include the item
+            result.push(Value::Record(vec![
+                ("line".to_string(), Value::Unit),
+                ("value".to_string(), item),
+            ]));
+        }
+    }
+
+    Value::List(result)
 }
 
 fn number_lines(lines: &[String], opts: &NlOptions) -> Value {

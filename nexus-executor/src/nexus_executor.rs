@@ -219,6 +219,46 @@ pub fn serialize_value_for_llm(value: &nexus_api::Value) -> String {
         Value::Error { code, message } => {
             format!("Error ({}): {}", code, message)
         }
+
+        Value::Process(proc) => {
+            format!(
+                "PID: {}, User: {}, CPU: {:.1}%, Mem: {:.1}%, Status: {:?}, Command: {}",
+                proc.pid, proc.user, proc.cpu_percent, proc.mem_percent, proc.status, proc.command
+            )
+        }
+
+        Value::GitStatus(status) => {
+            let mut parts = vec![format!("Branch: {}", status.branch)];
+            if let Some(upstream) = &status.upstream {
+                parts.push(format!("Upstream: {} (ahead: {}, behind: {})", upstream, status.ahead, status.behind));
+            }
+            if !status.staged.is_empty() {
+                parts.push(format!("Staged: {} files", status.staged.len()));
+            }
+            if !status.unstaged.is_empty() {
+                parts.push(format!("Unstaged: {} files", status.unstaged.len()));
+            }
+            if !status.untracked.is_empty() {
+                parts.push(format!("Untracked: {} files", status.untracked.len()));
+            }
+            parts.join("\n")
+        }
+
+        Value::GitCommit(commit) => {
+            format!(
+                "{} {} <{}> {}",
+                commit.short_hash, commit.author, commit.author_email, commit.message
+            )
+        }
+
+        Value::Structured { kind, data } => {
+            let prefix = kind.as_ref().map(|k| format!("[{}] ", k)).unwrap_or_default();
+            let fields = data.iter()
+                .map(|(k, v)| format!("{}: {}", k, serialize_value_for_llm(v)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}{}", prefix, fields)
+        }
     }
 }
 

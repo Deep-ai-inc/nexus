@@ -181,6 +181,98 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(map)
         }
+        Value::Process(proc) => {
+            let mut map = serde_json::Map::new();
+            map.insert("_type".to_string(), serde_json::Value::String("process".to_string()));
+            map.insert("pid".to_string(), serde_json::Value::Number(proc.pid.into()));
+            map.insert("ppid".to_string(), serde_json::Value::Number(proc.ppid.into()));
+            map.insert("user".to_string(), serde_json::Value::String(proc.user.clone()));
+            map.insert("command".to_string(), serde_json::Value::String(proc.command.clone()));
+            map.insert("args".to_string(), serde_json::Value::Array(
+                proc.args.iter().map(|s| serde_json::Value::String(s.clone())).collect()
+            ));
+            map.insert("cpu_percent".to_string(),
+                serde_json::Number::from_f64(proc.cpu_percent)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null));
+            map.insert("mem_bytes".to_string(), serde_json::Value::Number(proc.mem_bytes.into()));
+            map.insert("mem_percent".to_string(),
+                serde_json::Number::from_f64(proc.mem_percent)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null));
+            map.insert("status".to_string(), serde_json::Value::String(format!("{:?}", proc.status)));
+            if let Some(started) = proc.started {
+                map.insert("started".to_string(), serde_json::Value::Number(started.into()));
+            }
+            serde_json::Value::Object(map)
+        }
+        Value::GitStatus(status) => {
+            let mut map = serde_json::Map::new();
+            map.insert("_type".to_string(), serde_json::Value::String("git-status".to_string()));
+            map.insert("branch".to_string(), serde_json::Value::String(status.branch.clone()));
+            if let Some(upstream) = &status.upstream {
+                map.insert("upstream".to_string(), serde_json::Value::String(upstream.clone()));
+            }
+            map.insert("ahead".to_string(), serde_json::Value::Number(status.ahead.into()));
+            map.insert("behind".to_string(), serde_json::Value::Number(status.behind.into()));
+            map.insert("has_conflicts".to_string(), serde_json::Value::Bool(status.has_conflicts));
+            map.insert("staged".to_string(), serde_json::Value::Array(
+                status.staged.iter().map(|f| {
+                    let mut m = serde_json::Map::new();
+                    m.insert("path".to_string(), serde_json::Value::String(f.path.clone()));
+                    m.insert("status".to_string(), serde_json::Value::String(format!("{:?}", f.status)));
+                    if let Some(orig) = &f.orig_path {
+                        m.insert("orig_path".to_string(), serde_json::Value::String(orig.clone()));
+                    }
+                    serde_json::Value::Object(m)
+                }).collect()
+            ));
+            map.insert("unstaged".to_string(), serde_json::Value::Array(
+                status.unstaged.iter().map(|f| {
+                    let mut m = serde_json::Map::new();
+                    m.insert("path".to_string(), serde_json::Value::String(f.path.clone()));
+                    m.insert("status".to_string(), serde_json::Value::String(format!("{:?}", f.status)));
+                    serde_json::Value::Object(m)
+                }).collect()
+            ));
+            map.insert("untracked".to_string(), serde_json::Value::Array(
+                status.untracked.iter().map(|s| serde_json::Value::String(s.clone())).collect()
+            ));
+            serde_json::Value::Object(map)
+        }
+        Value::GitCommit(commit) => {
+            let mut map = serde_json::Map::new();
+            map.insert("_type".to_string(), serde_json::Value::String("git-commit".to_string()));
+            map.insert("hash".to_string(), serde_json::Value::String(commit.hash.clone()));
+            map.insert("short_hash".to_string(), serde_json::Value::String(commit.short_hash.clone()));
+            map.insert("author".to_string(), serde_json::Value::String(commit.author.clone()));
+            map.insert("author_email".to_string(), serde_json::Value::String(commit.author_email.clone()));
+            map.insert("date".to_string(), serde_json::Value::Number(commit.date.into()));
+            map.insert("message".to_string(), serde_json::Value::String(commit.message.clone()));
+            if let Some(body) = &commit.body {
+                map.insert("body".to_string(), serde_json::Value::String(body.clone()));
+            }
+            if let Some(n) = commit.files_changed {
+                map.insert("files_changed".to_string(), serde_json::Value::Number(n.into()));
+            }
+            if let Some(n) = commit.insertions {
+                map.insert("insertions".to_string(), serde_json::Value::Number(n.into()));
+            }
+            if let Some(n) = commit.deletions {
+                map.insert("deletions".to_string(), serde_json::Value::Number(n.into()));
+            }
+            serde_json::Value::Object(map)
+        }
+        Value::Structured { kind, data } => {
+            let mut map: serde_json::Map<String, serde_json::Value> = data
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect();
+            if let Some(k) = kind {
+                map.insert("_type".to_string(), serde_json::Value::String(k.clone()));
+            }
+            serde_json::Value::Object(map)
+        }
     }
 }
 

@@ -2,7 +2,23 @@
 //!
 //! Commands return `Value` instead of raw bytes, enabling rich rendering
 //! in the GUI while falling back to text for legacy interop.
+//!
+//! # Type System Philosophy: "Progressive Enhancement"
+//!
+//! The type system is designed around three tiers:
+//!
+//! 1. **High-Frequency Domain Types** - Explicit types for common operations
+//!    (FileEntry, Process, GitStatus). These enable rich GUI rendering and
+//!    type-safe pipelines.
+//!
+//! 2. **Generic Structured Type** - The `Structured { kind, data }` escape hatch
+//!    for parsed JSON/YAML/CSV that doesn't have a dedicated type. The `kind`
+//!    field helps the GUI pick a renderer (e.g., "k8s/pod", "docker/container").
+//!
+//! 3. **Legacy Fallback** - All types implement `to_text()` for piping to
+//!    external commands that expect plain text.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
@@ -11,6 +27,9 @@ use std::time::SystemTime;
 /// A structured value that can be passed between commands and rendered by the UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    // =========================================================================
+    // Primitives
+    // =========================================================================
     /// No value (like void/unit)
     Unit,
     /// Boolean
@@ -21,11 +40,15 @@ pub enum Value {
     Float(f64),
     /// Text string
     String(String),
-    /// Raw bytes
+    /// Raw bytes (legacy blob, compressed data, etc.)
     Bytes(Vec<u8>),
+
+    // =========================================================================
+    // Collections
+    // =========================================================================
     /// Ordered list of values
     List(Vec<Value>),
-    /// Ordered key-value pairs (like a JSON object but ordered)
+    /// Ordered key-value pairs (like a JSON object but preserves insertion order)
     Record(Vec<(String, Value)>),
     /// Tabular data with named columns
     Table {
@@ -33,9 +56,21 @@ pub enum Value {
         rows: Vec<Vec<Value>>,
     },
 
-    // Domain-specific rich types
-    /// Rich media content - images, audio, video, documents, etc.
-    /// The UI renders appropriately based on content_type.
+    // =========================================================================
+    // High-Frequency Domain Types
+    // These appear in 90% of interactive sessions and warrant explicit types.
+    // =========================================================================
+    /// A filesystem path
+    Path(PathBuf),
+    /// A file/directory entry with metadata (ls, find, fd)
+    FileEntry(Box<FileEntry>),
+    /// A running process (ps, top, kill)
+    Process(Box<ProcessInfo>),
+    /// Git repository status (git status)
+    GitStatus(Box<GitStatusInfo>),
+    /// A git commit (git log)
+    GitCommit(Box<GitCommitInfo>),
+    /// Rich media content - images, audio, video, documents
     Media {
         /// Raw file data
         data: Vec<u8>,
@@ -44,10 +79,29 @@ pub enum Value {
         /// Optional metadata (dimensions, duration, etc.)
         metadata: MediaMetadata,
     },
-    /// A filesystem path
-    Path(PathBuf),
-    /// A file/directory entry with metadata
-    FileEntry(Box<FileEntry>),
+
+    // =========================================================================
+    // Generic Structured Type (The Escape Hatch)
+    // For parsed data that doesn't have a dedicated type.
+    // =========================================================================
+    /// Generic structured data with an optional kind hint for rendering.
+    ///
+    /// Use this for:
+    /// - Parsed JSON/YAML/CSV that doesn't fit a domain type
+    /// - External API responses (k8s, docker, cloud providers)
+    /// - Any structured data where you want the GUI to pick a renderer
+    ///
+    /// The `kind` field is a hint like "k8s/pod", "docker/container", "aws/ec2".
+    Structured {
+        /// Optional type hint for GUI rendering (e.g., "k8s/pod", "docker/container")
+        kind: Option<String>,
+        /// The actual data, preserving field order
+        data: IndexMap<String, Value>,
+    },
+
+    // =========================================================================
+    // Control Flow & Errors
+    // =========================================================================
     /// An error value
     Error { code: i32, message: String },
 }
@@ -79,6 +133,190 @@ pub enum FileType {
     Socket,
     Unknown,
 }
+
+// =============================================================================
+// Process Information (ps, top, kill)
+// =============================================================================
+
+/// Information about a running process.
+///
+/// Returned by `ps`, `top`, and used as input to `kill`.
+/// The GUI can render this with CPU sparklines, memory bars, and kill buttons.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    /// Process ID
+    pub pid: u32,
+    /// Parent process ID
+    pub ppid: u32,
+    /// User who owns the process
+    pub user: String,
+    /// Executable name (e.g., "node", "python")
+    pub command: String,
+    /// Full command line arguments
+    pub args: Vec<String>,
+    /// CPU usage as percentage (0.0 - 100.0+)
+    pub cpu_percent: f64,
+    /// Memory usage in bytes
+    pub mem_bytes: u64,
+    /// Memory usage as percentage of total system memory
+    pub mem_percent: f64,
+    /// Process status
+    pub status: ProcessStatus,
+    /// Start time as Unix timestamp (seconds)
+    pub started: Option<u64>,
+}
+
+/// Process status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessStatus {
+    Running,
+    Sleeping,
+    Stopped,
+    Zombie,
+    Idle,
+    Unknown,
+}
+
+impl ProcessInfo {
+    /// Get a field by name for filtering/selection.
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "pid" => Some(Value::Int(self.pid as i64)),
+            "ppid" => Some(Value::Int(self.ppid as i64)),
+            "user" => Some(Value::String(self.user.clone())),
+            "command" | "cmd" => Some(Value::String(self.command.clone())),
+            "args" => Some(Value::List(self.args.iter().map(|s| Value::String(s.clone())).collect())),
+            "cpu" | "cpu_percent" => Some(Value::Float(self.cpu_percent)),
+            "mem" | "mem_bytes" => Some(Value::Int(self.mem_bytes as i64)),
+            "mem_percent" => Some(Value::Float(self.mem_percent)),
+            "status" => Some(Value::String(format!("{:?}", self.status))),
+            "started" => self.started.map(|t| Value::Int(t as i64)),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// Git Status (git status)
+// =============================================================================
+
+/// Git repository status information.
+///
+/// Returned by `git status`. The GUI can render this with branch badges,
+/// file status icons, and staging checkboxes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitStatusInfo {
+    /// Current branch name (or "HEAD (detached)" if detached)
+    pub branch: String,
+    /// Upstream branch if tracking one
+    pub upstream: Option<String>,
+    /// Commits ahead of upstream
+    pub ahead: u32,
+    /// Commits behind upstream
+    pub behind: u32,
+    /// Files staged for commit
+    pub staged: Vec<GitFileStatus>,
+    /// Files modified but not staged
+    pub unstaged: Vec<GitFileStatus>,
+    /// Untracked files
+    pub untracked: Vec<String>,
+    /// Whether there are conflicts
+    pub has_conflicts: bool,
+}
+
+/// Status of a file in git.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitFileStatus {
+    /// File path relative to repo root
+    pub path: String,
+    /// Type of change
+    pub status: GitChangeType,
+    /// Original path if renamed
+    pub orig_path: Option<String>,
+}
+
+/// Type of git file change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitChangeType {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Unmerged,
+}
+
+impl GitStatusInfo {
+    /// Get a field by name for filtering/selection.
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "branch" => Some(Value::String(self.branch.clone())),
+            "upstream" => self.upstream.clone().map(Value::String),
+            "ahead" => Some(Value::Int(self.ahead as i64)),
+            "behind" => Some(Value::Int(self.behind as i64)),
+            "has_conflicts" => Some(Value::Bool(self.has_conflicts)),
+            "staged_count" => Some(Value::Int(self.staged.len() as i64)),
+            "unstaged_count" => Some(Value::Int(self.unstaged.len() as i64)),
+            "untracked_count" => Some(Value::Int(self.untracked.len() as i64)),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// Git Commit (git log)
+// =============================================================================
+
+/// Information about a git commit.
+///
+/// Returned by `git log`. The GUI can render this with clickable hashes
+/// that open diffs, author avatars, and relative timestamps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitCommitInfo {
+    /// Full commit hash
+    pub hash: String,
+    /// Short hash (first 7 chars)
+    pub short_hash: String,
+    /// Author name
+    pub author: String,
+    /// Author email
+    pub author_email: String,
+    /// Commit timestamp (Unix seconds)
+    pub date: u64,
+    /// Commit message (first line / subject)
+    pub message: String,
+    /// Full commit body (if available)
+    pub body: Option<String>,
+    /// Number of files changed (if available)
+    pub files_changed: Option<u32>,
+    /// Lines added (if available)
+    pub insertions: Option<u32>,
+    /// Lines deleted (if available)
+    pub deletions: Option<u32>,
+}
+
+impl GitCommitInfo {
+    /// Get a field by name for filtering/selection.
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "hash" => Some(Value::String(self.hash.clone())),
+            "short_hash" => Some(Value::String(self.short_hash.clone())),
+            "author" => Some(Value::String(self.author.clone())),
+            "author_email" | "email" => Some(Value::String(self.author_email.clone())),
+            "date" | "time" | "timestamp" => Some(Value::Int(self.date as i64)),
+            "message" | "subject" => Some(Value::String(self.message.clone())),
+            "body" => self.body.clone().map(Value::String),
+            "files_changed" => self.files_changed.map(|n| Value::Int(n as i64)),
+            "insertions" | "additions" => self.insertions.map(|n| Value::Int(n as i64)),
+            "deletions" => self.deletions.map(|n| Value::Int(n as i64)),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// Media Metadata
+// =============================================================================
 
 /// Metadata for media content - dimensions, duration, etc.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -492,10 +730,127 @@ impl Value {
                 // Default: just the name (like simple `ls`)
                 buf.push_str(&entry.name);
             }
+            Value::Process(proc) => {
+                // ps-like output: PID USER CPU% MEM COMMAND
+                buf.push_str(&format!(
+                    "{}\t{}\t{:.1}%\t{}\t{}",
+                    proc.pid,
+                    proc.user,
+                    proc.cpu_percent,
+                    format_size(proc.mem_bytes),
+                    proc.command
+                ));
+            }
+            Value::GitStatus(status) => {
+                // git status -s like output
+                buf.push_str(&format!("On branch {}\n", status.branch));
+                if !status.staged.is_empty() {
+                    buf.push_str("Changes to be committed:\n");
+                    for f in &status.staged {
+                        buf.push_str(&format!("  {:?}: {}\n", f.status, f.path));
+                    }
+                }
+                if !status.unstaged.is_empty() {
+                    buf.push_str("Changes not staged for commit:\n");
+                    for f in &status.unstaged {
+                        buf.push_str(&format!("  {:?}: {}\n", f.status, f.path));
+                    }
+                }
+                if !status.untracked.is_empty() {
+                    buf.push_str("Untracked files:\n");
+                    for f in &status.untracked {
+                        buf.push_str(&format!("  {}\n", f));
+                    }
+                }
+            }
+            Value::GitCommit(commit) => {
+                // git log --oneline like output
+                buf.push_str(&format!(
+                    "{} {} <{}> {}",
+                    commit.short_hash, commit.author, commit.author_email, commit.message
+                ));
+            }
+            Value::Structured { kind, data } => {
+                // JSON-like output with optional kind prefix
+                if let Some(k) = kind {
+                    buf.push_str(&format!("[{}] ", k));
+                }
+                buf.push_str("{\n");
+                for (key, value) in data {
+                    buf.push_str(&format!("  {}: ", key));
+                    value.write_text(buf);
+                    buf.push('\n');
+                }
+                buf.push('}');
+            }
             Value::Error { message, .. } => {
                 buf.push_str("error: ");
                 buf.push_str(message);
             }
+        }
+    }
+
+    /// Get a field by name for filtering/selection operations.
+    ///
+    /// This enables typed filtering like `ps | where cpu > 80` by allowing
+    /// access to fields on domain-specific types.
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match self {
+            Value::Record(fields) => fields
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone()),
+            Value::Process(p) => p.get_field(name),
+            Value::GitStatus(g) => g.get_field(name),
+            Value::GitCommit(c) => c.get_field(name),
+            Value::FileEntry(f) => match name {
+                "name" => Some(Value::String(f.name.clone())),
+                "path" => Some(Value::Path(f.path.clone())),
+                "size" => Some(Value::Int(f.size as i64)),
+                "type" | "file_type" => Some(Value::String(format!("{:?}", f.file_type))),
+                "modified" => f.modified.map(|t| Value::Int(t as i64)),
+                "permissions" | "perms" => Some(Value::Int(f.permissions as i64)),
+                "is_hidden" | "hidden" => Some(Value::Bool(f.is_hidden)),
+                "is_symlink" | "symlink" => Some(Value::Bool(f.is_symlink)),
+                _ => None,
+            },
+            Value::Structured { data, .. } => data.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Check if this value is a domain-specific type that has typed fields.
+    pub fn is_typed(&self) -> bool {
+        matches!(
+            self,
+            Value::Process(_)
+                | Value::GitStatus(_)
+                | Value::GitCommit(_)
+                | Value::FileEntry(_)
+                | Value::Structured { .. }
+        )
+    }
+
+    /// Get the type name of this value (useful for debugging/display).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Unit => "unit",
+            Value::Bool(_) => "bool",
+            Value::Int(_) => "int",
+            Value::Float(_) => "float",
+            Value::String(_) => "string",
+            Value::Bytes(_) => "bytes",
+            Value::List(_) => "list",
+            Value::Record(_) => "record",
+            Value::Table { .. } => "table",
+            Value::Path(_) => "path",
+            Value::FileEntry(_) => "file",
+            Value::Process(_) => "process",
+            Value::GitStatus(_) => "git-status",
+            Value::GitCommit(_) => "git-commit",
+            Value::Media { .. } => "media",
+            Value::Structured { .. } => "structured",
+            Value::Error { .. } => "error",
         }
     }
 }
@@ -558,5 +913,29 @@ impl From<FileEntry> for Value {
 impl<T: Into<Value>> From<Vec<T>> for Value {
     fn from(items: Vec<T>) -> Self {
         Value::List(items.into_iter().map(Into::into).collect())
+    }
+}
+
+impl From<ProcessInfo> for Value {
+    fn from(proc: ProcessInfo) -> Self {
+        Value::Process(Box::new(proc))
+    }
+}
+
+impl From<GitStatusInfo> for Value {
+    fn from(status: GitStatusInfo) -> Self {
+        Value::GitStatus(Box::new(status))
+    }
+}
+
+impl From<GitCommitInfo> for Value {
+    fn from(commit: GitCommitInfo) -> Self {
+        Value::GitCommit(Box::new(commit))
+    }
+}
+
+impl From<IndexMap<String, Value>> for Value {
+    fn from(data: IndexMap<String, Value>) -> Self {
+        Value::Structured { kind: None, data }
     }
 }

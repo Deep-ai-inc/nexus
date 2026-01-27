@@ -46,6 +46,7 @@ use super::select::{
 use super::seq::SeqCommand;
 use super::shuf::ShufCommand;
 use super::signal::KillCommand;
+use super::ps::PsCommand;
 use super::sort::SortCommand;
 use super::system::{TtyCommand, UmaskCommand, UnameCommand};
 use super::split::{
@@ -201,6 +202,7 @@ impl CommandRegistry {
         registry.register(CmpCommand);
 
         // Resource/process info
+        registry.register(PsCommand);
         registry.register(UlimitCommand);
         registry.register(TimesCommand);
         registry.register(HashCommand);

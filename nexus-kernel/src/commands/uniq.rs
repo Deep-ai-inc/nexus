@@ -67,7 +67,7 @@ fn uniq_value(value: Value, opts: &UniqOptions) -> Value {
     match value {
         Value::List(items) => {
             if opts.count {
-                // Count occurrences
+                // Count occurrences - preserve typed values with count metadata
                 let mut counts: Vec<(String, usize, Value)> = Vec::new();
                 let mut prev_key: Option<String> = None;
 
@@ -89,7 +89,7 @@ fn uniq_value(value: Value, opts: &UniqOptions) -> Value {
                     }
                 }
 
-                // Filter and format
+                // Filter and return with counts - preserve original types
                 let results: Vec<Value> = counts
                     .into_iter()
                     .filter(|(_, count, _)| {
@@ -102,7 +102,11 @@ fn uniq_value(value: Value, opts: &UniqOptions) -> Value {
                         }
                     })
                     .map(|(_, count, item)| {
-                        Value::String(format!("{:7} {}", count, item.to_text()))
+                        // Return a record with count and original typed value
+                        Value::Record(vec![
+                            ("count".to_string(), Value::Int(count as i64)),
+                            ("value".to_string(), item),
+                        ])
                     })
                     .collect();
 
@@ -209,7 +213,15 @@ mod tests {
         let result = uniq_value(list, &opts);
         if let Value::List(items) = result {
             assert_eq!(items.len(), 2);
-            assert!(items[0].to_text().contains("2"));
+            // Now returns Record with count and value
+            if let Value::Record(fields) = &items[0] {
+                let count = fields.iter().find(|(k, _)| k == "count").map(|(_, v)| v);
+                assert_eq!(count, Some(&Value::Int(2)));
+                let value = fields.iter().find(|(k, _)| k == "value").map(|(_, v)| v);
+                assert_eq!(value, Some(&Value::String("a".to_string())));
+            } else {
+                panic!("Expected Record");
+            }
         }
     }
 }
