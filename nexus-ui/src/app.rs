@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use iced::widget::{column, container, scrollable, text_input, Column};
+use iced::widget::{column, container, mouse_area, scrollable, text_input, Column};
 use iced::{event, Element, Length, Subscription, Task, Theme};
 
 use nexus_api::BlockId;
@@ -184,16 +184,20 @@ fn view(state: &Nexus) -> Element<'_, Message> {
 
     let content = column![history, jobs_bar, input_line].spacing(0);
 
-    container(content)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgb(
-                0.07, 0.07, 0.09,
-            ))),
-            ..Default::default()
-        })
-        .into()
+    // Wrap in mouse_area to refocus input when clicking on empty areas
+    mouse_area(
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb(
+                    0.07, 0.07, 0.09,
+                ))),
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::Window(WindowMessage::BackgroundClicked))
+    .into()
 }
 
 // =============================================================================

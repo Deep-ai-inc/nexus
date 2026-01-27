@@ -5,10 +5,11 @@
 use std::sync::atomic::Ordering;
 
 use iced::keyboard::{self, Key};
+use iced::widget::text_input;
 use iced::{Event, Task};
 
 use crate::blocks::Focus;
-use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, LINE_HEIGHT_FACTOR};
+use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, INPUT_FIELD, LINE_HEIGHT_FACTOR};
 use crate::msg::{GlobalShortcut, InputMessage, Message, WindowMessage, ZoomDirection};
 use crate::state::Nexus;
 
@@ -19,6 +20,16 @@ pub fn update(state: &mut Nexus, msg: WindowMessage) -> Task<Message> {
         WindowMessage::Resized(w, h) => resize(state, w, h),
         WindowMessage::Shortcut(sc) => global_shortcut(state, sc),
         WindowMessage::Zoom(dir) => zoom(state, dir),
+        WindowMessage::BackgroundClicked => {
+            // Don't steal focus from a running PTY
+            if let Focus::Block(block_id) = state.terminal.focus {
+                if state.terminal.pty_handles.iter().any(|h| h.block_id == block_id) {
+                    return Task::none();
+                }
+            }
+            state.terminal.focus = Focus::Input;
+            text_input::focus(text_input::Id::new(INPUT_FIELD))
+        }
     }
 }
 

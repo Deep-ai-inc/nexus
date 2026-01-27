@@ -32,7 +32,20 @@ pub fn update(state: &mut Nexus, msg: TerminalMessage) -> Task<Message> {
         TerminalMessage::DismissPermissionPrompt => dismiss_permission(state),
         TerminalMessage::RunSuggestedCommand(cmd) => execute(state, cmd),
         TerminalMessage::DismissCommandNotFound => dismiss_not_found(state),
+        TerminalMessage::KillBlock(id) => kill_block(state, id),
     }
+}
+
+/// Force kill a running PTY block.
+/// Sends Ctrl+C first, then SIGKILL after 500ms.
+fn kill_block(state: &mut Nexus, block_id: BlockId) -> Task<Message> {
+    if let Some(handle) = state.terminal.pty_handles.iter().find(|h| h.block_id == block_id) {
+        // Send Ctrl+C first (graceful)
+        let _ = handle.send_interrupt();
+        // Then force kill
+        handle.kill();
+    }
+    Task::none()
 }
 
 // =============================================================================

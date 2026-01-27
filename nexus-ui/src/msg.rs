@@ -100,6 +100,8 @@ pub enum TerminalMessage {
     RunSuggestedCommand(String),
     /// Dismiss the command not found prompt.
     DismissCommandNotFound,
+    /// Force kill a running PTY block.
+    KillBlock(BlockId),
 }
 
 // =============================================================================
@@ -134,6 +136,8 @@ pub enum WindowMessage {
     Shortcut(GlobalShortcut),
     /// Zoom font size.
     Zoom(ZoomDirection),
+    /// Click on background - refocus input.
+    BackgroundClicked,
 }
 
 // =============================================================================

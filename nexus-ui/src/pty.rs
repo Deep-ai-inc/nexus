@@ -156,10 +156,9 @@ impl PtyHandle {
         self.write(&[0x1a])
     }
 
-    /// Kill the process.
-    #[allow(dead_code)]
+    /// Kill the process (don't take ownership so reader thread can still get exit status).
     pub fn kill(&self) {
-        if let Some(mut child) = self.child.lock().unwrap().take() {
+        if let Some(ref mut child) = *self.child.lock().unwrap() {
             let _ = child.kill();
         }
     }
