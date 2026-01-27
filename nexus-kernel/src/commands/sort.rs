@@ -316,43 +316,23 @@ mod tests {
     fn test_sort_process_by_cpu() {
         use nexus_api::{ProcessInfo, ProcessStatus};
 
+        // Helper to create test process
+        fn test_proc(pid: u32, command: &str, cpu: f64) -> ProcessInfo {
+            ProcessInfo {
+                pid, ppid: 0, user: "root".to_string(), group: None,
+                command: command.to_string(), args: vec![],
+                cpu_percent: cpu, mem_bytes: 1000, mem_percent: 1.0, virtual_size: 0,
+                status: ProcessStatus::Running, started: None, cpu_time: 0,
+                tty: None, nice: None, priority: 0, pgid: None, sid: None,
+                tpgid: None, threads: None, wchan: None, flags: None,
+                is_session_leader: None, has_foreground: None,
+            }
+        }
+
         let processes = Value::List(vec![
-            Value::Process(Box::new(ProcessInfo {
-                pid: 1,
-                ppid: 0,
-                user: "root".to_string(),
-                command: "low".to_string(),
-                args: vec![],
-                cpu_percent: 10.0,
-                mem_bytes: 1000,
-                mem_percent: 1.0,
-                status: ProcessStatus::Running,
-                started: None,
-            })),
-            Value::Process(Box::new(ProcessInfo {
-                pid: 2,
-                ppid: 0,
-                user: "root".to_string(),
-                command: "high".to_string(),
-                args: vec![],
-                cpu_percent: 90.0,
-                mem_bytes: 2000,
-                mem_percent: 2.0,
-                status: ProcessStatus::Running,
-                started: None,
-            })),
-            Value::Process(Box::new(ProcessInfo {
-                pid: 3,
-                ppid: 0,
-                user: "root".to_string(),
-                command: "medium".to_string(),
-                args: vec![],
-                cpu_percent: 50.0,
-                mem_bytes: 1500,
-                mem_percent: 1.5,
-                status: ProcessStatus::Running,
-                started: None,
-            })),
+            Value::Process(Box::new(test_proc(1, "low", 10.0))),
+            Value::Process(Box::new(test_proc(2, "high", 90.0))),
+            Value::Process(Box::new(test_proc(3, "medium", 50.0))),
         ]);
 
         // Sort by CPU ascending

@@ -150,30 +150,70 @@ pub struct ProcessInfo {
     pub ppid: u32,
     /// User who owns the process
     pub user: String,
+    /// Group who owns the process
+    pub group: Option<String>,
     /// Executable name (e.g., "node", "python")
     pub command: String,
     /// Full command line arguments
     pub args: Vec<String>,
     /// CPU usage as percentage (0.0 - 100.0+)
     pub cpu_percent: f64,
-    /// Memory usage in bytes
+    /// Memory usage in bytes (RSS - Resident Set Size)
     pub mem_bytes: u64,
     /// Memory usage as percentage of total system memory
     pub mem_percent: f64,
+    /// Virtual memory size in bytes
+    pub virtual_size: u64,
     /// Process status
     pub status: ProcessStatus,
     /// Start time as Unix timestamp (seconds)
     pub started: Option<u64>,
+    /// CPU time consumed in seconds
+    pub cpu_time: u64,
+    /// Controlling terminal (e.g., "/dev/pts/0")
+    pub tty: Option<String>,
+    /// Nice value (-20 to 19, lower = higher priority)
+    pub nice: Option<i8>,
+    /// Process priority
+    pub priority: i32,
+    /// Process group ID
+    pub pgid: Option<u32>,
+    /// Session ID
+    pub sid: Option<u32>,
+    /// Foreground process group ID of the controlling terminal
+    pub tpgid: Option<i32>,
+    /// Number of threads
+    pub threads: Option<u32>,
+    /// Kernel wait channel (what the process is waiting on)
+    pub wchan: Option<String>,
+    /// Process flags
+    pub flags: Option<u32>,
+    /// Is this process the session leader?
+    pub is_session_leader: Option<bool>,
+    /// Is this process in the foreground process group?
+    pub has_foreground: Option<bool>,
 }
 
 /// Process status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProcessStatus {
+    /// Running or runnable (on run queue)
     Running,
+    /// Interruptible sleep (waiting for an event)
     Sleeping,
+    /// Uninterruptible sleep (usually IO)
+    DiskSleep,
+    /// Stopped (by signal or tracing)
     Stopped,
+    /// Zombie (terminated but not reaped)
     Zombie,
+    /// Idle kernel thread
     Idle,
+    /// Dead (should never be seen)
+    Dead,
+    /// Stopped by debugger during tracing
+    TracingStop,
+    /// Unknown state
     Unknown,
 }
 
@@ -183,14 +223,26 @@ impl ProcessInfo {
         match name {
             "pid" => Some(Value::Int(self.pid as i64)),
             "ppid" => Some(Value::Int(self.ppid as i64)),
-            "user" => Some(Value::String(self.user.clone())),
-            "command" | "cmd" => Some(Value::String(self.command.clone())),
+            "user" | "euser" => Some(Value::String(self.user.clone())),
+            "group" => self.group.as_ref().map(|g| Value::String(g.clone())),
+            "command" | "cmd" | "comm" => Some(Value::String(self.command.clone())),
             "args" => Some(Value::List(self.args.iter().map(|s| Value::String(s.clone())).collect())),
-            "cpu" | "cpu_percent" => Some(Value::Float(self.cpu_percent)),
-            "mem" | "mem_bytes" => Some(Value::Int(self.mem_bytes as i64)),
-            "mem_percent" => Some(Value::Float(self.mem_percent)),
-            "status" => Some(Value::String(format!("{:?}", self.status))),
-            "started" => self.started.map(|t| Value::Int(t as i64)),
+            "cpu" | "cpu_percent" | "%cpu" | "pcpu" => Some(Value::Float(self.cpu_percent)),
+            "mem" | "mem_bytes" | "rss" => Some(Value::Int(self.mem_bytes as i64)),
+            "mem_percent" | "%mem" | "pmem" => Some(Value::Float(self.mem_percent)),
+            "vsz" | "vsize" | "virtual_size" => Some(Value::Int(self.virtual_size as i64)),
+            "status" | "state" | "stat" => Some(Value::String(format!("{:?}", self.status))),
+            "started" | "start" | "stime" => self.started.map(|t| Value::Int(t as i64)),
+            "time" | "cputime" | "cpu_time" => Some(Value::Int(self.cpu_time as i64)),
+            "tty" | "tt" => self.tty.as_ref().map(|t| Value::String(t.clone())),
+            "nice" | "ni" => self.nice.map(|n| Value::Int(n as i64)),
+            "priority" | "pri" => Some(Value::Int(self.priority as i64)),
+            "pgid" | "pgrp" => self.pgid.map(|p| Value::Int(p as i64)),
+            "sid" | "sess" => self.sid.map(|s| Value::Int(s as i64)),
+            "tpgid" => self.tpgid.map(|t| Value::Int(t as i64)),
+            "threads" | "nlwp" => self.threads.map(|t| Value::Int(t as i64)),
+            "wchan" => self.wchan.as_ref().map(|w| Value::String(w.clone())),
+            "flags" | "f" => self.flags.map(|f| Value::Int(f as i64)),
             _ => None,
         }
     }

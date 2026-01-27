@@ -373,32 +373,24 @@ mod tests {
     fn test_grep_preserves_typed_process_values() {
         use nexus_api::{ProcessInfo, ProcessStatus};
 
+        // Helper to create test process with minimal fields
+        fn test_proc(pid: u32, user: &str, command: &str, args: Vec<&str>) -> ProcessInfo {
+            ProcessInfo {
+                pid, ppid: 1, user: user.to_string(), group: None,
+                command: command.to_string(),
+                args: args.into_iter().map(String::from).collect(),
+                cpu_percent: 0.0, mem_bytes: 0, mem_percent: 0.0, virtual_size: 0,
+                status: ProcessStatus::Running, started: None, cpu_time: 0,
+                tty: None, nice: None, priority: 0, pgid: None, sid: None,
+                tpgid: None, threads: None, wchan: None, flags: None,
+                is_session_leader: None, has_foreground: None,
+            }
+        }
+
         // Create a list of Process values
         let processes = Value::List(vec![
-            Value::Process(Box::new(ProcessInfo {
-                pid: 1234,
-                ppid: 1,
-                user: "root".to_string(),
-                command: "node".to_string(),
-                args: vec!["server.js".to_string()],
-                cpu_percent: 50.0,
-                mem_bytes: 1024 * 1024,
-                mem_percent: 1.0,
-                status: ProcessStatus::Running,
-                started: None,
-            })),
-            Value::Process(Box::new(ProcessInfo {
-                pid: 5678,
-                ppid: 1,
-                user: "www".to_string(),
-                command: "python".to_string(),
-                args: vec!["app.py".to_string()],
-                cpu_percent: 10.0,
-                mem_bytes: 512 * 1024,
-                mem_percent: 0.5,
-                status: ProcessStatus::Running,
-                started: None,
-            })),
+            Value::Process(Box::new(test_proc(1234, "root", "node", vec!["server.js"]))),
+            Value::Process(Box::new(test_proc(5678, "www", "python", vec!["app.py"]))),
         ]);
 
         let opts = GrepOptions {
