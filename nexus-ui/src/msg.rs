@@ -52,8 +52,9 @@ pub enum InputMessage {
     TabCompletion,
     /// Shift+Tab pressed - cycle completion backwards.
     TabCompletionPrev,
-    /// Select a completion item by index (applies the completion).
-    SelectCompletion(usize),
+    /// Select a completion item - includes all data needed to apply it.
+    /// (original_text, start_position, completion_text)
+    SelectCompletion(String, usize, String),
     /// Navigate to a completion item (changes selection without applying).
     CompletionNavigate(usize),
     /// Cancel completion popup (Escape).

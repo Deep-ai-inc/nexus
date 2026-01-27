@@ -74,7 +74,9 @@ pub fn update(
         // Operations needing kernel access
         InputMessage::TabCompletion => completion_tab(input, kernel),
         InputMessage::TabCompletionPrev => completion_tab_prev(input),
-        InputMessage::SelectCompletion(idx) => select_completion(input, idx),
+        InputMessage::SelectCompletion(text, start, completion) => {
+            select_completion(input, text, start, completion)
+        }
         InputMessage::CompletionNavigate(idx) => completion_navigate(input, idx),
 
         // History search (needs kernel)
@@ -221,12 +223,14 @@ fn completion_tab(input: &mut InputState, kernel: &Arc<Mutex<Kernel>>) -> InputR
     }
 
     let kernel_guard = kernel.blocking_lock();
+    // text_editor::Content adds a trailing newline - strip it for completion
     let text = input.text();
+    let text = text.trim_end_matches('\n');
     let cursor = text.len();
-    let (completions, start) = kernel_guard.complete(&text, cursor);
+    let (completions, start) = kernel_guard.complete(text, cursor);
     drop(kernel_guard);
 
-    apply_completions(input, completions, start)
+    apply_completions(input, completions, start, text.to_string())
 }
 
 /// Cycle completion backwards (Shift+Tab).
@@ -246,8 +250,8 @@ fn apply_completions(
     input: &mut InputState,
     completions: Vec<Completion>,
     start: usize,
+    text: String, // Text with trailing newline stripped
 ) -> InputResult {
-    let text = input.text();
     if completions.len() == 1 {
         let completion = &completions[0];
         let new_text = format!("{}{}", &text[..start], completion.text);
@@ -257,20 +261,26 @@ fn apply_completions(
         input.completions = completions;
         input.completion_index = 0;
         input.completion_start = start;
+        input.completion_original_text = text; // Store stripped text for reliable completion
         input.completion_visible = true;
     }
     InputResult::none()
 }
 
 /// Select a completion from the popup (applies it and closes popup).
-fn select_completion(input: &mut InputState, index: usize) -> InputResult {
-    if let Some(completion) = input.completions.get(index) {
-        let text = input.text();
-        let new_text = format!("{}{}", &text[..input.completion_start], completion.text);
-        input.set_text(&new_text);
-    }
+/// All data is passed in the message to avoid depending on potentially-corrupted state.
+fn select_completion(
+    input: &mut InputState,
+    original_text: String,
+    start: usize,
+    completion_text: String,
+) -> InputResult {
+    let start = start.min(original_text.len());
+    let new_text = format!("{}{}", &original_text[..start], completion_text);
+    input.set_text(&new_text);
     input.completions.clear();
     input.completion_visible = false;
+    input.completion_original_text.clear();
     InputResult::none()
 }
 
@@ -334,8 +344,8 @@ fn submit(input: &mut InputState) -> InputResult {
 
 /// Handle keys when the input field is focused.
 /// Called from the window handler, returns InputMessage to process.
-/// Note: Most key handling is now done by text_editor's key_binding.
-/// This function only handles history search mode (special overlay).
+/// Handles overlay modes (history search, completion) where we need direct
+/// state access rather than captured closure values.
 pub fn handle_focus_key(
     input: &mut InputState,
     key: Key,
@@ -367,11 +377,60 @@ pub fn handle_focus_key(
         }
     }
 
+    // Completion mode - handle keys with direct state access to avoid stale closures
+    if input.completion_visible && !input.completions.is_empty() {
+        match &key {
+            Key::Named(keyboard::key::Named::Escape) => {
+                return Some(InputMessage::CancelCompletion);
+            }
+            Key::Named(keyboard::key::Named::Enter) => {
+                if let Some(completion) = input.completions.get(input.completion_index) {
+                    return Some(InputMessage::SelectCompletion(
+                        input.completion_original_text.clone(),
+                        input.completion_start,
+                        completion.text.clone(),
+                    ));
+                }
+                return None; // No completion available
+            }
+            Key::Named(keyboard::key::Named::ArrowUp) => {
+                let new_index = if input.completion_index == 0 {
+                    input.completions.len() - 1
+                } else {
+                    input.completion_index - 1
+                };
+                return Some(InputMessage::CompletionNavigate(new_index));
+            }
+            Key::Named(keyboard::key::Named::ArrowDown) => {
+                let new_index = if input.completion_index >= input.completions.len() - 1 {
+                    0
+                } else {
+                    input.completion_index + 1
+                };
+                return Some(InputMessage::CompletionNavigate(new_index));
+            }
+            Key::Named(keyboard::key::Named::Tab) => {
+                // Tab cycles forward through completions
+                return Some(InputMessage::TabCompletion);
+            }
+            _ => {
+                // Other keys (typing) cancel completion directly and let key pass through
+                input.completion_visible = false;
+                input.completions.clear();
+                return None; // Let key go to text_editor
+            }
+        }
+    }
+
+    // Handle Enter here (not in key_binding) to avoid stale closure issues
+    // key_binding's captured state may be stale, so we handle Enter with direct state access
+    if matches!(key, Key::Named(keyboard::key::Named::Enter)) {
+        return Some(InputMessage::Submit);
+    }
+
     // All other key handling is done by text_editor's key_binding:
-    // - Tab for completion
-    // - Escape to cancel completion
-    // - Arrow keys for completion navigation
+    // - Tab for completion (when not visible)
     // - Up/Down for history navigation
-    // - Enter for submit/newline
+    // - Shift+Enter for newline (handled by key_binding)
     None
 }

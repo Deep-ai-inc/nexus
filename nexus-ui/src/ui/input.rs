@@ -2,7 +2,7 @@
 
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
-use iced::widget::{button, column, container, row, text, text_editor, text_input, Column};
+use iced::widget::{button, column, container, mouse_area, row, text, text_editor, text_input, Column};
 use iced::{Element, Length};
 
 use nexus_kernel::CompletionKind;
@@ -71,10 +71,8 @@ pub fn view_input<'a>(
     let is_on_first_line = cursor_line == 0;
     let is_on_last_line = cursor_line >= line_count.saturating_sub(1);
 
-    // Capture completion state for key binding decisions
+    // Capture completion visibility for key binding (to skip keys handled by window handler)
     let completion_visible = input.completion_visible;
-    let completion_index = input.completion_index;
-    let completions_len = input.completions.len();
 
     let input_field = text_editor(&input.content)
         .on_action(|action| Message::Input(InputMessage::EditorAction(action)))
@@ -101,28 +99,36 @@ pub fn view_input<'a>(
                 return None;
             }
 
+            // Note: Completion-related keys (Enter, Escape, Arrow keys, Tab when visible)
+            // are handled by the window handler's handle_focus_key with direct state access.
+            // This key_binding only handles non-completion cases.
+
+            // If completion is visible, let window handler deal with special keys
+            if completion_visible {
+                match &key_press.key {
+                    // These are handled by window handler - return empty sequence to consume
+                    // the key without action (None would use default behavior)
+                    Key::Named(Named::Enter)
+                    | Key::Named(Named::Escape)
+                    | Key::Named(Named::Tab)
+                    | Key::Named(Named::ArrowUp)
+                    | Key::Named(Named::ArrowDown) => {
+                        return Some(text_editor::Binding::Sequence(vec![]))
+                    }
+                    _ => {} // Other keys fall through
+                }
+            }
+
             match &key_press.key {
                 Key::Named(Named::Enter) => {
                     if key_press.modifiers.shift() {
                         // Shift+Enter: insert newline
                         Some(text_editor::Binding::Enter)
-                    } else if completion_visible {
-                        // Enter with completion visible: select current completion
-                        Some(text_editor::Binding::Custom(Message::Input(
-                            InputMessage::SelectCompletion(completion_index),
-                        )))
                     } else {
-                        // Enter: submit command
-                        Some(text_editor::Binding::Custom(Message::Input(
-                            InputMessage::Submit,
-                        )))
+                        // Regular Enter is handled by window handler (handle_focus_key)
+                        // Return empty sequence to consume key without action (None = default behavior = newline)
+                        Some(text_editor::Binding::Sequence(vec![]))
                     }
-                }
-                Key::Named(Named::Escape) if completion_visible => {
-                    // Escape: cancel completion
-                    Some(text_editor::Binding::Custom(Message::Input(
-                        InputMessage::CancelCompletion,
-                    )))
                 }
                 Key::Named(Named::Tab) => {
                     if key_press.modifiers.shift() {
@@ -131,24 +137,14 @@ pub fn view_input<'a>(
                             InputMessage::TabCompletionPrev,
                         )))
                     } else {
-                        // Tab: trigger/cycle completion forward
+                        // Tab: trigger completion
                         Some(text_editor::Binding::Custom(Message::Input(
                             InputMessage::TabCompletion,
                         )))
                     }
                 }
                 Key::Named(Named::ArrowUp) if !key_press.modifiers.shift() => {
-                    if completion_visible && completions_len > 0 {
-                        // Up with completion visible: navigate completion up
-                        let new_index = if completion_index == 0 {
-                            completions_len - 1
-                        } else {
-                            completion_index - 1
-                        };
-                        Some(text_editor::Binding::Custom(Message::Input(
-                            InputMessage::CompletionNavigate(new_index),
-                        )))
-                    } else if is_on_first_line {
+                    if is_on_first_line {
                         // Up on first line: navigate history
                         Some(text_editor::Binding::Custom(Message::Input(
                             InputMessage::HistoryKey(key_press.key.clone(), key_press.modifiers),
@@ -158,17 +154,7 @@ pub fn view_input<'a>(
                     }
                 }
                 Key::Named(Named::ArrowDown) if !key_press.modifiers.shift() => {
-                    if completion_visible && completions_len > 0 {
-                        // Down with completion visible: navigate completion down
-                        let new_index = if completion_index >= completions_len - 1 {
-                            0
-                        } else {
-                            completion_index + 1
-                        };
-                        Some(text_editor::Binding::Custom(Message::Input(
-                            InputMessage::CompletionNavigate(new_index),
-                        )))
-                    } else if is_on_last_line {
+                    if is_on_last_line {
                         // Down on last line: navigate history
                         Some(text_editor::Binding::Custom(Message::Input(
                             InputMessage::HistoryKey(key_press.key.clone(), key_press.modifiers),
@@ -551,17 +537,27 @@ fn view_completion_popup<'a>(
             .spacing(2)
             .align_y(iced::Alignment::Center);
 
-            button(item_content)
-                .on_press(Message::Input(InputMessage::SelectCompletion(i)))
-                .padding([4, 8])
-                .width(Length::Fill)
-                .style(move |_theme, _status| button::Style {
-                    background: Some(iced::Background::Color(bg_color)),
-                    text_color,
-                    border: iced::Border::default(),
-                    ..Default::default()
-                })
-                .into()
+            // Use mouse_area + container instead of button to prevent focus stealing.
+            // Buttons are focusable and Tab would move focus to them, breaking
+            // arrow key navigation in the text_editor.
+            let original_text = input.completion_original_text.clone();
+            let start = input.completion_start;
+            let completion_text = completion.text.clone();
+            mouse_area(
+                container(item_content)
+                    .padding([4, 8])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(iced::Background::Color(bg_color)),
+                        ..Default::default()
+                    }),
+            )
+            .on_press(Message::Input(InputMessage::SelectCompletion(
+                original_text,
+                start,
+                completion_text,
+            )))
+            .into()
         })
         .collect();
 

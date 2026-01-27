@@ -52,6 +52,8 @@ pub struct InputState {
     pub completion_index: usize,
     /// Start position of the word being completed.
     pub completion_start: usize,
+    /// Original text when completion was triggered (for reliable insertion).
+    pub completion_original_text: String,
     /// Whether completion popup is visible.
     pub completion_visible: bool,
     /// History search active (Ctrl+R mode).
@@ -167,6 +169,7 @@ impl Default for InputState {
             completions: Vec::new(),
             completion_index: 0,
             completion_start: 0,
+            completion_original_text: String::new(),
             completion_visible: false,
             search_active: false,
             search_query: String::new(),

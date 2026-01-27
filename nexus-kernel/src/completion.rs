@@ -304,7 +304,13 @@ impl<'a> CompletionEngine<'a> {
         // Determine base directory and filename prefix
         let path = Path::new(&expanded);
         let (dir, file_prefix) = if expanded.ends_with('/') {
-            (PathBuf::from(&expanded), String::new())
+            // Path ending with / - list contents of that directory
+            let dir_path = if path.is_absolute() {
+                PathBuf::from(&expanded)
+            } else {
+                self.state.cwd.join(&expanded)
+            };
+            (dir_path, String::new())
         } else if path.is_dir() && !expanded.contains('/') {
             // Just a directory name without slash - treat as prefix
             (self.state.cwd.clone(), expanded.clone())
