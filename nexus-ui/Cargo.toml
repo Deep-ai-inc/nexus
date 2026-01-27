@@ -8,12 +8,8 @@ name = "nexus"
 path = "src/main.rs"
 
 [dependencies]
-nexus-agent = { workspace = true }
 nexus-api = { workspace = true }
-nexus-executor = { workspace = true }
 nexus-kernel = { workspace = true }
-nexus-llm = { workspace = true }
-nexus-pump = { workspace = true }
 nexus-term = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,3 +27,4 @@ image = { workspace = true }  # Image processing for clipboard images
 fontdue = { workspace = true }  # Glyph rasterization for GPU atlas
 bytemuck = { workspace = true }  # Safe transmutes for GPU buffers
 wgpu = { workspace = true }  # GPU access for custom shaders
+nix = { workspace = true }  # Unix signal handling for CLI cancellation

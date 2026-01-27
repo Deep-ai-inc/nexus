@@ -1,182 +1,39 @@
 //! Agent system for AI assistant integration.
+//!
+//! This module provides integration with Claude Code CLI, giving us access to
+//! all of Claude Code's capabilities without reimplementing the agent loop.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use iced::futures::stream;
 use iced::Subscription;
-use nexus_llm::Message as LlmMessage;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::agent_adapter::{AgentEvent, IcedAgentUI};
+use crate::agent_adapter::AgentEvent;
+use crate::claude_cli::spawn_claude_cli_task;
 
-/// No-op persistence for agent state (we don't persist agent sessions yet).
-pub struct NoopPersistence;
-
-impl nexus_agent::agent::persistence::AgentStatePersistence for NoopPersistence {
-    fn save_agent_state(&mut self, _state: nexus_agent::SessionState) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-/// Spawn an agent task to process a query.
-/// `prior_messages` contains conversation history from previous queries for continuity.
+/// Spawn an agent task to process a query using Claude Code CLI.
+///
+/// The CLI handles:
+/// - System prompt (same as Claude Code)
+/// - Context compaction (automatic when context gets long)
+/// - Tool execution (Read, Edit, Bash, Glob, Grep, etc.)
+/// - Session management (resume via session_id)
+/// - Subagents (via Task tool)
+/// - MCP integration
+///
+/// `session_id` is used to resume a prior conversation (the CLI maintains its own history).
 pub async fn spawn_agent_task(
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     cancel_flag: Arc<AtomicBool>,
     query: String,
     working_dir: PathBuf,
     attachments: Vec<nexus_api::Value>,
-    prior_messages: Vec<LlmMessage>,
-) -> anyhow::Result<()> {
-    use nexus_agent::{Agent, AgentComponents, SessionConfig};
-    use nexus_executor::DefaultCommandExecutor;
-    use nexus_llm::factory::create_llm_client_from_model;
-    use nexus_llm::ContentBlock;
-
-    // Try to detect which model to use based on environment
-    let model_name = if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        "claude-sonnet"
-    } else if std::env::var("OPENAI_API_KEY").is_ok() {
-        "gpt-4o"
-    } else {
-        // Send error event if no API key is configured
-        let _ = event_tx.send(AgentEvent::Error(
-            "No API key found. Set ANTHROPIC_API_KEY or OPENAI_API_KEY environment variable."
-                .to_string(),
-        ));
-        return Ok(());
-    };
-
-    tracing::info!("Creating LLM client for model: {}", model_name);
-
-    // Create LLM provider
-    let llm_provider = match create_llm_client_from_model(model_name, None, false, None).await {
-        Ok(provider) => provider,
-        Err(e) => {
-            let _ = event_tx.send(AgentEvent::Error(format!(
-                "Failed to create LLM client: {}",
-                e
-            )));
-            return Ok(());
-        }
-    };
-
-    // Create components with cancel flag connected to UI
-    let ui = Arc::new(IcedAgentUI::with_cancel_flag(event_tx.clone(), cancel_flag.clone()));
-
-    let components = AgentComponents {
-        llm_provider,
-        project_manager: Box::new(nexus_agent::config::DefaultProjectManager::new()),
-        command_executor: Box::new(DefaultCommandExecutor),
-        ui,
-        state_persistence: Box::new(NoopPersistence),
-        permission_handler: None, // TODO: Add permission handling
-        sub_agent_runner: None,
-    };
-
-    // Create session config
-    let session_config = SessionConfig {
-        init_path: Some(working_dir),
-        ..Default::default()
-    };
-
-    // Create and run agent
-    let mut agent = Agent::new(components, session_config);
-
-    // Initialize project context
-    if let Err(e) = agent.init_project_context() {
-        let _ = event_tx.send(AgentEvent::Error(format!(
-            "Failed to init project context: {}",
-            e
-        )));
-        return Ok(());
-    }
-
-    // Restore prior conversation history
-    if !prior_messages.is_empty() {
-        tracing::info!(
-            "Restoring {} prior messages for conversation continuity",
-            prior_messages.len()
-        );
-        for msg in prior_messages {
-            if let Err(e) = agent.append_message(msg) {
-                tracing::warn!("Failed to restore message: {}", e);
-            }
-        }
-    }
-
-    // Build user message with text and any image attachments
-    tracing::info!(
-        "spawn_agent_task: {} attachments received",
-        attachments.len()
-    );
-
-    let message = if attachments.is_empty() {
-        nexus_llm::Message::new_user(query)
-    } else {
-        // Convert attachments to content blocks
-        let mut content_blocks = Vec::new();
-
-        // Add images first
-        for attachment in &attachments {
-            if let nexus_api::Value::Media {
-                data,
-                content_type,
-                ..
-            } = attachment
-            {
-                tracing::info!(
-                    "Adding image attachment: {} ({} bytes)",
-                    content_type,
-                    data.len()
-                );
-                if content_type.starts_with("image/") {
-                    content_blocks.push(ContentBlock::new_image(content_type, data));
-                }
-            }
-        }
-
-        // Add the text query
-        content_blocks.push(ContentBlock::new_text(query));
-
-        tracing::info!(
-            "Built message with {} content blocks",
-            content_blocks.len()
-        );
-        nexus_llm::Message::new_user_content(content_blocks)
-    };
-
-    // Add the user message
-    if let Err(e) = agent.append_message(message) {
-        let _ = event_tx.send(AgentEvent::Error(format!("Failed to add message: {}", e)));
-        return Ok(());
-    }
-
-    // Run the agent iteration
-    let result = agent.run_single_iteration().await;
-
-    // Capture state for the completion event
-    let messages: Vec<LlmMessage> = agent.message_history().to_vec();
-    let was_interrupted = cancel_flag.load(Ordering::Relaxed);
-
-    // Determine outcome
-    let event = match result {
-        Ok(()) if was_interrupted => AgentEvent::Interrupted { request_id: 0, messages },
-        Ok(()) => AgentEvent::Finished { request_id: 0, messages },
-        Err(e) => {
-            let err_str = e.to_string();
-            if was_interrupted || err_str.contains("cancelled") {
-                AgentEvent::Interrupted { request_id: 0, messages }
-            } else {
-                AgentEvent::Error(format!("Agent error: {}", e))
-            }
-        }
-    };
-
-    let _ = event_tx.send(event);
-    Ok(())
+    session_id: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    spawn_claude_cli_task(event_tx, cancel_flag, query, working_dir, session_id, attachments).await
 }
 
 /// Async subscription that awaits agent events.

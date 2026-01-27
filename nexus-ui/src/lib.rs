@@ -24,6 +24,7 @@ pub mod utils;
 // Existing modules needed by others
 pub mod agent_adapter;
 pub mod agent_block;
+pub mod claude_cli;
 pub mod glyph_cache;
 pub mod theme;
 pub mod widgets;

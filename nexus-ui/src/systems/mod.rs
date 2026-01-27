@@ -9,6 +9,6 @@ pub mod agent;
 pub mod kernel;
 pub mod pty;
 
-pub use agent::{agent_subscription, spawn_agent_task, NoopPersistence};
+pub use agent::{agent_subscription, spawn_agent_task};
 pub use kernel::kernel_subscription;
 pub use pty::pty_subscription;

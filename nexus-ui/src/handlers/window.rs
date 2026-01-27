@@ -179,7 +179,7 @@ pub fn global_shortcut(state: &mut Nexus, shortcut: GlobalShortcut) -> Task<Mess
             state.agent.blocks.clear();
             state.agent.block_index.clear();
             state.agent.active_block = None;
-            state.agent.conversation.clear(); // Clear conversation history for fresh start
+            state.agent.session_id = None; // Clear session to start fresh
         }
         GlobalShortcut::CloseWindow | GlobalShortcut::Quit => {
             return iced::exit();

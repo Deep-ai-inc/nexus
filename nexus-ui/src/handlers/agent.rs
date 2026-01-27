@@ -1,6 +1,8 @@
 //! Agent domain handler.
 //!
 //! Handles AI agent events, widget interactions, and query spawning.
+//! Uses Claude Code CLI for agent execution, giving us access to all of
+//! Claude Code's capabilities.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -31,17 +33,26 @@ pub fn update(state: &mut Nexus, msg: AgentMessage) -> Task<Message> {
 // Agent Events
 // =============================================================================
 
-/// Handle agent events from the agent adapter.
+/// Handle agent events from the Claude CLI.
 pub fn handle_event(state: &mut Nexus, event: AgentEvent) -> Task<Message> {
     // Mark agent dirty to ensure UI updates
     state.agent.is_dirty = true;
 
     let agent = &mut state.agent;
 
+    // Handle session ID separately (doesn't require active block)
+    if let AgentEvent::SessionStarted { session_id } = &event {
+        agent.session_id = Some(session_id.clone());
+        tracing::info!("Stored session ID for continuity: {}", session_id);
+    }
+
     if let Some(block_id) = agent.active_block {
         if let Some(idx) = agent.block_index.get(&block_id) {
             if let Some(block) = agent.blocks.get_mut(*idx) {
                 match event {
+                    AgentEvent::SessionStarted { .. } => {
+                        // Already handled above
+                    }
                     AgentEvent::Started { .. } => {
                         block.state = AgentBlockState::Streaming;
                     }
@@ -93,14 +104,14 @@ pub fn handle_event(state: &mut Nexus, event: AgentEvent) -> Task<Message> {
                             working_dir,
                         });
                     }
-                    AgentEvent::Finished { messages, .. } => {
+                    AgentEvent::Finished { .. } => {
+                        // CLI manages conversation history via session_id
+                        // We don't need to store messages ourselves
                         block.complete();
-                        agent.conversation = messages;
                         agent.active_block = None;
                     }
-                    AgentEvent::Interrupted { messages, .. } => {
+                    AgentEvent::Interrupted { .. } => {
                         block.state = AgentBlockState::Interrupted;
-                        agent.conversation = messages;
                         agent.active_block = None;
                     }
                     AgentEvent::Error(err) => {
@@ -188,22 +199,20 @@ pub fn handle_widget(state: &mut Nexus, widget_msg: AgentWidgetMessage) -> Task<
 // Agent Control
 // =============================================================================
 
-/// Interrupt the current agent (Escape key). Preserves partial response.
-/// Agent will send HistorySnapshot before exiting, preserving conversation.
+/// Interrupt the current agent (Escape/Ctrl+C). Sends SIGINT to CLI process.
+/// The CLI will preserve partial response and session state.
 pub fn interrupt(state: &mut Nexus) -> Task<Message> {
     let agent = &mut state.agent;
 
     // Only interrupt if there's an active agent
     if agent.active_block.is_some() {
-        // Set cancel flag - agent will detect this and send Interrupted event
+        // Set cancel flag - ClaudeCli will detect this and send SIGINT
         agent.cancel_flag.store(true, Ordering::SeqCst);
-        // Note: Don't clear active_block here - let the Interrupted event do it
-        // so we get the conversation history first
     }
     Task::none()
 }
 
-/// Cancel the current agent operation (hard stop, no history preservation).
+/// Cancel the current agent operation (hard stop).
 pub fn cancel(state: &mut Nexus) -> Task<Message> {
     let agent = &mut state.agent;
 
@@ -219,21 +228,21 @@ pub fn cancel(state: &mut Nexus) -> Task<Message> {
     Task::none()
 }
 
-/// Spawn an agent query task.
+/// Spawn an agent query task using Claude Code CLI.
 pub fn spawn_query(
     state: &mut Nexus,
     query: String,
     attachments: Vec<nexus_api::Value>,
 ) -> Task<Message> {
     // Build query with context
-    let is_continuation = !state.agent.conversation.is_empty();
+    let is_continuation = state.agent.session_id.is_some();
     let current_cwd = &state.terminal.cwd;
 
     let contextualized_query = if is_continuation {
-        // Continuation: just inject current CWD so agent knows if user moved
+        // Continuation: CLI has full history via --resume, just inject CWD update
         format!("[CWD: {}]\n{}", current_cwd, query)
     } else {
-        // New conversation: full shell context (history, files, etc.)
+        // New conversation: include shell context for awareness
         let shell_context = build_shell_context(
             current_cwd,
             &state.terminal.blocks,
@@ -242,8 +251,9 @@ pub fn spawn_query(
         format!("{}{}", shell_context, query)
     };
     tracing::info!(
-        "Agent query (continuation={}, cwd={}): {}",
+        "Agent query (continuation={}, session={:?}, cwd={}): {}",
         is_continuation,
+        state.agent.session_id,
         current_cwd,
         query
     );
@@ -257,8 +267,8 @@ pub fn spawn_query(
     // Reset cancel flag
     state.agent.cancel_flag.store(false, Ordering::SeqCst);
 
-    // Clone prior conversation for the task
-    let prior_messages = state.agent.conversation.clone();
+    // Clone session_id for resume
+    let session_id = state.agent.session_id.clone();
 
     // Spawn agent task
     let agent_tx = state.agent.event_tx.clone();
@@ -266,17 +276,27 @@ pub fn spawn_query(
     let cwd = PathBuf::from(&state.terminal.cwd);
 
     tokio::spawn(async move {
-        if let Err(e) = spawn_agent_task(
-            agent_tx,
+        match spawn_agent_task(
+            agent_tx.clone(),
             cancel_flag,
             contextualized_query,
             cwd,
             attachments,
-            prior_messages,
+            session_id,
         )
         .await
         {
-            tracing::error!("Agent task failed: {}", e);
+            Ok(new_session_id) => {
+                // Session ID is returned but we can't store it here
+                // (we're in an async task). The CLI handles session
+                // continuity via its own session management.
+                if let Some(sid) = new_session_id {
+                    tracing::info!("Agent session: {}", sid);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Agent task failed: {}", e);
+            }
         }
     });
 
