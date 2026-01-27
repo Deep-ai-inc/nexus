@@ -26,6 +26,21 @@ pub use parser::Parser;
 pub use persistence::{HistoryEntry, Store};
 pub use state::{ShellState, TrapAction};
 
+/// Classification of how a command should be executed.
+///
+/// The UI uses this to decide whether to route through the kernel
+/// (for pipelines, native commands, builtins) or spawn a PTY directly
+/// (for single external commands that need interactive terminal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandClassification {
+    /// Execute through kernel - pipelines, native commands, or shell builtins.
+    /// The kernel handles these directly with structured Value output.
+    Kernel,
+    /// Execute via PTY - single external commands that need interactive terminal.
+    /// These are forked processes with raw terminal I/O.
+    Pty,
+}
+
 use nexus_api::ShellEvent;
 use tokio::sync::broadcast;
 
@@ -75,6 +90,31 @@ impl Kernel {
     /// Get a reference to the command registry.
     pub fn commands(&self) -> &CommandRegistry {
         &self.commands
+    }
+
+    /// Classify how a command should be executed.
+    ///
+    /// Returns `CommandClassification::Kernel` for:
+    /// - Pipelines (contain `|`)
+    /// - Native/in-process commands (ls, cat, grep, etc.)
+    /// - Shell builtins (cd, export, etc.)
+    ///
+    /// Returns `CommandClassification::Pty` for:
+    /// - Single external commands (git, vim, etc.)
+    ///
+    /// This method centralizes the decision logic so both UI and tests
+    /// use the same classification.
+    pub fn classify_command(&self, command: &str) -> CommandClassification {
+        let has_pipe = command.contains('|');
+        let first_word = command.split_whitespace().next().unwrap_or("");
+        let is_native = self.commands.contains(first_word);
+        let is_shell_builtin = is_builtin(first_word);
+
+        if has_pipe || is_native || is_shell_builtin {
+            CommandClassification::Kernel
+        } else {
+            CommandClassification::Pty
+        }
     }
 
     /// Get a reference to the current shell state.

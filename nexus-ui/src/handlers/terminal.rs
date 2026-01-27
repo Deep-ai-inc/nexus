@@ -7,7 +7,6 @@ use iced::widget::scrollable;
 use iced::Task;
 
 use nexus_api::{BlockId, BlockState, ShellEvent};
-use nexus_kernel::is_builtin;
 use nexus_term::TerminalParser;
 
 use crate::blocks::{Block, Focus};
@@ -367,13 +366,14 @@ pub fn execute(state: &mut Nexus, command: String) -> Task<Message> {
 
 /// Execute a command through the kernel (pipeline or native).
 pub fn execute_kernel(state: &mut Nexus, block_id: BlockId, command: String) -> Task<Message> {
-    let terminal = &mut state.terminal;
-    let has_pipe = command.contains('|');
-    let first_word = command.split_whitespace().next().unwrap_or("");
-    let is_native = terminal.commands.contains(first_word);
-    let is_shell_builtin = is_builtin(first_word);
+    use nexus_kernel::CommandClassification;
 
-    if has_pipe || is_native || is_shell_builtin {
+    let terminal = &mut state.terminal;
+
+    // Use kernel's classification to decide execution path
+    let classification = terminal.kernel.blocking_lock().classify_command(&command);
+
+    if classification == CommandClassification::Kernel {
         // Create block for kernel command
         let mut block = Block::new(block_id, command.clone());
         block.parser = TerminalParser::new(terminal.terminal_size.0, terminal.terminal_size.1);

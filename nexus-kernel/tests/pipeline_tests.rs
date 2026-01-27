@@ -2,11 +2,28 @@
 //!
 //! These tests verify that commands can be properly chained together via pipes,
 //! passing structured Value data between them.
+//!
+//! ## Execution Flow Consistency
+//!
+//! The UI classifies commands using `Kernel::classify_command()`:
+//! - `CommandClassification::Kernel`: Pipelines, native commands, shell builtins
+//! - `CommandClassification::Pty`: Single external commands
+//!
+//! This test harness executes all commands through the kernel, which matches
+//! the UI's behavior for Kernel-classified commands. For Pty-classified
+//! commands (like `git status`), the behavior differs:
+//! - UI: Spawns a real PTY with interactive terminal
+//! - Tests: Execute through kernel's process spawning (no PTY)
+//!
+//! Most tests here focus on Kernel-classified commands where behavior is identical.
 
 use nexus_api::{ShellEvent, Value};
 use nexus_kernel::Kernel;
 
 /// Test harness that executes a pipeline and collects the output Value.
+///
+/// This harness executes commands through the kernel, which is the same
+/// path the UI uses for pipelines, native commands, and shell builtins.
 struct PipelineTest {
     kernel: Kernel,
     rx: tokio::sync::broadcast::Receiver<ShellEvent>,
@@ -19,8 +36,12 @@ impl PipelineTest {
     }
 
     /// Execute a command and return the final output Value.
+    ///
+    /// This uses the same kernel execution path that the UI uses for
+    /// Kernel-classified commands (pipelines, native commands, builtins).
     fn run(&mut self, cmd: &str) -> Option<Value> {
-        // Execute the command
+        // Execute the command through the kernel
+        // This matches the UI's behavior for Kernel-classified commands
         let result = self.kernel.execute(cmd);
         assert!(result.is_ok(), "Command failed: {:?}", result.err());
 
@@ -1800,4 +1821,73 @@ fn test_control_flow_with_pipeline() {
     let mut t = PipelineTest::new();
     t.run("for i in 1 2 3; do true; done");
     t.expect_string("echo $i", "3");
+}
+
+// ============================================================================
+// Command Classification Tests
+// ============================================================================
+// These tests verify that commands are classified the same way as the UI does.
+// This ensures tests exercise the same code paths as real user input.
+
+use nexus_kernel::CommandClassification;
+
+#[test]
+fn test_classify_pipeline_as_kernel() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // Pipelines should be classified as Kernel
+    assert_eq!(kernel.classify_command("ls | grep foo"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("cat file.txt | head -10 | wc -l"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("echo hello | tr a-z A-Z"), CommandClassification::Kernel);
+}
+
+#[test]
+fn test_classify_native_commands_as_kernel() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // Native commands should be classified as Kernel
+    assert_eq!(kernel.classify_command("ls"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("cat file.txt"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("echo hello"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("grep pattern file"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("head -10 file"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("tail -5 file"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("wc -l file"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("sort file"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("uniq file"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("seq 1 10"), CommandClassification::Kernel);
+}
+
+#[test]
+fn test_classify_builtins_as_kernel() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // Shell builtins should be classified as Kernel
+    assert_eq!(kernel.classify_command("cd /tmp"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("export FOO=bar"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("alias ll='ls -la'"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("source ~/.bashrc"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("exit 0"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("true"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("false"), CommandClassification::Kernel);
+}
+
+#[test]
+fn test_classify_external_commands_as_pty() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // External commands (not native, not builtin, no pipe) should be classified as Pty
+    // Note: git is a native command in Nexus, so it's classified as Kernel
+    assert_eq!(kernel.classify_command("vim file.txt"), CommandClassification::Pty);
+    assert_eq!(kernel.classify_command("python script.py"), CommandClassification::Pty);
+    assert_eq!(kernel.classify_command("cargo build"), CommandClassification::Pty);
+    assert_eq!(kernel.classify_command("npm install"), CommandClassification::Pty);
+    assert_eq!(kernel.classify_command("htop"), CommandClassification::Pty);
+    assert_eq!(kernel.classify_command("ssh user@host"), CommandClassification::Pty);
+}
+
+#[test]
+fn test_classify_external_with_pipe_as_kernel() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // External commands with pipes should still go through Kernel
+    // (the kernel will handle the pipeline)
+    assert_eq!(kernel.classify_command("cargo test | grep FAILED"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("python script.py | head -10"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("npm run build | tail -20"), CommandClassification::Kernel);
 }
