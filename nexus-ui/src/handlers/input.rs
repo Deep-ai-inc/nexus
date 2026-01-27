@@ -87,6 +87,12 @@ pub fn update(
 
         // Cross-domain: submit command
         InputMessage::Submit => submit(input),
+
+        // Set text from external source (e.g., clickable examples)
+        InputMessage::SetText(text) => {
+            input.set_text(&text);
+            InputResult::none()
+        }
     }
 }
 

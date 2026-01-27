@@ -75,6 +75,8 @@ pub enum InputMessage {
     PasteImage(Vec<u8>, u32, u32),
     /// Remove an attachment by index.
     RemoveAttachment(usize),
+    /// Set the input text (for clickable examples).
+    SetText(String),
 }
 
 // =============================================================================

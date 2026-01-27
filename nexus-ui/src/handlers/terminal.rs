@@ -253,7 +253,6 @@ pub fn handle_kernel_event(state: &mut Nexus, shell_event: ShellEvent) -> Task<M
                 scrollable::RelativeOffset::END,
             );
         }
-        ShellEvent::OpenClaudePanel { .. } => {}
         ShellEvent::JobStateChanged { job_id, state: job_state } => {
             match job_state {
                 nexus_api::JobState::Running => {

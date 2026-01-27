@@ -5,7 +5,6 @@
 
 mod basic;
 mod cat;
-mod claude;
 mod cmp;
 mod cut;
 mod date;

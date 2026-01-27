@@ -9,7 +9,6 @@ use super::basic::{
     WhoamiCommand, YesCommand,
 };
 use super::cat::CatCommand;
-use super::claude::ClaudeCommand;
 use super::cmp::CmpCommand;
 use super::cut::CutCommand;
 use super::date::DateCommand;
@@ -218,9 +217,6 @@ impl CommandRegistry {
         // Command lookup
         registry.register(WhichCommand);
         registry.register(TypeCommand);
-
-        // Claude integration
-        registry.register(ClaudeCommand);
 
         // Persistent memory - access previous outputs
         registry.register(PrevCommand);    // _ - last output
