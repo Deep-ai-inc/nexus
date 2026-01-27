@@ -6,6 +6,7 @@ use iced::{Element, Length};
 use nexus_kernel::CompletionKind;
 
 use crate::blocks::InputMode;
+use crate::constants::INPUT_FIELD;
 use crate::msg::{InputMessage, Message, TerminalMessage};
 use crate::state::InputState;
 use crate::utils::{format_relative_time, shorten_path};
@@ -46,6 +47,7 @@ pub fn view_input<'a>(
         .font(iced::Font::MONOSPACE);
 
     let input_field = text_input("", &input.buffer)
+        .id(text_input::Id::new(INPUT_FIELD))
         .on_input(|s| Message::Input(InputMessage::Changed(s)))
         .on_submit(Message::Input(InputMessage::Submit))
         .padding(0)

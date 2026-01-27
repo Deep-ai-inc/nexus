@@ -13,3 +13,6 @@ pub const CHAR_WIDTH_RATIO: f32 = 0.607; // ~8.5/14.0, conservative for anti-ali
 
 /// Scrollable ID for auto-scrolling the history.
 pub const HISTORY_SCROLLABLE: &str = "history";
+
+/// TextInput ID for programmatic focus control.
+pub const INPUT_FIELD: &str = "main_input";
