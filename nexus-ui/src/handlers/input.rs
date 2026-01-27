@@ -56,6 +56,11 @@ pub fn update(
     kernel: &Arc<Mutex<Kernel>>,
     msg: InputMessage,
 ) -> InputResult {
+    // Clear suppress_char on any non-Changed message (window has passed)
+    if !matches!(msg, InputMessage::Changed(_)) {
+        input.suppress_char = None;
+    }
+
     match msg {
         // Pure input operations
         InputMessage::Changed(val) => changed(input, val),
@@ -86,11 +91,15 @@ pub fn update(
 
 /// Handle input text change. Pure operation on InputState.
 fn changed(input: &mut InputState, value: String) -> InputResult {
-    // suppress_next is set by global shortcuts (Cmd+K, etc) to prevent
-    // the shortcut character from being typed into the input
-    if input.suppress_next {
-        input.suppress_next = false;
-        return InputResult::none();
+    // suppress_char catches shortcut characters that arrive AFTER the KeyPressed handler
+    // (the stripping in window.rs catches ones that arrive BEFORE)
+    // Only suppress if the value is exactly buffer + the expected char
+    if let Some(ch) = input.suppress_char.take() {
+        let expected = format!("{}{}", input.buffer, ch);
+        if value == expected {
+            return InputResult::none();
+        }
+        // Didn't match - continue with normal processing
     }
 
     if input.completion_visible {

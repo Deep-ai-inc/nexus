@@ -61,9 +61,10 @@ pub struct InputState {
     pub search_results: Vec<HistoryEntry>,
     /// Selected history search index.
     pub search_index: usize,
-    /// Suppress next input change (after Cmd shortcut).
-    pub suppress_next: bool,
-    /// Input value before current event (to detect ghost characters).
+    /// Character to suppress if it arrives after the shortcut handler.
+    /// Only suppresses if the Changed event matches this exact character appended.
+    pub suppress_char: Option<char>,
+    /// Input value before current event (for shortcut character stripping).
     pub before_event: String,
 }
 
@@ -142,7 +143,7 @@ impl Default for InputState {
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
-            suppress_next: false,
+            suppress_char: None,
             before_event: String::new(),
         }
     }

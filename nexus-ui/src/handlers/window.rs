@@ -58,13 +58,18 @@ pub fn handle_event(
                                 crate::blocks::InputMode::Shell => crate::blocks::InputMode::Agent,
                                 crate::blocks::InputMode::Agent => crate::blocks::InputMode::Shell,
                             };
-                            state.input.suppress_next = true;
+                            // Strip period if TextInput already typed it
+                            let expected = format!("{}.", state.input.before_event);
+                            if state.input.buffer == expected {
+                                state.input.buffer.pop();
+                            }
+                            state.input.suppress_char = Some('.');
                             return Task::none();
                         }
                         _ => None,
                     };
                     if let Some(task) = task {
-                        state.input.suppress_next = true;
+                        state.input.suppress_char = ch.chars().next();
                         return task;
                     }
                 }
