@@ -177,6 +177,9 @@ pub fn handle_widget(state: &mut Nexus, widget_msg: AgentWidgetMessage) -> Task<
                 let _ = clipboard.set_text(&text);
             }
         }
+        AgentWidgetMessage::Interrupt => {
+            return interrupt(state);
+        }
     }
     Task::none()
 }

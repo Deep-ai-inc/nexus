@@ -27,6 +27,8 @@ pub enum AgentWidgetMessage {
     PermissionDenied(nexus_api::BlockId, String),
     /// Copy text to clipboard.
     CopyText(String),
+    /// Interrupt/stop the running agent.
+    Interrupt,
 }
 
 /// Colors for agent UI.
@@ -471,6 +473,14 @@ fn view_response(response: &str, font_size: f32) -> Element<'_, AgentWidgetMessa
 
 /// Render the status footer.
 fn view_status<'a>(block: &'a AgentBlock, font_size: f32) -> Element<'a, AgentWidgetMessage> {
+    let is_running = matches!(
+        block.state,
+        AgentBlockState::Pending
+            | AgentBlockState::Streaming
+            | AgentBlockState::Thinking
+            | AgentBlockState::Executing
+    );
+
     let (status_text, status_color) = match &block.state {
         AgentBlockState::Pending => ("Waiting...", colors::MUTED),
         AgentBlockState::Streaming => ("Streaming...", colors::TOOL_RUNNING),
@@ -482,7 +492,38 @@ fn view_status<'a>(block: &'a AgentBlock, font_size: f32) -> Element<'a, AgentWi
         AgentBlockState::Interrupted => ("Interrupted", colors::MUTED),
     };
 
-    let mut status = Row::new().spacing(8);
+    let mut status = Row::new().spacing(8).align_y(iced::Alignment::Center);
+
+    // Stop button when running
+    if is_running {
+        let stop_btn = button(text("Stop").size(font_size * 0.75))
+            .on_press(AgentWidgetMessage::Interrupt)
+            .padding(Padding::from([2, 8]))
+            .style(|_theme, status| {
+                let base = button::Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(0.5, 0.2, 0.2))),
+                    text_color: Color::WHITE,
+                    border: iced::Border {
+                        color: Color::from_rgb(0.6, 0.3, 0.3),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                };
+                match status {
+                    button::Status::Hovered => button::Style {
+                        background: Some(iced::Background::Color(Color::from_rgb(0.6, 0.25, 0.25))),
+                        ..base
+                    },
+                    button::Status::Pressed => button::Style {
+                        background: Some(iced::Background::Color(Color::from_rgb(0.4, 0.15, 0.15))),
+                        ..base
+                    },
+                    _ => base,
+                }
+            });
+        status = status.push(stop_btn);
+    }
 
     status = status.push(text(status_text).size(font_size * 0.8).color(status_color));
 
@@ -492,23 +533,22 @@ fn view_status<'a>(block: &'a AgentBlock, font_size: f32) -> Element<'a, AgentWi
         } else {
             format!("{:.1}s", ms as f64 / 1000.0)
         };
-        status = status.push(
-            text(duration).size(font_size * 0.8).color(colors::MUTED)
-        );
+        status = status.push(text(duration).size(font_size * 0.8).color(colors::MUTED));
     }
 
     if !block.tools.is_empty() {
         let tool_count = block.tools.len();
-        let success_count = block.tools.iter().filter(|t| t.status == ToolStatus::Success).count();
+        let success_count = block
+            .tools
+            .iter()
+            .filter(|t| t.status == ToolStatus::Success)
+            .count();
         status = status.push(
             text(format!("Tools: {}/{}", success_count, tool_count))
                 .size(font_size * 0.8)
-                .color(colors::MUTED)
+                .color(colors::MUTED),
         );
     }
 
-    container(status)
-        .width(Length::Fill)
-        .padding(4)
-        .into()
+    container(status).width(Length::Fill).padding(4).into()
 }
