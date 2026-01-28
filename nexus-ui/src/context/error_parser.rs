@@ -174,9 +174,26 @@ impl ErrorParser {
 // Extraction Helpers
 // =============================================================================
 
-/// Extract the first line that looks like an error message.
+/// Extract the most relevant error line from output.
+/// Searches from the end since errors typically appear last.
+/// Prioritizes lines starting with "Error:" or "fatal:".
 fn extract_first_error_line(output: &str) -> String {
-    for line in output.lines() {
+    let lines: Vec<&str> = output.lines().collect();
+
+    // First pass: look for lines starting with common error prefixes (from end)
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("error:")
+            || lower.starts_with("fatal:")
+            || lower.starts_with("error[")
+        {
+            return trimmed.to_string();
+        }
+    }
+
+    // Second pass: look for lines containing error keywords (from end)
+    for line in lines.iter().rev() {
         let lower = line.to_lowercase();
         if lower.contains("error")
             || lower.contains("failed")
@@ -186,11 +203,13 @@ fn extract_first_error_line(output: &str) -> String {
             return line.trim().to_string();
         }
     }
-    // Fallback to first non-empty line
-    output
-        .lines()
+
+    // Fallback to last non-empty line
+    lines
+        .iter()
+        .rev()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
+        .unwrap_or(&"")
         .trim()
         .to_string()
 }

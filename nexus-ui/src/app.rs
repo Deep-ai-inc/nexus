@@ -17,7 +17,7 @@ use crate::agent_widgets::view_agent_block;
 use crate::blocks::{Focus, UnifiedBlockRef};
 use crate::constants::HISTORY_SCROLLABLE;
 use crate::handlers;
-use crate::msg::{Action, AgentMessage, Message, TerminalMessage, WindowMessage};
+use crate::msg::{Action, AgentMessage, InputMessage, Message, TerminalMessage, WindowMessage};
 use crate::systems::{agent_subscription, kernel_subscription, pty_subscription};
 use crate::ui::{view_block, view_input};
 use crate::widgets::job_indicator::job_status_bar;
@@ -50,6 +50,10 @@ pub fn run() -> iced::Result {
 fn update(state: &mut Nexus, message: Message) -> Task<Message> {
     match message {
         Message::Input(msg) => {
+            // Auto-dismiss error suggestion when user starts typing
+            if matches!(msg, InputMessage::EditorAction(_)) {
+                state.context.last_interaction = None;
+            }
             let result =
                 handlers::input::update(&mut state.input, &state.terminal.kernel, msg);
             let action_tasks = process_actions(state, result.actions);
@@ -251,8 +255,6 @@ fn view(state: &Nexus) -> Element<'_, Message> {
 
 /// Render the command palette overlay.
 fn view_command_palette(state: &Nexus, font_size: f32) -> Element<'_, Message> {
-    use crate::msg::InputMessage;
-
     let registry = handlers::window::action_registry();
     let matches = registry.search(&state.input.palette_query, state);
     let query = state.input.palette_query.clone();
@@ -396,8 +398,6 @@ fn view_command_palette(state: &Nexus, font_size: f32) -> Element<'_, Message> {
 
 /// Render the buffer search overlay.
 fn view_buffer_search(state: &Nexus, font_size: f32) -> Element<'_, Message> {
-    use crate::msg::InputMessage;
-
     let results = &state.input.buffer_search_results;
     let match_count = results.len();
 
@@ -541,8 +541,6 @@ fn perform_buffer_search(state: &mut Nexus) {
 
 /// Render the welcome screen shown when there are no commands yet.
 fn view_welcome<'a>(font_size: f32, cwd: &str) -> Element<'a, Message> {
-    use crate::msg::InputMessage;
-
     let title_color = iced::Color::from_rgb(0.6, 0.8, 0.6);
     let heading_color = iced::Color::from_rgb(0.8, 0.7, 0.5);
     let text_color = iced::Color::from_rgb(0.7, 0.7, 0.7);

@@ -145,12 +145,13 @@ impl NexusContext {
 // =============================================================================
 
 /// Scan for git repository.
+/// Optimized to use minimal git commands (2 instead of 4).
 fn scan_git_sync(cwd: &PathBuf) -> Option<GitContext> {
     use std::process::Command;
 
-    // Check if we're in a git repo
+    // Get root and branch in one command
     let output = Command::new("git")
-        .args(["rev-parse", "--git-dir"])
+        .args(["rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"])
         .current_dir(cwd)
         .output()
         .ok()?;
@@ -159,27 +160,12 @@ fn scan_git_sync(cwd: &PathBuf) -> Option<GitContext> {
         return None;
     }
 
-    // Get repo root
-    let root_output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let out_str = String::from_utf8_lossy(&output.stdout);
+    let mut lines = out_str.lines();
+    let root = PathBuf::from(lines.next()?.trim());
+    let branch = lines.next().unwrap_or("").trim().to_string();
 
-    let root = PathBuf::from(String::from_utf8_lossy(&root_output.stdout).trim());
-
-    // Get current branch
-    let branch_output = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-
-    let branch = String::from_utf8_lossy(&branch_output.stdout)
-        .trim()
-        .to_string();
-
-    // Get dirty files (quick check)
+    // Get dirty files with porcelain status
     let status_output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(cwd)
