@@ -16,3 +16,12 @@ pub const HISTORY_SCROLLABLE: &str = "history";
 
 /// TextInput ID for programmatic focus control.
 pub const INPUT_FIELD: &str = "main_input";
+
+/// TextInput ID for buffer search overlay.
+pub const BUFFER_SEARCH_INPUT: &str = "buffer_search";
+
+/// TextInput ID for command palette overlay.
+pub const PALETTE_INPUT: &str = "palette_input";
+
+/// Scrollable ID for command palette results.
+pub const PALETTE_SCROLLABLE: &str = "palette_scrollable";

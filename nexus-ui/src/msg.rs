@@ -77,6 +77,28 @@ pub enum InputMessage {
     RemoveAttachment(usize),
     /// Set the input text (for clickable examples).
     SetText(String),
+    /// Open the command palette.
+    PaletteOpen,
+    /// Close the command palette.
+    PaletteClose,
+    /// Command palette search query changed.
+    PaletteQueryChanged(String),
+    /// Navigate palette selection (delta: +1 down, -1 up).
+    PaletteNavigate(i32),
+    /// Execute the selected palette action.
+    PaletteExecute,
+    /// Select and execute a palette action by index (from mouse click).
+    PaletteSelect(String, usize),
+    /// Open buffer search overlay (Cmd+F).
+    BufferSearchOpen,
+    /// Close buffer search overlay.
+    BufferSearchClose,
+    /// Buffer search query changed.
+    BufferSearchChanged(String),
+    /// Navigate to a buffer search result (delta: +1 down, -1 up).
+    BufferSearchNavigate(i32),
+    /// Select the current buffer search result.
+    BufferSearchSelect,
 }
 
 // =============================================================================
@@ -194,6 +216,12 @@ pub enum Action {
     ClearAll,
     /// Set focus to input.
     FocusInput,
+    /// Execute a palette action by query and selection index.
+    ExecutePaletteAction { query: String, index: usize },
+    /// Perform buffer search (needs access to terminal blocks).
+    BufferSearch,
+    /// Update palette match count (needs access to registry).
+    UpdatePaletteMatches,
 }
 
 // =============================================================================

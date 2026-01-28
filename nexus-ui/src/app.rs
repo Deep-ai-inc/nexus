@@ -6,7 +6,9 @@
 
 use std::time::Instant;
 
-use iced::widget::{button, column, container, mouse_area, row, scrollable, text, Column, Space};
+use iced::widget::{
+    button, column, container, mouse_area, row, scrollable, stack, text, text_input, Column, Space,
+};
 use iced::{event, Element, Length, Subscription, Task, Theme};
 
 use nexus_api::BlockId;
@@ -87,6 +89,26 @@ fn process_actions(state: &mut Nexus, actions: Vec<Action>) -> Task<Message> {
             Action::FocusInput => {
                 state.terminal.focus = Focus::Input;
                 tasks.push(iced::widget::focus_next());
+            }
+            Action::ExecutePaletteAction { query, index } => {
+                // Look up the action in the registry and execute it
+                let registry = handlers::window::action_registry();
+                let matches = registry.search(&query, state);
+                if let Some(action) = matches.get(index) {
+                    if action.available(state) {
+                        tasks.push(action.run(state));
+                    }
+                }
+            }
+            Action::BufferSearch => {
+                // Perform buffer search across terminal blocks
+                perform_buffer_search(state);
+            }
+            Action::UpdatePaletteMatches => {
+                // Update palette match count for navigation bounds
+                let registry = handlers::window::action_registry();
+                let matches = registry.search(&state.input.palette_query, state);
+                state.input.palette_match_count = matches.len();
             }
         }
     }
@@ -202,8 +224,8 @@ fn view(state: &Nexus) -> Element<'_, Message> {
 
     let content = column![history, jobs_bar, input_line].spacing(0);
 
-    // Wrap in mouse_area to refocus input when clicking on empty areas
-    mouse_area(
+    // Main content with background
+    let main_content = mouse_area(
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -214,8 +236,306 @@ fn view(state: &Nexus) -> Element<'_, Message> {
                 ..Default::default()
             }),
     )
-    .on_press(Message::Window(WindowMessage::BackgroundClicked))
+    .on_press(Message::Window(WindowMessage::BackgroundClicked));
+
+    // Layer overlays on top when visible (only one at a time)
+    if state.input.palette_visible {
+        stack![main_content, view_command_palette(state, font_size),].into()
+    } else if state.input.buffer_search_visible {
+        stack![main_content, view_buffer_search(state, font_size),].into()
+    } else {
+        main_content.into()
+    }
+}
+
+/// Render the command palette overlay.
+fn view_command_palette(state: &Nexus, font_size: f32) -> Element<'_, Message> {
+    use crate::msg::InputMessage;
+
+    let registry = handlers::window::action_registry();
+    let matches = registry.search(&state.input.palette_query, state);
+    let query = state.input.palette_query.clone();
+
+    // Build result list with clickable items
+    let results: Vec<Element<Message>> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let is_selected = i == state.input.palette_index;
+            let bg_color = if is_selected {
+                iced::Color::from_rgb(0.2, 0.25, 0.35)
+            } else {
+                iced::Color::TRANSPARENT
+            };
+
+            let keybinding_text = action
+                .keybinding
+                .as_ref()
+                .map(|kb| kb.display())
+                .unwrap_or_default();
+
+            let query_clone = query.clone();
+            let item_content = container(
+                row![
+                    column![
+                        text(action.name).size(font_size),
+                        text(action.description)
+                            .size(font_size * 0.8)
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+                    ]
+                    .spacing(2),
+                    Space::with_width(Length::Fill),
+                    text(keybinding_text)
+                        .size(font_size * 0.85)
+                        .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                ]
+                .align_y(iced::Alignment::Center)
+                .padding([8, 12]),
+            )
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(bg_color)),
+                ..Default::default()
+            });
+
+            // Make item clickable - clicking executes the action directly
+            mouse_area(item_content)
+                .on_press(Message::Input(InputMessage::PaletteSelect(
+                    query_clone,
+                    i,
+                )))
+                .interaction(iced::mouse::Interaction::Pointer)
+                .into()
+        })
+        .collect();
+
+    let results_column = Column::with_children(results).spacing(0);
+
+    // Wrap results in a scrollable with max height
+    let results_scrollable = scrollable(results_column)
+        .id(scrollable::Id::new(crate::constants::PALETTE_SCROLLABLE))
+        .height(Length::Shrink)
+        .style(|_theme, _status| scrollable::Style {
+            container: container::Style::default(),
+            vertical_rail: scrollable::Rail {
+                background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
+                border: iced::Border::default(),
+                scroller: scrollable::Scroller {
+                    color: iced::Color::from_rgb(0.3, 0.3, 0.35),
+                    border: iced::Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                },
+            },
+            horizontal_rail: scrollable::Rail {
+                background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
+                border: iced::Border::default(),
+                scroller: scrollable::Scroller {
+                    color: iced::Color::from_rgb(0.3, 0.3, 0.35),
+                    border: iced::Border::default(),
+                },
+            },
+            gap: None,
+        });
+
+    // Search input
+    let search_input = text_input("Type to search actions...", &state.input.palette_query)
+        .id(text_input::Id::new(crate::constants::PALETTE_INPUT))
+        .on_input(|s| Message::Input(InputMessage::PaletteQueryChanged(s)))
+        .padding([10, 12])
+        .size(font_size * 1.1)
+        .width(Length::Fill);
+
+    // Palette container with max height for results
+    let palette = container(
+        column![
+            search_input,
+            container(results_scrollable).max_height(400.0),
+        ]
+        .spacing(0)
+        .width(Length::Fixed(500.0)),
+    )
+    .style(|_theme| container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb(
+            0.12, 0.12, 0.15,
+        ))),
+        border: iced::Border {
+            color: iced::Color::from_rgb(0.25, 0.25, 0.3),
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 20.0,
+        },
+        ..Default::default()
+    });
+
+    // Center the palette at top of screen with some margin
+    // Wrap in mouse_area to close when clicking outside
+    mouse_area(
+        container(
+            column![Space::with_height(80.0), palette,].align_x(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.0, 0.0, 0.0, 0.5,
+            ))),
+            ..Default::default()
+        }),
+    )
+    .on_press(Message::Input(InputMessage::PaletteClose))
     .into()
+}
+
+/// Render the buffer search overlay.
+fn view_buffer_search(state: &Nexus, font_size: f32) -> Element<'_, Message> {
+    use crate::msg::InputMessage;
+
+    let results = &state.input.buffer_search_results;
+    let match_count = results.len();
+
+    // Build result list
+    let results_elements: Vec<Element<Message>> = results
+        .iter()
+        .enumerate()
+        .take(15) // Limit to 15 results
+        .map(|(i, (_block_id, line_num, line_text))| {
+            let is_selected = i == state.input.buffer_search_index;
+            let bg_color = if is_selected {
+                iced::Color::from_rgb(0.2, 0.25, 0.35)
+            } else {
+                iced::Color::TRANSPARENT
+            };
+
+            container(
+                row![
+                    text(format!("L{}", line_num))
+                        .size(font_size * 0.8)
+                        .color(iced::Color::from_rgb(0.5, 0.5, 0.5))
+                        .width(Length::Fixed(50.0)),
+                    text(line_text.trim())
+                        .size(font_size * 0.9)
+                        .color(iced::Color::from_rgb(0.85, 0.85, 0.85)),
+                ]
+                .spacing(8)
+                .padding([6, 12]),
+            )
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(iced::Background::Color(bg_color)),
+                ..Default::default()
+            })
+            .into()
+        })
+        .collect();
+
+    let results_column = Column::with_children(results_elements).spacing(0);
+
+    // Search input with match count
+    let match_info = if state.input.buffer_search_query.is_empty() {
+        String::new()
+    } else if match_count == 0 {
+        "No matches".to_string()
+    } else {
+        format!(
+            "{} of {} matches",
+            state.input.buffer_search_index + 1,
+            match_count
+        )
+    };
+
+    let search_row = row![
+        text_input("Search in output...", &state.input.buffer_search_query)
+            .id(text_input::Id::new(crate::constants::BUFFER_SEARCH_INPUT))
+            .on_input(|s| Message::Input(InputMessage::BufferSearchChanged(s)))
+            .padding([10, 12])
+            .size(font_size)
+            .width(Length::Fill),
+        text(match_info)
+            .size(font_size * 0.85)
+            .color(iced::Color::from_rgb(0.5, 0.5, 0.5))
+            .width(Length::Shrink),
+        Space::with_width(12.0),
+    ]
+    .align_y(iced::Alignment::Center);
+
+    // Search container
+    let search_panel = container(
+        column![search_row, results_column]
+            .spacing(0)
+            .width(Length::Fixed(600.0)),
+    )
+    .style(|_theme| container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb(
+            0.12, 0.12, 0.15,
+        ))),
+        border: iced::Border {
+            color: iced::Color::from_rgb(0.25, 0.25, 0.3),
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+            offset: iced::Vector::new(0.0, 4.0),
+            blur_radius: 20.0,
+        },
+        ..Default::default()
+    });
+
+    // Center at top of screen
+    // Wrap in mouse_area to close when clicking outside
+    mouse_area(
+        container(
+            column![Space::with_height(80.0), search_panel,].align_x(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.0, 0.0, 0.0, 0.5,
+            ))),
+            ..Default::default()
+        }),
+    )
+    .on_press(Message::Input(InputMessage::BufferSearchClose))
+    .into()
+}
+
+/// Perform buffer search across terminal blocks.
+fn perform_buffer_search(state: &mut Nexus) {
+    let query = state.input.buffer_search_query.to_lowercase();
+    state.input.buffer_search_results.clear();
+
+    if query.is_empty() {
+        return;
+    }
+
+    // Search through all terminal blocks
+    for block in &state.terminal.blocks {
+        let output = block.parser.grid_with_scrollback().to_string();
+
+        for (line_num, line) in output.lines().enumerate() {
+            if line.to_lowercase().contains(&query) {
+                state.input.buffer_search_results.push((
+                    block.id,
+                    line_num + 1, // 1-indexed
+                    line.to_string(),
+                ));
+
+                // Limit total results
+                if state.input.buffer_search_results.len() >= 100 {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Render the welcome screen shown when there are no commands yet.

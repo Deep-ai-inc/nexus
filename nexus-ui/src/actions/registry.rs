@@ -174,6 +174,17 @@ impl ActionRegistry {
         });
 
         self.register(Action {
+            id: ActionId("command_palette"),
+            name: "Command Palette",
+            description: "Open the command palette to search and run actions",
+            keywords: &["search", "find", "actions", "commands"],
+            keybinding: Some(KeyCombo::new(Modifiers::CMD, KeySpec::char('p'))),
+            context: ActionContext::Global,
+            is_enabled: |state| !state.input.palette_visible,
+            execute: |_| Task::done(Message::Input(InputMessage::PaletteOpen)),
+        });
+
+        self.register(Action {
             id: ActionId("history_search"),
             name: "Search History",
             description: "Search command history",
@@ -252,6 +263,46 @@ impl ActionRegistry {
             context: ActionContext::InputFocused,
             is_enabled: |state| state.terminal.permission_denied_command.is_some(),
             execute: action_retry_sudo,
+        });
+
+        // =====================================================================
+        // Long-Tail Utility Actions
+        // =====================================================================
+
+        self.register(Action {
+            id: ActionId("copy_last_output"),
+            name: "Copy Last Output",
+            description: "Copy the output of the last command to clipboard",
+            keywords: &["clipboard", "stdout", "result", "previous"],
+            keybinding: None, // Palette-only action
+            context: ActionContext::Global,
+            is_enabled: |state| {
+                // Enabled if there's at least one completed block
+                state.terminal.blocks.iter().any(|b| !b.is_running())
+            },
+            execute: action_copy_last_output,
+        });
+
+        self.register(Action {
+            id: ActionId("restart_session"),
+            name: "Restart Session",
+            description: "Clear all blocks and reset the session without closing the window",
+            keywords: &["reset", "fresh", "new", "clear", "wipe"],
+            keybinding: None, // Palette-only action
+            context: ActionContext::Global,
+            is_enabled: |_| true,
+            execute: action_restart_session,
+        });
+
+        self.register(Action {
+            id: ActionId("find_in_buffer"),
+            name: "Find in Buffer",
+            description: "Search terminal output for text",
+            keywords: &["search", "grep", "filter", "text", "find"],
+            keybinding: Some(KeyCombo::new(Modifiers::CMD, KeySpec::char('f'))),
+            context: ActionContext::Global,
+            is_enabled: |_| true,
+            execute: action_find_in_buffer,
         });
     }
 }
@@ -390,4 +441,54 @@ fn action_retry_sudo(state: &mut Nexus) -> Task<Message> {
             .chain(Task::done(Message::Input(InputMessage::Submit)));
     }
     Task::none()
+}
+
+fn action_copy_last_output(state: &mut Nexus) -> Task<Message> {
+    // Find the last completed block (reverse search)
+    if let Some(block) = state.terminal.blocks.iter().rev().find(|b| !b.is_running()) {
+        // Extract text from the terminal grid (includes scrollback)
+        let output = block.parser.grid_with_scrollback().to_string();
+        // Trim trailing whitespace/newlines
+        let output = output.trim_end();
+
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_text(output);
+        }
+    }
+    Task::none()
+}
+
+fn action_restart_session(state: &mut Nexus) -> Task<Message> {
+    // Cancel any running agent
+    state.agent.cancel_flag.store(true, Ordering::SeqCst);
+
+    // Clear terminal blocks
+    state.terminal.blocks.clear();
+    state.terminal.block_index.clear();
+
+    // Clear agent blocks
+    state.agent.blocks.clear();
+    state.agent.block_index.clear();
+    state.agent.active_block = None;
+    state.agent.session_id = None;
+
+    // Reset input state
+    state.input.clear();
+    state.input.shell_history_index = None;
+    state.input.agent_history_index = None;
+    state.input.saved_input.clear();
+    state.input.search_active = false;
+    state.input.completion_visible = false;
+
+    // Reset terminal error states
+    state.terminal.permission_denied_command = None;
+    state.terminal.command_not_found = None;
+    state.terminal.last_exit_code = None;
+
+    Task::none()
+}
+
+fn action_find_in_buffer(state: &mut Nexus) -> Task<Message> {
+    state.input.suppress_char = Some('f');
+    Task::done(Message::Input(InputMessage::BufferSearchOpen))
 }

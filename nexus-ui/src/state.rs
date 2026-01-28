@@ -70,6 +70,22 @@ pub struct InputState {
     pub suppress_char: Option<char>,
     /// Input value before current event (for shortcut character stripping).
     pub before_event: String,
+    /// Command palette visible.
+    pub palette_visible: bool,
+    /// Command palette search query.
+    pub palette_query: String,
+    /// Selected index in command palette.
+    pub palette_index: usize,
+    /// Number of matches in command palette (for navigation bounds).
+    pub palette_match_count: usize,
+    /// Buffer search overlay visible (Cmd+F).
+    pub buffer_search_visible: bool,
+    /// Buffer search query.
+    pub buffer_search_query: String,
+    /// Buffer search results: (block_id, line_number, line_text).
+    pub buffer_search_results: Vec<(BlockId, usize, String)>,
+    /// Selected buffer search result index.
+    pub buffer_search_index: usize,
 }
 
 impl InputState {
@@ -179,6 +195,14 @@ impl Default for InputState {
             search_index: 0,
             suppress_char: None,
             before_event: String::new(),
+            palette_visible: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            palette_match_count: 0,
+            buffer_search_visible: false,
+            buffer_search_query: String::new(),
+            buffer_search_results: Vec::new(),
+            buffer_search_index: 0,
         }
     }
 }

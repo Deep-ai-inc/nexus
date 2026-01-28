@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use iced::keyboard::{self, Key, Modifiers};
-use iced::widget::text_editor;
+use iced::widget::{text_editor, text_input};
 use iced::Task;
 use tokio::sync::Mutex;
 
@@ -45,6 +45,14 @@ impl InputResult {
         Self {
             task: Task::none(),
             actions: vec![action],
+        }
+    }
+
+    /// Multiple actions, no task.
+    pub fn actions(actions: Vec<Action>) -> Self {
+        Self {
+            task: Task::none(),
+            actions,
         }
     }
 }
@@ -93,6 +101,21 @@ pub fn update(
             input.set_text(&text);
             InputResult::none()
         }
+
+        // Command palette
+        InputMessage::PaletteOpen => palette_open(input),
+        InputMessage::PaletteClose => palette_close(input),
+        InputMessage::PaletteQueryChanged(q) => palette_query_changed(input, q),
+        InputMessage::PaletteNavigate(delta) => palette_navigate(input, delta),
+        InputMessage::PaletteExecute => palette_execute(input),
+        InputMessage::PaletteSelect(query, index) => palette_select(input, query, index),
+
+        // Buffer search
+        InputMessage::BufferSearchOpen => buffer_search_open(input),
+        InputMessage::BufferSearchClose => buffer_search_close(input),
+        InputMessage::BufferSearchChanged(q) => buffer_search_changed(input, q),
+        InputMessage::BufferSearchNavigate(delta) => buffer_search_navigate(input, delta),
+        InputMessage::BufferSearchSelect => buffer_search_select(input),
     }
 }
 
@@ -394,13 +417,51 @@ fn submit(input: &mut InputState) -> InputResult {
 
 /// Handle keys when the input field is focused.
 /// Called from the window handler, returns InputMessage to process.
-/// Handles overlay modes (history search, completion) where we need direct
+/// Handles overlay modes (history search, completion, palette) where we need direct
 /// state access rather than captured closure values.
 pub fn handle_focus_key(
     input: &mut InputState,
     key: Key,
     _modifiers: Modifiers,
 ) -> Option<InputMessage> {
+    // Command palette takes priority - it's a modal overlay
+    if input.palette_visible {
+        match &key {
+            Key::Named(keyboard::key::Named::Escape) => {
+                return Some(InputMessage::PaletteClose);
+            }
+            Key::Named(keyboard::key::Named::Enter) => {
+                return Some(InputMessage::PaletteExecute);
+            }
+            Key::Named(keyboard::key::Named::ArrowUp) => {
+                return Some(InputMessage::PaletteNavigate(-1));
+            }
+            Key::Named(keyboard::key::Named::ArrowDown) => {
+                return Some(InputMessage::PaletteNavigate(1));
+            }
+            _ => return None, // Let typing go through to palette input
+        }
+    }
+
+    // Buffer search overlay takes priority
+    if input.buffer_search_visible {
+        match &key {
+            Key::Named(keyboard::key::Named::Escape) => {
+                return Some(InputMessage::BufferSearchClose);
+            }
+            Key::Named(keyboard::key::Named::Enter) => {
+                return Some(InputMessage::BufferSearchSelect);
+            }
+            Key::Named(keyboard::key::Named::ArrowUp) => {
+                return Some(InputMessage::BufferSearchNavigate(-1));
+            }
+            Key::Named(keyboard::key::Named::ArrowDown) => {
+                return Some(InputMessage::BufferSearchNavigate(1));
+            }
+            _ => return None, // Let typing go through to search input
+        }
+    }
+
     // History search mode takes priority - this is a special overlay mode
     // where the text_editor is not the primary focus
     if input.search_active {
@@ -482,4 +543,138 @@ pub fn handle_focus_key(
     // - Up/Down for history navigation
     // - Shift+Enter for newline (handled by key_binding)
     None
+}
+
+// =============================================================================
+// Command Palette
+// =============================================================================
+
+/// Open the command palette and focus the search input.
+fn palette_open(input: &mut InputState) -> InputResult {
+    input.palette_visible = true;
+    input.palette_query.clear();
+    input.palette_index = 0;
+    InputResult {
+        task: text_input::focus(text_input::Id::new(crate::constants::PALETTE_INPUT)),
+        actions: vec![Action::UpdatePaletteMatches],
+    }
+}
+
+/// Close the command palette and refocus input.
+fn palette_close(input: &mut InputState) -> InputResult {
+    input.palette_visible = false;
+    input.palette_query.clear();
+    input.palette_index = 0;
+    InputResult::action(Action::FocusInput)
+}
+
+/// Handle palette search query change.
+fn palette_query_changed(input: &mut InputState, query: String) -> InputResult {
+    input.palette_query = query;
+    input.palette_index = 0; // Reset selection on query change
+    // Return action to update match count (needs registry access)
+    InputResult::action(Action::UpdatePaletteMatches)
+}
+
+/// Navigate palette selection.
+fn palette_navigate(input: &mut InputState, delta: i32) -> InputResult {
+    if input.palette_match_count == 0 {
+        return InputResult::none();
+    }
+    let max_index = input.palette_match_count.saturating_sub(1) as i32;
+    let new_index = (input.palette_index as i32 + delta).clamp(0, max_index);
+    input.palette_index = new_index as usize;
+
+    // Scroll to keep selected item visible
+    // Calculate relative offset (0.0 = top, 1.0 = bottom)
+    let offset = if input.palette_match_count <= 1 {
+        0.0
+    } else {
+        input.palette_index as f32 / (input.palette_match_count - 1) as f32
+    };
+
+    InputResult::task(iced::widget::scrollable::snap_to(
+        iced::widget::scrollable::Id::new(crate::constants::PALETTE_SCROLLABLE),
+        iced::widget::scrollable::RelativeOffset { x: 0.0, y: offset },
+    ))
+}
+
+/// Execute the selected palette action.
+/// Returns an action that triggers the actual execution via the registry.
+fn palette_execute(input: &mut InputState) -> InputResult {
+    // Close palette first
+    input.palette_visible = false;
+    let query = std::mem::take(&mut input.palette_query);
+    let index = input.palette_index;
+    input.palette_index = 0;
+
+    // Return actions: execute the palette action and refocus input
+    InputResult::actions(vec![
+        Action::ExecutePaletteAction { query, index },
+        Action::FocusInput,
+    ])
+}
+
+/// Select and execute a palette action by index (from mouse click).
+fn palette_select(input: &mut InputState, query: String, index: usize) -> InputResult {
+    input.palette_visible = false;
+    input.palette_query.clear();
+    input.palette_index = 0;
+
+    InputResult::actions(vec![
+        Action::ExecutePaletteAction { query, index },
+        Action::FocusInput,
+    ])
+}
+
+// =============================================================================
+// Buffer Search
+// =============================================================================
+
+/// Open the buffer search overlay and focus the search input.
+fn buffer_search_open(input: &mut InputState) -> InputResult {
+    input.buffer_search_visible = true;
+    input.buffer_search_query.clear();
+    input.buffer_search_results.clear();
+    input.buffer_search_index = 0;
+    InputResult::task(text_input::focus(text_input::Id::new(
+        crate::constants::BUFFER_SEARCH_INPUT,
+    )))
+}
+
+/// Close the buffer search overlay and refocus input.
+fn buffer_search_close(input: &mut InputState) -> InputResult {
+    input.buffer_search_visible = false;
+    input.buffer_search_query.clear();
+    input.buffer_search_results.clear();
+    input.buffer_search_index = 0;
+    InputResult::action(Action::FocusInput)
+}
+
+/// Handle buffer search query change.
+/// Note: The actual search happens in app.rs since it needs access to terminal blocks.
+fn buffer_search_changed(input: &mut InputState, query: String) -> InputResult {
+    input.buffer_search_query = query;
+    input.buffer_search_index = 0;
+    // Return an action to trigger the search in the coordinator
+    InputResult::action(Action::BufferSearch)
+}
+
+/// Navigate buffer search results.
+fn buffer_search_navigate(input: &mut InputState, delta: i32) -> InputResult {
+    if input.buffer_search_results.is_empty() {
+        return InputResult::none();
+    }
+    let len = input.buffer_search_results.len() as i32;
+    let new_index = (input.buffer_search_index as i32 + delta).rem_euclid(len);
+    input.buffer_search_index = new_index as usize;
+    InputResult::none()
+}
+
+/// Select the current buffer search result.
+/// This just closes the overlay (for now - could scroll to result later).
+fn buffer_search_select(input: &mut InputState) -> InputResult {
+    input.buffer_search_visible = false;
+    // Keep query/results in case user wants to search again
+    InputResult::action(Action::FocusInput)
 }
