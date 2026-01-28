@@ -22,9 +22,6 @@ pub use crate::blocks::{Block, PtyEvent, UnifiedBlock};
 pub use crate::constants::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
 pub use crate::msg::{GlobalShortcut, ZoomDirection};
 
-// Re-export perform_buffer_search for Action processing
-pub use orchestrator::perform_buffer_search;
-
 /// Run the Nexus application.
 pub fn run() -> iced::Result {
     iced::application("Nexus", update, view::view)

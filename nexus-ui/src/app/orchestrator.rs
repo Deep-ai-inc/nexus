@@ -158,7 +158,7 @@ fn handle_tick(state: &mut Nexus) -> Task<Message> {
 }
 
 /// Perform buffer search across terminal blocks.
-pub fn perform_buffer_search(state: &mut Nexus) {
+fn perform_buffer_search(state: &mut Nexus) {
     let query = state.input.buffer_search_query.to_lowercase();
     state.input.buffer_search_results.clear();
 

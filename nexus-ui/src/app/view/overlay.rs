@@ -3,6 +3,7 @@
 use iced::widget::{column, container, mouse_area, row, scrollable, text, text_input, Column, Space};
 use iced::{Element, Length};
 
+use crate::constants::{BUFFER_SEARCH_INPUT, PALETTE_INPUT, PALETTE_SCROLLABLE};
 use crate::handlers;
 use crate::msg::{InputMessage, Message};
 use crate::state::Nexus;
@@ -65,7 +66,7 @@ pub fn command_palette(state: &Nexus, font_size: f32) -> Element<'_, Message> {
     let results_column = Column::with_children(results).spacing(0);
 
     let results_scrollable = scrollable(results_column)
-        .id(scrollable::Id::new(crate::constants::PALETTE_SCROLLABLE))
+        .id(scrollable::Id::new(PALETTE_SCROLLABLE))
         .height(Length::Shrink)
         .style(|_theme, _status| scrollable::Style {
             container: container::Style::default(),
@@ -92,7 +93,7 @@ pub fn command_palette(state: &Nexus, font_size: f32) -> Element<'_, Message> {
         });
 
     let search_input = text_input("Type to search actions...", &state.input.palette_query)
-        .id(text_input::Id::new(crate::constants::PALETTE_INPUT))
+        .id(text_input::Id::new(PALETTE_INPUT))
         .on_input(|s| Message::Input(InputMessage::PaletteQueryChanged(s)))
         .padding([10, 12])
         .size(font_size * 1.1)
@@ -192,7 +193,7 @@ pub fn buffer_search(state: &Nexus, font_size: f32) -> Element<'_, Message> {
 
     let search_row = row![
         text_input("Search in output...", &state.input.buffer_search_query)
-            .id(text_input::Id::new(crate::constants::BUFFER_SEARCH_INPUT))
+            .id(text_input::Id::new(BUFFER_SEARCH_INPUT))
             .on_input(|s| Message::Input(InputMessage::BufferSearchChanged(s)))
             .padding([10, 12])
             .size(font_size)
