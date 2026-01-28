@@ -206,6 +206,7 @@ fn view(state: &Nexus) -> Element<'_, Message> {
         &state.terminal.cwd,
         state.terminal.last_exit_code,
         state.terminal.permission_denied_command.as_deref(),
+        state.context.current_suggestion(),
         state.terminal.focus.clone(),
     ))
     .padding([8, 12])

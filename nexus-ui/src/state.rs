@@ -20,6 +20,7 @@ use crate::agent_adapter::{AgentEvent, PermissionResponse};
 use crate::agent_block::AgentBlock;
 use crate::blocks::{Block, Focus, InputMode, PtyEvent};
 use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, LINE_HEIGHT_FACTOR};
+use crate::context::NexusContext;
 use crate::pty::PtyHandle;
 use crate::widgets::job_indicator::VisualJob;
 
@@ -453,6 +454,8 @@ pub struct Nexus {
     pub agent: AgentState,
     /// Window state (dimensions, font).
     pub window: WindowState,
+    /// Context system (git, project, error parsing).
+    pub context: NexusContext,
 }
 
 impl Nexus {
@@ -521,11 +524,16 @@ impl Default for Nexus {
         let mut input = InputState::default();
         input.shell_history = command_history;
 
+        // Initialize context with current working directory
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let context = NexusContext::new(cwd);
+
         Self {
             input,
             terminal: TerminalState::new(kernel, kernel_tx, kernel_rx),
             agent: AgentState::new(),
             window: WindowState::default(),
+            context,
         }
     }
 }

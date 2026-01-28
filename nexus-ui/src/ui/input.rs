@@ -8,6 +8,7 @@ use iced::{Element, Length};
 use nexus_kernel::CompletionKind;
 
 use crate::blocks::{Focus, InputMode};
+use crate::context::Suggestion;
 use crate::msg::{InputMessage, Message, TerminalMessage};
 use crate::state::InputState;
 use crate::utils::{format_relative_time, shorten_path};
@@ -19,6 +20,7 @@ pub fn view_input<'a>(
     cwd: &'a str,
     last_exit_code: Option<i32>,
     permission_denied_command: Option<&'a str>,
+    error_suggestion: Option<&'a Suggestion>,
     focus: Focus,
 ) -> Element<'a, Message> {
     // Check if input should receive keyboard input
@@ -321,6 +323,11 @@ pub fn view_input<'a>(
         return view_permission_denied_prompt(font_size, cmd, input_row);
     }
 
+    // Show error suggestion if applicable (from context system)
+    if let Some(suggestion) = error_suggestion {
+        return view_error_suggestion(font_size, suggestion, input_row);
+    }
+
     // Build popup element (either visible popup or zero-height placeholder)
     // Using stable tree structure prevents focus loss when popup appears/disappears
     let popup_element: Element<'_, Message> = if input.completion_visible && !input.completions.is_empty()
@@ -519,6 +526,79 @@ fn view_permission_denied_prompt<'a>(
                 radius: 6.0.into(),
                 width: 1.0,
                 color: iced::Color::from_rgb(0.6, 0.4, 0.2),
+            },
+            ..Default::default()
+        })
+        .padding(10)
+        .width(Length::Fill);
+
+    column![prompt, input_row].spacing(8).into()
+}
+
+/// Render the error suggestion prompt (from context system).
+fn view_error_suggestion<'a>(
+    font_size: f32,
+    suggestion: &'a Suggestion,
+    input_row: iced::widget::Row<'a, Message>,
+) -> Element<'a, Message> {
+    let bulb_icon = text("💡").size(font_size);
+    let label = text(&suggestion.label)
+        .size(font_size * 0.95)
+        .color(iced::Color::from_rgb(0.5, 0.8, 1.0))
+        .font(iced::Font::MONOSPACE);
+    let cmd_text = text(&suggestion.command)
+        .size(font_size * 0.85)
+        .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+        .font(iced::Font::MONOSPACE);
+
+    let fix_btn = button(text("Fix").size(font_size * 0.9))
+        .on_press(Message::Terminal(TerminalMessage::RunSuggestedCommand(
+            suggestion.command.clone(),
+        )))
+        .padding([6, 12])
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(
+                0.2, 0.5, 0.3,
+            ))),
+            text_color: iced::Color::WHITE,
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+    let dismiss_btn = button(text("Dismiss").size(font_size * 0.9))
+        .on_press(Message::Terminal(TerminalMessage::DismissCommandNotFound))
+        .padding([6, 12])
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(
+                0.25, 0.25, 0.28,
+            ))),
+            text_color: iced::Color::from_rgb(0.8, 0.8, 0.8),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+    let header = row![bulb_icon, label]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+    let buttons = row![fix_btn, dismiss_btn]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+    let prompt = container(column![header, cmd_text, buttons].spacing(6))
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(
+                0.1, 0.15, 0.18,
+            ))),
+            border: iced::Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: iced::Color::from_rgb(0.3, 0.5, 0.6),
             },
             ..Default::default()
         })

@@ -18,6 +18,9 @@
 // Shared constants (no dependencies)
 pub mod constants;
 
+// Context system (minimal dependencies)
+pub mod context;
+
 // Action registry (minimal dependencies)
 pub mod actions;
 

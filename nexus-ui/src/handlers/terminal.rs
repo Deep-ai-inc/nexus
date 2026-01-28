@@ -29,7 +29,11 @@ pub fn update(state: &mut Nexus, msg: TerminalMessage) -> Task<Message> {
         TerminalMessage::JobClicked(id) => foreground_job(state, id),
         TerminalMessage::RetryWithSudo => retry_sudo(state),
         TerminalMessage::DismissPermissionPrompt => dismiss_permission(state),
-        TerminalMessage::RunSuggestedCommand(cmd) => execute(state, cmd),
+        TerminalMessage::RunSuggestedCommand(cmd) => {
+            // Clear the context suggestion before running
+            state.context.last_interaction = None;
+            execute(state, cmd)
+        }
         TerminalMessage::DismissCommandNotFound => dismiss_not_found(state),
         TerminalMessage::KillBlock(id) => kill_block(state, id),
     }
@@ -224,6 +228,9 @@ pub fn handle_kernel_event(state: &mut Nexus, shell_event: ShellEvent) -> Task<M
         } => {
             let mut show_permission_prompt = false;
             let mut failed_command = None;
+            let mut command_for_context = String::new();
+            let mut output_for_context = String::new();
+
             if let Some(&idx) = terminal.block_index.get(&block_id) {
                 if let Some(block) = terminal.blocks.get_mut(idx) {
                     block.state = if exit_code == 0 {
@@ -237,6 +244,10 @@ pub fn handle_kernel_event(state: &mut Nexus, shell_event: ShellEvent) -> Task<M
                         show_permission_prompt = true;
                         failed_command = Some(block.command.clone());
                     }
+
+                    // Capture for context update
+                    command_for_context = block.command.clone();
+                    output_for_context = block.parser.grid_with_scrollback().to_string();
                 }
             }
             terminal.last_exit_code = Some(exit_code);
@@ -244,6 +255,15 @@ pub fn handle_kernel_event(state: &mut Nexus, shell_event: ShellEvent) -> Task<M
 
             if show_permission_prompt {
                 terminal.permission_denied_command = failed_command;
+            }
+
+            // Update context with command result (for error parsing)
+            if !command_for_context.is_empty() {
+                state.context.on_command_finished(
+                    command_for_context,
+                    output_for_context,
+                    exit_code,
+                );
             }
 
             // Text editor keeps iced focus; we just need to scroll
@@ -324,9 +344,11 @@ pub fn dismiss_permission(state: &mut Nexus) -> Task<Message> {
     Task::none()
 }
 
-/// Dismiss the command not found prompt.
+/// Dismiss the command not found / error suggestion prompt.
 pub fn dismiss_not_found(state: &mut Nexus) -> Task<Message> {
     state.terminal.command_not_found = None;
+    // Also clear context suggestion
+    state.context.last_interaction = None;
     Task::none()
 }
 
