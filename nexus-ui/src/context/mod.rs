@@ -8,10 +8,22 @@
 //! The Context System complements (not duplicates) Claude Code CLI's context.
 //! CLI handles: conversation history, system prompt, context compaction.
 //! Nexus handles: instant error parsing, completions, project detection.
+//!
+//! ## Architecture
+//!
+//! Error parsing uses a trait-based provider system for modularity:
+//! - `SystemProvider`: permissions, ports, command not found
+//! - `NodeProvider`: npm/module errors
+//! - `PythonProvider`: pip/module errors
+//! - `RustProvider`: cargo compilation errors
+//!
+//! Providers also generate context snippets for AI prompts.
 
-mod error_parser;
+mod providers;
 
-pub use error_parser::{ErrorKind, ErrorParser, ParsedError, Suggestion};
+pub use providers::{
+    ContextProvider, ErrorKind, ParsedError, ProviderRegistry, Suggestion,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -110,7 +122,8 @@ impl NexusContext {
     /// Update after a command finishes.
     pub fn on_command_finished(&mut self, command: String, output: String, exit_code: i32) {
         let parsed_error = if exit_code != 0 {
-            ErrorParser::analyze(&command, &output, self.project.as_ref())
+            let registry = ProviderRegistry::new();
+            registry.analyze(&command, &output, self.project.as_ref())
         } else {
             None
         };
@@ -121,6 +134,47 @@ impl NexusContext {
             exit_code,
             parsed_error,
         });
+    }
+
+    /// Build a context prompt for AI interactions.
+    /// This enriches the system prompt with project-specific context.
+    pub fn build_ai_prompt(&self) -> String {
+        let mut parts = Vec::new();
+
+        // CWD
+        parts.push(format!("CWD: {}", self.cwd.display()));
+
+        // Git context
+        if let Some(ref git) = self.git {
+            let dirty = if git.dirty_files.is_empty() {
+                "clean".to_string()
+            } else {
+                format!("{} dirty files", git.dirty_files.len())
+            };
+            parts.push(format!("Git: {} ({})", git.branch, dirty));
+        }
+
+        // Project context from providers
+        let registry = ProviderRegistry::new();
+        let provider_context = registry.build_context_prompt(self.project.as_ref());
+        if !provider_context.is_empty() {
+            parts.push(provider_context);
+        }
+
+        // Last command result
+        if let Some(ref interaction) = self.last_interaction {
+            parts.push(format!(
+                "Last command: `{}` (exit {})",
+                interaction.command, interaction.exit_code
+            ));
+        }
+
+        // NEXUS.md instructions
+        if let Some(ref instructions) = self.nexus_md {
+            parts.push(format!("Project instructions:\n{}", instructions));
+        }
+
+        parts.join("\n")
     }
 
     /// Update CWD and refresh context.
