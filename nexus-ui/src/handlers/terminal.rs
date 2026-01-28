@@ -245,9 +245,14 @@ pub fn handle_kernel_event(state: &mut Nexus, shell_event: ShellEvent) -> Task<M
                         failed_command = Some(block.command.clone());
                     }
 
-                    // Capture for context update
+                    // Capture for context update (truncate to avoid memory bloat on large outputs)
                     command_for_context = block.command.clone();
                     output_for_context = block.parser.grid_with_scrollback().to_string();
+                    // Errors are typically at the end, so keep last 10KB
+                    if output_for_context.len() > 10_000 {
+                        let start = output_for_context.len() - 10_000;
+                        output_for_context = output_for_context[start..].to_string();
+                    }
                 }
             }
             terminal.last_exit_code = Some(exit_code);

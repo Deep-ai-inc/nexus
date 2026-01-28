@@ -214,7 +214,8 @@ fn extract_command_name(output: &str) -> Option<String> {
 
 /// Suggest installation command for missing command.
 fn suggest_install(cmd: &str, project: Option<&ProjectContext>) -> Option<Suggestion> {
-    // Common tools and their installation commands
+    // Platform-specific installation suggestions
+    #[cfg(target_os = "macos")]
     let suggestions: &[(&str, &str, &str)] = &[
         ("node", "Install Node.js", "brew install node"),
         ("npm", "Install Node.js", "brew install node"),
@@ -230,6 +231,16 @@ fn suggest_install(cmd: &str, project: Option<&ProjectContext>) -> Option<Sugges
         ("make", "Install make", "xcode-select --install"),
         ("gcc", "Install GCC", "xcode-select --install"),
     ];
+
+    #[cfg(target_os = "linux")]
+    let suggestions: &[(&str, &str, &str)] = &[
+        // Cross-platform installers only - avoid distro-specific package managers
+        ("cargo", "Install Rust", "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"),
+        ("rustc", "Install Rust", "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"),
+    ];
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let suggestions: &[(&str, &str, &str)] = &[];
 
     for (name, label, install_cmd) in suggestions {
         if cmd == *name {
