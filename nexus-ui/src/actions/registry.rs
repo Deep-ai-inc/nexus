@@ -287,54 +287,32 @@ fn action_toggle_mode(state: &mut Nexus) -> Task<Message> {
 }
 
 fn action_zoom_in(state: &mut Nexus) -> Task<Message> {
-    use crate::constants::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
-
-    state.window.font_size = (state.window.font_size + 1.0).min(32.0);
+    let new_size = (state.window.font_size + 1.0).min(32.0);
     state.input.suppress_char = Some('=');
-
-    let (cols, rows) = state.terminal.terminal_size;
-    let new_char_width = state.window.font_size * CHAR_WIDTH_RATIO;
-    let new_line_height = state.window.font_size * LINE_HEIGHT_FACTOR;
-    let new_width = (cols as f32 * new_char_width) + 16.0;
-    let new_height = (rows as f32 * new_line_height) + 60.0;
-    state.window.dims = (new_width, new_height);
-
-    if let Some(window_id) = state.window.id {
-        return iced::window::resize(window_id, iced::Size::new(new_width, new_height));
-    }
-    Task::none()
+    apply_zoom(state, new_size)
 }
 
 fn action_zoom_out(state: &mut Nexus) -> Task<Message> {
-    use crate::constants::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
-
-    state.window.font_size = (state.window.font_size - 1.0).max(8.0);
+    let new_size = (state.window.font_size - 1.0).max(8.0);
     state.input.suppress_char = Some('-');
-
-    let (cols, rows) = state.terminal.terminal_size;
-    let new_char_width = state.window.font_size * CHAR_WIDTH_RATIO;
-    let new_line_height = state.window.font_size * LINE_HEIGHT_FACTOR;
-    let new_width = (cols as f32 * new_char_width) + 16.0;
-    let new_height = (rows as f32 * new_line_height) + 60.0;
-    state.window.dims = (new_width, new_height);
-
-    if let Some(window_id) = state.window.id {
-        return iced::window::resize(window_id, iced::Size::new(new_width, new_height));
-    }
-    Task::none()
+    apply_zoom(state, new_size)
 }
 
 fn action_zoom_reset(state: &mut Nexus) -> Task<Message> {
-    use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, LINE_HEIGHT_FACTOR};
-
-    state.window.font_size = DEFAULT_FONT_SIZE;
+    use crate::constants::DEFAULT_FONT_SIZE;
     state.input.suppress_char = Some('0');
+    apply_zoom(state, DEFAULT_FONT_SIZE)
+}
+
+/// Helper to apply zoom and resize window.
+fn apply_zoom(state: &mut Nexus, new_size: f32) -> Task<Message> {
+    use crate::constants::{CHAR_WIDTH_RATIO, LINE_HEIGHT_FACTOR};
+
+    state.window.font_size = new_size;
 
     let (cols, rows) = state.terminal.terminal_size;
-    let new_char_width = state.window.font_size * CHAR_WIDTH_RATIO;
-    let new_line_height = state.window.font_size * LINE_HEIGHT_FACTOR;
-    let new_width = (cols as f32 * new_char_width) + 16.0;
-    let new_height = (rows as f32 * new_line_height) + 60.0;
+    let new_width = (cols as f32 * new_size * CHAR_WIDTH_RATIO) + 16.0;
+    let new_height = (rows as f32 * new_size * LINE_HEIGHT_FACTOR) + 60.0;
     state.window.dims = (new_width, new_height);
 
     if let Some(window_id) = state.window.id {
