@@ -153,23 +153,14 @@ impl ContextProvider for SystemProvider {
 
     fn parse_error(
         &self,
-        command: &str,
+        _command: &str,
         output: &str,
         project: Option<&ProjectContext>,
     ) -> Option<ParsedError> {
         let output_lower = output.to_lowercase();
 
-        // Permission denied
-        if output_lower.contains("permission denied") || output_lower.contains("eacces") {
-            return Some(ParsedError {
-                kind: ErrorKind::PermissionDenied,
-                message: extract_error_line(output),
-                suggestion: Some(Suggestion {
-                    label: "Retry with sudo".into(),
-                    command: format!("sudo {}", command),
-                }),
-            });
-        }
+        // NOTE: Permission denied is handled by the legacy system in terminal.rs
+        // which provides a better UX with Ctrl+S shortcut hint. Skip it here.
 
         // Port in use
         if output_lower.contains("eaddrinuse") || output_lower.contains("address already in use") {
@@ -576,19 +567,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_permission_denied() {
-        let registry = ProviderRegistry::new();
-        let result = registry.analyze(
-            "rm /etc/passwd",
-            "rm: /etc/passwd: Permission denied",
-            None,
-        );
-        assert!(result.is_some());
-        let err = result.unwrap();
-        assert!(matches!(err.kind, ErrorKind::PermissionDenied));
-        assert!(err.suggestion.unwrap().command.starts_with("sudo"));
-    }
+    // NOTE: Permission denied is handled by legacy system in terminal.rs,
+    // not by the Context System providers.
 
     #[test]
     fn test_command_not_found() {

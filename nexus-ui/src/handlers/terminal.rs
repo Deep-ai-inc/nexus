@@ -336,6 +336,8 @@ pub fn sort_table(state: &mut Nexus, block_id: BlockId, column_index: usize) -> 
 
 /// Retry last failed command with sudo.
 pub fn retry_sudo(state: &mut Nexus) -> Task<Message> {
+    // Clear context suggestion too (avoid duplicate prompts)
+    state.context.last_interaction = None;
     if let Some(cmd) = state.terminal.permission_denied_command.take() {
         let sudo_cmd = format!("sudo {}", cmd);
         return execute(state, sudo_cmd);
@@ -346,6 +348,8 @@ pub fn retry_sudo(state: &mut Nexus) -> Task<Message> {
 /// Dismiss the permission denied prompt.
 pub fn dismiss_permission(state: &mut Nexus) -> Task<Message> {
     state.terminal.permission_denied_command = None;
+    // Clear context suggestion too
+    state.context.last_interaction = None;
     Task::none()
 }
 
