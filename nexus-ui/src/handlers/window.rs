@@ -1,24 +1,34 @@
 //! Window domain handler.
 //!
 //! Handles window resize, zoom, global shortcuts, and event routing.
+//!
+//! Keyboard shortcuts are dispatched through the ActionRegistry, which
+//! centralizes all user-invokable actions with metadata for the command
+//! palette, keybindings, and context menus.
 
-use std::sync::atomic::Ordering;
-
-use iced::keyboard::{self, Key};
+use iced::keyboard;
 use iced::{Event, Task};
 
+use crate::actions::{ActionId, ActionRegistry};
 use crate::blocks::Focus;
-use crate::constants::{CHAR_WIDTH_RATIO, DEFAULT_FONT_SIZE, LINE_HEIGHT_FACTOR};
-use crate::msg::{GlobalShortcut, InputMessage, Message, WindowMessage, ZoomDirection};
+use crate::msg::{GlobalShortcut, Message, WindowMessage, ZoomDirection};
 use crate::state::Nexus;
+
+// Lazy-initialized action registry (shared across all handler calls)
+use std::sync::OnceLock;
+static ACTION_REGISTRY: OnceLock<ActionRegistry> = OnceLock::new();
+
+fn get_registry() -> &'static ActionRegistry {
+    ACTION_REGISTRY.get_or_init(ActionRegistry::new)
+}
 
 /// Update the window domain state.
 pub fn update(state: &mut Nexus, msg: WindowMessage) -> Task<Message> {
     match msg {
         WindowMessage::Event(evt, id) => handle_event(state, evt, id),
         WindowMessage::Resized(w, h) => resize(state, w, h),
-        WindowMessage::Shortcut(sc) => global_shortcut(state, sc),
-        WindowMessage::Zoom(dir) => zoom(state, dir),
+        WindowMessage::Shortcut(sc) => dispatch_shortcut(state, sc),
+        WindowMessage::Zoom(dir) => dispatch_zoom(state, dir),
         WindowMessage::BackgroundClicked => {
             // Don't steal focus from a running PTY
             if let Focus::Block(block_id) = state.terminal.focus {
@@ -31,6 +41,42 @@ pub fn update(state: &mut Nexus, msg: WindowMessage) -> Task<Message> {
             iced::widget::focus_next()
         }
     }
+}
+
+/// Dispatch a shortcut message through the action registry.
+fn dispatch_shortcut(state: &mut Nexus, shortcut: GlobalShortcut) -> Task<Message> {
+    let action_id = match shortcut {
+        GlobalShortcut::ClearScreen => ActionId("clear_screen"),
+        GlobalShortcut::CloseWindow => ActionId("close_window"),
+        GlobalShortcut::Quit => ActionId("quit"),
+        GlobalShortcut::Copy => ActionId("copy"),
+        GlobalShortcut::Paste => ActionId("paste"),
+    };
+
+    let registry = get_registry();
+    if let Some(action) = registry.get(action_id) {
+        if action.available(state) {
+            return action.run(state);
+        }
+    }
+    Task::none()
+}
+
+/// Dispatch a zoom message through the action registry.
+fn dispatch_zoom(state: &mut Nexus, direction: ZoomDirection) -> Task<Message> {
+    let action_id = match direction {
+        ZoomDirection::In => ActionId("zoom_in"),
+        ZoomDirection::Out => ActionId("zoom_out"),
+        ZoomDirection::Reset => ActionId("zoom_reset"),
+    };
+
+    let registry = get_registry();
+    if let Some(action) = registry.get(action_id) {
+        if action.available(state) {
+            return action.run(state);
+        }
+    }
+    Task::none()
 }
 
 // =============================================================================
@@ -50,81 +96,17 @@ pub fn handle_event(
 
     match event {
         Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-            // Global shortcuts (Cmd+K, Cmd+Q, etc.)
-            if modifiers.command() {
-                if let Key::Character(c) = &key {
-                    let ch = c.to_lowercase();
-                    let task = match ch.as_str() {
-                        "k" => Some(global_shortcut(state, GlobalShortcut::ClearScreen)),
-                        "w" => Some(global_shortcut(state, GlobalShortcut::CloseWindow)),
-                        "q" => Some(global_shortcut(state, GlobalShortcut::Quit)),
-                        "c" => Some(global_shortcut(state, GlobalShortcut::Copy)),
-                        "v" => Some(global_shortcut(state, GlobalShortcut::Paste)),
-                        "=" | "+" => Some(zoom(state, ZoomDirection::In)),
-                        "-" => Some(zoom(state, ZoomDirection::Out)),
-                        "0" => Some(zoom(state, ZoomDirection::Reset)),
-                        "." => {
-                            // Toggle input mode
-                            state.input.mode = match state.input.mode {
-                                crate::blocks::InputMode::Shell => crate::blocks::InputMode::Agent,
-                                crate::blocks::InputMode::Agent => crate::blocks::InputMode::Shell,
-                            };
-                            // Suppress the period character if it arrives after this event
-                            state.input.suppress_char = Some('.');
-                            return Task::none();
-                        }
-                        _ => None,
-                    };
-                    if let Some(task) = task {
-                        state.input.suppress_char = ch.chars().next();
-                        return task;
-                    }
+            // Try to dispatch through the action registry first
+            let registry = get_registry();
+            if let Some(action) = registry.find_by_key(&key, &modifiers) {
+                if action.available(state) {
+                    return action.run(state);
                 }
             }
 
-            // Ctrl+C handling
-            if modifiers.control() && matches!(state.terminal.focus, Focus::Input) {
-                if let Key::Character(c) = &key {
-                    match c.to_lowercase().as_str() {
-                        "c" => {
-                            // If agent is running, interrupt it (like Escape)
-                            if state.agent.active_block.is_some() {
-                                return Task::done(Message::Agent(crate::msg::AgentMessage::Interrupt));
-                            }
-                            // Otherwise clear the input line
-                            state.input.clear();
-                            state.input.shell_history_index = None;
-                            state.input.agent_history_index = None;
-                            state.input.saved_input.clear();
-                            state.input.search_active = false;
-                            state.terminal.permission_denied_command = None;
-                            return Task::none();
-                        }
-                        "r" => {
-                            // Start history search - call through InputMessage
-                            return Task::done(Message::Input(InputMessage::HistorySearchStart));
-                        }
-                        "s" => {
-                            if state.terminal.permission_denied_command.is_some() {
-                                return super::terminal::retry_sudo(state);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Escape key - interrupt running agent
-            if matches!(key, Key::Named(keyboard::key::Named::Escape)) {
-                if state.agent.active_block.is_some() {
-                    return Task::done(Message::Agent(crate::msg::AgentMessage::Interrupt));
-                }
-            }
-
-            // Focus-dependent key handling
+            // Focus-dependent key handling (not in registry - these are context-specific)
             match state.terminal.focus {
                 Focus::Input => {
-                    // Use the new handle_focus_key which returns Option<InputMessage>
                     if let Some(input_msg) = super::input::handle_focus_key(
                         &mut state.input,
                         key,
@@ -162,101 +144,10 @@ pub fn resize(state: &mut Nexus, width: u32, height: u32) -> Task<Message> {
 }
 
 // =============================================================================
-// Global Shortcuts
+// Action Registry Access
 // =============================================================================
 
-/// Handle global shortcuts (Cmd+K, Cmd+Q, etc.).
-pub fn global_shortcut(state: &mut Nexus, shortcut: GlobalShortcut) -> Task<Message> {
-    // Note: Character suppression is now handled in the EditorAction handler.
-    // The suppress_char is already set in handle_event before this is called.
-
-    match shortcut {
-        GlobalShortcut::ClearScreen => {
-            // Cancel agent and clear everything
-            state.agent.cancel_flag.store(true, Ordering::SeqCst);
-            state.terminal.blocks.clear();
-            state.terminal.block_index.clear();
-            state.agent.blocks.clear();
-            state.agent.block_index.clear();
-            state.agent.active_block = None;
-            state.agent.session_id = None; // Clear session to start fresh
-        }
-        GlobalShortcut::CloseWindow | GlobalShortcut::Quit => {
-            return iced::exit();
-        }
-        GlobalShortcut::Copy => {
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                let _ = clipboard.set_text(&state.input.text());
-            }
-        }
-        GlobalShortcut::Paste => {
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                // Try clipboard image data (screenshots)
-                if let Ok(img) = clipboard.get_image() {
-                    let width = img.width as u32;
-                    let height = img.height as u32;
-
-                    let mut png_data = Vec::new();
-                    {
-                        use image::{ImageBuffer, RgbaImage};
-                        let img_buf: RgbaImage =
-                            ImageBuffer::from_raw(width, height, img.bytes.into_owned())
-                                .unwrap_or_else(|| ImageBuffer::new(1, 1));
-
-                        img_buf
-                            .write_to(
-                                &mut std::io::Cursor::new(&mut png_data),
-                                image::ImageFormat::Png,
-                            )
-                            .ok();
-                    }
-
-                    if !png_data.is_empty() {
-                        return Task::done(Message::Input(InputMessage::PasteImage(
-                            png_data, width, height,
-                        )));
-                    }
-                }
-
-                // Text paste: Let Iced's TextInput handle it natively.
-            }
-        }
-    }
-    Task::none()
-}
-
-// =============================================================================
-// Zoom
-// =============================================================================
-
-/// Handle zoom (font size) changes.
-pub fn zoom(state: &mut Nexus, direction: ZoomDirection) -> Task<Message> {
-    // Note: Character suppression is now handled in the EditorAction handler.
-    // The suppress_char is already set in handle_event before this is called.
-
-    let old_size = state.window.font_size;
-    state.window.font_size = match direction {
-        ZoomDirection::In => (state.window.font_size + 1.0).min(32.0),
-        ZoomDirection::Out => (state.window.font_size - 1.0).max(8.0),
-        ZoomDirection::Reset => DEFAULT_FONT_SIZE,
-    };
-
-    if (state.window.font_size - old_size).abs() > 0.001 {
-        let (cols, rows) = state.terminal.terminal_size;
-        let new_char_width = state.window.font_size * CHAR_WIDTH_RATIO;
-        let new_line_height = state.window.font_size * LINE_HEIGHT_FACTOR;
-
-        let h_padding = 16.0;  // Minimal horizontal padding
-        let v_padding = 60.0;  // Minimal vertical padding
-
-        let new_width = (cols as f32 * new_char_width) + h_padding;
-        let new_height = (rows as f32 * new_line_height) + v_padding;
-
-        state.window.dims = (new_width, new_height);
-
-        if let Some(window_id) = state.window.id {
-            return iced::window::resize(window_id, iced::Size::new(new_width, new_height));
-        }
-    }
-    Task::none()
+/// Get the global action registry (for command palette, etc.)
+pub fn action_registry() -> &'static ActionRegistry {
+    get_registry()
 }

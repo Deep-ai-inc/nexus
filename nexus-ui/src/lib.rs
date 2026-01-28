@@ -18,6 +18,9 @@
 // Shared constants (no dependencies)
 pub mod constants;
 
+// Action registry (minimal dependencies)
+pub mod actions;
+
 // Utility modules (minimal dependencies)
 pub mod utils;
 
