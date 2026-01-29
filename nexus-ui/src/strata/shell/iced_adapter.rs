@@ -10,6 +10,7 @@ use iced::{Element, Event, Length, Subscription, Task, Theme};
 
 use crate::strata::app::{AppConfig, Command, StrataApp};
 use crate::strata::content_address::Selection;
+use crate::strata::gpu::StrataPipeline;
 use crate::strata::event_context::{
     CaptureState, EventContext, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey,
     ScrollDelta,
@@ -386,14 +387,14 @@ impl shader::Primitive for StrataPrimitive {
         bounds: &iced::Rectangle,
         viewport: &iced::advanced::graphics::Viewport,
     ) {
-        // Get or create the pipeline
-        if !storage.has::<StrataPipeline>() {
-            let pipeline = StrataPipeline::new(device, format);
-            storage.store(pipeline);
+        // Get or create the pipeline wrapper
+        if !storage.has::<PipelineWrapper>() {
+            let wrapper = PipelineWrapper::new(device, format);
+            storage.store(wrapper);
         }
 
-        let pipeline = storage.get_mut::<StrataPipeline>().unwrap();
-        pipeline.prepare(
+        let wrapper = storage.get_mut::<PipelineWrapper>().unwrap();
+        wrapper.prepare(
             device,
             queue,
             &self.snapshot,
@@ -411,86 +412,91 @@ impl shader::Primitive for StrataPrimitive {
         target: &wgpu::TextureView,
         clip_bounds: &iced::Rectangle<u32>,
     ) {
-        let Some(pipeline) = storage.get::<StrataPipeline>() else {
+        let Some(wrapper) = storage.get::<PipelineWrapper>() else {
             return;
         };
 
-        pipeline.render(encoder, target, clip_bounds);
+        wrapper.render(encoder, target, clip_bounds);
     }
 }
 
 // ============================================================================
-// GPU Pipeline (Minimal Implementation)
+// Pipeline Wrapper (Bridges iced shader::Primitive to StrataPipeline)
 // ============================================================================
 
-/// GPU pipeline for rendering Strata content.
-///
-/// This is a minimal implementation that just clears to a background color.
-/// The full implementation will integrate text rendering and selection.
-struct StrataPipeline {
-    clear_color: wgpu::Color,
+/// Base font size in logical points.
+const BASE_FONT_SIZE: f32 = 14.0;
+
+/// Wrapper around StrataPipeline for use with iced's shader storage.
+struct PipelineWrapper {
+    pipeline: Option<StrataPipeline>,
+    format: wgpu::TextureFormat,
+    current_scale: f32,
 }
 
-impl StrataPipeline {
-    fn new(_device: &wgpu::Device, _format: wgpu::TextureFormat) -> Self {
+impl PipelineWrapper {
+    fn new(_device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        // Don't create pipeline yet - we need scale factor first
         Self {
-            clear_color: wgpu::Color {
-                r: 0.1,
-                g: 0.1,
-                b: 0.1,
-                a: 1.0,
-            },
+            pipeline: None,
+            format,
+            current_scale: 0.0,
         }
     }
 
     fn prepare(
         &mut self,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         _snapshot: &LayoutSnapshot,
         _selection: Option<&Selection>,
-        _bounds: &iced::Rectangle,
-        _viewport: &iced::advanced::graphics::Viewport,
+        bounds: &iced::Rectangle,
+        viewport: &iced::advanced::graphics::Viewport,
         background: crate::strata::primitives::Color,
     ) {
-        // Update clear color
-        self.clear_color = wgpu::Color {
-            r: background.r as f64,
-            g: background.g as f64,
-            b: background.b as f64,
-            a: background.a as f64,
-        };
+        let scale = viewport.scale_factor() as f32;
 
-        // TODO: Build render data from snapshot
-        // - Generate glyph instances
-        // - Generate selection quads
+        // Create or recreate pipeline if scale factor changed
+        if self.pipeline.is_none() || (self.current_scale - scale).abs() > 0.01 {
+            let font_size = BASE_FONT_SIZE * scale;
+            self.pipeline = Some(StrataPipeline::new(device, self.format, font_size));
+            self.current_scale = scale;
+        }
+
+        let pipeline = self.pipeline.as_mut().unwrap();
+
+        // Clear previous frame data
+        pipeline.clear();
+        pipeline.set_background(background);
+
+        // Render demo text (positions in logical coordinates, scaled to physical)
+        let white = crate::strata::primitives::Color::WHITE;
+        let green = crate::strata::primitives::Color::rgb(0.3, 0.9, 0.4);
+
+        pipeline.add_text("Strata GPU Text Rendering", 20.0 * scale, 20.0 * scale, white);
+        pipeline.add_text("Hello, World!", 20.0 * scale, 50.0 * scale, green);
+        pipeline.add_text("The quick brown fox jumps over the lazy dog.", 20.0 * scale, 80.0 * scale, white);
+
+        // TODO: Render actual content from snapshot
+        // for (source_id, layout) in snapshot.sources() { ... }
+
+        // Prepare for GPU (upload buffers, etc.)
+        pipeline.prepare(
+            device,
+            queue,
+            bounds.width * scale,
+            bounds.height * scale,
+        );
     }
 
     fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
-        _clip_bounds: &iced::Rectangle<u32>,
+        clip_bounds: &iced::Rectangle<u32>,
     ) {
-        // For now, just clear to background color
-        let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Strata Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(self.clear_color),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        // TODO: Draw content
-        // - Set pipeline
-        // - Set bind groups
-        // - Draw instances
+        if let Some(pipeline) = &self.pipeline {
+            pipeline.render(encoder, target, clip_bounds);
+        }
     }
 }

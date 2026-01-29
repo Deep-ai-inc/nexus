@@ -65,8 +65,8 @@ pub use app::{StrataApp, Command, Subscription, AppConfig};
 // mod text_engine;
 // pub use text_engine::{TextEngine, TextHandle, TextAttrs, TextLayoutData};
 
-// GPU pipeline (Phase 4)
-// pub mod gpu;
+// GPU pipeline
+pub mod gpu;
 
 // Widgets (Phase 4)
 // pub mod widgets;
