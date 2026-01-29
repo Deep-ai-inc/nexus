@@ -132,6 +132,9 @@ pub enum LayoutChild {
     /// A nested row.
     Row(Row),
 
+    /// A scroll column (virtualized vertical scroll container).
+    ScrollColumn(ScrollColumn),
+
     /// A spacer that expands to fill available space.
     Spacer { flex: f32 },
 
@@ -147,6 +150,7 @@ impl LayoutChild {
             LayoutChild::Terminal(t) => t.size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
+            LayoutChild::ScrollColumn(s) => s.measure(),
             LayoutChild::Spacer { .. } => return 0.0,
             LayoutChild::FixedSpacer { size } => return *size,
         };
@@ -160,6 +164,7 @@ impl LayoutChild {
             LayoutChild::Terminal(t) => t.size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
+            LayoutChild::ScrollColumn(s) => s.measure(),
             LayoutChild::Spacer { .. } => return 0.0,
             LayoutChild::FixedSpacer { .. } => return 0.0,
         };
@@ -178,6 +183,9 @@ impl LayoutChild {
             }
             LayoutChild::Row(r) => {
                 if is_column { r.height.flex() } else { r.width.flex() }
+            }
+            LayoutChild::ScrollColumn(s) => {
+                if is_column { s.height.flex() } else { s.width.flex() }
             }
             _ => 0.0,
         }
@@ -338,6 +346,8 @@ impl TerminalElement {
 
 /// A vertical layout container (children flow top to bottom).
 pub struct Column {
+    /// Widget ID for hit-testing and overlay anchoring.
+    id: Option<SourceId>,
     /// Child elements.
     children: Vec<LayoutChild>,
     /// Spacing between children.
@@ -374,6 +384,7 @@ impl Column {
     /// Create a new column.
     pub fn new() -> Self {
         Self {
+            id: None,
             children: Vec::new(),
             spacing: 0.0,
             padding: Padding::default(),
@@ -387,6 +398,12 @@ impl Column {
             border_width: 0.0,
             shadow: None,
         }
+    }
+
+    /// Set widget ID for hit-testing and overlay anchoring.
+    pub fn id(mut self, id: SourceId) -> Self {
+        self.id = Some(id);
+        self
     }
 
     /// Set spacing between children.
@@ -480,6 +497,12 @@ impl Column {
         self
     }
 
+    /// Add a scroll column.
+    pub fn scroll_column(mut self, scroll: ScrollColumn) -> Self {
+        self.children.push(LayoutChild::ScrollColumn(scroll));
+        self
+    }
+
     /// Add a flexible spacer.
     pub fn spacer(mut self, flex: f32) -> Self {
         self.children.push(LayoutChild::Spacer { flex });
@@ -565,26 +588,19 @@ impl Column {
             );
         }
 
-        // Clip when the container has visual chrome (background/border) or when
-        // the allocated bounds can't fit content (e.g. window resized very small).
-        // The parent's clip stack already handles ancestry, but structural containers
-        // must also clip when their bounds are smaller than their intrinsic size.
         let has_chrome = self.background.is_some() || self.border_color.is_some();
-        let intrinsic = self.measure();
-        let content_overflows = bounds.width < intrinsic.width || bounds.height < intrinsic.height;
-        let clips = has_chrome || content_overflows;
-        if clips {
-            snapshot.primitives_mut().push_clip(bounds);
-        }
 
         // =====================================================================
         // Measurement pass: compute child heights and flex factors
+        // Also tracks max cross-axis width for overflow detection.
         // =====================================================================
         let mut total_fixed_height = 0.0;
         let mut total_flex = 0.0;
+        let mut max_child_cross: f32 = 0.0;
         let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
 
         for child in &self.children {
+            max_child_cross = max_child_cross.max(child.measure_cross(true));
             match child {
                 LayoutChild::Text(t) => {
                     let h = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).height;
@@ -630,6 +646,23 @@ impl Column {
                         }
                     }
                 }
+                LayoutChild::ScrollColumn(s) => {
+                    match s.height {
+                        Length::Fixed(px) => {
+                            child_heights.push(px);
+                            total_fixed_height += px;
+                        }
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_heights.push(0.0);
+                            total_flex += s.height.flex();
+                        }
+                        Length::Shrink => {
+                            let h = s.measure().height;
+                            child_heights.push(h);
+                            total_fixed_height += h;
+                        }
+                    }
+                }
                 LayoutChild::Spacer { flex } => {
                     child_heights.push(0.0);
                     total_flex += flex;
@@ -644,6 +677,15 @@ impl Column {
         // Add spacing to fixed height
         if !self.children.is_empty() {
             total_fixed_height += self.spacing * (self.children.len() - 1) as f32;
+        }
+
+        // Overflow detection (replaces previous self.measure() call)
+        let content_w = max_child_cross + self.padding.horizontal();
+        let content_h = total_fixed_height + self.padding.vertical();
+        let content_overflows = bounds.width < content_w || bounds.height < content_h;
+        let clips = has_chrome || content_overflows;
+        if clips {
+            snapshot.primitives_mut().push_clip(bounds);
         }
 
         let available_flex = (bounds.height - self.padding.vertical() - total_fixed_height).max(0.0);
@@ -769,6 +811,22 @@ impl Column {
                     nested.layout(snapshot, nested_bounds);
                     y += height + self.spacing + alignment_gap;
                 }
+                LayoutChild::ScrollColumn(nested) => {
+                    // Resolve flex height for Fill children
+                    if nested.height.is_flex() && total_flex > 0.0 {
+                        height = (nested.height.flex() / total_flex) * available_flex;
+                    }
+                    // Resolve width
+                    let w = match nested.width {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) => content_width,
+                        Length::Shrink => nested.measure().width.min(content_width),
+                    };
+                    let x = cross_x(w);
+                    let nested_bounds = Rect::new(x, y, w, height);
+                    nested.layout(snapshot, nested_bounds);
+                    y += height + self.spacing + alignment_gap;
+                }
                 LayoutChild::Spacer { flex } => {
                     if total_flex > 0.0 {
                         let space = (flex / total_flex) * available_flex;
@@ -780,6 +838,11 @@ impl Column {
                     y += size + alignment_gap;
                 }
             }
+        }
+
+        // Register widget ID for hit-testing and overlay anchoring
+        if let Some(id) = self.id {
+            snapshot.register_widget(id, bounds);
         }
 
         if clips {
@@ -794,6 +857,8 @@ impl Column {
 
 /// A horizontal layout container (children flow left to right).
 pub struct Row {
+    /// Widget ID for hit-testing and overlay anchoring.
+    id: Option<SourceId>,
     /// Child elements.
     children: Vec<LayoutChild>,
     /// Spacing between children.
@@ -830,6 +895,7 @@ impl Row {
     /// Create a new row.
     pub fn new() -> Self {
         Self {
+            id: None,
             children: Vec::new(),
             spacing: 0.0,
             padding: Padding::default(),
@@ -843,6 +909,12 @@ impl Row {
             border_width: 0.0,
             shadow: None,
         }
+    }
+
+    /// Set widget ID for hit-testing and overlay anchoring.
+    pub fn id(mut self, id: SourceId) -> Self {
+        self.id = Some(id);
+        self
     }
 
     /// Set spacing between children.
@@ -936,6 +1008,12 @@ impl Row {
         self
     }
 
+    /// Add a scroll column.
+    pub fn scroll_column(mut self, scroll: ScrollColumn) -> Self {
+        self.children.push(LayoutChild::ScrollColumn(scroll));
+        self
+    }
+
     /// Add a flexible spacer.
     pub fn spacer(mut self, flex: f32) -> Self {
         self.children.push(LayoutChild::Spacer { flex });
@@ -1016,23 +1094,19 @@ impl Row {
             );
         }
 
-        // Clip when the container has visual chrome or when bounds overflow.
         let has_chrome = self.background.is_some() || self.border_color.is_some();
-        let intrinsic = self.measure();
-        let content_overflows = bounds.width < intrinsic.width || bounds.height < intrinsic.height;
-        let clips = has_chrome || content_overflows;
-        if clips {
-            snapshot.primitives_mut().push_clip(bounds);
-        }
 
         // =====================================================================
-        // Measurement pass: compute child widths and flex factors
+        // Measurement pass: compute child widths and flex factors.
+        // Also tracks max cross-axis height for overflow detection.
         // =====================================================================
         let mut total_fixed_width = 0.0;
         let mut total_flex = 0.0;
+        let mut max_child_cross: f32 = 0.0;
         let mut child_widths: Vec<f32> = Vec::with_capacity(self.children.len());
 
         for child in &self.children {
+            max_child_cross = max_child_cross.max(child.measure_cross(false));
             match child {
                 LayoutChild::Text(t) => {
                     let w = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).width;
@@ -1078,6 +1152,23 @@ impl Row {
                         }
                     }
                 }
+                LayoutChild::ScrollColumn(s) => {
+                    match s.width {
+                        Length::Fixed(px) => {
+                            child_widths.push(px);
+                            total_fixed_width += px;
+                        }
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_widths.push(0.0);
+                            total_flex += s.width.flex();
+                        }
+                        Length::Shrink => {
+                            let w = s.measure().width;
+                            child_widths.push(w);
+                            total_fixed_width += w;
+                        }
+                    }
+                }
                 LayoutChild::Spacer { flex } => {
                     child_widths.push(0.0);
                     total_flex += flex;
@@ -1092,6 +1183,15 @@ impl Row {
         // Add spacing to fixed width
         if !self.children.is_empty() {
             total_fixed_width += self.spacing * (self.children.len() - 1) as f32;
+        }
+
+        // Overflow detection (replaces previous self.measure() call)
+        let content_w = total_fixed_width + self.padding.horizontal();
+        let content_h = max_child_cross + self.padding.vertical();
+        let content_overflows = bounds.width < content_w || bounds.height < content_h;
+        let clips = has_chrome || content_overflows;
+        if clips {
+            snapshot.primitives_mut().push_clip(bounds);
         }
 
         let available_flex = (bounds.width - self.padding.horizontal() - total_fixed_width).max(0.0);
@@ -1219,6 +1319,22 @@ impl Row {
                     nested.layout(snapshot, nested_bounds);
                     x += width + self.spacing + alignment_gap;
                 }
+                LayoutChild::ScrollColumn(nested) => {
+                    // Resolve flex width for Fill children
+                    if nested.width.is_flex() && total_flex > 0.0 {
+                        width = (nested.width.flex() / total_flex) * available_flex;
+                    }
+                    // Resolve height
+                    let h = match nested.height {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) => content_height,
+                        Length::Shrink => nested.measure().height.min(content_height),
+                    };
+                    let y = cross_y(h);
+                    let nested_bounds = Rect::new(x, y, width, h);
+                    nested.layout(snapshot, nested_bounds);
+                    x += width + self.spacing + alignment_gap;
+                }
                 LayoutChild::Spacer { flex } => {
                     if total_flex > 0.0 {
                         let space = (flex / total_flex) * available_flex;
@@ -1232,8 +1348,343 @@ impl Row {
             }
         }
 
+        // Register widget ID for hit-testing and overlay anchoring
+        if let Some(id) = self.id {
+            snapshot.register_widget(id, bounds);
+        }
+
         if clips {
             snapshot.primitives_mut().pop_clip();
         }
+    }
+}
+
+// =========================================================================
+// ScrollColumn
+// =========================================================================
+
+/// A virtualized vertical scroll container.
+///
+/// Scroll state lives in app state. The container receives the current scroll
+/// offset as a parameter. Wheel events flow through `on_mouse` → message →
+/// `update()` modifies offset.
+///
+/// The ID is required (for event routing and hit-testing the scroll area).
+pub struct ScrollColumn {
+    /// Widget ID (required for hit-testing and scroll event routing).
+    id: SourceId,
+    /// Child elements.
+    children: Vec<LayoutChild>,
+    /// Current scroll offset (from app state).
+    scroll_offset: f32,
+    /// Spacing between children.
+    spacing: f32,
+    /// Padding around all children.
+    padding: Padding,
+    /// Background color (optional).
+    background: Option<Color>,
+    /// Corner radius for background.
+    corner_radius: f32,
+    /// Width sizing mode.
+    pub(crate) width: Length,
+    /// Height sizing mode.
+    pub(crate) height: Length,
+    /// Border color (optional).
+    border_color: Option<Color>,
+    /// Border width.
+    border_width: f32,
+}
+
+impl ScrollColumn {
+    /// Create a new scroll column with a required ID.
+    pub fn new(id: SourceId) -> Self {
+        Self {
+            id,
+            children: Vec::new(),
+            scroll_offset: 0.0,
+            spacing: 0.0,
+            padding: Padding::default(),
+            background: None,
+            corner_radius: 0.0,
+            width: Length::Shrink,
+            height: Length::Shrink,
+            border_color: None,
+            border_width: 0.0,
+        }
+    }
+
+    /// Set the scroll offset (from app state).
+    pub fn scroll_offset(mut self, offset: f32) -> Self {
+        self.scroll_offset = offset;
+        self
+    }
+
+    /// Set spacing between children.
+    pub fn spacing(mut self, spacing: f32) -> Self {
+        self.spacing = spacing;
+        self
+    }
+
+    /// Set padding (uniform on all sides).
+    pub fn padding(mut self, padding: f32) -> Self {
+        self.padding = Padding::all(padding);
+        self
+    }
+
+    /// Set custom padding.
+    pub fn padding_custom(mut self, padding: Padding) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Set background color.
+    pub fn background(mut self, color: Color) -> Self {
+        self.background = Some(color);
+        self
+    }
+
+    /// Set corner radius for background.
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        self.corner_radius = radius;
+        self
+    }
+
+    /// Set width sizing mode.
+    pub fn width(mut self, width: Length) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Set height sizing mode.
+    pub fn height(mut self, height: Length) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// Set border (color + width).
+    pub fn border(mut self, color: Color, width: f32) -> Self {
+        self.border_color = Some(color);
+        self.border_width = width;
+        self
+    }
+
+    /// Add a text element.
+    pub fn text(mut self, element: TextElement) -> Self {
+        self.children.push(LayoutChild::Text(element));
+        self
+    }
+
+    /// Add a terminal element.
+    pub fn terminal(mut self, element: TerminalElement) -> Self {
+        self.children.push(LayoutChild::Terminal(element));
+        self
+    }
+
+    /// Add a nested column.
+    pub fn column(mut self, column: Column) -> Self {
+        self.children.push(LayoutChild::Column(column));
+        self
+    }
+
+    /// Add a nested row.
+    pub fn row(mut self, row: Row) -> Self {
+        self.children.push(LayoutChild::Row(row));
+        self
+    }
+
+    /// Add a flexible spacer.
+    pub fn spacer(mut self, flex: f32) -> Self {
+        self.children.push(LayoutChild::Spacer { flex });
+        self
+    }
+
+    /// Add a fixed-size spacer.
+    pub fn fixed_spacer(mut self, size: f32) -> Self {
+        self.children.push(LayoutChild::FixedSpacer { size });
+        self
+    }
+
+    /// Compute intrinsic size (content size + padding).
+    pub fn measure(&self) -> Size {
+        let intrinsic_width = match self.width {
+            Length::Fixed(px) => px,
+            _ => {
+                let mut max_child_width: f32 = 0.0;
+                for child in &self.children {
+                    max_child_width = max_child_width.max(child.measure_cross(true));
+                }
+                max_child_width + self.padding.horizontal()
+            }
+        };
+
+        let intrinsic_height = match self.height {
+            Length::Fixed(px) => px,
+            _ => {
+                let mut total_height: f32 = 0.0;
+                for child in &self.children {
+                    if child.flex_factor(true) > 0.0 {
+                        continue;
+                    }
+                    total_height += child.measure_main(true);
+                }
+                if self.children.len() > 1 {
+                    total_height += self.spacing * (self.children.len() - 1) as f32;
+                }
+                total_height + self.padding.vertical()
+            }
+        };
+
+        Size::new(intrinsic_width, intrinsic_height)
+    }
+
+    /// Compute layout and flush to snapshot.
+    ///
+    /// Implements virtualization: only children intersecting the viewport
+    /// are laid out. A scrollbar thumb is drawn when content overflows.
+    pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
+        let content_x = bounds.x + self.padding.left;
+        let content_width = bounds.width - self.padding.horizontal();
+        let viewport_h = bounds.height;
+
+        // Draw chrome outside clip
+        if let Some(bg) = self.background {
+            if self.corner_radius > 0.0 {
+                snapshot.primitives_mut().add_rounded_rect(bounds, self.corner_radius, bg);
+            } else {
+                snapshot.primitives_mut().add_solid_rect(bounds, bg);
+            }
+        }
+        if let Some(border_color) = self.border_color {
+            snapshot.primitives_mut().add_border(
+                bounds,
+                self.corner_radius,
+                self.border_width,
+                border_color,
+            );
+        }
+
+        // Push clip to viewport bounds
+        snapshot.primitives_mut().push_clip(bounds);
+
+        // Register widget ID for hit-testing (scroll events route here)
+        snapshot.register_widget(self.id, bounds);
+
+        // Measure all children to compute total content height
+        let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
+        let mut total_content_height = self.padding.vertical();
+        for child in &self.children {
+            let h = child.measure_main(true);
+            child_heights.push(h);
+            total_content_height += h;
+        }
+        if self.children.len() > 1 {
+            total_content_height += self.spacing * (self.children.len() - 1) as f32;
+        }
+
+        // Clamp scroll offset and record max for app-side clamping
+        let max_scroll = (total_content_height - viewport_h).max(0.0);
+        snapshot.set_scroll_limit(self.id, max_scroll);
+        let offset = self.scroll_offset.clamp(0.0, max_scroll);
+
+        // Position pass with virtualization
+        let mut virtual_y = self.padding.top; // position in content space
+        let viewport_top = offset;
+        let viewport_bottom = offset + viewport_h;
+
+        for (i, child) in self.children.into_iter().enumerate() {
+            let h = child_heights[i];
+            let child_top = virtual_y;
+            let child_bottom = virtual_y + h;
+
+            // Check if child intersects the viewport
+            if child_bottom > viewport_top && child_top < viewport_bottom {
+                // Compute screen-space Y
+                let screen_y = bounds.y + child_top - offset;
+
+                match child {
+                    LayoutChild::Text(t) => {
+                        use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                        if let Some(source_id) = t.source_id {
+                            let text_layout = TextLayout::simple(
+                                t.text.clone(),
+                                t.color.pack(),
+                                content_x, screen_y,
+                                CHAR_WIDTH, LINE_HEIGHT,
+                            );
+                            snapshot.register_source(source_id, SourceLayout::text(text_layout));
+                        }
+
+                        snapshot.primitives_mut().add_text_cached(
+                            t.text,
+                            crate::strata::primitives::Point::new(content_x, screen_y),
+                            t.color,
+                            t.cache_key,
+                        );
+                    }
+                    LayoutChild::Terminal(t) => {
+                        let size = t.size();
+
+                        use crate::strata::layout_snapshot::{GridLayout, GridRow, SourceLayout};
+                        let rows_content: Vec<GridRow> = t.row_content.into_iter()
+                            .map(|(text, color)| GridRow { text, color })
+                            .collect();
+                        let mut grid_layout = GridLayout::with_rows(
+                            Rect::new(content_x, screen_y, size.width, size.height),
+                            t.cell_width, t.cell_height,
+                            t.cols, t.rows,
+                            rows_content,
+                        );
+                        grid_layout.clip_rect = snapshot.current_clip();
+                        snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
+                    }
+                    LayoutChild::Column(nested) => {
+                        let w = match nested.width {
+                            Length::Fixed(px) => px,
+                            Length::Fill | Length::FillPortion(_) => content_width,
+                            Length::Shrink => nested.measure().width.min(content_width),
+                        };
+                        nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
+                    }
+                    LayoutChild::Row(nested) => {
+                        let w = match nested.width {
+                            Length::Fixed(px) => px,
+                            Length::Fill | Length::FillPortion(_) => content_width,
+                            Length::Shrink => nested.measure().width.min(content_width),
+                        };
+                        nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
+                    }
+                    LayoutChild::ScrollColumn(nested) => {
+                        let w = match nested.width {
+                            Length::Fixed(px) => px,
+                            Length::Fill | Length::FillPortion(_) => content_width,
+                            Length::Shrink => nested.measure().width.min(content_width),
+                        };
+                        nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
+                    }
+                    LayoutChild::Spacer { .. } | LayoutChild::FixedSpacer { .. } => {
+                        // Spacers have no visual representation
+                    }
+                }
+            }
+
+            virtual_y += h + self.spacing;
+        }
+
+        // Draw scrollbar thumb if content overflows
+        if total_content_height > viewport_h {
+            let thumb_h = ((viewport_h / total_content_height) * viewport_h).max(20.0);
+            let scroll_pct = if max_scroll > 0.0 { offset / max_scroll } else { 0.0 };
+            let scroll_available = viewport_h - thumb_h;
+            let thumb_y = bounds.y + scroll_pct * scroll_available;
+
+            snapshot.primitives_mut().add_rounded_rect(
+                Rect::new(bounds.x + bounds.width - 6.0, thumb_y, 4.0, thumb_h),
+                2.0,
+                Color::rgba(1.0, 1.0, 1.0, 0.2),
+            );
+        }
+
+        // Pop clip
+        snapshot.primitives_mut().pop_clip();
     }
 }

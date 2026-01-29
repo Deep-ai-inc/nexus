@@ -6,9 +6,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::strata::content_address::{ContentAddress, Selection, SourceId};
+use crate::strata::content_address::{Selection, SourceId};
 use crate::strata::event_context::{CaptureState, MouseEvent};
-use crate::strata::layout_snapshot::LayoutSnapshot;
+use crate::strata::layout_snapshot::{HitResult, LayoutSnapshot};
 
 /// Response from a mouse event handler.
 ///
@@ -241,7 +241,7 @@ pub trait StrataApp: Sized + 'static {
     fn on_mouse(
         _state: &Self::State,
         _event: MouseEvent,
-        _hit: Option<ContentAddress>,
+        _hit: Option<HitResult>,
         _capture: &CaptureState,
     ) -> MouseResponse<Self::Message> {
         MouseResponse::none()

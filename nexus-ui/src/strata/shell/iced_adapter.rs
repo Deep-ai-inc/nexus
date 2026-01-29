@@ -12,6 +12,7 @@ use iced::{Element, Event, Length, Subscription, Task, Theme};
 
 use crate::strata::app::{AppConfig, Command, StrataApp};
 use crate::strata::content_address::Selection;
+use crate::strata::layout_snapshot::HitResult;
 use crate::strata::gpu::StrataPipeline;
 use crate::strata::event_context::{
     CaptureState, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey, ScrollDelta,
@@ -165,8 +166,8 @@ fn update<A: StrataApp>(
                     ));
                     A::view(&state.app, &mut snapshot);
 
-                    // Hit-test at cursor position
-                    let hit = state
+                    // Hit-test at cursor position → HitResult
+                    let hit: Option<HitResult> = state
                         .cursor_position
                         .and_then(|pos| snapshot.hit_test(pos));
 

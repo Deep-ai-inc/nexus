@@ -191,7 +191,7 @@ impl StrataWidget<TerminalMessage> for TerminalWidget {
                 button: MouseButton::Left,
                 position,
             }) => {
-                if let Some(addr) = ctx.layout.hit_test(*position) {
+                if let Some(crate::strata::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {
                     if addr.source_id == self.source_id {
                         // Convert content_offset to (col, row)
                         let col = (addr.content_offset % self.cols as usize) as u16;

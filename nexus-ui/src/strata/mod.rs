@@ -62,7 +62,7 @@ pub mod gpu;
 // Re-export core types
 pub use primitives::{Color, Rect, Size, Constraints, Point};
 pub use content_address::{ContentAddress, SourceId, Selection, SourceOrdering};
-pub use layout_snapshot::{Decoration, LayoutSnapshot, SourceLayout, ItemLayout, TextLayout, GridLayout, GridRow};
+pub use layout_snapshot::{Anchor, Decoration, HitResult, LayoutSnapshot, SourceLayout, ItemLayout, TextLayout, GridLayout, GridRow};
 pub use event_context::{
     CaptureState, Event, EventContext, Key, KeyEvent, Modifiers, MouseButton, MouseEvent,
     NamedKey, ScrollDelta,
@@ -74,6 +74,6 @@ pub use widgets::{TextWidget, TerminalWidget};
 
 // Layout system exports
 pub use layout::{
-    Column, Row, Padding, Alignment, CrossAxisAlignment, Length, LineStyle, PrimitiveBatch,
+    Column, Row, ScrollColumn, Padding, Alignment, CrossAxisAlignment, Length, LineStyle, PrimitiveBatch,
 };
 pub use layout::containers::{TextElement, TerminalElement};

@@ -15,8 +15,33 @@ use std::collections::HashMap;
 
 use crate::strata::content_address::{ContentAddress, Selection, SourceId, SourceOrdering};
 use crate::strata::layout::PrimitiveBatch;
-use crate::strata::primitives::{Color, Point, Rect};
+use crate::strata::primitives::{Color, Point, Rect, Size};
 use crate::strata::text_engine::ShapedText;
+
+/// Result of a hit test.
+///
+/// Distinguishes between character-level content hits (text, terminal cells)
+/// and opaque widget hits (buttons, cards, panels).
+#[derive(Debug, Clone)]
+pub enum HitResult {
+    /// Character-level hit on text or terminal content.
+    Content(ContentAddress),
+    /// Hit on a widget container identified by its SourceId.
+    Widget(SourceId),
+}
+
+/// Anchor position for overlays relative to a widget.
+#[derive(Debug, Clone, Copy)]
+pub enum Anchor {
+    /// Position below the widget, left-aligned.
+    Below,
+    /// Position above the widget, left-aligned.
+    Above,
+    /// Position to the right of the widget, top-aligned.
+    Right,
+    /// Position to the left of the widget, top-aligned.
+    Left,
+}
 
 /// A decoration primitive for non-text rendering.
 ///
@@ -364,6 +389,14 @@ pub struct LayoutSnapshot {
     /// Direct primitive batch for high-performance rendering.
     /// This is the "escape hatch" for canvas-like drawing.
     primitives: PrimitiveBatch,
+
+    /// Bounds of widgets registered with an ID.
+    /// Used for hit-testing non-content areas (buttons, panels) and overlay anchoring.
+    widget_bounds: HashMap<SourceId, Rect>,
+
+    /// Max scroll values for ScrollColumn containers.
+    /// Written during layout, readable by the app to clamp scroll offsets.
+    scroll_limits: HashMap<SourceId, f32>,
 }
 
 impl Default for LayoutSnapshot {
@@ -382,6 +415,8 @@ impl LayoutSnapshot {
             background_decorations: Vec::new(),
             foreground_decorations: Vec::new(),
             primitives: PrimitiveBatch::new(),
+            widget_bounds: HashMap::new(),
+            scroll_limits: HashMap::new(),
         }
     }
 
@@ -392,6 +427,8 @@ impl LayoutSnapshot {
         self.background_decorations.clear();
         self.foreground_decorations.clear();
         self.primitives.clear();
+        self.widget_bounds.clear();
+        self.scroll_limits.clear();
     }
 
     /// Get read-only access to the primitive batch.
@@ -415,6 +452,40 @@ impl LayoutSnapshot {
     /// render paths (e.g., GridLayout for terminal content).
     pub fn current_clip(&self) -> Option<Rect> {
         self.primitives.current_clip_public()
+    }
+
+    /// Register a widget with its bounds for hit-testing and overlay anchoring.
+    pub fn register_widget(&mut self, id: SourceId, bounds: Rect) {
+        self.widget_bounds.insert(id, bounds);
+    }
+
+    /// Get the bounds of a registered widget.
+    pub fn widget_bounds(&self, id: &SourceId) -> Option<Rect> {
+        self.widget_bounds.get(id).copied()
+    }
+
+    /// Compute the position of an overlay anchored to a widget.
+    ///
+    /// Returns `None` if the widget ID is not registered.
+    pub fn anchor_to(&self, id: &SourceId, anchor: Anchor, size: Size) -> Option<Rect> {
+        let wb = self.widget_bounds.get(id)?;
+        let (x, y) = match anchor {
+            Anchor::Below => (wb.x, wb.bottom()),
+            Anchor::Above => (wb.x, wb.y - size.height),
+            Anchor::Right => (wb.right(), wb.y),
+            Anchor::Left => (wb.x - size.width, wb.y),
+        };
+        Some(Rect::new(x, y, size.width, size.height))
+    }
+
+    /// Record the max scroll value for a ScrollColumn.
+    pub fn set_scroll_limit(&mut self, id: SourceId, max_scroll: f32) {
+        self.scroll_limits.insert(id, max_scroll);
+    }
+
+    /// Get the max scroll value for a ScrollColumn.
+    pub fn scroll_limit(&self, id: &SourceId) -> Option<f32> {
+        self.scroll_limits.get(id).copied()
     }
 
     /// Add a background decoration (rendered behind text).
@@ -498,17 +569,18 @@ impl LayoutSnapshot {
             .filter_map(|id| self.sources.get(id).map(|layout| (*id, layout)))
     }
 
-    /// Hit test: screen point → content address.
+    /// Hit test: screen point → hit result.
     ///
-    /// This is the core function that replaces iced's broken
-    /// `Paragraph::grapheme_position()`.
-    pub fn hit_test(&self, point: Point) -> Option<ContentAddress> {
+    /// Returns `HitResult::Content` for character-level hits (text, terminal),
+    /// or `HitResult::Widget` for opaque container hits (buttons, panels).
+    /// Content hits take priority over widget hits.
+    pub fn hit_test(&self, point: Point) -> Option<HitResult> {
         self.hit_test_xy(point.x, point.y)
     }
 
     /// Hit test with separate x, y coordinates.
-    pub fn hit_test_xy(&self, x: f32, y: f32) -> Option<ContentAddress> {
-        // Check each source in document order
+    pub fn hit_test_xy(&self, x: f32, y: f32) -> Option<HitResult> {
+        // 1. Priority: Check content sources (text/terminal) in document order
         for source_id in self.source_ordering.sources_in_order() {
             let Some(layout) = self.sources.get(source_id) else {
                 continue;
@@ -534,7 +606,15 @@ impl LayoutSnapshot {
                     }
                 };
 
-                return Some(ContentAddress::new(*source_id, item_index, content_offset));
+                return Some(HitResult::Content(ContentAddress::new(*source_id, item_index, content_offset)));
+            }
+        }
+
+        // 2. Fallback: Check widget bounds (buttons, panels, etc.)
+        // Reverse iteration so later-registered (top-most) widgets win.
+        for (id, rect) in &self.widget_bounds {
+            if rect.contains_xy(x, y) {
+                return Some(HitResult::Widget(*id));
             }
         }
 
@@ -854,6 +934,14 @@ impl LayoutSnapshot {
 mod tests {
     use super::*;
 
+    /// Extract ContentAddress from HitResult::Content, panicking on Widget.
+    fn unwrap_content(hit: Option<HitResult>) -> ContentAddress {
+        match hit.expect("expected a hit") {
+            HitResult::Content(addr) => addr,
+            HitResult::Widget(id) => panic!("expected Content hit, got Widget({:?})", id),
+        }
+    }
+
     fn make_text_layout() -> TextLayout {
         // "Hello\nWorld" - 5 chars on line 0, 5 chars on line 1
         TextLayout::new(
@@ -921,17 +1009,17 @@ mod tests {
         snapshot.register_source(source, SourceLayout::text(text_layout));
 
         // Hit first character
-        let addr = snapshot.hit_test_xy(5.0, 6.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(5.0, 6.0));
         assert_eq!(addr.source_id, source);
         assert_eq!(addr.item_index, 0);
         assert_eq!(addr.content_offset, 0);
 
         // Hit character in middle of first line
-        let addr = snapshot.hit_test_xy(25.0, 6.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(25.0, 6.0));
         assert_eq!(addr.content_offset, 2);
 
         // Hit second line
-        let addr = snapshot.hit_test_xy(15.0, 18.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(15.0, 18.0));
         assert_eq!(addr.content_offset, 6); // Second line starts at offset 5
     }
 
@@ -944,16 +1032,16 @@ mod tests {
         snapshot.register_source(source, SourceLayout::grid(grid_layout));
 
         // Hit first cell
-        let addr = snapshot.hit_test_xy(4.0, 6.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(4.0, 6.0));
         assert_eq!(addr.source_id, source);
         assert_eq!(addr.content_offset, 0);
 
         // Hit cell (5, 0)
-        let addr = snapshot.hit_test_xy(44.0, 6.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(44.0, 6.0));
         assert_eq!(addr.content_offset, 5);
 
         // Hit cell (3, 1)
-        let addr = snapshot.hit_test_xy(28.0, 18.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(28.0, 18.0));
         assert_eq!(addr.content_offset, 13); // row 1, col 3 = 10 + 3
     }
 
@@ -1004,11 +1092,11 @@ mod tests {
         snapshot.register_source(source2, SourceLayout::text(text2));
 
         // Hit source 1
-        let addr = snapshot.hit_test_xy(5.0, 6.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(5.0, 6.0));
         assert_eq!(addr.source_id, source1);
 
         // Hit source 2
-        let addr = snapshot.hit_test_xy(5.0, 26.0).unwrap();
+        let addr = unwrap_content(snapshot.hit_test_xy(5.0, 26.0));
         assert_eq!(addr.source_id, source2);
 
         // Source 1 is before source 2 in document order

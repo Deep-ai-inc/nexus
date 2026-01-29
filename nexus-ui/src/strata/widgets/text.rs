@@ -137,7 +137,7 @@ impl StrataWidget<TextMessage> for TextWidget {
                 position,
             }) => {
                 // Hit-test to find cursor position
-                if let Some(addr) = ctx.layout.hit_test(*position) {
+                if let Some(crate::strata::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {
                     if addr.source_id == self.source_id {
                         return EventResult::Message(TextMessage::Clicked {
                             cursor_position: addr.content_offset,

@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use crate::strata::content_address::{ContentAddress, SourceId};
+use crate::strata::layout_snapshot::HitResult;
 use crate::strata::demo_widgets::{
     AgentBlock, InputBar, JobPanel, JobPill, PermissionDialog, ShellBlock, StatusIndicator,
     StatusPanel, ToolInvocation,
@@ -20,8 +21,8 @@ use crate::strata::layout::containers::Length;
 use crate::strata::layout::primitives::LineStyle;
 use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::{
-    AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, Selection, StrataApp,
-    Subscription,
+    AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, ScrollColumn, Selection,
+    StrataApp, Subscription,
 };
 
 // =========================================================================
@@ -75,6 +76,7 @@ pub enum DemoMessage {
     SelectionStart(ContentAddress),
     SelectionExtend(ContentAddress),
     SelectionEnd,
+    Scroll(f32),
 }
 
 /// Demo application state.
@@ -84,6 +86,13 @@ pub struct DemoState {
     response_source: SourceId,
     terminal_source: SourceId,
     tool_output_source: SourceId,
+    // Widget IDs
+    scroll_id: SourceId,
+    status_panel_id: SourceId,
+    job_panel_id: SourceId,
+    // Scroll state
+    scroll_offset: f32,
+    scroll_max: Cell<f32>,
     // Selection state
     selection: Option<Selection>,
     is_selecting: bool,
@@ -107,6 +116,11 @@ impl StrataApp for DemoApp {
             response_source: SourceId::new(),
             terminal_source: SourceId::new(),
             tool_output_source: SourceId::new(),
+            scroll_id: SourceId::new(),
+            status_panel_id: SourceId::new(),
+            job_panel_id: SourceId::new(),
+            scroll_offset: 0.0,
+            scroll_max: Cell::new(f32::MAX),
             selection: None,
             is_selecting: false,
             last_frame: Cell::new(Instant::now()),
@@ -129,6 +143,10 @@ impl StrataApp for DemoApp {
             }
             DemoMessage::SelectionEnd => {
                 state.is_selecting = false;
+            }
+            DemoMessage::Scroll(delta) => {
+                let max = state.scroll_max.get();
+                state.scroll_offset = (state.scroll_offset - delta).clamp(0.0, max);
             }
         }
         Command::none()
@@ -165,12 +183,14 @@ impl StrataApp for DemoApp {
             .width(Length::Fixed(vw))
             .height(Length::Fixed(vh))
             // =============================================================
-            // LEFT COLUMN: Nexus App Mockup
+            // LEFT COLUMN: Scrollable Nexus App Mockup
             // =============================================================
-            .column(
-                Column::new()
+            .scroll_column(
+                ScrollColumn::new(state.scroll_id)
+                    .scroll_offset(state.scroll_offset)
                     .spacing(16.0)
                     .width(Length::Fill)
+                    .height(Length::Fill)
                     // Shell Block
                     .column(
                         ShellBlock {
@@ -267,7 +287,7 @@ impl StrataApp for DemoApp {
                 Column::new()
                     .spacing(16.0)
                     .width(Length::Fixed(right_col_width))
-                    // Status Indicators
+                    // Status Indicators (ID for overlay anchoring)
                     .column(
                         StatusPanel {
                             indicators: vec![
@@ -293,7 +313,8 @@ impl StrataApp for DemoApp {
                                 },
                             ],
                         }
-                        .build(),
+                        .build()
+                        .id(state.status_panel_id),
                     )
                     // Job Pills
                     .column(
@@ -319,21 +340,39 @@ impl StrataApp for DemoApp {
                                 },
                             ],
                         }
-                        .build(),
+                        .build()
+                        .id(state.job_panel_id),
                     ),
             )
             .layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
 
+        // Update scroll max from layout (for clamping in update())
+        if let Some(max) = snapshot.scroll_limit(&state.scroll_id) {
+            state.scroll_max.set(max);
+        }
+
         // =================================================================
-        // OVERLAYS (absolute positioned, not in flow layout)
+        // OVERLAYS (anchored to widgets via layout snapshot)
         // =================================================================
-        // Right column x: viewport - outer padding - right column width
         let rx = vw - outer_padding - right_col_width;
-        // Right column panels end at ~y=160 (StatusPanel ~62 + gap 16 + JobPanel ~66 + top padding 16)
-        view_context_menu(snapshot, rx, 166.0);
         let anim_t = now.duration_since(state.start_time).as_secs_f32();
-        view_drawing_styles(snapshot, rx, 344.0, right_col_width, anim_t);
-        view_table(snapshot, rx, 540.0, right_col_width);
+
+        // Context menu anchored below the job panel
+        use crate::strata::layout_snapshot::Anchor;
+        if let Some(job_bottom) = snapshot.anchor_to(
+            &state.job_panel_id,
+            Anchor::Below,
+            crate::strata::primitives::Size::new(right_col_width, 0.0),
+        ) {
+            let menu_y = job_bottom.y + 16.0;
+            view_context_menu(snapshot, job_bottom.x, menu_y);
+
+            let drawing_y = menu_y + 178.0;
+            view_drawing_styles(snapshot, job_bottom.x, drawing_y, right_col_width, anim_t);
+
+            let table_y = drawing_y + 196.0;
+            view_table(snapshot, job_bottom.x, table_y, right_col_width);
+        }
 
         // FPS counter (top-right corner)
         let fps_text = format!("{:.0} FPS", fps);
@@ -351,15 +390,17 @@ impl StrataApp for DemoApp {
     fn on_mouse(
         state: &Self::State,
         event: MouseEvent,
-        hit: Option<ContentAddress>,
+        hit: Option<HitResult>,
         capture: &CaptureState,
     ) -> MouseResponse<Self::Message> {
+        use crate::strata::event_context::ScrollDelta;
+
         match event {
             MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
                 ..
             } => {
-                if let Some(addr) = hit {
+                if let Some(HitResult::Content(addr)) = hit {
                     return MouseResponse::message_and_capture(
                         DemoMessage::SelectionStart(addr),
                         state.query_source,
@@ -368,7 +409,7 @@ impl StrataApp for DemoApp {
             }
             MouseEvent::CursorMoved { .. } => {
                 if capture.is_captured() {
-                    if let Some(addr) = hit {
+                    if let Some(HitResult::Content(addr)) = hit {
                         return MouseResponse::message(DemoMessage::SelectionExtend(addr));
                     }
                 }
@@ -379,6 +420,26 @@ impl StrataApp for DemoApp {
             } => {
                 if capture.is_captured() {
                     return MouseResponse::message_and_release(DemoMessage::SelectionEnd);
+                }
+            }
+            MouseEvent::WheelScrolled { delta } => {
+                // Route scroll events to the scroll container
+                if let Some(HitResult::Widget(id)) = &hit {
+                    if *id == state.scroll_id {
+                        let dy = match delta {
+                            ScrollDelta::Lines { y, .. } => y * 40.0,
+                            ScrollDelta::Pixels { y, .. } => y,
+                        };
+                        return MouseResponse::message(DemoMessage::Scroll(dy));
+                    }
+                }
+                // Also scroll if hovering content inside the scroll container
+                if let Some(HitResult::Content(_)) = &hit {
+                    let dy = match delta {
+                        ScrollDelta::Lines { y, .. } => y * 40.0,
+                        ScrollDelta::Pixels { y, .. } => y,
+                    };
+                    return MouseResponse::message(DemoMessage::Scroll(dy));
                 }
             }
             _ => {}
