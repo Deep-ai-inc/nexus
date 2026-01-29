@@ -243,12 +243,16 @@ fn subscription<A: StrataApp>(state: &ShellState<A>) -> Subscription<ShellMessag
         Some(ShellMessage::Event(event, window_id))
     });
 
+    // Animation tick synced to monitor refresh rate (vsync)
+    let tick = iced::window::frames()
+        .map(|_| ShellMessage::Tick);
+
     // Get app subscriptions
     let _app_sub = A::subscription(&state.app);
     // TODO: Convert app subscription to iced subscription
 
     // Combine subscriptions
-    Subscription::batch([events])
+    Subscription::batch([events, tick])
 }
 
 /// Convert a Strata Command to an iced Task.

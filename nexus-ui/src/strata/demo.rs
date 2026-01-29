@@ -7,6 +7,9 @@
 //!
 //! Run with: `cargo run -p nexus-ui --example strata_demo`
 
+use std::cell::Cell;
+use std::time::Instant;
+
 use crate::strata::content_address::{ContentAddress, SourceId};
 use crate::strata::demo_widgets::{
     AgentBlock, InputBar, JobPanel, JobPill, PermissionDialog, ShellBlock, StatusIndicator,
@@ -84,6 +87,11 @@ pub struct DemoState {
     // Selection state
     selection: Option<Selection>,
     is_selecting: bool,
+    // FPS tracking (Cell for interior mutability in view())
+    last_frame: Cell<Instant>,
+    fps_smooth: Cell<f32>,
+    // Animation start time
+    start_time: Instant,
 }
 
 /// Demo application.
@@ -101,6 +109,9 @@ impl StrataApp for DemoApp {
             tool_output_source: SourceId::new(),
             selection: None,
             is_selecting: false,
+            last_frame: Cell::new(Instant::now()),
+            fps_smooth: Cell::new(0.0),
+            start_time: Instant::now(),
         };
         (state, Command::none())
     }
@@ -124,6 +135,16 @@ impl StrataApp for DemoApp {
     }
 
     fn view(state: &Self::State, snapshot: &mut LayoutSnapshot) {
+        // FPS calculation (exponential moving average)
+        let now = Instant::now();
+        let dt = now.duration_since(state.last_frame.get()).as_secs_f32();
+        state.last_frame.set(now);
+        let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+        let prev = state.fps_smooth.get();
+        // Smoothing: 95% old + 5% new (avoids flicker)
+        let fps = if prev == 0.0 { instant_fps } else { prev * 0.95 + instant_fps * 0.05 };
+        state.fps_smooth.set(fps);
+
         // Dynamic viewport — reflows on window resize
         let vp = snapshot.viewport();
         let vw = vp.width;
@@ -310,8 +331,17 @@ impl StrataApp for DemoApp {
         let rx = vw - outer_padding - right_col_width;
         // Right column panels end at ~y=160 (StatusPanel ~62 + gap 16 + JobPanel ~66 + top padding 16)
         view_context_menu(snapshot, rx, 166.0);
-        view_drawing_styles(snapshot, rx, 344.0, right_col_width);
+        let anim_t = now.duration_since(state.start_time).as_secs_f32();
+        view_drawing_styles(snapshot, rx, 344.0, right_col_width, anim_t);
         view_table(snapshot, rx, 540.0, right_col_width);
+
+        // FPS counter (top-right corner)
+        let fps_text = format!("{:.0} FPS", fps);
+        snapshot.primitives_mut().add_text(
+            fps_text,
+            Point::new(vw - 70.0, 4.0),
+            colors::TEXT_MUTED,
+        );
     }
 
     fn selection(state: &Self::State) -> Option<&Selection> {
@@ -488,7 +518,7 @@ fn view_table(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32) {
 // Overlay: Drawing Styles (lines, curves, polylines)
 // =========================================================================
 
-fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32) {
+fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32, time: f32) {
     let p = snapshot.primitives_mut();
 
     p.add_rounded_rect(Rect::new(x, y, width, 180.0), 6.0, colors::BG_BLOCK);
@@ -532,28 +562,30 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
         .collect();
     p.add_polyline(zigzag, 1.5, colors::TEXT_PURPLE);
 
-    // --- Polyline (smooth curve approximation) ---
+    // --- Polyline (animated sine wave) ---
     let ly = ly + 28.0;
     p.add_text("Curve", Point::new(lx, ly), colors::TEXT_MUTED);
     let curve_w = lw - 50.0;
-    let curve: Vec<Point> = (0..30)
+    let phase = time * 2.0; // scrolling phase
+    let curve: Vec<Point> = (0..40)
         .map(|i| {
-            let t = i as f32 / 29.0;
+            let t = i as f32 / 39.0;
             let px = lx + 50.0 + t * curve_w;
-            let py = ly + 8.0 - (t * std::f32::consts::PI * 2.0).sin() * 8.0;
+            let py = ly + 8.0 - (t * std::f32::consts::PI * 2.0 + phase).sin() * 8.0;
             Point::new(px, py)
         })
         .collect();
     p.add_polyline(curve, 1.5, colors::RUNNING);
 
-    // --- Dashed polyline (wave) ---
+    // --- Dashed polyline (animated wave) ---
     let ly = ly + 28.0;
     p.add_text("Wave", Point::new(lx, ly), colors::TEXT_MUTED);
-    let wave: Vec<Point> = (0..30)
+    let wave_phase = time * 3.0;
+    let wave: Vec<Point> = (0..40)
         .map(|i| {
-            let t = i as f32 / 29.0;
+            let t = i as f32 / 39.0;
             let px = lx + 50.0 + t * curve_w;
-            let py = ly + 8.0 - (t * std::f32::consts::PI * 3.0).sin() * 6.0;
+            let py = ly + 8.0 - (t * std::f32::consts::PI * 3.0 + wave_phase).sin() * 6.0;
             Point::new(px, py)
         })
         .collect();
