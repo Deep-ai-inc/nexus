@@ -1,6 +1,8 @@
 //! GPU Pipeline for Strata rendering.
 //!
-//! Provides text rendering using instanced glyph quads.
+//! Unified ubershader pipeline that renders all 2D content in a single draw call.
+//! Uses the "white pixel" trick: a 1x1 white pixel at atlas (0,0) enables solid
+//! quads (selection, backgrounds) to render with the same shader as glyphs.
 //!
 //! # Apple Silicon Optimization
 //!
@@ -14,12 +16,15 @@ use iced::widget::shader::wgpu;
 use wgpu::util::StagingBelt;
 
 use super::glyph_atlas::GlyphAtlas;
-use crate::strata::primitives::Color;
+use crate::strata::primitives::{Color, Rect};
 
-/// Glyph instance for GPU rendering (32 bytes).
+/// Instance for GPU rendering (28 bytes, padded to 32).
+///
+/// Used for both glyphs and solid quads (selection, backgrounds).
+/// For solid quads, UV points to the white pixel at (0,0) in the atlas.
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-pub struct GlyphInstance {
+pub struct GpuInstance {
     /// Position (x, y) in pixels.
     pub position: [f32; 2],   // 8 bytes
     /// Size (width, height) in pixels.
@@ -28,8 +33,8 @@ pub struct GlyphInstance {
     pub uv: [u16; 4],         // 8 bytes
     /// Color as packed RGBA8.
     pub color: u32,           // 4 bytes
-    /// Flags (e.g., selected).
-    pub flags: u32,           // 4 bytes
+    /// Padding for alignment (reserved for future flags).
+    pub _padding: u32,        // 4 bytes
 }
 
 /// Uniform data for the shader.
@@ -44,16 +49,20 @@ struct Globals {
     _padding: [f32; 2],        // 8 bytes
 }
 
+/// Default selection highlight color (blue with transparency).
+pub const SELECTION_COLOR: Color = Color {
+    r: 0.3,
+    g: 0.5,
+    b: 0.8,
+    a: 0.35,
+};
+
 /// GPU pipeline for Strata rendering.
 ///
-/// # Future optimization
-/// Currently instances are collected into a `Vec` then copied to the staging belt.
-/// For maximum throughput, the API could be redesigned to write directly into
-/// the staging belt's mapped memory slice, bypassing the intermediate Vec.
-/// This would require exposing a "begin frame" / "end frame" pattern where
-/// callers write instances directly to a provided slice.
+/// Uses a unified ubershader that renders glyphs and solid quads in one draw call.
+/// Instances are rendered in buffer order, enabling perfect Z-ordering.
 pub struct StrataPipeline {
-    glyph_pipeline: wgpu::RenderPipeline,
+    pipeline: wgpu::RenderPipeline,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     atlas_texture: wgpu::Texture,
@@ -63,13 +72,11 @@ pub struct StrataPipeline {
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     glyph_atlas: GlyphAtlas,
-    /// Instances to render this frame (CPU-side collection).
-    /// TODO: Future optimization - write directly to staging belt slice.
-    instances: Vec<GlyphInstance>,
+    /// All instances to render (glyphs + solid quads, in draw order).
+    instances: Vec<GpuInstance>,
     /// Background color.
     background: Color,
     /// Staging belt for unified memory uploads (Apple Silicon optimization).
-    /// Writes directly to mapped memory, avoiding intermediate copies.
     staging_belt: StagingBelt,
 }
 
@@ -81,7 +88,7 @@ impl StrataPipeline {
 
         // Create shader module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Strata Glyph Shader"),
+            label: Some("Strata Ubershader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/glyph.wgsl").into()),
         });
 
@@ -132,14 +139,14 @@ impl StrataPipeline {
         });
 
         // Create render pipeline
-        let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Strata Glyph Pipeline"),
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Strata Ubershader Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GlyphInstance>() as u64,
+                    array_stride: std::mem::size_of::<GpuInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
                         // position
@@ -165,12 +172,6 @@ impl StrataPipeline {
                             format: wgpu::VertexFormat::Uint32,
                             offset: 24,
                             shader_location: 3,
-                        },
-                        // flags
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Uint32,
-                            offset: 28,
-                            shader_location: 4,
                         },
                     ],
                 }],
@@ -257,7 +258,7 @@ impl StrataPipeline {
         let initial_capacity = 4096;
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Strata Instance Buffer"),
-            size: (initial_capacity * std::mem::size_of::<GlyphInstance>()) as u64,
+            size: (initial_capacity * std::mem::size_of::<GpuInstance>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -268,7 +269,7 @@ impl StrataPipeline {
         let staging_belt = StagingBelt::new(8 * 1024 * 1024);
 
         Self {
-            glyph_pipeline,
+            pipeline,
             globals_buffer,
             globals_bind_group,
             atlas_texture,
@@ -294,11 +295,45 @@ impl StrataPipeline {
         self.instances.clear();
     }
 
+    /// Add a solid colored rectangle (for selection highlights, backgrounds, etc.).
+    ///
+    /// Uses the white pixel trick: samples the 1x1 white pixel in the atlas,
+    /// so the final color is just the specified color with no texture modulation.
+    pub fn add_solid_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
+        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        self.instances.push(GpuInstance {
+            position: [x, y],
+            size: [width, height],
+            uv: [uv_x, uv_y, uv_w, uv_h],
+            color: color.pack(),
+            _padding: 0,
+        });
+    }
+
+    /// Add a solid colored rectangle from a Rect.
+    pub fn add_solid_rect_from(&mut self, rect: &Rect, color: Color) {
+        self.add_solid_rect(rect.x, rect.y, rect.width, rect.height, color);
+    }
+
+    /// Add multiple solid rectangles with the same color (for selection).
+    pub fn add_solid_rects(&mut self, rects: &[Rect], color: Color) {
+        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        let packed_color = color.pack();
+        for rect in rects {
+            self.instances.push(GpuInstance {
+                position: [rect.x, rect.y],
+                size: [rect.width, rect.height],
+                uv: [uv_x, uv_y, uv_w, uv_h],
+                color: packed_color,
+                _padding: 0,
+            });
+        }
+    }
+
     /// Add a text string to render.
     pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: Color) {
         let packed_color = color.pack();
         let mut cursor_x = x;
-        let line_height = self.glyph_atlas.cell_height;
         let ascent = self.glyph_atlas.ascent;
 
         for ch in text.chars() {
@@ -318,12 +353,12 @@ impl StrataPipeline {
             let glyph_x = cursor_x + glyph.offset_x as f32;
             let glyph_y = y + ascent - glyph.offset_y as f32 - glyph.height as f32;
 
-            self.instances.push(GlyphInstance {
+            self.instances.push(GpuInstance {
                 position: [glyph_x, glyph_y],
                 size: [glyph.width as f32, glyph.height as f32],
                 uv: [glyph.uv_x, glyph.uv_y, glyph.uv_w, glyph.uv_h],
                 color: packed_color,
-                flags: 0,
+                _padding: 0,
             });
 
             cursor_x += self.glyph_atlas.cell_width;
@@ -352,7 +387,7 @@ impl StrataPipeline {
             self.glyph_atlas.mark_clean();
         }
 
-        // Update globals (small uniform buffer, write_buffer is fine)
+        // Update globals
         let globals = Globals {
             transform: create_orthographic_matrix(viewport_width, viewport_height),
             atlas_size: [
@@ -368,7 +403,7 @@ impl StrataPipeline {
             self.instance_capacity = self.instances.len().next_power_of_two();
             self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Strata Instance Buffer"),
-                size: (self.instance_capacity * std::mem::size_of::<GlyphInstance>()) as u64,
+                size: (self.instance_capacity * std::mem::size_of::<GpuInstance>()) as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -377,7 +412,7 @@ impl StrataPipeline {
         // Upload instances using staging belt (unified memory optimization).
         // On Apple Silicon, this writes directly to mapped memory shared by CPU/GPU.
         if !self.instances.is_empty() {
-            let instance_bytes = self.instances.len() * std::mem::size_of::<GlyphInstance>();
+            let instance_bytes = self.instances.len() * std::mem::size_of::<GpuInstance>();
             if let Some(size) = NonZeroU64::new(instance_bytes as u64) {
                 let mut staging_buffer = self.staging_belt.write_buffer(
                     encoder,
@@ -403,6 +438,8 @@ impl StrataPipeline {
     }
 
     /// Render to the target.
+    ///
+    /// Single draw call renders all instances (selection, glyphs, etc.) in buffer order.
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -439,8 +476,9 @@ impl StrataPipeline {
             clip_bounds.height,
         );
 
+        // Single draw call for all instances
         if !self.instances.is_empty() {
-            render_pass.set_pipeline(&self.glyph_pipeline);
+            render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
             render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));

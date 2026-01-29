@@ -76,7 +76,16 @@ impl GlyphAtlas {
 
         let atlas_width = 512;
         let atlas_height = 512;
-        let atlas_data = vec![0u8; (atlas_width * atlas_height * 4) as usize];
+        let mut atlas_data = vec![0u8; (atlas_width * atlas_height * 4) as usize];
+
+        // Reserve a 1x1 white pixel at (0,0) for solid quads (selection, backgrounds).
+        // This enables the "white pixel trick" for branchless ubershader rendering:
+        // - Glyphs sample their actual texture region
+        // - Solid quads sample this white pixel, so color * 1.0 = color
+        atlas_data[0] = 255; // R
+        atlas_data[1] = 255; // G
+        atlas_data[2] = 255; // B
+        atlas_data[3] = 255; // A (fully opaque)
 
         Self {
             font_size,
@@ -85,15 +94,36 @@ impl GlyphAtlas {
             atlas_data,
             atlas_width,
             atlas_height,
-            pack_x: 1,
+            pack_x: 1,  // Start packing after the white pixel
             pack_y: 1,
             row_height: 0,
-            dirty: false,
+            dirty: true, // Mark dirty so white pixel gets uploaded
             resized: false,
             cell_width,
             cell_height,
             ascent,
         }
+    }
+
+    /// Get the UV coordinates for the white pixel (used for solid quads).
+    ///
+    /// Returns (uv_x, uv_y, uv_w, uv_h) in normalized u16 range (0-65535).
+    /// All solid quads (selection, backgrounds) should use these UVs.
+    #[inline]
+    pub fn white_pixel_uv(&self) -> (u16, u16, u16, u16) {
+        // The white pixel is at (0,0) with size 1x1.
+        // We need to sample the CENTER of the pixel to avoid filtering artifacts.
+        // UV for center of pixel (0,0) in a texture of size (w,h):
+        //   u = 0.5 / w, v = 0.5 / h
+        // But since we're using a 1x1 region, we just point to (0,0) with tiny size.
+        let inv_w = 65535.0 / self.atlas_width as f32;
+        let inv_h = 65535.0 / self.atlas_height as f32;
+        (
+            0,                          // uv_x: left edge
+            0,                          // uv_y: top edge
+            (1.0 * inv_w) as u16,       // uv_w: 1 pixel wide
+            (1.0 * inv_h) as u16,       // uv_h: 1 pixel tall
+        )
     }
 
     /// Get or create a cached glyph for the given character.
@@ -219,11 +249,16 @@ impl GlyphAtlas {
         true
     }
 
-    /// Clear glyph cache state.
+    /// Clear glyph cache state (preserves the white pixel at 0,0).
     fn clear_atlas(&mut self) {
         self.glyphs.clear();
         self.ascii_cache = [None; 128];
         self.atlas_data.fill(0);
+        // Re-write the white pixel at (0,0)
+        self.atlas_data[0] = 255; // R
+        self.atlas_data[1] = 255; // G
+        self.atlas_data[2] = 255; // B
+        self.atlas_data[3] = 255; // A
         self.pack_x = 1;
         self.pack_y = 1;
         self.row_height = 0;

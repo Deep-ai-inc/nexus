@@ -1,6 +1,12 @@
-// Strata glyph rendering shader.
-// Renders textured quads for each glyph using instanced rendering.
-// Unified pipeline for all text content.
+// Strata unified rendering shader (ubershader).
+//
+// Renders all 2D content in a single draw call using the "white pixel" trick:
+// - Glyphs: Sample glyph alpha from atlas, multiply by glyph color
+// - Solid quads (selection, backgrounds): Sample the 1x1 white pixel at (0,0),
+//   so atlas_alpha = 1.0, and final color = quad_color * 1.0 = quad_color
+//
+// This eliminates pipeline switches and enables perfect Z-ordering by
+// simply ordering instances in the buffer.
 
 struct Globals {
     transform: mat4x4<f32>,
@@ -17,22 +23,20 @@ var atlas_texture: texture_2d<f32>;
 @group(1) @binding(1)
 var atlas_sampler: sampler;
 
-struct GlyphInstance {
+struct Instance {
     @location(0) position: vec2<f32>,
     @location(1) size: vec2<f32>,
-    @location(2) uv: vec4<u32>,
-    @location(3) color: u32,
-    @location(4) flags: u32,
+    @location(2) uv: vec4<u32>,   // [uv_x, uv_y, uv_w, uv_h] as normalized u16
+    @location(3) color: u32,      // Packed RGBA8
 }
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
-    @location(2) selected: f32,
 }
 
-// Quad vertices (two triangles)
+// Quad vertices (two triangles forming a quad)
 var<private> QUAD_VERTICES: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
     vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
     vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
@@ -49,48 +53,38 @@ fn unpack_color(packed: u32) -> vec4<f32> {
 @vertex
 fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
-    instance: GlyphInstance,
+    instance: Instance,
 ) -> VertexOutput {
     var out: VertexOutput;
 
     let quad_pos = QUAD_VERTICES[vertex_index];
 
-    // Position glyph quad
+    // Position the quad
     let pos = instance.position + quad_pos * instance.size;
     out.position = globals.transform * vec4<f32>(pos, 0.0, 1.0);
 
-    // UV unpacking (normalized u16 -> f32)
+    // Unpack UV coordinates (normalized u16 -> f32)
     let uv_scale = 1.0 / 65535.0;
     let uv_x = f32(instance.uv.x) * uv_scale;
     let uv_y = f32(instance.uv.y) * uv_scale;
     let uv_w = f32(instance.uv.z) * uv_scale;
     let uv_h = f32(instance.uv.w) * uv_scale;
 
+    // Interpolate UV across quad
     out.uv = vec2<f32>(uv_x, uv_y) + quad_pos * vec2<f32>(uv_w, uv_h);
     out.color = unpack_color(instance.color);
-    out.selected = f32(instance.flags & 1u);
 
     return out;
 }
 
-// Selection highlight color
-const SELECTION_COLOR: vec3<f32> = vec3<f32>(0.3, 0.5, 0.8);
-const SELECTION_ALPHA: f32 = 0.4;
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let glyph = textureSample(atlas_texture, atlas_sampler, in.uv);
+    // Sample the atlas.
+    // - For glyphs: gets the glyph's alpha mask
+    // - For solid quads: samples the white pixel (alpha = 1.0)
+    let atlas_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).a;
 
-    // Alpha from atlas (glyph shape) * color alpha
-    let alpha = glyph.a * in.color.a;
-
-    // Use glyph color
-    var rgb = in.color.rgb;
-
-    // Apply selection highlight if selected
-    if (in.selected > 0.5) {
-        rgb = mix(rgb, SELECTION_COLOR, SELECTION_ALPHA);
-    }
-
-    return vec4<f32>(rgb, alpha);
+    // Final color = instance color * atlas alpha
+    // This is branchless and handles both glyphs and solid quads uniformly.
+    return vec4<f32>(in.color.rgb, in.color.a * atlas_alpha);
 }
