@@ -248,6 +248,14 @@ impl InputBar {
                     .text(TextElement::new(self.mode).color(self.mode_color)),
             )
             .text(TextElement::new("$").color(colors::SUCCESS))
+            // Cursor block (rendered inline, moves with the widget)
+            .column(
+                Column::new()
+                    .width(Length::Fixed(8.0))
+                    .height(Length::Fixed(18.0))
+                    .background(colors::CURSOR)
+                    .corner_radius(1.0),
+            )
     }
 }
 

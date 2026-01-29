@@ -14,6 +14,7 @@ use crate::strata::demo_widgets::{
 };
 use crate::strata::event_context::{CaptureState, MouseButton, MouseEvent};
 use crate::strata::layout::containers::Length;
+use crate::strata::layout::primitives::LineStyle;
 use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::{
     AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, Selection, StrataApp,
@@ -309,19 +310,8 @@ impl StrataApp for DemoApp {
         let rx = vw - outer_padding - right_col_width;
         // Right column panels end at ~y=160 (StatusPanel ~62 + gap 16 + JobPanel ~66 + top padding 16)
         view_context_menu(snapshot, rx, 166.0);
-        view_completion_popup(snapshot, rx, 344.0);
-        view_table(snapshot, rx, 524.0, right_col_width);
-
-        // Cursor blinking block (escape hatch — added after layout)
-        // InputBar is 38px tall at the bottom of the left column.
-        // cursor y = vh - outer_padding - 38(inputbar) + 8(pad_top) + 2(center_offset) = vh - 44
-        // cursor x = outer_padding + 12(row_pad) + "~/Desktop/nexus"(126) + 10 + pill(37) + 10 + "$"(8.4) + 10 ≈ 229
-        let cursor_y = vh - outer_padding - 38.0 + 8.0 + 2.0;
-        snapshot.primitives_mut().add_rounded_rect(
-            Rect::new(229.0, cursor_y, 8.0, 18.0),
-            1.0,
-            colors::CURSOR,
-        );
+        view_drawing_styles(snapshot, rx, 344.0, right_col_width);
+        view_table(snapshot, rx, 540.0, right_col_width);
     }
 
     fn selection(state: &Self::State) -> Option<&Selection> {
@@ -445,61 +435,6 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
 }
 
 // =========================================================================
-// Overlay: Completion Popup (absolute positioned)
-// =========================================================================
-
-fn view_completion_popup(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
-    let w = 220.0;
-    let item_h = 24.0;
-    let items = 6;
-    let h = items as f32 * item_h + 12.0;
-
-    let p = snapshot.primitives_mut();
-
-    p.add_text("Completion Popup", Point::new(x, y), colors::TEXT_SECONDARY);
-
-    let py = y + 22.0;
-    p.add_rounded_rect(Rect::new(x, py, w, h), 6.0, colors::BG_OVERLAY);
-    p.add_border(Rect::new(x, py, w, h), 6.0, 1.0, colors::BORDER_SUBTLE);
-
-    let ix = x + 6.0;
-    let iw = w - 12.0;
-    let completions = [
-        ("serde_json", "crate", true),
-        ("serde", "crate", false),
-        ("serde_yaml", "crate", false),
-        ("serde_cbor", "crate", false),
-        ("serialize", "fn", false),
-        ("ser_field", "fn", false),
-    ];
-
-    for (i, (name, kind, selected)) in completions.iter().enumerate() {
-        let iy = py + 6.0 + i as f32 * item_h;
-
-        if *selected {
-            p.add_rounded_rect(
-                Rect::new(ix, iy, iw, item_h - 2.0),
-                4.0, colors::BG_HOVER,
-            );
-        }
-
-        let text_color = if *selected { Color::WHITE } else { colors::TEXT_PRIMARY };
-        p.add_text(*name, Point::new(ix + 8.0, iy + 2.0), text_color);
-
-        let badge_color = if *kind == "crate" {
-            Color::rgba(0.3, 0.6, 0.9, 0.3)
-        } else {
-            Color::rgba(0.6, 0.4, 0.9, 0.3)
-        };
-        p.add_rounded_rect(
-            Rect::new(ix + iw - 56.0, iy + 2.0, 48.0, 18.0),
-            4.0, badge_color,
-        );
-        p.add_text(*kind, Point::new(ix + iw - 48.0, iy + 2.0), colors::TEXT_SECONDARY);
-    }
-}
-
-// =========================================================================
 // Overlay: Table (absolute positioned)
 // =========================================================================
 
@@ -547,6 +482,82 @@ fn view_table(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32) {
         p.add_text(*size, Point::new(col2, ry), colors::TEXT_SECONDARY);
         p.add_text(*kind, Point::new(col3, ry), colors::TEXT_MUTED);
     }
+}
+
+// =========================================================================
+// Overlay: Drawing Styles (lines, curves, polylines)
+// =========================================================================
+
+fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32) {
+    let p = snapshot.primitives_mut();
+
+    p.add_rounded_rect(Rect::new(x, y, width, 180.0), 6.0, colors::BG_BLOCK);
+    p.add_text("Drawing Styles", Point::new(x + 10.0, y + 6.0), colors::TEXT_SECONDARY);
+
+    let lx = x + 14.0;
+    let lw = width - 28.0;
+
+    // --- Solid lines (various thickness) ---
+    let ly = y + 32.0;
+    p.add_text("Solid", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_line(Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw * 0.5, ly + 9.0), 1.0, colors::RUNNING);
+    p.add_line(Point::new(lx + lw * 0.5 + 8.0, ly + 9.0), Point::new(lx + lw, ly + 9.0), 2.0, colors::SUCCESS);
+
+    // --- Dashed lines ---
+    let ly = ly + 24.0;
+    p.add_text("Dashed", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_line_styled(
+        Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw, ly + 9.0),
+        1.5, colors::WARNING, LineStyle::Dashed,
+    );
+
+    // --- Dotted lines ---
+    let ly = ly + 24.0;
+    p.add_text("Dotted", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_line_styled(
+        Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw, ly + 9.0),
+        1.5, colors::ERROR, LineStyle::Dotted,
+    );
+
+    // --- Polyline (zigzag) ---
+    let ly = ly + 24.0;
+    p.add_text("Poly", Point::new(lx, ly), colors::TEXT_MUTED);
+    let seg_w = (lw - 50.0) / 8.0;
+    let zigzag: Vec<Point> = (0..9)
+        .map(|i| {
+            let px = lx + 50.0 + i as f32 * seg_w;
+            let py = ly + if i % 2 == 0 { 14.0 } else { 2.0 };
+            Point::new(px, py)
+        })
+        .collect();
+    p.add_polyline(zigzag, 1.5, colors::TEXT_PURPLE);
+
+    // --- Polyline (smooth curve approximation) ---
+    let ly = ly + 28.0;
+    p.add_text("Curve", Point::new(lx, ly), colors::TEXT_MUTED);
+    let curve_w = lw - 50.0;
+    let curve: Vec<Point> = (0..30)
+        .map(|i| {
+            let t = i as f32 / 29.0;
+            let px = lx + 50.0 + t * curve_w;
+            let py = ly + 8.0 - (t * std::f32::consts::PI * 2.0).sin() * 8.0;
+            Point::new(px, py)
+        })
+        .collect();
+    p.add_polyline(curve, 1.5, colors::RUNNING);
+
+    // --- Dashed polyline (wave) ---
+    let ly = ly + 28.0;
+    p.add_text("Wave", Point::new(lx, ly), colors::TEXT_MUTED);
+    let wave: Vec<Point> = (0..30)
+        .map(|i| {
+            let t = i as f32 / 29.0;
+            let px = lx + 50.0 + t * curve_w;
+            let py = ly + 8.0 - (t * std::f32::consts::PI * 3.0).sin() * 6.0;
+            Point::new(px, py)
+        })
+        .collect();
+    p.add_polyline_styled(wave, 1.0, colors::SUCCESS, LineStyle::Dashed);
 }
 
 /// Run the demo application.
