@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::strata::content_address::{ContentAddress, Selection};
-use crate::strata::event_context::MouseEvent;
+use crate::strata::event_context::{CaptureState, MouseEvent};
 use crate::strata::layout_snapshot::LayoutSnapshot;
 
 /// A command that produces a message asynchronously.
@@ -146,11 +146,14 @@ pub trait StrataApp: Sized + 'static {
     ///
     /// Called by the shell when a mouse event occurs. The `hit` parameter
     /// contains the ContentAddress at the mouse position (if any).
+    /// The `capture` parameter indicates if the pointer is currently captured,
+    /// which is essential for handling drag operations outside widget bounds.
     /// Returns an optional message to send to `update()`.
     fn on_mouse(
         _state: &Self::State,
         _event: MouseEvent,
         _hit: Option<ContentAddress>,
+        _capture: &CaptureState,
     ) -> Option<Self::Message> {
         None
     }

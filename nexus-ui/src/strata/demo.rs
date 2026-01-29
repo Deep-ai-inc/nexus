@@ -4,7 +4,7 @@
 //! Or temporarily replace main() to call `strata::demo::run()`
 
 use crate::strata::content_address::{ContentAddress, SourceId};
-use crate::strata::event_context::{MouseButton, MouseEvent};
+use crate::strata::event_context::{CaptureState, MouseButton, MouseEvent};
 use crate::strata::primitives::{Color, Rect};
 use crate::strata::widget::StrataWidget;
 use crate::strata::widgets::{TextWidget, TerminalWidget};
@@ -120,6 +120,7 @@ impl StrataApp for DemoApp {
         _state: &Self::State,
         event: MouseEvent,
         hit: Option<ContentAddress>,
+        _capture: &CaptureState,
     ) -> Option<Self::Message> {
         // When user clicks, send the hit result as a message
         if let MouseEvent::ButtonPressed { button: MouseButton::Left, .. } = event {

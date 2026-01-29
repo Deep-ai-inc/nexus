@@ -5,6 +5,8 @@
 //!
 //! **This is the ONLY file in Strata that imports iced.**
 
+use std::sync::Arc;
+
 use iced::widget::shader::{self, wgpu};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
 
@@ -168,10 +170,16 @@ fn update<A: StrataApp>(
                         .cursor_position
                         .and_then(|pos| snapshot.hit_test(pos));
 
-                    // Dispatch to app
-                    if let Some(msg) = A::on_mouse(&state.app, strata_event, hit) {
-                        let cmd = A::update(&mut state.app, msg);
-                        return command_to_task(cmd);
+                    // CAPTURE LOGIC FIX:
+                    // If pointer is captured, we MUST dispatch the event even if hit is None.
+                    // This allows dragging outside the widget/window bounds.
+                    let should_dispatch = hit.is_some() || state.capture.is_captured();
+
+                    if should_dispatch {
+                        if let Some(msg) = A::on_mouse(&state.app, strata_event, hit, &state.capture) {
+                            let cmd = A::update(&mut state.app, msg);
+                            return command_to_task(cmd);
+                        }
                     }
                 }
             }
@@ -195,9 +203,13 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
     snapshot.set_viewport(Rect::new(0.0, 0.0, state.window_size.0, state.window_size.1));
     A::view(&state.app, &mut snapshot);
 
+    // Wrap in Arc to prevent deep copying when iced clones the primitive.
+    // The shader only needs read access.
+    let snapshot = Arc::new(snapshot);
+
     // Create the shader widget that will render Strata content
     let program = StrataShaderProgram {
-        snapshot,
+        snapshot, // Cheap Arc clone
         selection: A::selection(&state.app).cloned(),
         background: crate::strata::primitives::Color::rgb(0.1, 0.1, 0.1),
         frame: state.frame,
@@ -396,7 +408,8 @@ fn convert_modifiers(mods: iced::keyboard::Modifiers) -> Modifiers {
 /// Shader program that renders Strata content.
 #[derive(Clone)]
 struct StrataShaderProgram {
-    snapshot: LayoutSnapshot,
+    /// Layout snapshot wrapped in Arc to avoid deep copying when iced clones.
+    snapshot: Arc<LayoutSnapshot>,
     selection: Option<Selection>,
     background: crate::strata::primitives::Color,
     /// Frame counter - changing this triggers iced to redraw.
@@ -406,7 +419,8 @@ struct StrataShaderProgram {
 /// Primitive passed to the GPU.
 #[derive(Clone, Debug)]
 struct StrataPrimitive {
-    snapshot: LayoutSnapshot,
+    /// Layout snapshot wrapped in Arc to avoid deep copying.
+    snapshot: Arc<LayoutSnapshot>,
     selection: Option<Selection>,
     background: crate::strata::primitives::Color,
     frame: u64,
@@ -451,7 +465,7 @@ impl shader::Primitive for StrataPrimitive {
         wrapper.prepare(
             device,
             queue,
-            &self.snapshot,
+            &*self.snapshot, // Deref Arc to get &LayoutSnapshot
             self.selection.as_ref(),
             bounds,
             viewport,

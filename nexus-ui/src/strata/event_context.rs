@@ -31,6 +31,21 @@ impl Default for CaptureState {
     }
 }
 
+impl CaptureState {
+    /// Check if the pointer is currently captured.
+    pub fn is_captured(&self) -> bool {
+        matches!(self, CaptureState::Captured(_))
+    }
+
+    /// Get the source that has captured the pointer, if any.
+    pub fn captured_by(&self) -> Option<SourceId> {
+        match self {
+            CaptureState::Captured(source) => Some(*source),
+            CaptureState::None => None,
+        }
+    }
+}
+
 /// Event context provided to widget event handlers.
 ///
 /// Provides access to:
