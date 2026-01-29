@@ -16,4 +16,4 @@ pub mod containers;
 pub mod primitives;
 
 pub use containers::{Column, Row, Padding, Alignment, CrossAxisAlignment};
-pub use primitives::PrimitiveBatch;
+pub use primitives::{LineStyle, PrimitiveBatch};

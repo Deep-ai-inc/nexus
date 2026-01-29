@@ -20,6 +20,12 @@ pub struct PrimitiveBatch {
     /// Circles (rendered via SDF).
     pub(crate) circles: Vec<Circle>,
 
+    /// Line segments (rendered as rotated quads).
+    pub(crate) lines: Vec<LineSegment>,
+
+    /// Polylines (series of connected line segments).
+    pub(crate) polylines: Vec<Polyline>,
+
     /// Raw text runs (pre-positioned, for canvas-like drawing).
     pub(crate) text_runs: Vec<TextRun>,
 }
@@ -47,6 +53,37 @@ pub struct Circle {
     pub color: Color,
 }
 
+/// Line rendering style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineStyle {
+    /// Solid line (default).
+    #[default]
+    Solid,
+    /// Dashed line (repeating dash-gap pattern).
+    Dashed,
+    /// Dotted line (repeating dot-gap pattern).
+    Dotted,
+}
+
+/// A line segment primitive (rendered as a rotated quad in the shader).
+#[derive(Debug, Clone, Copy)]
+pub struct LineSegment {
+    pub p1: Point,
+    pub p2: Point,
+    pub thickness: f32,
+    pub color: Color,
+    pub style: LineStyle,
+}
+
+/// A polyline primitive (series of connected line segments).
+#[derive(Debug, Clone)]
+pub struct Polyline {
+    pub points: Vec<Point>,
+    pub thickness: f32,
+    pub color: Color,
+    pub style: LineStyle,
+}
+
 /// A pre-positioned text run (bypasses layout).
 #[derive(Debug, Clone)]
 pub struct TextRun {
@@ -67,6 +104,8 @@ impl PrimitiveBatch {
         self.solid_rects.clear();
         self.rounded_rects.clear();
         self.circles.clear();
+        self.lines.clear();
+        self.polylines.clear();
         self.text_runs.clear();
     }
 
@@ -96,6 +135,40 @@ impl PrimitiveBatch {
             radius,
             color,
         });
+        self
+    }
+
+    /// Add a solid line segment.
+    #[inline]
+    pub fn add_line(&mut self, p1: Point, p2: Point, thickness: f32, color: Color) -> &mut Self {
+        self.lines.push(LineSegment { p1, p2, thickness, color, style: LineStyle::Solid });
+        self
+    }
+
+    /// Add a styled line segment (solid, dashed, or dotted).
+    #[inline]
+    pub fn add_line_styled(&mut self, p1: Point, p2: Point, thickness: f32, color: Color, style: LineStyle) -> &mut Self {
+        self.lines.push(LineSegment { p1, p2, thickness, color, style });
+        self
+    }
+
+    /// Add a solid polyline (series of connected line segments).
+    ///
+    /// For N points, renders N-1 line segments. Efficient for charts and graphs.
+    #[inline]
+    pub fn add_polyline(&mut self, points: Vec<Point>, thickness: f32, color: Color) -> &mut Self {
+        if points.len() >= 2 {
+            self.polylines.push(Polyline { points, thickness, color, style: LineStyle::Solid });
+        }
+        self
+    }
+
+    /// Add a styled polyline (solid, dashed, or dotted).
+    #[inline]
+    pub fn add_polyline_styled(&mut self, points: Vec<Point>, thickness: f32, color: Color, style: LineStyle) -> &mut Self {
+        if points.len() >= 2 {
+            self.polylines.push(Polyline { points, thickness, color, style });
+        }
         self
     }
 
@@ -140,6 +213,8 @@ impl PrimitiveBatch {
         self.solid_rects.is_empty()
             && self.rounded_rects.is_empty()
             && self.circles.is_empty()
+            && self.lines.is_empty()
+            && self.polylines.is_empty()
             && self.text_runs.is_empty()
     }
 
@@ -148,6 +223,8 @@ impl PrimitiveBatch {
         self.solid_rects.len()
             + self.rounded_rects.len()
             + self.circles.len()
+            + self.lines.len()
+            + self.polylines.len()
             + self.text_runs.len()
     }
 }

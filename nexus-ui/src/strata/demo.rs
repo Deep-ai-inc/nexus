@@ -4,6 +4,8 @@
 //! - Solid rectangles (white pixel trick, zero-branch)
 //! - Rounded rectangles (SDF with screen-space AA)
 //! - Circles (SDF, same pipeline as rounded rects)
+//! - Line segments (rotated quads, GPU-expanded)
+//! - Polylines / charts (N-1 line segment instances)
 //! - Glyph rendering (atlas-sampled, anti-aliased)
 //! - Alpha blending (semi-transparent overlays)
 //! - Selection highlighting (hit-tested, cross-source)
@@ -22,6 +24,7 @@
 use crate::strata::content_address::{ContentAddress, SourceId};
 use crate::strata::event_context::{CaptureState, MouseButton, MouseEvent};
 use crate::strata::layout::containers::{TextElement, TerminalElement};
+use crate::strata::layout::primitives::LineStyle;
 use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::{
     AppConfig, Column, Command, Decoration, LayoutSnapshot,
@@ -120,6 +123,69 @@ impl StrataApp for DemoApp {
                 Rect::new(640.0, 250.0, 60.0, 30.0),
                 6.0,
                 Color::rgba(1.0, 1.0, 1.0, 0.15),
+            )
+            // =====================================================================
+            // Lines and Polylines (rendered as rotated quads in the ubershader)
+            // =====================================================================
+            // Solid line
+            .add_line(
+                Point::new(530.0, 370.0),
+                Point::new(700.0, 370.0),
+                2.0,
+                Color::rgb(0.5, 0.5, 0.6),
+            )
+            // Dashed line
+            .add_line_styled(
+                Point::new(530.0, 382.0),
+                Point::new(700.0, 382.0),
+                2.0,
+                Color::rgb(0.9, 0.5, 0.3),
+                LineStyle::Dashed,
+            )
+            // Dotted line
+            .add_line_styled(
+                Point::new(530.0, 394.0),
+                Point::new(700.0, 394.0),
+                2.0,
+                Color::rgb(0.4, 0.8, 0.5),
+                LineStyle::Dotted,
+            )
+            // Mini chart background
+            .add_rounded_rect(
+                Rect::new(525.0, 400.0, 190.0, 100.0),
+                8.0,
+                Color::rgb(0.1, 0.1, 0.14),
+            )
+            // Chart: sine-wave polyline (simulated data)
+            // Curves sit in the lower 75px of the chart (y=425..490)
+            .add_polyline(
+                {
+                    let mut points = Vec::with_capacity(30);
+                    for i in 0..30 {
+                        let t = i as f32 / 29.0;
+                        let x = 535.0 + t * 170.0;
+                        let y = 462.0 - (t * 6.0).sin() * 25.0;
+                        points.push(Point::new(x, y));
+                    }
+                    points
+                },
+                2.0,
+                Color::rgb(0.3, 0.8, 0.9),
+            )
+            // Chart: second polyline (offset data)
+            .add_polyline(
+                {
+                    let mut points = Vec::with_capacity(30);
+                    for i in 0..30 {
+                        let t = i as f32 / 29.0;
+                        let x = 535.0 + t * 170.0;
+                        let y = 462.0 - (t * 6.0 + 2.0).sin() * 18.0 - 4.0;
+                        points.push(Point::new(x, y));
+                    }
+                    points
+                },
+                1.5,
+                Color::rgb(0.9, 0.4, 0.6),
             );
 
         // =====================================================================
@@ -199,6 +265,13 @@ impl StrataApp for DemoApp {
 
         card.layout(snapshot, Rect::new(545.0, 288.0, 150.0, 50.0));
 
+        // Chart label
+        snapshot.primitives_mut().add_text(
+            "GPU Chart (polylines)",
+            Point::new(545.0, 405.0),
+            Color::rgb(0.6, 0.6, 0.7),
+        );
+
         // =====================================================================
         // Background decoration (rendered behind primitives)
         // =====================================================================
@@ -274,7 +347,7 @@ impl StrataApp for DemoApp {
 pub fn run() -> Result<(), crate::strata::shell::Error> {
     crate::strata::shell::run_with_config::<DemoApp>(AppConfig {
         title: String::from("Strata Production API Demo"),
-        window_size: (750.0, 400.0),
+        window_size: (750.0, 520.0),
         antialiasing: true,
         background_color: crate::strata::Color::rgb(0.08, 0.08, 0.1),
     })

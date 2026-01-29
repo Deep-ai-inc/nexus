@@ -604,6 +604,33 @@ impl PipelineWrapper {
             );
         }
 
+        // 2b. Line segments
+        for prim in &primitives.lines {
+            pipeline.add_line_styled(
+                prim.p1.x * scale,
+                prim.p1.y * scale,
+                prim.p2.x * scale,
+                prim.p2.y * scale,
+                prim.thickness * scale,
+                prim.color,
+                convert_line_style(prim.style),
+            );
+        }
+        // 2c. Polylines (each expands to N-1 line segment instances)
+        for prim in &primitives.polylines {
+            let scaled_points: Vec<[f32; 2]> = prim
+                .points
+                .iter()
+                .map(|p| [p.x * scale, p.y * scale])
+                .collect();
+            pipeline.add_polyline_styled(
+                &scaled_points,
+                prim.thickness * scale,
+                prim.color,
+                convert_line_style(prim.style),
+            );
+        }
+
         // 3. Selection highlight (on top of backgrounds, behind text)
         if let Some(sel) = selection {
             if !sel.is_collapsed() {
@@ -724,6 +751,21 @@ fn render_decoration(
             color,
         } => {
             pipeline.add_circle(center.x * scale, center.y * scale, radius * scale, *color);
+        }
+    }
+}
+
+/// Convert layout LineStyle to GPU LineStyle.
+fn convert_line_style(
+    style: crate::strata::layout::primitives::LineStyle,
+) -> crate::strata::gpu::LineStyle {
+    match style {
+        crate::strata::layout::primitives::LineStyle::Solid => crate::strata::gpu::LineStyle::Solid,
+        crate::strata::layout::primitives::LineStyle::Dashed => {
+            crate::strata::gpu::LineStyle::Dashed
+        }
+        crate::strata::layout::primitives::LineStyle::Dotted => {
+            crate::strata::gpu::LineStyle::Dotted
         }
     }
 }

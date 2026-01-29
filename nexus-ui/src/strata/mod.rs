@@ -73,6 +73,6 @@ pub use widgets::{TextWidget, TerminalWidget};
 
 // Layout system exports
 pub use layout::{
-    Column, Row, Padding, Alignment, CrossAxisAlignment, PrimitiveBatch,
+    Column, Row, Padding, Alignment, CrossAxisAlignment, LineStyle, PrimitiveBatch,
 };
 pub use layout::containers::{TextElement, TerminalElement};

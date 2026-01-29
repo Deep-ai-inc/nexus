@@ -18,29 +18,63 @@ use wgpu::util::StagingBelt;
 use super::glyph_atlas::GlyphAtlas;
 use crate::strata::primitives::{Color, Rect};
 
-/// Instance for GPU rendering (32 bytes).
+/// Instance for GPU rendering (36 bytes).
 ///
 /// Universal primitive for the ubershader - renders glyphs, solid quads,
-/// rounded rects, and (future) images all in a single draw call.
+/// rounded rects, lines, and (future) images all in a single draw call.
 ///
-/// Rendering modes:
-/// - Glyphs: UV points to glyph in atlas, corner_radius = 0
-/// - Solid quads: UV points to white pixel (0,0), corner_radius = 0
-/// - Rounded rects: UV points to white pixel, corner_radius > 0 (SDF mask)
-/// - Images (future): texture_layer > 0, samples from texture array
+/// Rendering modes (controlled by `mode` field):
+/// - Mode 0 (Quad): Standard quad rendering
+///   - Glyphs: UV points to glyph in atlas, corner_radius = 0
+///   - Solid quads: UV points to white pixel (0,0), corner_radius = 0
+///   - Rounded rects: UV points to white pixel, corner_radius > 0 (SDF mask)
+/// - Mode 1 (Line Segment): Thick line rendered as rotated quad
+///   - position = P1 (start point)
+///   - size = P2 (end point, repurposed)
+///   - corner_radius = line thickness
+///   - UV = white pixel (solid color)
+///   - Line style packed in upper bits of mode: `1 | (style << 8)`
+///     - style 0 = Solid, 1 = Dashed, 2 = Dotted
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GpuInstance {
     /// Position (x, y) in pixels.
+    /// Mode 0: top-left of quad. Mode 1: line start point.
     pub position: [f32; 2],     // 8 bytes
     /// Size (width, height) in pixels.
+    /// Mode 0: quad dimensions. Mode 1: line end point (P2).
     pub size: [f32; 2],         // 8 bytes
     /// UV coordinates (u, v, w, h) as normalized u16.
     pub uv: [u16; 4],           // 8 bytes
     /// Color as packed RGBA8.
     pub color: u32,             // 4 bytes
-    /// Corner radius for SDF-based rounded rectangles (0 = sharp corners).
+    /// Mode 0: Corner radius for SDF rounded rects (0 = sharp).
+    /// Mode 1: Line thickness in pixels.
     pub corner_radius: f32,     // 4 bytes
+    /// Rendering mode (low 8 bits) and sub-flags (upper bits).
+    /// Low byte: 0 = Quad, 1 = Line Segment.
+    /// For lines, bits 8..15 = line style (0=solid, 1=dashed, 2=dotted).
+    pub mode: u32,              // 4 bytes
+}
+
+/// Line style for GPU rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineStyle {
+    /// Solid line (default).
+    #[default]
+    Solid = 0,
+    /// Dashed line (repeating dash-gap pattern).
+    Dashed = 1,
+    /// Dotted line (repeating dot-gap pattern).
+    Dotted = 2,
+}
+
+impl LineStyle {
+    /// Encode line style into the mode field for a line instance.
+    #[inline]
+    fn encode_mode(self) -> u32 {
+        1 | ((self as u32) << 8)
+    }
 }
 
 /// Uniform data for the shader.
@@ -185,6 +219,12 @@ impl StrataPipeline {
                             offset: 28,
                             shader_location: 4,
                         },
+                        // mode
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 32,
+                            shader_location: 5,
+                        },
                     ],
                 }],
             },
@@ -319,6 +359,7 @@ impl StrataPipeline {
             uv: [uv_x, uv_y, uv_w, uv_h],
             color: color.pack(),
             corner_radius: 0.0,
+            mode: 0,
         });
     }
 
@@ -338,6 +379,7 @@ impl StrataPipeline {
                 uv: [uv_x, uv_y, uv_w, uv_h],
                 color: packed_color,
                 corner_radius: 0.0,
+                mode: 0,
             });
         }
     }
@@ -361,6 +403,7 @@ impl StrataPipeline {
             uv: [uv_x, uv_y, uv_w, uv_h],
             color: color.pack(),
             corner_radius,
+            mode: 0,
         });
     }
 
@@ -375,6 +418,68 @@ impl StrataPipeline {
             radius,
             color,
         );
+    }
+
+    /// Add a solid line segment (rendered as a rotated quad in the shader).
+    ///
+    /// The vertex shader expands the two endpoints into a thick quad.
+    pub fn add_line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Color) {
+        self.add_line_styled(x1, y1, x2, y2, thickness, color, LineStyle::Solid);
+    }
+
+    /// Add a styled line segment (solid, dashed, or dotted).
+    pub fn add_line_styled(
+        &mut self,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        thickness: f32,
+        color: Color,
+        style: LineStyle,
+    ) {
+        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        self.instances.push(GpuInstance {
+            position: [x1, y1],       // P1
+            size: [x2, y2],           // P2 (repurposed)
+            uv: [uv_x, uv_y, uv_w, uv_h],
+            color: color.pack(),
+            corner_radius: thickness,  // Thickness (repurposed)
+            mode: style.encode_mode(),
+        });
+    }
+
+    /// Add a solid polyline (series of connected line segments).
+    ///
+    /// Each consecutive pair of points becomes a line segment instance.
+    pub fn add_polyline(&mut self, points: &[[f32; 2]], thickness: f32, color: Color) {
+        self.add_polyline_styled(points, thickness, color, LineStyle::Solid);
+    }
+
+    /// Add a styled polyline (solid, dashed, or dotted).
+    pub fn add_polyline_styled(
+        &mut self,
+        points: &[[f32; 2]],
+        thickness: f32,
+        color: Color,
+        style: LineStyle,
+    ) {
+        if points.len() < 2 {
+            return;
+        }
+        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        let packed_color = color.pack();
+        let mode = style.encode_mode();
+        for i in 0..points.len() - 1 {
+            self.instances.push(GpuInstance {
+                position: points[i],
+                size: points[i + 1],
+                uv: [uv_x, uv_y, uv_w, uv_h],
+                color: packed_color,
+                corner_radius: thickness,
+                mode,
+            });
+        }
     }
 
     /// Add a text string to render.
@@ -406,6 +511,7 @@ impl StrataPipeline {
                 uv: [glyph.uv_x, glyph.uv_y, glyph.uv_w, glyph.uv_h],
                 color: packed_color,
                 corner_radius: 0.0,
+                mode: 0,
             });
 
             cursor_x += self.glyph_atlas.cell_width;
