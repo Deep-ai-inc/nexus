@@ -9,6 +9,7 @@
 //! This solves iced's broken text APIs by storing character positions computed
 //! during layout rather than re-querying them.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -22,7 +23,8 @@ use crate::strata::primitives::{Point, Rect};
 #[derive(Debug, Clone)]
 pub struct TextLayout {
     /// The actual text content (for rendering).
-    pub text: String,
+    /// Uses Cow to avoid allocation for string literals.
+    pub text: Cow<'static, str>,
 
     /// Foreground color (packed RGBA).
     pub color: u32,
@@ -53,7 +55,7 @@ pub struct TextLayout {
 impl TextLayout {
     /// Create a new text layout.
     pub fn new(
-        text: impl Into<String>,
+        text: impl Into<Cow<'static, str>>,
         color: u32,
         bounds: Rect,
         char_positions: Vec<f32>,
@@ -79,7 +81,7 @@ impl TextLayout {
     /// This is a convenience method for simple text where each character
     /// has the same width. For proper text shaping, use the full constructor.
     pub fn simple(
-        text: impl Into<String>,
+        text: impl Into<Cow<'static, str>>,
         color: u32,
         x: f32,
         y: f32,
