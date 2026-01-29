@@ -71,6 +71,9 @@ struct ShellState<A: StrataApp> {
     /// Current window size.
     window_size: (f32, f32),
 
+    /// Current cursor position.
+    cursor_position: Option<Point>,
+
     /// Frame counter (forces shader redraw when changed).
     frame: u64,
 }
@@ -107,6 +110,7 @@ fn init<A: StrataApp>() -> (ShellState<A>, Task<ShellMessage<A::Message>>) {
         app: app_state,
         capture: CaptureState::None,
         window_size: (1200.0, 800.0),
+        cursor_position: None,
         frame: 0,
     };
 
@@ -139,7 +143,38 @@ fn update<A: StrataApp>(
                 state.window_size = (size.width, size.height);
             }
 
-            // TODO: Convert iced events to Strata events and dispatch to app
+            // Handle mouse events
+            if let Event::Mouse(mouse_event) = &event {
+                // Update cursor position
+                if let iced::mouse::Event::CursorMoved { position } = mouse_event {
+                    state.cursor_position = Some(Point::new(position.x, position.y));
+                }
+
+                // Convert to Strata mouse event and dispatch
+                if let Some(strata_event) = convert_mouse_event(mouse_event, state.cursor_position)
+                {
+                    // Build snapshot for hit-testing
+                    let mut snapshot = LayoutSnapshot::new();
+                    snapshot.set_viewport(Rect::new(
+                        0.0,
+                        0.0,
+                        state.window_size.0,
+                        state.window_size.1,
+                    ));
+                    A::view(&state.app, &mut snapshot);
+
+                    // Hit-test at cursor position
+                    let hit = state
+                        .cursor_position
+                        .and_then(|pos| snapshot.hit_test(pos));
+
+                    // Dispatch to app
+                    if let Some(msg) = A::on_mouse(&state.app, strata_event, hit) {
+                        let cmd = A::update(&mut state.app, msg);
+                        return command_to_task(cmd);
+                    }
+                }
+            }
 
             Task::none()
         }
@@ -259,6 +294,36 @@ fn convert_event(event: &Event) -> Option<crate::strata::event_context::Event> {
         }
 
         _ => None,
+    }
+}
+
+/// Convert an iced mouse event to a Strata MouseEvent.
+fn convert_mouse_event(
+    event: &iced::mouse::Event,
+    cursor_position: Option<Point>,
+) -> Option<MouseEvent> {
+    let pos = cursor_position.unwrap_or(Point::ORIGIN);
+
+    match event {
+        iced::mouse::Event::ButtonPressed(button) => Some(MouseEvent::ButtonPressed {
+            button: convert_mouse_button(*button),
+            position: pos,
+        }),
+        iced::mouse::Event::ButtonReleased(button) => Some(MouseEvent::ButtonReleased {
+            button: convert_mouse_button(*button),
+            position: pos,
+        }),
+        iced::mouse::Event::CursorMoved { position } => Some(MouseEvent::CursorMoved {
+            position: Point::new(position.x, position.y),
+        }),
+        iced::mouse::Event::CursorEntered => Some(MouseEvent::CursorEntered),
+        iced::mouse::Event::CursorLeft => Some(MouseEvent::CursorLeft),
+        iced::mouse::Event::WheelScrolled { delta } => Some(MouseEvent::WheelScrolled {
+            delta: match delta {
+                iced::mouse::ScrollDelta::Lines { x, y } => ScrollDelta::Lines { x: *x, y: *y },
+                iced::mouse::ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels { x: *x, y: *y },
+            },
+        }),
     }
 }
 
