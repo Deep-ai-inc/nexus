@@ -14,6 +14,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::strata::content_address::{ContentAddress, Selection, SourceId, SourceOrdering};
+use crate::strata::layout::PrimitiveBatch;
 use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::text_engine::ShapedText;
 
@@ -354,6 +355,10 @@ pub struct LayoutSnapshot {
 
     /// Decoration primitives rendered AFTER text (foreground layer).
     foreground_decorations: Vec<Decoration>,
+
+    /// Direct primitive batch for high-performance rendering.
+    /// This is the "escape hatch" for canvas-like drawing.
+    primitives: PrimitiveBatch,
 }
 
 impl Default for LayoutSnapshot {
@@ -371,6 +376,7 @@ impl LayoutSnapshot {
             viewport: Rect::ZERO,
             background_decorations: Vec::new(),
             foreground_decorations: Vec::new(),
+            primitives: PrimitiveBatch::new(),
         }
     }
 
@@ -380,6 +386,22 @@ impl LayoutSnapshot {
         self.source_ordering.clear();
         self.background_decorations.clear();
         self.foreground_decorations.clear();
+        self.primitives.clear();
+    }
+
+    /// Get read-only access to the primitive batch.
+    ///
+    /// Use this for inspecting primitives added by the layout system.
+    pub fn primitives(&self) -> &PrimitiveBatch {
+        &self.primitives
+    }
+
+    /// Get mutable access to the primitive batch.
+    ///
+    /// This is the fast path for direct GPU instance creation.
+    /// Primitives added here bypass the widget system entirely.
+    pub fn primitives_mut(&mut self) -> &mut PrimitiveBatch {
+        &mut self.primitives
     }
 
     /// Add a background decoration (rendered behind text).

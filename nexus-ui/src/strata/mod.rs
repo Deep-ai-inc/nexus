@@ -36,6 +36,9 @@ pub mod content_address;
 pub mod layout_snapshot;
 pub mod event_context;
 
+// Layout system (flexbox-inspired containers)
+pub mod layout;
+
 // Text engine (cosmic-text integration)
 pub mod text_engine;
 
@@ -48,7 +51,7 @@ pub mod shell;
 // Demo application for testing
 pub mod demo;
 
-// Widget system (Phase 3)
+// Widget system (legacy - being replaced by layout system)
 pub mod widget;
 pub mod widgets;
 
@@ -67,3 +70,9 @@ pub use app::{StrataApp, Command, Subscription, AppConfig, MouseResponse, Captur
 pub use widget::{StrataWidget, StrataWidgetExt, EventResult, BoxedWidget};
 pub use text_engine::{TextEngine, TextAttrs, ShapedText, FontFamily};
 pub use widgets::{TextWidget, TerminalWidget};
+
+// Layout system exports
+pub use layout::{
+    Column, Row, Padding, Alignment, CrossAxisAlignment, PrimitiveBatch,
+};
+pub use layout::containers::{TextElement, TerminalElement};

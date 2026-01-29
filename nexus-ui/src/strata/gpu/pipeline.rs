@@ -18,23 +18,29 @@ use wgpu::util::StagingBelt;
 use super::glyph_atlas::GlyphAtlas;
 use crate::strata::primitives::{Color, Rect};
 
-/// Instance for GPU rendering (28 bytes, padded to 32).
+/// Instance for GPU rendering (32 bytes).
 ///
-/// Used for both glyphs and solid quads (selection, backgrounds).
-/// For solid quads, UV points to the white pixel at (0,0) in the atlas.
+/// Universal primitive for the ubershader - renders glyphs, solid quads,
+/// rounded rects, and (future) images all in a single draw call.
+///
+/// Rendering modes:
+/// - Glyphs: UV points to glyph in atlas, corner_radius = 0
+/// - Solid quads: UV points to white pixel (0,0), corner_radius = 0
+/// - Rounded rects: UV points to white pixel, corner_radius > 0 (SDF mask)
+/// - Images (future): texture_layer > 0, samples from texture array
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GpuInstance {
     /// Position (x, y) in pixels.
-    pub position: [f32; 2],   // 8 bytes
+    pub position: [f32; 2],     // 8 bytes
     /// Size (width, height) in pixels.
-    pub size: [f32; 2],       // 8 bytes
+    pub size: [f32; 2],         // 8 bytes
     /// UV coordinates (u, v, w, h) as normalized u16.
-    pub uv: [u16; 4],         // 8 bytes
+    pub uv: [u16; 4],           // 8 bytes
     /// Color as packed RGBA8.
-    pub color: u32,           // 4 bytes
-    /// Padding for alignment (reserved for future flags).
-    pub _padding: u32,        // 4 bytes
+    pub color: u32,             // 4 bytes
+    /// Corner radius for SDF-based rounded rectangles (0 = sharp corners).
+    pub corner_radius: f32,     // 4 bytes
 }
 
 /// Uniform data for the shader.
@@ -173,6 +179,12 @@ impl StrataPipeline {
                             offset: 24,
                             shader_location: 3,
                         },
+                        // corner_radius
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 28,
+                            shader_location: 4,
+                        },
                     ],
                 }],
             },
@@ -306,7 +318,7 @@ impl StrataPipeline {
             size: [width, height],
             uv: [uv_x, uv_y, uv_w, uv_h],
             color: color.pack(),
-            _padding: 0,
+            corner_radius: 0.0,
         });
     }
 
@@ -325,9 +337,44 @@ impl StrataPipeline {
                 size: [rect.width, rect.height],
                 uv: [uv_x, uv_y, uv_w, uv_h],
                 color: packed_color,
-                _padding: 0,
+                corner_radius: 0.0,
             });
         }
+    }
+
+    /// Add a rounded rectangle (uses SDF in the shader for smooth edges).
+    ///
+    /// The corner_radius is in pixels. Set to half of min(width, height) for a pill shape.
+    pub fn add_rounded_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        corner_radius: f32,
+        color: Color,
+    ) {
+        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        self.instances.push(GpuInstance {
+            position: [x, y],
+            size: [width, height],
+            uv: [uv_x, uv_y, uv_w, uv_h],
+            color: color.pack(),
+            corner_radius,
+        });
+    }
+
+    /// Add a circle (a rounded rect where radius = size/2).
+    pub fn add_circle(&mut self, center_x: f32, center_y: f32, radius: f32, color: Color) {
+        let diameter = radius * 2.0;
+        self.add_rounded_rect(
+            center_x - radius,
+            center_y - radius,
+            diameter,
+            diameter,
+            radius,
+            color,
+        );
     }
 
     /// Add a text string to render.
@@ -358,7 +405,7 @@ impl StrataPipeline {
                 size: [glyph.width as f32, glyph.height as f32],
                 uv: [glyph.uv_x, glyph.uv_y, glyph.uv_w, glyph.uv_h],
                 color: packed_color,
-                _padding: 0,
+                corner_radius: 0.0,
             });
 
             cursor_x += self.glyph_atlas.cell_width;

@@ -558,17 +558,56 @@ impl PipelineWrapper {
         pipeline.clear();
         pipeline.set_background(background);
 
-        // Render background decorations FIRST (behind everything).
+        // =====================================================================
+        // RENDER ORDER (back to front via ubershader instance order):
+        //   1. Background decorations
+        //   2. Primitive backgrounds (solid rects, rounded rects, circles)
+        //   3. Selection highlight
+        //   4. Grid content (terminal rows)
+        //   5. Primitive text runs
+        //   6. Foreground decorations
+        // =====================================================================
+
+        let primitives = snapshot.primitives();
+
+        // 1. Background decorations
         for decoration in snapshot.background_decorations() {
             render_decoration(pipeline, decoration, scale);
         }
 
-        // Render selection (behind text, on top of backgrounds).
-        // Uses the ubershader with white pixel trick - single draw call.
+        // 2. Primitive backgrounds (solid rects, rounded rects, circles)
+        for prim in &primitives.solid_rects {
+            pipeline.add_solid_rect(
+                prim.rect.x * scale,
+                prim.rect.y * scale,
+                prim.rect.width * scale,
+                prim.rect.height * scale,
+                prim.color,
+            );
+        }
+        for prim in &primitives.rounded_rects {
+            pipeline.add_rounded_rect(
+                prim.rect.x * scale,
+                prim.rect.y * scale,
+                prim.rect.width * scale,
+                prim.rect.height * scale,
+                prim.corner_radius * scale,
+                prim.color,
+            );
+        }
+        for prim in &primitives.circles {
+            pipeline.add_circle(
+                prim.center.x * scale,
+                prim.center.y * scale,
+                prim.radius * scale,
+                prim.color,
+            );
+        }
+
+        // 3. Selection highlight (on top of backgrounds, behind text)
         if let Some(sel) = selection {
             if !sel.is_collapsed() {
                 let selection_rects = snapshot.selection_bounds(sel);
-                // Scale rects to physical pixels
                 let scaled_rects: Vec<_> = selection_rects
                     .iter()
                     .map(|r| crate::strata::primitives::Rect {
@@ -582,34 +621,34 @@ impl PipelineWrapper {
             }
         }
 
-        // Render text content from the snapshot
+        // 4. Grid content from sources (terminals use this path)
         for (_source_id, source_layout) in snapshot.sources_in_order() {
             for item in &source_layout.items {
-                match item {
-                    crate::strata::layout_snapshot::ItemLayout::Text(text_layout) => {
-                        // Scale logical coordinates to physical pixels
-                        let x = text_layout.bounds.x * scale;
-                        let y = text_layout.bounds.y * scale;
-                        let color = crate::strata::primitives::Color::unpack(text_layout.color);
-                        pipeline.add_text(&text_layout.text, x, y, color);
-                    }
-                    crate::strata::layout_snapshot::ItemLayout::Grid(grid_layout) => {
-                        // Render each row of the grid
-                        for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
-                            if row.text.trim().is_empty() {
-                                continue;
-                            }
-                            let x = grid_layout.bounds.x * scale;
-                            let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
-                            let color = crate::strata::primitives::Color::unpack(row.color);
-                            pipeline.add_text(&row.text, x, y, color);
+                if let crate::strata::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
+                    for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
+                        if row.text.trim().is_empty() {
+                            continue;
                         }
+                        let x = grid_layout.bounds.x * scale;
+                        let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
+                        let color = crate::strata::primitives::Color::unpack(row.color);
+                        pipeline.add_text(&row.text, x, y, color);
                     }
                 }
             }
         }
 
-        // Render foreground decorations LAST (on top of text).
+        // 5. Primitive text runs
+        for prim in &primitives.text_runs {
+            pipeline.add_text(
+                &prim.text,
+                prim.position.x * scale,
+                prim.position.y * scale,
+                prim.color,
+            );
+        }
+
+        // Render foreground decorations LAST (on top of everything).
         for decoration in snapshot.foreground_decorations() {
             render_decoration(pipeline, decoration, scale);
         }
