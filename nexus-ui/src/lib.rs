@@ -15,6 +15,9 @@
 //! - `systems`: External system integrations (PTY, kernel, agent)
 //! - `utils`: Utility functions
 
+// Strata: High-performance GUI abstraction layer
+pub mod strata;
+
 // Shared constants (no dependencies)
 pub mod constants;
 
@@ -44,7 +47,10 @@ pub mod keymap;
 // Message types (depends on agent_adapter, agent_block)
 pub mod msg;
 
-// State (depends on agent_adapter, agent_block, blocks)
+// Selection state (minimal dependencies)
+pub mod selection;
+
+// State (depends on agent_adapter, agent_block, blocks, selection)
 pub mod state;
 
 // PTY handling (depends on blocks)
