@@ -21,6 +21,12 @@ use crate::strata::primitives::{Point, Rect};
 /// enabling accurate hit-testing and selection rendering.
 #[derive(Debug, Clone)]
 pub struct TextLayout {
+    /// The actual text content (for rendering).
+    pub text: String,
+
+    /// Foreground color (packed RGBA).
+    pub color: u32,
+
     /// Bounding rectangle of the text.
     pub bounds: Rect,
 
@@ -47,17 +53,53 @@ pub struct TextLayout {
 impl TextLayout {
     /// Create a new text layout.
     pub fn new(
+        text: impl Into<String>,
+        color: u32,
         bounds: Rect,
         char_positions: Vec<f32>,
         line_breaks: Vec<usize>,
         line_height: f32,
     ) -> Self {
+        let text = text.into();
         let char_count = char_positions.len();
         Self {
+            text,
+            color,
             bounds,
             char_positions,
             char_widths: Vec::new(), // Computed on demand
             line_breaks,
+            line_height,
+            char_count,
+        }
+    }
+
+    /// Create a simple single-line text layout with uniform character spacing.
+    ///
+    /// This is a convenience method for simple text where each character
+    /// has the same width. For proper text shaping, use the full constructor.
+    pub fn simple(
+        text: impl Into<String>,
+        color: u32,
+        x: f32,
+        y: f32,
+        char_width: f32,
+        line_height: f32,
+    ) -> Self {
+        let text = text.into();
+        let char_count = text.chars().count();
+        let char_positions: Vec<f32> = (0..char_count)
+            .map(|i| i as f32 * char_width)
+            .collect();
+        let width = char_count as f32 * char_width;
+
+        Self {
+            text,
+            color,
+            bounds: Rect::new(x, y, width, line_height),
+            char_positions,
+            char_widths: Vec::new(),
+            line_breaks: Vec::new(),
             line_height,
             char_count,
         }
@@ -645,6 +687,8 @@ mod tests {
     fn make_text_layout() -> TextLayout {
         // "Hello\nWorld" - 5 chars on line 0, 5 chars on line 1
         TextLayout::new(
+            "Hello\nWorld",
+            0xFFFFFFFF, // White
             Rect::new(0.0, 0.0, 50.0, 24.0),
             vec![
                 0.0, 10.0, 20.0, 30.0, 40.0, // Hello
@@ -769,6 +813,8 @@ mod tests {
 
         // Source 1 at top
         let text1 = TextLayout::new(
+            "ABC",
+            0xFFFFFFFF,
             Rect::new(0.0, 0.0, 50.0, 12.0),
             vec![0.0, 10.0, 20.0],
             vec![],
@@ -778,6 +824,8 @@ mod tests {
 
         // Source 2 below source 1
         let text2 = TextLayout::new(
+            "DEF",
+            0xFFFFFFFF,
             Rect::new(0.0, 20.0, 50.0, 12.0),
             vec![0.0, 10.0, 20.0],
             vec![],

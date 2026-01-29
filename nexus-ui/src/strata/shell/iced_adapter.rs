@@ -12,8 +12,7 @@ use crate::strata::app::{AppConfig, Command, StrataApp};
 use crate::strata::content_address::Selection;
 use crate::strata::gpu::StrataPipeline;
 use crate::strata::event_context::{
-    CaptureState, EventContext, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey,
-    ScrollDelta,
+    CaptureState, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey, ScrollDelta,
 };
 use crate::strata::layout_snapshot::LayoutSnapshot;
 use crate::strata::primitives::{Point, Rect};
@@ -66,17 +65,14 @@ struct ShellState<A: StrataApp> {
     /// The application state.
     app: A::State,
 
-    /// Current layout snapshot (rebuilt each frame).
-    snapshot: LayoutSnapshot,
-
     /// Current pointer capture state.
     capture: CaptureState,
 
     /// Current window size.
     window_size: (f32, f32),
 
-    /// Whether we need to rebuild the snapshot.
-    dirty: bool,
+    /// Frame counter (forces shader redraw when changed).
+    frame: u64,
 }
 
 /// Messages handled by the shell.
@@ -109,14 +105,15 @@ fn init<A: StrataApp>() -> (ShellState<A>, Task<ShellMessage<A::Message>>) {
 
     let shell_state = ShellState {
         app: app_state,
-        snapshot: LayoutSnapshot::new(),
         capture: CaptureState::None,
         window_size: (1200.0, 800.0),
-        dirty: true,
+        frame: 0,
     };
 
-    // Convert app command to shell tasks
-    let task = command_to_task(cmd);
+    // Convert app command to shell tasks, and send initial tick to trigger first render
+    let app_task = command_to_task(cmd);
+    let tick_task = Task::done(ShellMessage::Tick);
+    let task = Task::batch([app_task, tick_task]);
 
     (shell_state, task)
 }
@@ -129,46 +126,27 @@ fn update<A: StrataApp>(
     match message {
         ShellMessage::App(msg) => {
             let cmd = A::update(&mut state.app, msg);
-            state.dirty = true;
+            state.frame = state.frame.wrapping_add(1); // Trigger redraw
             command_to_task(cmd)
         }
 
         ShellMessage::Event(event, _window_id) => {
-            // Convert iced event to Strata event and dispatch
-            if let Some(strata_event) = convert_event(&event) {
-                // Rebuild snapshot if dirty
-                if state.dirty {
-                    state.snapshot.clear();
-                    state.snapshot.set_viewport(Rect::new(
-                        0.0,
-                        0.0,
-                        state.window_size.0,
-                        state.window_size.1,
-                    ));
-                    A::view(&state.app, &mut state.snapshot);
-                    state.dirty = false;
-                }
-
-                // Create event context with current capture state
-                let ctx = EventContext::with_capture(&state.snapshot, state.capture);
-
-                // TODO: Dispatch event to widgets and collect messages
-                // For now, just handle capture state changes
-                state.capture = ctx.take_capture();
-            }
+            // Increment frame counter to trigger redraw
+            state.frame = state.frame.wrapping_add(1);
 
             // Handle window resize
             if let Event::Window(iced::window::Event::Resized(size)) = event {
                 state.window_size = (size.width, size.height);
-                state.dirty = true;
             }
+
+            // TODO: Convert iced events to Strata events and dispatch to app
 
             Task::none()
         }
 
         ShellMessage::Tick => {
-            // Mark dirty to trigger view rebuild
-            state.dirty = true;
+            // Increment frame to trigger view rebuild
+            state.frame = state.frame.wrapping_add(1);
             Task::none()
         }
     }
@@ -176,11 +154,18 @@ fn update<A: StrataApp>(
 
 /// Build the view.
 fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Message>> {
+    // Build snapshot fresh each frame
+    // (iced calls view() whenever it needs to render)
+    let mut snapshot = LayoutSnapshot::new();
+    snapshot.set_viewport(Rect::new(0.0, 0.0, state.window_size.0, state.window_size.1));
+    A::view(&state.app, &mut snapshot);
+
     // Create the shader widget that will render Strata content
     let program = StrataShaderProgram {
-        snapshot: state.snapshot.clone(),
+        snapshot,
         selection: A::selection(&state.app).cloned(),
         background: crate::strata::primitives::Color::rgb(0.1, 0.1, 0.1),
+        frame: state.frame,
     };
 
     shader::Shader::new(program)
@@ -349,6 +334,8 @@ struct StrataShaderProgram {
     snapshot: LayoutSnapshot,
     selection: Option<Selection>,
     background: crate::strata::primitives::Color,
+    /// Frame counter - changing this triggers iced to redraw.
+    frame: u64,
 }
 
 /// Primitive passed to the GPU.
@@ -357,6 +344,7 @@ struct StrataPrimitive {
     snapshot: LayoutSnapshot,
     selection: Option<Selection>,
     background: crate::strata::primitives::Color,
+    frame: u64,
 }
 
 impl<Message> shader::Program<Message> for StrataShaderProgram {
@@ -373,6 +361,7 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             snapshot: self.snapshot.clone(),
             selection: self.selection.clone(),
             background: self.background,
+            frame: self.frame,
         }
     }
 }
@@ -448,7 +437,7 @@ impl PipelineWrapper {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _snapshot: &LayoutSnapshot,
+        snapshot: &LayoutSnapshot,
         _selection: Option<&Selection>,
         bounds: &iced::Rectangle,
         viewport: &iced::advanced::graphics::Viewport,
@@ -469,16 +458,23 @@ impl PipelineWrapper {
         pipeline.clear();
         pipeline.set_background(background);
 
-        // Render demo text (positions in logical coordinates, scaled to physical)
-        let white = crate::strata::primitives::Color::WHITE;
-        let green = crate::strata::primitives::Color::rgb(0.3, 0.9, 0.4);
-
-        pipeline.add_text("Strata GPU Text Rendering", 20.0 * scale, 20.0 * scale, white);
-        pipeline.add_text("Hello, World!", 20.0 * scale, 50.0 * scale, green);
-        pipeline.add_text("The quick brown fox jumps over the lazy dog.", 20.0 * scale, 80.0 * scale, white);
-
-        // TODO: Render actual content from snapshot
-        // for (source_id, layout) in snapshot.sources() { ... }
+        // Render content from the snapshot
+        for (_source_id, source_layout) in snapshot.sources_in_order() {
+            for item in &source_layout.items {
+                match item {
+                    crate::strata::layout_snapshot::ItemLayout::Text(text_layout) => {
+                        // Scale logical coordinates to physical pixels
+                        let x = text_layout.bounds.x * scale;
+                        let y = text_layout.bounds.y * scale;
+                        let color = crate::strata::primitives::Color::unpack(text_layout.color);
+                        pipeline.add_text(&text_layout.text, x, y, color);
+                    }
+                    crate::strata::layout_snapshot::ItemLayout::Grid(_grid_layout) => {
+                        // TODO: Render grid content (terminals)
+                    }
+                }
+            }
+        }
 
         // Prepare for GPU (upload buffers, etc.)
         pipeline.prepare(
