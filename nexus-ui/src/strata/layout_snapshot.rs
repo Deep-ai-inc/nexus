@@ -43,6 +43,45 @@ pub enum Anchor {
     Left,
 }
 
+/// Info about a scroll track, used to convert mouse position to scroll offset.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollTrackInfo {
+    /// Y position of the scroll track (top of viewport).
+    pub track_y: f32,
+    /// Height of the scroll track (viewport height).
+    pub track_height: f32,
+    /// Height of the scrollbar thumb.
+    pub thumb_height: f32,
+    /// Maximum scroll offset.
+    pub max_scroll: f32,
+}
+
+impl ScrollTrackInfo {
+    /// Convert a mouse Y position to a scroll offset.
+    ///
+    /// `grab_offset` is the distance from the top of the thumb to where the
+    /// user initially clicked. This keeps the thumb anchored to the cursor
+    /// instead of jumping on first drag.
+    pub fn offset_from_y(&self, mouse_y: f32, grab_offset: f32) -> f32 {
+        let available = self.track_height - self.thumb_height;
+        if available <= 0.0 {
+            return 0.0;
+        }
+        let thumb_top = mouse_y - grab_offset;
+        let relative = (thumb_top - self.track_y).clamp(0.0, available);
+        (relative / available) * self.max_scroll
+    }
+
+    /// Compute the current thumb top Y from a scroll offset.
+    pub fn thumb_y(&self, scroll_offset: f32) -> f32 {
+        let available = self.track_height - self.thumb_height;
+        if available <= 0.0 || self.max_scroll <= 0.0 {
+            return self.track_y;
+        }
+        self.track_y + (scroll_offset / self.max_scroll) * available
+    }
+}
+
 /// A decoration primitive for non-text rendering.
 ///
 /// These are rendered via the ubershader along with glyphs.
@@ -397,6 +436,11 @@ pub struct LayoutSnapshot {
     /// Max scroll values for ScrollColumn containers.
     /// Written during layout, readable by the app to clamp scroll offsets.
     scroll_limits: HashMap<SourceId, f32>,
+
+    /// Scroll track info for ScrollColumn containers.
+    /// Maps scroll container ID → (track_y, track_height, thumb_height, max_scroll).
+    /// Used to convert mouse Y position to scroll offset during thumb dragging.
+    scroll_tracks: HashMap<SourceId, ScrollTrackInfo>,
 }
 
 impl Default for LayoutSnapshot {
@@ -417,6 +461,7 @@ impl LayoutSnapshot {
             primitives: PrimitiveBatch::new(),
             widget_bounds: HashMap::new(),
             scroll_limits: HashMap::new(),
+            scroll_tracks: HashMap::new(),
         }
     }
 
@@ -429,6 +474,7 @@ impl LayoutSnapshot {
         self.primitives.clear();
         self.widget_bounds.clear();
         self.scroll_limits.clear();
+        self.scroll_tracks.clear();
     }
 
     /// Get read-only access to the primitive batch.
@@ -486,6 +532,16 @@ impl LayoutSnapshot {
     /// Get the max scroll value for a ScrollColumn.
     pub fn scroll_limit(&self, id: &SourceId) -> Option<f32> {
         self.scroll_limits.get(id).copied()
+    }
+
+    /// Record scroll track info for a ScrollColumn.
+    pub fn set_scroll_track(&mut self, id: SourceId, info: ScrollTrackInfo) {
+        self.scroll_tracks.insert(id, info);
+    }
+
+    /// Get scroll track info for a ScrollColumn.
+    pub fn scroll_track(&self, id: &SourceId) -> Option<&ScrollTrackInfo> {
+        self.scroll_tracks.get(id)
     }
 
     /// Add a background decoration (rendered behind text).

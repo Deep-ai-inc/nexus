@@ -1373,6 +1373,8 @@ impl Row {
 pub struct ScrollColumn {
     /// Widget ID (required for hit-testing and scroll event routing).
     id: SourceId,
+    /// Scrollbar thumb widget ID (for drag interaction).
+    thumb_id: SourceId,
     /// Child elements.
     children: Vec<LayoutChild>,
     /// Current scroll offset (from app state).
@@ -1397,9 +1399,10 @@ pub struct ScrollColumn {
 
 impl ScrollColumn {
     /// Create a new scroll column with a required ID.
-    pub fn new(id: SourceId) -> Self {
+    pub fn new(id: SourceId, thumb_id: SourceId) -> Self {
         Self {
             id,
+            thumb_id,
             children: Vec::new(),
             scroll_offset: 0.0,
             spacing: 0.0,
@@ -1543,7 +1546,7 @@ impl ScrollColumn {
     /// are laid out. A scrollbar thumb is drawn when content overflows.
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
         let content_x = bounds.x + self.padding.left;
-        let content_width = bounds.width - self.padding.horizontal();
+        let full_content_width = bounds.width - self.padding.horizontal();
         let viewport_h = bounds.height;
 
         // Draw chrome outside clip
@@ -1566,9 +1569,6 @@ impl ScrollColumn {
         // Push clip to viewport bounds
         snapshot.primitives_mut().push_clip(bounds);
 
-        // Register widget ID for hit-testing (scroll events route here)
-        snapshot.register_widget(self.id, bounds);
-
         // Measure all children to compute total content height
         let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
         let mut total_content_height = self.padding.vertical();
@@ -1580,6 +1580,18 @@ impl ScrollColumn {
         if self.children.len() > 1 {
             total_content_height += self.spacing * (self.children.len() - 1) as f32;
         }
+
+        // Reserve space for scrollbar when content overflows, so child content
+        // doesn't extend into the scrollbar hit region (which would block clicks).
+        const SCROLLBAR_GUTTER: f32 = 24.0;
+        let overflows = total_content_height > viewport_h;
+        let content_width = if overflows { full_content_width - SCROLLBAR_GUTTER } else { full_content_width };
+
+        // Register container widget for hit-testing (wheel events route here).
+        // When overflowing, exclude the gutter so this doesn't compete with the
+        // scrollbar thumb track widget in the HashMap-based hit test.
+        let container_hit_width = if overflows { bounds.width - SCROLLBAR_GUTTER } else { bounds.width };
+        snapshot.register_widget(self.id, Rect::new(bounds.x, bounds.y, container_hit_width, bounds.height));
 
         // Clamp scroll offset and record max for app-side clamping
         let max_scroll = (total_content_height - viewport_h).max(0.0);
@@ -1676,12 +1688,27 @@ impl ScrollColumn {
             let scroll_pct = if max_scroll > 0.0 { offset / max_scroll } else { 0.0 };
             let scroll_available = viewport_h - thumb_h;
             let thumb_y = bounds.y + scroll_pct * scroll_available;
+            let thumb_visual = Rect::new(bounds.x + bounds.width - 8.0, thumb_y, 6.0, thumb_h);
 
             snapshot.primitives_mut().add_rounded_rect(
-                Rect::new(bounds.x + bounds.width - 6.0, thumb_y, 4.0, thumb_h),
-                2.0,
-                Color::rgba(1.0, 1.0, 1.0, 0.2),
+                thumb_visual,
+                3.0,
+                Color::rgba(1.0, 1.0, 1.0, 0.25),
             );
+
+            // Register the full-height track as the hit region so clicking
+            // anywhere in the scrollbar gutter initiates a drag.
+            let track_hit = Rect::new(bounds.x + bounds.width - SCROLLBAR_GUTTER, bounds.y, SCROLLBAR_GUTTER, viewport_h);
+            snapshot.register_widget(self.thumb_id, track_hit);
+
+            // Store track info so the app can convert mouse Y → scroll offset
+            use crate::strata::layout_snapshot::ScrollTrackInfo;
+            snapshot.set_scroll_track(self.id, ScrollTrackInfo {
+                track_y: bounds.y,
+                track_height: viewport_h,
+                thumb_height: thumb_h,
+                max_scroll,
+            });
         }
 
         // Pop clip

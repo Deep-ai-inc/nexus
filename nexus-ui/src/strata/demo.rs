@@ -77,6 +77,10 @@ pub enum DemoMessage {
     SelectionExtend(ContentAddress),
     SelectionEnd,
     Scroll(f32),
+    /// Start dragging the scrollbar thumb. Carries the mouse Y at click time.
+    ScrollDragStart(f32),
+    ScrollDragMove(f32),
+    ScrollDragEnd,
 }
 
 /// Demo application state.
@@ -88,11 +92,15 @@ pub struct DemoState {
     tool_output_source: SourceId,
     // Widget IDs
     scroll_id: SourceId,
+    scroll_thumb_id: SourceId,
     status_panel_id: SourceId,
     job_panel_id: SourceId,
     // Scroll state
     scroll_offset: f32,
     scroll_max: Cell<f32>,
+    scroll_track: Cell<Option<crate::strata::layout_snapshot::ScrollTrackInfo>>,
+    /// Distance from mouse click to top of thumb when drag started.
+    scroll_grab_offset: f32,
     // Selection state
     selection: Option<Selection>,
     is_selecting: bool,
@@ -117,10 +125,13 @@ impl StrataApp for DemoApp {
             terminal_source: SourceId::new(),
             tool_output_source: SourceId::new(),
             scroll_id: SourceId::new(),
+            scroll_thumb_id: SourceId::new(),
             status_panel_id: SourceId::new(),
             job_panel_id: SourceId::new(),
             scroll_offset: 0.0,
             scroll_max: Cell::new(f32::MAX),
+            scroll_track: Cell::new(None),
+            scroll_grab_offset: 0.0,
             selection: None,
             is_selecting: false,
             last_frame: Cell::new(Instant::now()),
@@ -147,6 +158,35 @@ impl StrataApp for DemoApp {
             DemoMessage::Scroll(delta) => {
                 let max = state.scroll_max.get();
                 state.scroll_offset = (state.scroll_offset - delta).clamp(0.0, max);
+            }
+            DemoMessage::ScrollDragStart(mouse_y) => {
+                if let Some(track) = state.scroll_track.get() {
+                    let effective_offset = state.scroll_offset.clamp(0.0, state.scroll_max.get());
+                    let thumb_top = track.thumb_y(effective_offset);
+                    let thumb_bottom = thumb_top + track.thumb_height;
+
+                    // Tolerance absorbs float rounding between layout and event frames.
+                    const GRAB_TOLERANCE: f32 = 4.0;
+                    if mouse_y >= (thumb_top - GRAB_TOLERANCE) && mouse_y <= (thumb_bottom + GRAB_TOLERANCE) {
+                        // Clicked on the thumb: preserve grab offset so it doesn't jump.
+                        state.scroll_grab_offset = mouse_y - thumb_top;
+                    } else {
+                        // Clicked on the track: jump thumb center to click point.
+                        state.scroll_grab_offset = track.thumb_height / 2.0;
+                        let new_offset = track.offset_from_y(mouse_y, state.scroll_grab_offset);
+                        state.scroll_offset = new_offset.clamp(0.0, state.scroll_max.get());
+                    }
+                }
+            }
+            DemoMessage::ScrollDragMove(mouse_y) => {
+                // Clamp output to prevent dead zones when dragging past edges.
+                if let Some(track) = state.scroll_track.get() {
+                    let new_offset = track.offset_from_y(mouse_y, state.scroll_grab_offset);
+                    state.scroll_offset = new_offset.clamp(0.0, state.scroll_max.get());
+                }
+            }
+            DemoMessage::ScrollDragEnd => {
+                state.scroll_grab_offset = 0.0;
             }
         }
         Command::none()
@@ -186,7 +226,7 @@ impl StrataApp for DemoApp {
             // LEFT COLUMN: Scrollable Nexus App Mockup
             // =============================================================
             .scroll_column(
-                ScrollColumn::new(state.scroll_id)
+                ScrollColumn::new(state.scroll_id, state.scroll_thumb_id)
                     .scroll_offset(state.scroll_offset)
                     .spacing(16.0)
                     .width(Length::Fill)
@@ -346,9 +386,12 @@ impl StrataApp for DemoApp {
             )
             .layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
 
-        // Update scroll max from layout (for clamping in update())
+        // Update scroll limits from layout (for clamping in update())
         if let Some(max) = snapshot.scroll_limit(&state.scroll_id) {
             state.scroll_max.set(max);
+        }
+        if let Some(track) = snapshot.scroll_track(&state.scroll_id) {
+            state.scroll_track.set(Some(*track));
         }
 
         // =================================================================
@@ -398,8 +441,18 @@ impl StrataApp for DemoApp {
         match event {
             MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
-                ..
+                position,
             } => {
+                // Scrollbar thumb drag
+                if let Some(HitResult::Widget(id)) = &hit {
+                    if *id == state.scroll_thumb_id {
+                        return MouseResponse::message_and_capture(
+                            DemoMessage::ScrollDragStart(position.y),
+                            state.scroll_thumb_id,
+                        );
+                    }
+                }
+                // Text selection
                 if let Some(HitResult::Content(addr)) = hit {
                     return MouseResponse::message_and_capture(
                         DemoMessage::SelectionStart(addr),
@@ -407,8 +460,13 @@ impl StrataApp for DemoApp {
                     );
                 }
             }
-            MouseEvent::CursorMoved { .. } => {
-                if capture.is_captured() {
+            MouseEvent::CursorMoved { position } => {
+                if let CaptureState::Captured(id) = capture {
+                    // Scrollbar thumb drag
+                    if *id == state.scroll_thumb_id {
+                        return MouseResponse::message(DemoMessage::ScrollDragMove(position.y));
+                    }
+                    // Text selection
                     if let Some(HitResult::Content(addr)) = hit {
                         return MouseResponse::message(DemoMessage::SelectionExtend(addr));
                     }
@@ -418,7 +476,10 @@ impl StrataApp for DemoApp {
                 button: MouseButton::Left,
                 ..
             } => {
-                if capture.is_captured() {
+                if let CaptureState::Captured(id) = capture {
+                    if *id == state.scroll_thumb_id {
+                        return MouseResponse::message_and_release(DemoMessage::ScrollDragEnd);
+                    }
                     return MouseResponse::message_and_release(DemoMessage::SelectionEnd);
                 }
             }
