@@ -176,7 +176,22 @@ fn update<A: StrataApp>(
                     let should_dispatch = hit.is_some() || state.capture.is_captured();
 
                     if should_dispatch {
-                        if let Some(msg) = A::on_mouse(&state.app, strata_event, hit, &state.capture) {
+                        let response = A::on_mouse(&state.app, strata_event, hit, &state.capture);
+
+                        // Process capture request
+                        use crate::strata::app::CaptureRequest;
+                        match response.capture {
+                            CaptureRequest::Capture(source) => {
+                                state.capture = CaptureState::Captured(source);
+                            }
+                            CaptureRequest::Release => {
+                                state.capture = CaptureState::None;
+                            }
+                            CaptureRequest::None => {}
+                        }
+
+                        // Process message
+                        if let Some(msg) = response.message {
                             let cmd = A::update(&mut state.app, msg);
                             return command_to_task(cmd);
                         }
@@ -517,7 +532,7 @@ impl PipelineWrapper {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         snapshot: &LayoutSnapshot,
-        _selection: Option<&Selection>,
+        selection: Option<&Selection>,
         bounds: &iced::Rectangle,
         viewport: &iced::advanced::graphics::Viewport,
         background: crate::strata::primitives::Color,
@@ -543,7 +558,31 @@ impl PipelineWrapper {
         pipeline.clear();
         pipeline.set_background(background);
 
-        // Render content from the snapshot
+        // Render background decorations FIRST (behind everything).
+        for decoration in snapshot.background_decorations() {
+            render_decoration(pipeline, decoration, scale);
+        }
+
+        // Render selection (behind text, on top of backgrounds).
+        // Uses the ubershader with white pixel trick - single draw call.
+        if let Some(sel) = selection {
+            if !sel.is_collapsed() {
+                let selection_rects = snapshot.selection_bounds(sel);
+                // Scale rects to physical pixels
+                let scaled_rects: Vec<_> = selection_rects
+                    .iter()
+                    .map(|r| crate::strata::primitives::Rect {
+                        x: r.x * scale,
+                        y: r.y * scale,
+                        width: r.width * scale,
+                        height: r.height * scale,
+                    })
+                    .collect();
+                pipeline.add_solid_rects(&scaled_rects, crate::strata::gpu::SELECTION_COLOR);
+            }
+        }
+
+        // Render text content from the snapshot
         for (_source_id, source_layout) in snapshot.sources_in_order() {
             for item in &source_layout.items {
                 match item {
@@ -568,6 +607,11 @@ impl PipelineWrapper {
                     }
                 }
             }
+        }
+
+        // Render foreground decorations LAST (on top of text).
+        for decoration in snapshot.foreground_decorations() {
+            render_decoration(pipeline, decoration, scale);
         }
 
         // Create command encoder for staging belt uploads.
@@ -599,6 +643,48 @@ impl PipelineWrapper {
     ) {
         if let Some(pipeline) = &self.pipeline {
             pipeline.render(encoder, target, clip_bounds);
+        }
+    }
+}
+
+/// Helper to render a decoration primitive via the ubershader pipeline.
+fn render_decoration(
+    pipeline: &mut StrataPipeline,
+    decoration: &crate::strata::layout_snapshot::Decoration,
+    scale: f32,
+) {
+    use crate::strata::layout_snapshot::Decoration;
+
+    match decoration {
+        Decoration::SolidRect { rect, color } => {
+            pipeline.add_solid_rect(
+                rect.x * scale,
+                rect.y * scale,
+                rect.width * scale,
+                rect.height * scale,
+                *color,
+            );
+        }
+        Decoration::RoundedRect {
+            rect,
+            corner_radius,
+            color,
+        } => {
+            pipeline.add_rounded_rect(
+                rect.x * scale,
+                rect.y * scale,
+                rect.width * scale,
+                rect.height * scale,
+                corner_radius * scale,
+                *color,
+            );
+        }
+        Decoration::Circle {
+            center,
+            radius,
+            color,
+        } => {
+            pipeline.add_circle(center.x * scale, center.y * scale, radius * scale, *color);
         }
     }
 }

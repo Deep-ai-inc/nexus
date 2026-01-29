@@ -1,12 +1,12 @@
 // Strata unified rendering shader (ubershader).
 //
-// Renders all 2D content in a single draw call using the "white pixel" trick:
+// Renders all 2D content in a single draw call:
 // - Glyphs: Sample glyph alpha from atlas, multiply by glyph color
-// - Solid quads (selection, backgrounds): Sample the 1x1 white pixel at (0,0),
-//   so atlas_alpha = 1.0, and final color = quad_color * 1.0 = quad_color
+// - Solid quads: Sample white pixel (alpha=1.0), result = color
+// - Rounded rects: Sample white pixel, apply SDF mask for smooth corners
 //
-// This eliminates pipeline switches and enables perfect Z-ordering by
-// simply ordering instances in the buffer.
+// Uses the "white pixel" trick: a 1x1 white pixel at atlas (0,0) enables
+// solid quads to render with the same shader path as textured glyphs.
 
 struct Globals {
     transform: mat4x4<f32>,
@@ -26,14 +26,18 @@ var atlas_sampler: sampler;
 struct Instance {
     @location(0) position: vec2<f32>,
     @location(1) size: vec2<f32>,
-    @location(2) uv: vec4<u32>,   // [uv_x, uv_y, uv_w, uv_h] as normalized u16
-    @location(3) color: u32,      // Packed RGBA8
+    @location(2) uv: vec4<u32>,       // [uv_x, uv_y, uv_w, uv_h] as normalized u16
+    @location(3) color: u32,          // Packed RGBA8
+    @location(4) corner_radius: f32,  // 0 = sharp corners, >0 = SDF rounded
 }
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) local_pos: vec2<f32>,  // Position within quad (0-1)
+    @location(3) size: vec2<f32>,       // Quad size in pixels
+    @location(4) corner_radius: f32,
 }
 
 // Quad vertices (two triangles forming a quad)
@@ -74,7 +78,22 @@ fn vs_main(
     out.uv = vec2<f32>(uv_x, uv_y) + quad_pos * vec2<f32>(uv_w, uv_h);
     out.color = unpack_color(instance.color);
 
+    // Pass through for SDF calculation
+    out.local_pos = quad_pos;
+    out.size = instance.size;
+    out.corner_radius = instance.corner_radius;
+
     return out;
+}
+
+// Signed Distance Function for a rounded rectangle.
+// Returns negative inside, positive outside, zero on edge.
+// p: position relative to center of rect
+// b: half-size of rect (width/2, height/2)
+// r: corner radius
+fn sdf_rounded_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - b + vec2<f32>(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - r;
 }
 
 @fragment
@@ -84,7 +103,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // - For solid quads: samples the white pixel (alpha = 1.0)
     let atlas_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).a;
 
-    // Final color = instance color * atlas alpha
-    // This is branchless and handles both glyphs and solid quads uniformly.
-    return vec4<f32>(in.color.rgb, in.color.a * atlas_alpha);
+    // Start with atlas-modulated alpha
+    var alpha = in.color.a * atlas_alpha;
+
+    // Apply SDF rounded corner mask if corner_radius > 0
+    if (in.corner_radius > 0.0) {
+        // Convert local_pos (0-1) to position relative to rect center
+        let centered_pos = (in.local_pos - 0.5) * in.size;
+        let half_size = in.size * 0.5;
+
+        // Calculate signed distance to rounded rect edge
+        let dist = sdf_rounded_box(centered_pos, half_size, in.corner_radius);
+
+        // Anti-aliased edge using screen-space derivatives
+        // fwidth gives us the rate of change for smooth AA
+        let edge_aa = fwidth(dist);
+        let sdf_alpha = 1.0 - smoothstep(-edge_aa, edge_aa, dist);
+
+        // Combine SDF mask with existing alpha
+        alpha = alpha * sdf_alpha;
+    }
+
+    return vec4<f32>(in.color.rgb, alpha);
 }

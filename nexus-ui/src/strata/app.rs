@@ -6,9 +6,92 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::strata::content_address::{ContentAddress, Selection};
+use crate::strata::content_address::{ContentAddress, Selection, SourceId};
 use crate::strata::event_context::{CaptureState, MouseEvent};
 use crate::strata::layout_snapshot::LayoutSnapshot;
+
+/// Response from a mouse event handler.
+///
+/// Combines an optional message with optional pointer capture state changes.
+/// This allows widgets to both update state AND request pointer capture atomically.
+#[derive(Debug)]
+pub struct MouseResponse<M> {
+    /// Optional message to send to update().
+    pub message: Option<M>,
+
+    /// Pointer capture request.
+    pub capture: CaptureRequest,
+}
+
+impl<M> MouseResponse<M> {
+    /// No response (no message, no capture change).
+    pub fn none() -> Self {
+        Self {
+            message: None,
+            capture: CaptureRequest::None,
+        }
+    }
+
+    /// Response with just a message.
+    pub fn message(msg: M) -> Self {
+        Self {
+            message: Some(msg),
+            capture: CaptureRequest::None,
+        }
+    }
+
+    /// Response that captures the pointer for a source.
+    pub fn capture(source: SourceId) -> Self {
+        Self {
+            message: None,
+            capture: CaptureRequest::Capture(source),
+        }
+    }
+
+    /// Response with message that also captures the pointer.
+    pub fn message_and_capture(msg: M, source: SourceId) -> Self {
+        Self {
+            message: Some(msg),
+            capture: CaptureRequest::Capture(source),
+        }
+    }
+
+    /// Response that releases pointer capture.
+    pub fn release() -> Self {
+        Self {
+            message: None,
+            capture: CaptureRequest::Release,
+        }
+    }
+
+    /// Response with message that also releases capture.
+    pub fn message_and_release(msg: M) -> Self {
+        Self {
+            message: Some(msg),
+            capture: CaptureRequest::Release,
+        }
+    }
+}
+
+impl<M> Default for MouseResponse<M> {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+/// Request to change pointer capture state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRequest {
+    /// No change to capture state.
+    None,
+
+    /// Capture the pointer for the specified source.
+    /// While captured, mouse events will be dispatched even when outside widget bounds.
+    Capture(SourceId),
+
+    /// Release pointer capture.
+    Release,
+}
 
 /// A command that produces a message asynchronously.
 pub struct Command<M> {
@@ -148,14 +231,20 @@ pub trait StrataApp: Sized + 'static {
     /// contains the ContentAddress at the mouse position (if any).
     /// The `capture` parameter indicates if the pointer is currently captured,
     /// which is essential for handling drag operations outside widget bounds.
-    /// Returns an optional message to send to `update()`.
+    ///
+    /// Returns a `MouseResponse` that can include:
+    /// - An optional message to send to `update()`
+    /// - A capture request to capture or release the pointer
+    ///
+    /// Use `MouseResponse::message_and_capture()` to start drag selection,
+    /// and `MouseResponse::message_and_release()` to end it.
     fn on_mouse(
         _state: &Self::State,
         _event: MouseEvent,
         _hit: Option<ContentAddress>,
         _capture: &CaptureState,
-    ) -> Option<Self::Message> {
-        None
+    ) -> MouseResponse<Self::Message> {
+        MouseResponse::none()
     }
 
     /// Create subscriptions based on current state.

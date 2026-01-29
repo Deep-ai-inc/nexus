@@ -14,8 +14,31 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::strata::content_address::{ContentAddress, Selection, SourceId, SourceOrdering};
-use crate::strata::primitives::{Point, Rect};
+use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::text_engine::ShapedText;
+
+/// A decoration primitive for non-text rendering.
+///
+/// These are rendered via the ubershader along with glyphs.
+#[derive(Debug, Clone)]
+pub enum Decoration {
+    /// A solid rectangle (sharp corners).
+    SolidRect { rect: Rect, color: Color },
+
+    /// A rounded rectangle with corner radius.
+    RoundedRect {
+        rect: Rect,
+        corner_radius: f32,
+        color: Color,
+    },
+
+    /// A circle (rendered as a rounded rect where radius = size/2).
+    Circle {
+        center: Point,
+        radius: f32,
+        color: Color,
+    },
+}
 
 /// Layout information for text content.
 ///
@@ -324,6 +347,13 @@ pub struct LayoutSnapshot {
 
     /// Current viewport (for culling).
     viewport: Rect,
+
+    /// Decoration primitives (solid rects, rounded rects, circles).
+    /// Rendered BEFORE text (background layer).
+    background_decorations: Vec<Decoration>,
+
+    /// Decoration primitives rendered AFTER text (foreground layer).
+    foreground_decorations: Vec<Decoration>,
 }
 
 impl Default for LayoutSnapshot {
@@ -339,6 +369,8 @@ impl LayoutSnapshot {
             sources: HashMap::new(),
             source_ordering: SourceOrdering::new(),
             viewport: Rect::ZERO,
+            background_decorations: Vec::new(),
+            foreground_decorations: Vec::new(),
         }
     }
 
@@ -346,6 +378,52 @@ impl LayoutSnapshot {
     pub fn clear(&mut self) {
         self.sources.clear();
         self.source_ordering.clear();
+        self.background_decorations.clear();
+        self.foreground_decorations.clear();
+    }
+
+    /// Add a background decoration (rendered behind text).
+    pub fn add_background(&mut self, decoration: Decoration) {
+        self.background_decorations.push(decoration);
+    }
+
+    /// Add a foreground decoration (rendered in front of text).
+    pub fn add_foreground(&mut self, decoration: Decoration) {
+        self.foreground_decorations.push(decoration);
+    }
+
+    /// Add a solid rectangle background.
+    pub fn add_solid_rect(&mut self, rect: Rect, color: Color) {
+        self.background_decorations
+            .push(Decoration::SolidRect { rect, color });
+    }
+
+    /// Add a rounded rectangle background.
+    pub fn add_rounded_rect(&mut self, rect: Rect, corner_radius: f32, color: Color) {
+        self.background_decorations.push(Decoration::RoundedRect {
+            rect,
+            corner_radius,
+            color,
+        });
+    }
+
+    /// Add a circle background.
+    pub fn add_circle(&mut self, center: Point, radius: f32, color: Color) {
+        self.background_decorations.push(Decoration::Circle {
+            center,
+            radius,
+            color,
+        });
+    }
+
+    /// Get background decorations.
+    pub fn background_decorations(&self) -> &[Decoration] {
+        &self.background_decorations
+    }
+
+    /// Get foreground decorations.
+    pub fn foreground_decorations(&self) -> &[Decoration] {
+        &self.foreground_decorations
     }
 
     /// Set the viewport rectangle.

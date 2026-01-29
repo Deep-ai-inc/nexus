@@ -58,12 +58,12 @@ pub mod gpu;
 // Re-export core types
 pub use primitives::{Color, Rect, Size, Constraints, Point};
 pub use content_address::{ContentAddress, SourceId, Selection, SourceOrdering};
-pub use layout_snapshot::{LayoutSnapshot, SourceLayout, ItemLayout, TextLayout, GridLayout, GridRow};
+pub use layout_snapshot::{Decoration, LayoutSnapshot, SourceLayout, ItemLayout, TextLayout, GridLayout, GridRow};
 pub use event_context::{
     CaptureState, Event, EventContext, Key, KeyEvent, Modifiers, MouseButton, MouseEvent,
     NamedKey, ScrollDelta,
 };
-pub use app::{StrataApp, Command, Subscription, AppConfig};
+pub use app::{StrataApp, Command, Subscription, AppConfig, MouseResponse, CaptureRequest};
 pub use widget::{StrataWidget, StrataWidgetExt, EventResult, BoxedWidget};
 pub use text_engine::{TextEngine, TextAttrs, ShapedText, FontFamily};
 pub use widgets::{TextWidget, TerminalWidget};
