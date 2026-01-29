@@ -3,13 +3,11 @@
 //! Run with: `cargo run -p nexus-ui --example strata_demo`
 //! Or temporarily replace main() to call `strata::demo::run()`
 
-use std::cell::RefCell;
-
 use crate::strata::content_address::{ContentAddress, SourceId};
 use crate::strata::event_context::{MouseButton, MouseEvent};
-use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
-use crate::strata::primitives::Color;
-use crate::strata::text_engine::{TextAttrs, TextEngine};
+use crate::strata::primitives::{Color, Rect};
+use crate::strata::widget::StrataWidget;
+use crate::strata::widgets::{TextWidget, TerminalWidget};
 use crate::strata::{
     AppConfig, Command, LayoutSnapshot, Selection, StrataApp, Subscription,
 };
@@ -29,11 +27,10 @@ pub struct DemoState {
     title_source: SourceId,
     hello_source: SourceId,
     pangram_source: SourceId,
+    terminal_source: SourceId,
     status_source: SourceId,
     /// Last clicked position (for displaying hit-test results).
     last_click: Option<ContentAddress>,
-    /// Text engine for cosmic-text shaping (RefCell for interior mutability in view()).
-    text_engine: RefCell<TextEngine>,
 }
 
 /// Demo application.
@@ -49,9 +46,9 @@ impl StrataApp for DemoApp {
             title_source: SourceId::new(),
             hello_source: SourceId::new(),
             pangram_source: SourceId::new(),
+            terminal_source: SourceId::new(),
             status_source: SourceId::new(),
             last_click: None,
-            text_engine: RefCell::new(TextEngine::new()),
         };
         (state, Command::none())
     }
@@ -69,55 +66,50 @@ impl StrataApp for DemoApp {
     }
 
     fn view(state: &Self::State, snapshot: &mut LayoutSnapshot) {
-        // Register demo content with snapshot.
-        // Positions are in logical coordinates - the shell adapter scales them.
-        // Use cosmic-text for accurate character positioning.
-        let mut engine = state.text_engine.borrow_mut();
+        // Demo content using the new widget system.
+        // Widgets handle text shaping and layout registration automatically.
 
         // Title text (white)
-        let title_attrs = TextAttrs {
-            color: Color::WHITE,
-            ..Default::default()
-        };
-        let title_shaped = engine.shape("Strata GPU Text Rendering", &title_attrs);
-        let title = TextLayout::from_shaped(&title_shaped, 20.0, 20.0);
-        snapshot.register_source(state.title_source, SourceLayout::text(title));
+        let mut title = TextWidget::with_source_id(state.title_source, "Strata Widget Demo")
+            .color(Color::WHITE);
+        title.layout(snapshot, Rect::new(20.0, 20.0, 400.0, 20.0));
 
         // Hello text (green)
-        let hello_attrs = TextAttrs {
-            color: Color::rgb(0.3, 0.9, 0.4),
-            ..Default::default()
-        };
-        let hello_shaped = engine.shape("Hello, World!", &hello_attrs);
-        let hello = TextLayout::from_shaped(&hello_shaped, 20.0, 50.0);
-        snapshot.register_source(state.hello_source, SourceLayout::text(hello));
+        let mut hello = TextWidget::with_source_id(state.hello_source, "Hello from TextWidget!")
+            .color(Color::rgb(0.3, 0.9, 0.4));
+        hello.layout(snapshot, Rect::new(20.0, 50.0, 400.0, 20.0));
 
         // Pangram text (white)
-        let pangram_attrs = TextAttrs {
-            color: Color::WHITE,
-            ..Default::default()
-        };
-        let pangram_shaped = engine.shape("The quick brown fox jumps over the lazy dog.", &pangram_attrs);
-        let pangram = TextLayout::from_shaped(&pangram_shaped, 20.0, 80.0);
-        snapshot.register_source(state.pangram_source, SourceLayout::text(pangram));
+        let mut pangram = TextWidget::with_source_id(
+            state.pangram_source,
+            "The quick brown fox jumps over the lazy dog.",
+        )
+        .color(Color::WHITE);
+        pangram.layout(snapshot, Rect::new(20.0, 80.0, 400.0, 20.0));
+
+        // Terminal widget demo (small 20x3 grid)
+        let mut terminal = TerminalWidget::with_source_id(
+            state.terminal_source,
+            20, 3,  // cols, rows
+            8.4, 20.0,  // cell_width, cell_height
+        );
+        terminal.write_str(0, 0, "Terminal Grid:", Color::rgb(0.5, 0.8, 1.0), Color::TRANSPARENT);
+        terminal.write_str(0, 1, "Row 1: Hello", Color::WHITE, Color::TRANSPARENT);
+        terminal.write_str(0, 2, "Row 2: World", Color::WHITE, Color::TRANSPARENT);
+        terminal.layout(snapshot, Rect::new(20.0, 120.0, 200.0, 60.0));
 
         // Status line showing last click (yellow)
-        // content_offset is a cursor position (0 to N), not a character index
         let status_text = if let Some(addr) = &state.last_click {
-            format!("Cursor position: {} (between chars {} and {})",
-                addr.content_offset,
-                addr.content_offset.saturating_sub(1),
-                addr.content_offset)
+            format!(
+                "Clicked: pos {} in source {:?}",
+                addr.content_offset, addr.source_id
+            )
         } else {
-            "Click on text to test hit-testing".to_string()
+            "Click on text or terminal to test hit-testing".to_string()
         };
-        let status_attrs = TextAttrs {
-            color: Color::rgb(1.0, 0.9, 0.3),
-            ..Default::default()
-        };
-        let status_shaped = engine.shape(status_text, &status_attrs);
-        let status = TextLayout::from_shaped(&status_shaped, 20.0, 120.0);
-        snapshot.register_source(state.status_source, SourceLayout::text(status));
+        let mut status = TextWidget::with_source_id(state.status_source, status_text)
+            .color(Color::rgb(1.0, 0.9, 0.3));
+        status.layout(snapshot, Rect::new(20.0, 200.0, 600.0, 20.0));
     }
 
     fn selection(_state: &Self::State) -> Option<&Selection> {

@@ -48,35 +48,22 @@ pub mod shell;
 // Demo application for testing
 pub mod demo;
 
+// Widget system (Phase 3)
+pub mod widget;
+pub mod widgets;
+
+// GPU pipeline
+pub mod gpu;
+
 // Re-export core types
 pub use primitives::{Color, Rect, Size, Constraints, Point};
 pub use content_address::{ContentAddress, SourceId, Selection, SourceOrdering};
-pub use layout_snapshot::{LayoutSnapshot, SourceLayout, ItemLayout, TextLayout, GridLayout};
+pub use layout_snapshot::{LayoutSnapshot, SourceLayout, ItemLayout, TextLayout, GridLayout, GridRow};
 pub use event_context::{
     CaptureState, Event, EventContext, Key, KeyEvent, Modifiers, MouseButton, MouseEvent,
     NamedKey, ScrollDelta,
 };
 pub use app::{StrataApp, Command, Subscription, AppConfig};
-
-// Widget system (Phase 3)
-// mod widget;
-// mod virtual_list;
-// pub use widget::{StrataWidget, Event, EventResult};
-// pub use virtual_list::{VirtualList, ListDelegate, ListItemDescriptor};
-
-// Text engine (Phase 2)
-// mod text_engine;
-// pub use text_engine::{TextEngine, TextHandle, TextAttrs, TextLayoutData};
-
-// GPU pipeline
-pub mod gpu;
-
-// Widgets (Phase 4)
-// pub mod widgets;
-
-// Shell integration (Phase 2)
-// pub mod shell;
-
-// App trait (Phase 2)
-// mod app;
-// pub use app::{StrataApp, Command, Subscription};
+pub use widget::{StrataWidget, StrataWidgetExt, EventResult, BoxedWidget};
+pub use text_engine::{TextEngine, TextAttrs, ShapedText, FontFamily};
+pub use widgets::{TextWidget, TerminalWidget};

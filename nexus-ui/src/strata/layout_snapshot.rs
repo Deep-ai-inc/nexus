@@ -159,6 +159,15 @@ impl TextLayout {
     }
 }
 
+/// A row of text in a grid layout.
+#[derive(Debug, Clone)]
+pub struct GridRow {
+    /// The text content for this row.
+    pub text: String,
+    /// Foreground color (packed RGBA).
+    pub color: u32,
+}
+
 /// Layout information for grid content (terminals).
 #[derive(Debug, Clone)]
 pub struct GridLayout {
@@ -176,6 +185,9 @@ pub struct GridLayout {
 
     /// Number of rows.
     pub rows: u16,
+
+    /// Row content for rendering.
+    pub rows_content: Vec<GridRow>,
 }
 
 impl GridLayout {
@@ -187,6 +199,26 @@ impl GridLayout {
             cell_height,
             cols,
             rows,
+            rows_content: Vec::new(),
+        }
+    }
+
+    /// Create a grid layout with row content.
+    pub fn with_rows(
+        bounds: Rect,
+        cell_width: f32,
+        cell_height: f32,
+        cols: u16,
+        rows: u16,
+        rows_content: Vec<GridRow>,
+    ) -> Self {
+        Self {
+            bounds,
+            cell_width,
+            cell_height,
+            cols,
+            rows,
+            rows_content,
         }
     }
 

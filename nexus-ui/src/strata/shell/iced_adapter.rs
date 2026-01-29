@@ -540,8 +540,17 @@ impl PipelineWrapper {
                         let color = crate::strata::primitives::Color::unpack(text_layout.color);
                         pipeline.add_text(&text_layout.text, x, y, color);
                     }
-                    crate::strata::layout_snapshot::ItemLayout::Grid(_grid_layout) => {
-                        // TODO: Render grid content (terminals)
+                    crate::strata::layout_snapshot::ItemLayout::Grid(grid_layout) => {
+                        // Render each row of the grid
+                        for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
+                            if row.text.trim().is_empty() {
+                                continue;
+                            }
+                            let x = grid_layout.bounds.x * scale;
+                            let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
+                            let color = crate::strata::primitives::Color::unpack(row.color);
+                            pipeline.add_text(&row.text, x, y, color);
+                        }
                     }
                 }
             }
