@@ -36,6 +36,9 @@ pub mod content_address;
 pub mod layout_snapshot;
 pub mod event_context;
 
+// Text engine (cosmic-text integration)
+pub mod text_engine;
+
 // Application trait
 pub mod app;
 

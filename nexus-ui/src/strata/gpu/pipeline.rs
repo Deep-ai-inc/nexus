@@ -1,8 +1,17 @@
 //! GPU Pipeline for Strata rendering.
 //!
 //! Provides text rendering using instanced glyph quads.
+//!
+//! # Apple Silicon Optimization
+//!
+//! Uses `StagingBelt` for buffer uploads to exploit unified memory on M1/M2/M3.
+//! Instead of `queue.write_buffer()` which may involve intermediate copies,
+//! we write directly to mapped memory that lives in the unified address space.
+
+use std::num::NonZeroU64;
 
 use iced::widget::shader::wgpu;
+use wgpu::util::StagingBelt;
 
 use super::glyph_atlas::GlyphAtlas;
 use crate::strata::primitives::Color;
@@ -36,6 +45,13 @@ struct Globals {
 }
 
 /// GPU pipeline for Strata rendering.
+///
+/// # Future optimization
+/// Currently instances are collected into a `Vec` then copied to the staging belt.
+/// For maximum throughput, the API could be redesigned to write directly into
+/// the staging belt's mapped memory slice, bypassing the intermediate Vec.
+/// This would require exposing a "begin frame" / "end frame" pattern where
+/// callers write instances directly to a provided slice.
 pub struct StrataPipeline {
     glyph_pipeline: wgpu::RenderPipeline,
     globals_buffer: wgpu::Buffer,
@@ -47,10 +63,14 @@ pub struct StrataPipeline {
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     glyph_atlas: GlyphAtlas,
-    /// Instances to render this frame.
+    /// Instances to render this frame (CPU-side collection).
+    /// TODO: Future optimization - write directly to staging belt slice.
     instances: Vec<GlyphInstance>,
     /// Background color.
     background: Color,
+    /// Staging belt for unified memory uploads (Apple Silicon optimization).
+    /// Writes directly to mapped memory, avoiding intermediate copies.
+    staging_belt: StagingBelt,
 }
 
 impl StrataPipeline {
@@ -242,6 +262,11 @@ impl StrataPipeline {
             mapped_at_creation: false,
         });
 
+        // Create staging belt for unified memory uploads.
+        // 8MB chunk size to handle large text dumps (e.g., cat'ing huge log files)
+        // without needing to allocate additional chunks on the fly.
+        let staging_belt = StagingBelt::new(8 * 1024 * 1024);
+
         Self {
             glyph_pipeline,
             globals_buffer,
@@ -255,6 +280,7 @@ impl StrataPipeline {
             glyph_atlas,
             instances: Vec::new(),
             background: Color::BLACK,
+            staging_belt,
         }
     }
 
@@ -305,10 +331,14 @@ impl StrataPipeline {
     }
 
     /// Prepare for rendering (upload data to GPU).
+    ///
+    /// Uses StagingBelt to write directly to unified memory on Apple Silicon,
+    /// avoiding intermediate buffer copies.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         viewport_width: f32,
         viewport_height: f32,
     ) {
@@ -322,7 +352,7 @@ impl StrataPipeline {
             self.glyph_atlas.mark_clean();
         }
 
-        // Update globals
+        // Update globals (small uniform buffer, write_buffer is fine)
         let globals = Globals {
             transform: create_orthographic_matrix(viewport_width, viewport_height),
             atlas_size: [
@@ -344,14 +374,32 @@ impl StrataPipeline {
             });
         }
 
-        // Upload instances
+        // Upload instances using staging belt (unified memory optimization).
+        // On Apple Silicon, this writes directly to mapped memory shared by CPU/GPU.
         if !self.instances.is_empty() {
-            queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.instances),
-            );
+            let instance_bytes = self.instances.len() * std::mem::size_of::<GlyphInstance>();
+            if let Some(size) = NonZeroU64::new(instance_bytes as u64) {
+                let mut staging_buffer = self.staging_belt.write_buffer(
+                    encoder,
+                    &self.instance_buffer,
+                    0,
+                    size,
+                    device,
+                );
+                staging_buffer.copy_from_slice(bytemuck::cast_slice(&self.instances));
+            }
         }
+
+        // Signal that we're done writing to the staging belt for this frame.
+        self.staging_belt.finish();
+    }
+
+    /// Call after the GPU has finished rendering the frame.
+    ///
+    /// Reclaims staging buffer memory for reuse, preventing allocations
+    /// after the initial warmup phase.
+    pub fn after_frame(&mut self) {
+        self.staging_belt.recall();
     }
 
     /// Render to the target.

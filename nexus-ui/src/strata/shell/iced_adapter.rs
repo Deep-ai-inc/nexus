@@ -519,6 +519,12 @@ impl PipelineWrapper {
 
         let pipeline = self.pipeline.as_mut().unwrap();
 
+        // Reclaim staging belt memory from previous frame.
+        // This should be called after GPU work completes, but calling at the
+        // start of the next frame is safe (the staging buffers are no longer
+        // referenced by the previous frame's command buffer at this point).
+        pipeline.after_frame();
+
         // Clear previous frame data
         pipeline.clear();
         pipeline.set_background(background);
@@ -541,13 +547,25 @@ impl PipelineWrapper {
             }
         }
 
-        // Prepare for GPU (upload buffers, etc.)
+        // Create command encoder for staging belt uploads.
+        // The StagingBelt writes directly to unified memory on Apple Silicon,
+        // avoiding intermediate buffer copies.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Strata Staging Upload"),
+        });
+
+        // Prepare for GPU (upload buffers via staging belt)
         pipeline.prepare(
             device,
             queue,
+            &mut encoder,
             bounds.width * scale,
             bounds.height * scale,
         );
+
+        // Submit staging commands. The staging belt's copy commands need to
+        // execute before the render commands that use the buffers.
+        queue.submit(std::iter::once(encoder.finish()));
     }
 
     fn render(

@@ -3,10 +3,13 @@
 //! Run with: `cargo run -p nexus-ui --example strata_demo`
 //! Or temporarily replace main() to call `strata::demo::run()`
 
+use std::cell::RefCell;
+
 use crate::strata::content_address::{ContentAddress, SourceId};
 use crate::strata::event_context::{MouseButton, MouseEvent};
 use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
 use crate::strata::primitives::Color;
+use crate::strata::text_engine::{TextAttrs, TextEngine};
 use crate::strata::{
     AppConfig, Command, LayoutSnapshot, Selection, StrataApp, Subscription,
 };
@@ -29,6 +32,8 @@ pub struct DemoState {
     status_source: SourceId,
     /// Last clicked position (for displaying hit-test results).
     last_click: Option<ContentAddress>,
+    /// Text engine for cosmic-text shaping (RefCell for interior mutability in view()).
+    text_engine: RefCell<TextEngine>,
 }
 
 /// Demo application.
@@ -46,6 +51,7 @@ impl StrataApp for DemoApp {
             pangram_source: SourceId::new(),
             status_source: SourceId::new(),
             last_click: None,
+            text_engine: RefCell::new(TextEngine::new()),
         };
         (state, Command::none())
     }
@@ -65,57 +71,52 @@ impl StrataApp for DemoApp {
     fn view(state: &Self::State, snapshot: &mut LayoutSnapshot) {
         // Register demo content with snapshot.
         // Positions are in logical coordinates - the shell adapter scales them.
-        // We use a fixed char_width estimate; proper text shaping comes in Phase 2.
-        let char_width = 8.4; // Approximate for 14pt monospace
-        let line_height = 20.0;
+        // Use cosmic-text for accurate character positioning.
+        let mut engine = state.text_engine.borrow_mut();
 
         // Title text (white)
-        let title = TextLayout::simple(
-            "Strata GPU Text Rendering",
-            Color::WHITE.pack(),
-            20.0,
-            20.0,
-            char_width,
-            line_height,
-        );
+        let title_attrs = TextAttrs {
+            color: Color::WHITE,
+            ..Default::default()
+        };
+        let title_shaped = engine.shape("Strata GPU Text Rendering", &title_attrs);
+        let title = TextLayout::from_shaped(&title_shaped, 20.0, 20.0);
         snapshot.register_source(state.title_source, SourceLayout::text(title));
 
         // Hello text (green)
-        let hello = TextLayout::simple(
-            "Hello, World!",
-            Color::rgb(0.3, 0.9, 0.4).pack(),
-            20.0,
-            50.0,
-            char_width,
-            line_height,
-        );
+        let hello_attrs = TextAttrs {
+            color: Color::rgb(0.3, 0.9, 0.4),
+            ..Default::default()
+        };
+        let hello_shaped = engine.shape("Hello, World!", &hello_attrs);
+        let hello = TextLayout::from_shaped(&hello_shaped, 20.0, 50.0);
         snapshot.register_source(state.hello_source, SourceLayout::text(hello));
 
         // Pangram text (white)
-        let pangram = TextLayout::simple(
-            "The quick brown fox jumps over the lazy dog.",
-            Color::WHITE.pack(),
-            20.0,
-            80.0,
-            char_width,
-            line_height,
-        );
+        let pangram_attrs = TextAttrs {
+            color: Color::WHITE,
+            ..Default::default()
+        };
+        let pangram_shaped = engine.shape("The quick brown fox jumps over the lazy dog.", &pangram_attrs);
+        let pangram = TextLayout::from_shaped(&pangram_shaped, 20.0, 80.0);
         snapshot.register_source(state.pangram_source, SourceLayout::text(pangram));
 
         // Status line showing last click (yellow)
+        // content_offset is a cursor position (0 to N), not a character index
         let status_text = if let Some(addr) = &state.last_click {
-            format!("Clicked: offset {} in source {:?}", addr.content_offset, addr.source_id)
+            format!("Cursor position: {} (between chars {} and {})",
+                addr.content_offset,
+                addr.content_offset.saturating_sub(1),
+                addr.content_offset)
         } else {
             "Click on text to test hit-testing".to_string()
         };
-        let status = TextLayout::simple(
-            status_text,
-            Color::rgb(1.0, 0.9, 0.3).pack(),
-            20.0,
-            120.0,
-            char_width,
-            line_height,
-        );
+        let status_attrs = TextAttrs {
+            color: Color::rgb(1.0, 0.9, 0.3),
+            ..Default::default()
+        };
+        let status_shaped = engine.shape(status_text, &status_attrs);
+        let status = TextLayout::from_shaped(&status_shaped, 20.0, 120.0);
         snapshot.register_source(state.status_source, SourceLayout::text(status));
     }
 

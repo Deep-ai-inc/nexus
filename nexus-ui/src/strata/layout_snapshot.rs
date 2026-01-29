@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use crate::strata::content_address::{ContentAddress, Selection, SourceId, SourceOrdering};
 use crate::strata::primitives::{Point, Rect};
+use crate::strata::text_engine::ShapedText;
 
 /// Layout information for text content.
 ///
@@ -104,6 +105,23 @@ impl TextLayout {
             line_breaks: Vec::new(),
             line_height,
             char_count,
+        }
+    }
+
+    /// Create a text layout from shaped text.
+    ///
+    /// This uses cosmic-text shaping results for accurate character positions.
+    /// The position (x, y) specifies the top-left corner of the text bounds.
+    pub fn from_shaped(shaped: &ShapedText, x: f32, y: f32) -> Self {
+        Self {
+            text: shaped.text.clone(),
+            color: shaped.color.pack(),
+            bounds: Rect::new(x, y, shaped.width, shaped.height),
+            char_positions: shaped.char_positions.clone(),
+            char_widths: shaped.char_widths.clone(),
+            line_breaks: shaped.line_breaks.clone(),
+            line_height: shaped.line_height,
+            char_count: shaped.char_positions.len(),
         }
     }
 
@@ -379,6 +397,10 @@ impl LayoutSnapshot {
     }
 
     /// Hit test within a text layout.
+    ///
+    /// Returns a cursor position (0 to char_count) suitable for text selection.
+    /// Position N means "between character N-1 and character N" (or before first/after last).
+    /// This snaps to the nearest character boundary based on click position.
     fn hit_test_text(&self, layout: &TextLayout, x: f32, y: f32) -> usize {
         let rel_x = x - layout.bounds.x;
         let rel_y = y - layout.bounds.y;
@@ -393,27 +415,28 @@ impl LayoutSnapshot {
             return line_start;
         }
 
-        // Get character positions for this line
+        // Get character positions for this line (left edge of each character)
         let line_chars = &layout.char_positions[line_start..line_end];
         if line_chars.is_empty() {
             return line_start;
         }
 
-        // Find character by x position
-        // Binary search for the character whose position is closest
+        // Find cursor position by snapping to nearest character boundary.
+        // char_positions[i] = left edge of character i = cursor position i.
+        // We also need the right edge of the last character for cursor position N.
         let idx = line_chars.partition_point(|&pos| pos < rel_x);
 
-        // Snap to nearest character boundary
         let final_idx = if idx == 0 {
+            // Before first character
             0
         } else if idx >= line_chars.len() {
-            line_chars.len().saturating_sub(1)
+            // Past last character - cursor goes at the end
+            line_chars.len()
         } else {
-            // Check which side of the character midpoint we're on
-            // Prefer left character when exactly at midpoint
-            let left_pos = line_chars[idx - 1];
-            let right_pos = line_chars[idx];
-            let midpoint = (left_pos + right_pos) / 2.0;
+            // Between two characters - snap to nearest boundary
+            let left_edge = line_chars[idx - 1];
+            let right_edge = line_chars[idx];
+            let midpoint = (left_edge + right_edge) / 2.0;
             if rel_x <= midpoint {
                 idx - 1
             } else {
