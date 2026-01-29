@@ -28,6 +28,12 @@ pub struct PrimitiveBatch {
 
     /// Raw text runs (pre-positioned, for canvas-like drawing).
     pub(crate) text_runs: Vec<TextRun>,
+
+    /// Borders (hollow rounded rects via SDF ring).
+    pub(crate) borders: Vec<Border>,
+
+    /// Drop shadows (soft SDF blur).
+    pub(crate) shadows: Vec<Shadow>,
 }
 
 /// A solid rectangle primitive.
@@ -93,6 +99,24 @@ pub struct TextRun {
     pub cache_key: Option<u64>,
 }
 
+/// A border/outline primitive (hollow rounded rect via SDF ring).
+#[derive(Debug, Clone, Copy)]
+pub struct Border {
+    pub rect: Rect,
+    pub corner_radius: f32,
+    pub border_width: f32,
+    pub color: Color,
+}
+
+/// A drop shadow primitive (soft SDF-based blur).
+#[derive(Debug, Clone, Copy)]
+pub struct Shadow {
+    pub rect: Rect,
+    pub corner_radius: f32,
+    pub blur_radius: f32,
+    pub color: Color,
+}
+
 impl PrimitiveBatch {
     /// Create an empty primitive batch.
     pub fn new() -> Self {
@@ -107,6 +131,8 @@ impl PrimitiveBatch {
         self.lines.clear();
         self.polylines.clear();
         self.text_runs.clear();
+        self.borders.clear();
+        self.shadows.clear();
     }
 
     /// Add a solid rectangle.
@@ -208,6 +234,44 @@ impl PrimitiveBatch {
         self
     }
 
+    /// Add a border/outline (hollow rounded rect).
+    #[inline]
+    pub fn add_border(
+        &mut self,
+        rect: Rect,
+        corner_radius: f32,
+        border_width: f32,
+        color: Color,
+    ) -> &mut Self {
+        self.borders.push(Border {
+            rect,
+            corner_radius,
+            border_width,
+            color,
+        });
+        self
+    }
+
+    /// Add a drop shadow.
+    ///
+    /// Draw shadows BEFORE the content they shadow for correct layering.
+    #[inline]
+    pub fn add_shadow(
+        &mut self,
+        rect: Rect,
+        corner_radius: f32,
+        blur_radius: f32,
+        color: Color,
+    ) -> &mut Self {
+        self.shadows.push(Shadow {
+            rect,
+            corner_radius,
+            blur_radius,
+            color,
+        });
+        self
+    }
+
     /// Check if the batch is empty.
     pub fn is_empty(&self) -> bool {
         self.solid_rects.is_empty()
@@ -216,6 +280,8 @@ impl PrimitiveBatch {
             && self.lines.is_empty()
             && self.polylines.is_empty()
             && self.text_runs.is_empty()
+            && self.borders.is_empty()
+            && self.shadows.is_empty()
     }
 
     /// Total number of primitives.
@@ -226,5 +292,7 @@ impl PrimitiveBatch {
             + self.lines.len()
             + self.polylines.len()
             + self.text_runs.len()
+            + self.borders.len()
+            + self.shadows.len()
     }
 }

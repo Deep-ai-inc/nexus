@@ -575,7 +575,20 @@ impl PipelineWrapper {
             render_decoration(pipeline, decoration, scale);
         }
 
-        // 2. Primitive backgrounds (solid rects, rounded rects, circles)
+        // 2. Shadows (behind everything they shadow)
+        for prim in &primitives.shadows {
+            pipeline.add_shadow(
+                prim.rect.x * scale,
+                prim.rect.y * scale,
+                prim.rect.width * scale,
+                prim.rect.height * scale,
+                prim.corner_radius * scale,
+                prim.blur_radius * scale,
+                prim.color,
+            );
+        }
+
+        // 2b. Primitive backgrounds (solid rects, rounded rects, circles)
         for prim in &primitives.solid_rects {
             pipeline.add_solid_rect(
                 prim.rect.x * scale,
@@ -604,7 +617,20 @@ impl PipelineWrapper {
             );
         }
 
-        // 2b. Line segments
+        // 2c. Borders (outlines)
+        for prim in &primitives.borders {
+            pipeline.add_border(
+                prim.rect.x * scale,
+                prim.rect.y * scale,
+                prim.rect.width * scale,
+                prim.rect.height * scale,
+                prim.corner_radius * scale,
+                prim.border_width * scale,
+                prim.color,
+            );
+        }
+
+        // 2d. Line segments
         for prim in &primitives.lines {
             pipeline.add_line_styled(
                 prim.p1.x * scale,

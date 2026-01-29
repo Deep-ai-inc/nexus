@@ -112,8 +112,22 @@ impl StrataApp for DemoApp {
             .add_rounded_rect(Rect::new(530.0, 130.0, 100.0, 36.0), 8.0, Color::rgb(0.3, 0.8, 0.5))
             // Pill button
             .add_rounded_rect(Rect::new(530.0, 180.0, 140.0, 30.0), 15.0, Color::rgb(0.9, 0.7, 0.2))
+            // Card shadow (drawn before card for correct layering)
+            .add_shadow(
+                Rect::new(534.0, 234.0, 180.0, 120.0),
+                12.0,
+                12.0,
+                Color::rgba(0.0, 0.0, 0.0, 0.5),
+            )
             // Card
             .add_rounded_rect(Rect::new(530.0, 230.0, 180.0, 120.0), 12.0, Color::rgb(0.15, 0.15, 0.2))
+            // Card border
+            .add_border(
+                Rect::new(530.0, 230.0, 180.0, 120.0),
+                12.0,
+                1.0,
+                Color::rgba(1.0, 1.0, 1.0, 0.1),
+            )
             // Status circles
             .add_circle(Point::new(560.0, 260.0), 8.0, Color::rgb(0.3, 0.9, 0.5))
             .add_circle(Point::new(590.0, 260.0), 8.0, Color::rgb(0.9, 0.7, 0.2))

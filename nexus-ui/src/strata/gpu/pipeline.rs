@@ -4,11 +4,22 @@
 //! Uses the "white pixel" trick: a 1x1 white pixel at atlas (0,0) enables solid
 //! quads (selection, backgrounds) to render with the same shader as glyphs.
 //!
+//! # Rendering Modes
+//!
+//! | Mode | Name    | uv_tl           | uv_br            | corner_radius    |
+//! |------|---------|-----------------|------------------|------------------|
+//! | 0    | Quad    | Atlas UV TL     | Atlas UV BR      | SDF radius       |
+//! | 1    | Line    | (unused)        | (unused)         | Line thickness   |
+//! | 2    | Border  | [border_w, 0]   | (unused)         | SDF radius       |
+//! | 3    | Shadow  | (unused)        | [blur, 0]        | SDF radius       |
+//! | 4    | Image   | Atlas UV TL     | Atlas UV BR      | SDF mask radius  |
+//!
+//! All modes support per-instance `clip_rect` for SDF-based clipping
+//! without breaking the single draw call.
+//!
 //! # Apple Silicon Optimization
 //!
 //! Uses `StagingBelt` for buffer uploads to exploit unified memory on M1/M2/M3.
-//! Instead of `queue.write_buffer()` which may involve intermediate copies,
-//! we write directly to mapped memory that lives in the unified address space.
 
 use std::num::NonZeroU64;
 
@@ -18,44 +29,41 @@ use wgpu::util::StagingBelt;
 use super::glyph_atlas::GlyphAtlas;
 use crate::strata::primitives::{Color, Rect};
 
-/// Instance for GPU rendering (36 bytes).
+/// Instance for GPU rendering (64 bytes — one cache line).
 ///
-/// Universal primitive for the ubershader - renders glyphs, solid quads,
-/// rounded rects, lines, and (future) images all in a single draw call.
-///
-/// Rendering modes (controlled by `mode` field):
-/// - Mode 0 (Quad): Standard quad rendering
-///   - Glyphs: UV points to glyph in atlas, corner_radius = 0
-///   - Solid quads: UV points to white pixel (0,0), corner_radius = 0
-///   - Rounded rects: UV points to white pixel, corner_radius > 0 (SDF mask)
-/// - Mode 1 (Line Segment): Thick line rendered as rotated quad
-///   - position = P1 (start point)
-///   - size = P2 (end point, repurposed)
-///   - corner_radius = line thickness
-///   - UV = white pixel (solid color)
-///   - Line style packed in upper bits of mode: `1 | (style << 8)`
-///     - style 0 = Solid, 1 = Dashed, 2 = Dotted
+/// Universal primitive for the ubershader. Supports text glyphs, solid quads,
+/// rounded rects, lines, borders, shadows, images, and per-instance clipping
+/// — all in a single draw call.
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GpuInstance {
     /// Position (x, y) in pixels.
-    /// Mode 0: top-left of quad. Mode 1: line start point.
-    pub position: [f32; 2],     // 8 bytes
+    /// Mode 0/2/3/4: top-left of quad. Mode 1: line start point (P1).
+    pub pos: [f32; 2],             // 8 bytes
     /// Size (width, height) in pixels.
-    /// Mode 0: quad dimensions. Mode 1: line end point (P2).
-    pub size: [f32; 2],         // 8 bytes
-    /// UV coordinates (u, v, w, h) as normalized u16.
-    pub uv: [u16; 4],           // 8 bytes
+    /// Mode 0/2/3/4: quad dimensions. Mode 1: line end point (P2).
+    pub size: [f32; 2],            // 8 bytes
+    /// UV top-left (normalized 0-1).
+    /// Mode 0/4: atlas UV origin. Mode 2: [border_width, 0]. Others: unused.
+    pub uv_tl: [f32; 2],          // 8 bytes
+    /// UV bottom-right (normalized 0-1).
+    /// Mode 0/4: atlas UV extent. Mode 3: [blur_radius, 0]. Others: unused.
+    pub uv_br: [f32; 2],          // 8 bytes
     /// Color as packed RGBA8.
-    pub color: u32,             // 4 bytes
-    /// Mode 0: Corner radius for SDF rounded rects (0 = sharp).
-    /// Mode 1: Line thickness in pixels.
-    pub corner_radius: f32,     // 4 bytes
+    pub color: u32,                // 4 bytes
     /// Rendering mode (low 8 bits) and sub-flags (upper bits).
-    /// Low byte: 0 = Quad, 1 = Line Segment.
+    /// Low byte: 0=Quad, 1=Line, 2=Border, 3=Shadow, 4=Image.
     /// For lines, bits 8..15 = line style (0=solid, 1=dashed, 2=dotted).
-    pub mode: u32,              // 4 bytes
+    pub mode: u32,                 // 4 bytes
+    /// SDF corner radius (modes 0/2/3/4) or line thickness (mode 1).
+    pub corner_radius: f32,        // 4 bytes
+    /// Image texture array layer index (mode 4). Reserved for other modes.
+    pub texture_layer: u32,        // 4 bytes
+    /// Per-instance clip rectangle (x, y, w, h). w=0 disables clipping.
+    /// Enables nested scroll regions without breaking the single draw call.
+    pub clip_rect: [f32; 4],       // 16 bytes
 }
+// Total: 64 bytes (one cache line)
 
 /// Line style for GPU rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,9 +105,12 @@ pub const SELECTION_COLOR: Color = Color {
     a: 0.35,
 };
 
+/// No-clip sentinel value.
+const NO_CLIP: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
 /// GPU pipeline for Strata rendering.
 ///
-/// Uses a unified ubershader that renders glyphs and solid quads in one draw call.
+/// Uses a unified ubershader that renders all 2D primitives in one draw call.
 /// Instances are rendered in buffer order, enabling perfect Z-ordering.
 pub struct StrataPipeline {
     pipeline: wgpu::RenderPipeline,
@@ -112,7 +123,7 @@ pub struct StrataPipeline {
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     glyph_atlas: GlyphAtlas,
-    /// All instances to render (glyphs + solid quads, in draw order).
+    /// All instances to render, in draw order.
     instances: Vec<GpuInstance>,
     /// Background color.
     background: Color,
@@ -137,7 +148,7 @@ impl StrataPipeline {
             label: Some("Strata Globals Layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -189,7 +200,7 @@ impl StrataPipeline {
                     array_stride: std::mem::size_of::<GpuInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &[
-                        // position
+                        // pos
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Float32x2,
                             offset: 0,
@@ -201,29 +212,47 @@ impl StrataPipeline {
                             offset: 8,
                             shader_location: 1,
                         },
-                        // uv
+                        // uv_tl
                         wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Uint16x4,
+                            format: wgpu::VertexFormat::Float32x2,
                             offset: 16,
                             shader_location: 2,
+                        },
+                        // uv_br
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 24,
+                            shader_location: 3,
                         },
                         // color
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Uint32,
-                            offset: 24,
-                            shader_location: 3,
-                        },
-                        // corner_radius
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32,
-                            offset: 28,
+                            offset: 32,
                             shader_location: 4,
                         },
                         // mode
                         wgpu::VertexAttribute {
                             format: wgpu::VertexFormat::Uint32,
-                            offset: 32,
+                            offset: 36,
                             shader_location: 5,
+                        },
+                        // corner_radius
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32,
+                            offset: 40,
+                            shader_location: 6,
+                        },
+                        // texture_layer
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Uint32,
+                            offset: 44,
+                            shader_location: 7,
+                        },
+                        // clip_rect
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 48,
+                            shader_location: 8,
                         },
                     ],
                 }],
@@ -316,8 +345,6 @@ impl StrataPipeline {
         });
 
         // Create staging belt for unified memory uploads.
-        // 8MB chunk size to handle large text dumps (e.g., cat'ing huge log files)
-        // without needing to allocate additional chunks on the fly.
         let staging_belt = StagingBelt::new(8 * 1024 * 1024);
 
         Self {
@@ -337,6 +364,23 @@ impl StrataPipeline {
         }
     }
 
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
+    /// Convert a glyph atlas u16 UV to f32 normalized (0-1).
+    #[inline]
+    fn uv_to_f32(v: u16) -> f32 {
+        v as f32 / 65535.0
+    }
+
+    /// Get white pixel UVs as f32 (tl == br == center of white pixel).
+    fn white_pixel_uv_f32(&self) -> ([f32; 2], [f32; 2]) {
+        let (ux, uy, _, _) = self.glyph_atlas.white_pixel_uv();
+        let tl = [Self::uv_to_f32(ux), Self::uv_to_f32(uy)];
+        (tl, tl) // Same point for solid color sampling
+    }
+
     /// Set the background color.
     pub fn set_background(&mut self, color: Color) {
         self.background = color;
@@ -347,19 +391,23 @@ impl StrataPipeline {
         self.instances.clear();
     }
 
-    /// Add a solid colored rectangle (for selection highlights, backgrounds, etc.).
-    ///
-    /// Uses the white pixel trick: samples the 1x1 white pixel in the atlas,
-    /// so the final color is just the specified color with no texture modulation.
+    // =========================================================================
+    // Mode 0: Quad (text, solid rects, rounded rects, circles)
+    // =========================================================================
+
+    /// Add a solid colored rectangle.
     pub fn add_solid_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
-        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        let (uv_tl, uv_br) = self.white_pixel_uv_f32();
         self.instances.push(GpuInstance {
-            position: [x, y],
+            pos: [x, y],
             size: [width, height],
-            uv: [uv_x, uv_y, uv_w, uv_h],
+            uv_tl,
+            uv_br,
             color: color.pack(),
-            corner_radius: 0.0,
             mode: 0,
+            corner_radius: 0.0,
+            texture_layer: 0,
+            clip_rect: NO_CLIP,
         });
     }
 
@@ -370,23 +418,24 @@ impl StrataPipeline {
 
     /// Add multiple solid rectangles with the same color (for selection).
     pub fn add_solid_rects(&mut self, rects: &[Rect], color: Color) {
-        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        let (uv_tl, uv_br) = self.white_pixel_uv_f32();
         let packed_color = color.pack();
         for rect in rects {
             self.instances.push(GpuInstance {
-                position: [rect.x, rect.y],
+                pos: [rect.x, rect.y],
                 size: [rect.width, rect.height],
-                uv: [uv_x, uv_y, uv_w, uv_h],
+                uv_tl,
+                uv_br,
                 color: packed_color,
-                corner_radius: 0.0,
                 mode: 0,
+                corner_radius: 0.0,
+                texture_layer: 0,
+                clip_rect: NO_CLIP,
             });
         }
     }
 
-    /// Add a rounded rectangle (uses SDF in the shader for smooth edges).
-    ///
-    /// The corner_radius is in pixels. Set to half of min(width, height) for a pill shape.
+    /// Add a rounded rectangle (SDF-based smooth edges).
     pub fn add_rounded_rect(
         &mut self,
         x: f32,
@@ -396,14 +445,17 @@ impl StrataPipeline {
         corner_radius: f32,
         color: Color,
     ) {
-        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        let (uv_tl, uv_br) = self.white_pixel_uv_f32();
         self.instances.push(GpuInstance {
-            position: [x, y],
+            pos: [x, y],
             size: [width, height],
-            uv: [uv_x, uv_y, uv_w, uv_h],
+            uv_tl,
+            uv_br,
             color: color.pack(),
-            corner_radius,
             mode: 0,
+            corner_radius,
+            texture_layer: 0,
+            clip_rect: NO_CLIP,
         });
     }
 
@@ -420,9 +472,11 @@ impl StrataPipeline {
         );
     }
 
-    /// Add a solid line segment (rendered as a rotated quad in the shader).
-    ///
-    /// The vertex shader expands the two endpoints into a thick quad.
+    // =========================================================================
+    // Mode 1: Line (solid, dashed, dotted)
+    // =========================================================================
+
+    /// Add a solid line segment.
     pub fn add_line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Color) {
         self.add_line_styled(x1, y1, x2, y2, thickness, color, LineStyle::Solid);
     }
@@ -438,25 +492,26 @@ impl StrataPipeline {
         color: Color,
         style: LineStyle,
     ) {
-        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        let (uv_tl, uv_br) = self.white_pixel_uv_f32();
         self.instances.push(GpuInstance {
-            position: [x1, y1],       // P1
-            size: [x2, y2],           // P2 (repurposed)
-            uv: [uv_x, uv_y, uv_w, uv_h],
+            pos: [x1, y1],
+            size: [x2, y2],
+            uv_tl,
+            uv_br,
             color: color.pack(),
-            corner_radius: thickness,  // Thickness (repurposed)
             mode: style.encode_mode(),
+            corner_radius: thickness,
+            texture_layer: 0,
+            clip_rect: NO_CLIP,
         });
     }
 
-    /// Add a solid polyline (series of connected line segments).
-    ///
-    /// Each consecutive pair of points becomes a line segment instance.
+    /// Add a solid polyline (N-1 line segment instances).
     pub fn add_polyline(&mut self, points: &[[f32; 2]], thickness: f32, color: Color) {
         self.add_polyline_styled(points, thickness, color, LineStyle::Solid);
     }
 
-    /// Add a styled polyline (solid, dashed, or dotted).
+    /// Add a styled polyline.
     pub fn add_polyline_styled(
         &mut self,
         points: &[[f32; 2]],
@@ -467,20 +522,116 @@ impl StrataPipeline {
         if points.len() < 2 {
             return;
         }
-        let (uv_x, uv_y, uv_w, uv_h) = self.glyph_atlas.white_pixel_uv();
+        let (uv_tl, uv_br) = self.white_pixel_uv_f32();
         let packed_color = color.pack();
         let mode = style.encode_mode();
         for i in 0..points.len() - 1 {
             self.instances.push(GpuInstance {
-                position: points[i],
+                pos: points[i],
                 size: points[i + 1],
-                uv: [uv_x, uv_y, uv_w, uv_h],
+                uv_tl,
+                uv_br,
                 color: packed_color,
-                corner_radius: thickness,
                 mode,
+                corner_radius: thickness,
+                texture_layer: 0,
+                clip_rect: NO_CLIP,
             });
         }
     }
+
+    // =========================================================================
+    // Mode 2: Border (SDF ring / outline)
+    // =========================================================================
+
+    /// Add a border/outline (hollow rounded rect via SDF ring).
+    pub fn add_border(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        corner_radius: f32,
+        border_width: f32,
+        color: Color,
+    ) {
+        let (_, uv_br) = self.white_pixel_uv_f32();
+        self.instances.push(GpuInstance {
+            pos: [x, y],
+            size: [width, height],
+            uv_tl: [border_width, 0.0], // Store border width in uv_tl.x
+            uv_br,
+            color: color.pack(),
+            mode: 2,
+            corner_radius,
+            texture_layer: 0,
+            clip_rect: NO_CLIP,
+        });
+    }
+
+    // =========================================================================
+    // Mode 3: Shadow (soft SDF)
+    // =========================================================================
+
+    /// Add a drop shadow (SDF-based Gaussian approximation).
+    ///
+    /// Draw this BEFORE the content it shadows. The blur_radius controls
+    /// how soft/spread the shadow appears.
+    pub fn add_shadow(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        corner_radius: f32,
+        blur_radius: f32,
+        color: Color,
+    ) {
+        let (uv_tl, _) = self.white_pixel_uv_f32();
+        self.instances.push(GpuInstance {
+            pos: [x, y],
+            size: [width, height],
+            uv_tl,
+            uv_br: [blur_radius, 0.0], // Store blur radius in uv_br.x
+            color: color.pack(),
+            mode: 3,
+            corner_radius,
+            texture_layer: 0,
+            clip_rect: NO_CLIP,
+        });
+    }
+
+    // =========================================================================
+    // Mode 4: Image (texture array — stubbed, requires texture array setup)
+    // =========================================================================
+
+    /// Add an image from the texture array (future: requires texture array setup).
+    pub fn add_image(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        layer: u32,
+        corner_radius: f32,
+        tint: Color,
+    ) {
+        self.instances.push(GpuInstance {
+            pos: [x, y],
+            size: [width, height],
+            uv_tl: [0.0, 0.0],
+            uv_br: [1.0, 1.0],
+            color: tint.pack(),
+            mode: 4,
+            corner_radius,
+            texture_layer: layer,
+            clip_rect: NO_CLIP,
+        });
+    }
+
+    // =========================================================================
+    // Text rendering
+    // =========================================================================
 
     /// Add a text string to render.
     pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: Color) {
@@ -505,23 +656,33 @@ impl StrataPipeline {
             let glyph_x = cursor_x + glyph.offset_x as f32;
             let glyph_y = y + ascent - glyph.offset_y as f32 - glyph.height as f32;
 
+            // Convert u16 atlas UVs to f32 tl/br
+            let tl_u = Self::uv_to_f32(glyph.uv_x);
+            let tl_v = Self::uv_to_f32(glyph.uv_y);
+            let br_u = Self::uv_to_f32(glyph.uv_x + glyph.uv_w);
+            let br_v = Self::uv_to_f32(glyph.uv_y + glyph.uv_h);
+
             self.instances.push(GpuInstance {
-                position: [glyph_x, glyph_y],
+                pos: [glyph_x, glyph_y],
                 size: [glyph.width as f32, glyph.height as f32],
-                uv: [glyph.uv_x, glyph.uv_y, glyph.uv_w, glyph.uv_h],
+                uv_tl: [tl_u, tl_v],
+                uv_br: [br_u, br_v],
                 color: packed_color,
-                corner_radius: 0.0,
                 mode: 0,
+                corner_radius: 0.0,
+                texture_layer: 0,
+                clip_rect: NO_CLIP,
             });
 
             cursor_x += self.glyph_atlas.cell_width;
         }
     }
 
+    // =========================================================================
+    // GPU upload and rendering
+    // =========================================================================
+
     /// Prepare for rendering (upload data to GPU).
-    ///
-    /// Uses StagingBelt to write directly to unified memory on Apple Silicon,
-    /// avoiding intermediate buffer copies.
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -562,8 +723,7 @@ impl StrataPipeline {
             });
         }
 
-        // Upload instances using staging belt (unified memory optimization).
-        // On Apple Silicon, this writes directly to mapped memory shared by CPU/GPU.
+        // Upload instances via staging belt
         if !self.instances.is_empty() {
             let instance_bytes = self.instances.len() * std::mem::size_of::<GpuInstance>();
             if let Some(size) = NonZeroU64::new(instance_bytes as u64) {
@@ -578,21 +738,15 @@ impl StrataPipeline {
             }
         }
 
-        // Signal that we're done writing to the staging belt for this frame.
         self.staging_belt.finish();
     }
 
-    /// Call after the GPU has finished rendering the frame.
-    ///
-    /// Reclaims staging buffer memory for reuse, preventing allocations
-    /// after the initial warmup phase.
+    /// Reclaim staging buffer memory after GPU finishes the frame.
     pub fn after_frame(&mut self) {
         self.staging_belt.recall();
     }
 
-    /// Render to the target.
-    ///
-    /// Single draw call renders all instances (selection, glyphs, etc.) in buffer order.
+    /// Render all instances in a single draw call.
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -621,7 +775,6 @@ impl StrataPipeline {
             occlusion_query_set: None,
         });
 
-        // Set scissor rect
         render_pass.set_scissor_rect(
             clip_bounds.x,
             clip_bounds.y,
@@ -629,13 +782,11 @@ impl StrataPipeline {
             clip_bounds.height,
         );
 
-        // Single draw call for all instances
         if !self.instances.is_empty() {
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
             render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-            // 6 vertices per quad (2 triangles)
             render_pass.draw(0..6, 0..self.instances.len() as u32);
         }
     }
