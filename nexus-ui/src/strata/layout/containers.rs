@@ -8,6 +8,40 @@ use crate::strata::content_address::SourceId;
 use crate::strata::layout_snapshot::LayoutSnapshot;
 use crate::strata::primitives::{Color, Rect, Size};
 
+// Layout metrics (centralized; will come from font system in production)
+const CHAR_WIDTH: f32 = 8.4;
+const LINE_HEIGHT: f32 = 18.0;
+
+/// Sizing mode for a container axis.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Length {
+    /// Shrink to fit content (intrinsic size).
+    #[default]
+    Shrink,
+    /// Expand to fill available space (flex: 1).
+    Fill,
+    /// Expand proportionally (flex: n). `FillPortion(1)` == `Fill`.
+    FillPortion(u16),
+    /// Fixed pixel size.
+    Fixed(f32),
+}
+
+impl Length {
+    /// Get the flex factor for this length, or 0 if not flexible.
+    fn flex(&self) -> f32 {
+        match self {
+            Length::Fill => 1.0,
+            Length::FillPortion(n) => *n as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Whether this length participates in flex distribution.
+    fn is_flex(&self) -> bool {
+        matches!(self, Length::Fill | Length::FillPortion(_))
+    }
+}
+
 /// Alignment on the main axis (direction of flow).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Alignment {
@@ -48,6 +82,11 @@ pub struct Padding {
 }
 
 impl Padding {
+    /// Create padding with explicit values for each side.
+    pub fn new(top: f32, right: f32, bottom: f32, left: f32) -> Self {
+        Self { top, right, bottom, left }
+    }
+
     /// Uniform padding on all sides.
     pub fn all(value: f32) -> Self {
         Self {
@@ -98,6 +137,52 @@ pub enum LayoutChild {
 
     /// A fixed-size spacer.
     FixedSpacer { size: f32 },
+}
+
+impl LayoutChild {
+    /// Measure this child's main axis size (height for Column parent, width for Row parent).
+    fn measure_main(&self, is_column: bool) -> f32 {
+        let size = match self {
+            LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT),
+            LayoutChild::Terminal(t) => t.size(),
+            LayoutChild::Column(c) => c.measure(),
+            LayoutChild::Row(r) => r.measure(),
+            LayoutChild::Spacer { .. } => return 0.0,
+            LayoutChild::FixedSpacer { size } => return *size,
+        };
+        if is_column { size.height } else { size.width }
+    }
+
+    /// Measure this child's cross axis size (width for Column parent, height for Row parent).
+    fn measure_cross(&self, is_column: bool) -> f32 {
+        let size = match self {
+            LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT),
+            LayoutChild::Terminal(t) => t.size(),
+            LayoutChild::Column(c) => c.measure(),
+            LayoutChild::Row(r) => r.measure(),
+            LayoutChild::Spacer { .. } => return 0.0,
+            LayoutChild::FixedSpacer { .. } => return 0.0,
+        };
+        if is_column { size.width } else { size.height }
+    }
+
+    /// Get the flex factor on the parent's main axis.
+    ///
+    /// `is_column`: true if the parent is a Column (main axis = height),
+    ///              false if the parent is a Row (main axis = width).
+    fn flex_factor(&self, is_column: bool) -> f32 {
+        match self {
+            LayoutChild::Spacer { flex } => *flex,
+            LayoutChild::Column(c) => {
+                if is_column { c.height.flex() } else { c.width.flex() }
+            }
+            LayoutChild::Row(r) => {
+                if is_column { r.height.flex() } else { r.width.flex() }
+            }
+            _ => 0.0,
+        }
+    }
+
 }
 
 /// A text element descriptor.
@@ -247,6 +332,10 @@ impl TerminalElement {
     }
 }
 
+// =========================================================================
+// Column
+// =========================================================================
+
 /// A vertical layout container (children flow top to bottom).
 pub struct Column {
     /// Child elements.
@@ -263,6 +352,16 @@ pub struct Column {
     background: Option<Color>,
     /// Corner radius for background.
     corner_radius: f32,
+    /// Width sizing mode.
+    pub(crate) width: Length,
+    /// Height sizing mode.
+    pub(crate) height: Length,
+    /// Border color (optional).
+    border_color: Option<Color>,
+    /// Border width.
+    border_width: f32,
+    /// Shadow: (blur_radius, color).
+    shadow: Option<(f32, Color)>,
 }
 
 impl Default for Column {
@@ -282,6 +381,11 @@ impl Column {
             cross_alignment: CrossAxisAlignment::Start,
             background: None,
             corner_radius: 0.0,
+            width: Length::Shrink,
+            height: Length::Shrink,
+            border_color: None,
+            border_width: 0.0,
+            shadow: None,
         }
     }
 
@@ -327,6 +431,31 @@ impl Column {
         self
     }
 
+    /// Set width sizing mode.
+    pub fn width(mut self, width: Length) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Set height sizing mode.
+    pub fn height(mut self, height: Length) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// Set border (color + width).
+    pub fn border(mut self, color: Color, width: f32) -> Self {
+        self.border_color = Some(color);
+        self.border_width = width;
+        self
+    }
+
+    /// Set drop shadow (blur_radius, color).
+    pub fn shadow(mut self, blur: f32, color: Color) -> Self {
+        self.shadow = Some((blur, color));
+        self
+    }
+
     /// Add a text element.
     pub fn text(mut self, element: TextElement) -> Self {
         self.children.push(LayoutChild::Text(element));
@@ -363,30 +492,81 @@ impl Column {
         self
     }
 
+    /// Compute intrinsic size (content size + padding).
+    ///
+    /// Short-circuits on Fixed axes — does not recurse into children
+    /// for dimensions that are already determined.
+    pub fn measure(&self) -> Size {
+        let intrinsic_width = match self.width {
+            Length::Fixed(px) => px,
+            _ => {
+                let mut max_child_width: f32 = 0.0;
+                for child in &self.children {
+                    max_child_width = max_child_width.max(child.measure_cross(true));
+                }
+                max_child_width + self.padding.horizontal()
+            }
+        };
+
+        let intrinsic_height = match self.height {
+            Length::Fixed(px) => px,
+            _ => {
+                let mut total_height: f32 = 0.0;
+                for child in &self.children {
+                    // Skip flex children in measurement (they fill remaining space)
+                    if child.flex_factor(true) > 0.0 {
+                        continue;
+                    }
+                    total_height += child.measure_main(true);
+                }
+                // Spacing between all children (flex children still occupy a slot)
+                if self.children.len() > 1 {
+                    total_height += self.spacing * (self.children.len() - 1) as f32;
+                }
+                total_height + self.padding.vertical()
+            }
+        };
+
+        Size::new(intrinsic_width, intrinsic_height)
+    }
+
     /// Compute layout and flush to snapshot.
     ///
     /// This is where the actual layout math happens - ONCE per frame.
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
-        // Layout metrics (would come from font system in production)
-        let char_width = 8.4;
-        let line_height = 18.0;
-
         // Available space after padding
         let content_x = bounds.x + self.padding.left;
         let content_y = bounds.y + self.padding.top;
         let content_width = bounds.width - self.padding.horizontal();
-        let _content_height = bounds.height - self.padding.vertical();
 
-        // Draw background if set
+        // Draw shadow → background → border (correct z-order)
+        if let Some((blur, color)) = self.shadow {
+            snapshot.primitives_mut().add_shadow(
+                Rect::new(bounds.x + 4.0, bounds.y + 4.0, bounds.width, bounds.height),
+                self.corner_radius,
+                blur,
+                color,
+            );
+        }
         if let Some(bg) = self.background {
             if self.corner_radius > 0.0 {
-                snapshot.add_rounded_rect(bounds, self.corner_radius, bg);
+                snapshot.primitives_mut().add_rounded_rect(bounds, self.corner_radius, bg);
             } else {
-                snapshot.add_solid_rect(bounds, bg);
+                snapshot.primitives_mut().add_solid_rect(bounds, bg);
             }
         }
+        if let Some(border_color) = self.border_color {
+            snapshot.primitives_mut().add_border(
+                bounds,
+                self.corner_radius,
+                self.border_width,
+                border_color,
+            );
+        }
 
-        // Calculate total fixed height and flex factor
+        // =====================================================================
+        // Measurement pass: compute child heights and flex factors
+        // =====================================================================
         let mut total_fixed_height = 0.0;
         let mut total_flex = 0.0;
         let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
@@ -394,23 +574,51 @@ impl Column {
         for child in &self.children {
             match child {
                 LayoutChild::Text(t) => {
-                    let size = t.estimate_size(char_width, line_height);
-                    child_heights.push(size.height);
-                    total_fixed_height += size.height;
+                    let h = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).height;
+                    child_heights.push(h);
+                    total_fixed_height += h;
                 }
                 LayoutChild::Terminal(t) => {
-                    let size = t.size();
-                    child_heights.push(size.height);
-                    total_fixed_height += size.height;
+                    let h = t.size().height;
+                    child_heights.push(h);
+                    total_fixed_height += h;
                 }
-                LayoutChild::Column(_) | LayoutChild::Row(_) => {
-                    // Nested containers need recursive measurement
-                    // For now, use a default estimate
-                    child_heights.push(100.0);
-                    total_fixed_height += 100.0;
+                LayoutChild::Column(c) => {
+                    match c.height {
+                        Length::Fixed(px) => {
+                            child_heights.push(px);
+                            total_fixed_height += px;
+                        }
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_heights.push(0.0);
+                            total_flex += c.height.flex();
+                        }
+                        Length::Shrink => {
+                            let h = c.measure().height;
+                            child_heights.push(h);
+                            total_fixed_height += h;
+                        }
+                    }
+                }
+                LayoutChild::Row(r) => {
+                    match r.height {
+                        Length::Fixed(px) => {
+                            child_heights.push(px);
+                            total_fixed_height += px;
+                        }
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_heights.push(0.0);
+                            total_flex += r.height.flex();
+                        }
+                        Length::Shrink => {
+                            let h = r.measure().height;
+                            child_heights.push(h);
+                            total_fixed_height += h;
+                        }
+                    }
                 }
                 LayoutChild::Spacer { flex } => {
-                    child_heights.push(0.0); // Will be computed
+                    child_heights.push(0.0);
                     total_flex += flex;
                 }
                 LayoutChild::FixedSpacer { size } => {
@@ -425,38 +633,69 @@ impl Column {
             total_fixed_height += self.spacing * (self.children.len() - 1) as f32;
         }
 
-        // Position children
-        let mut y = content_y;
+        let available_flex = (bounds.height - self.padding.vertical() - total_fixed_height).max(0.0);
 
+        // Compute total consumed height (flex children consume available_flex)
+        let total_flex_consumed = if total_flex > 0.0 { available_flex } else { 0.0 };
+        let used_height = total_fixed_height + total_flex_consumed;
+        let free_space = (bounds.height - self.padding.vertical() - used_height).max(0.0);
+
+        // =====================================================================
+        // Main axis alignment: compute starting y and extra per-gap spacing
+        // =====================================================================
+        let n = self.children.len();
+        let (mut y, alignment_gap) = match self.alignment {
+            Alignment::Start => (content_y, 0.0),
+            Alignment::End => (content_y + free_space, 0.0),
+            Alignment::Center => (content_y + free_space / 2.0, 0.0),
+            Alignment::SpaceBetween => {
+                if n > 1 {
+                    (content_y, free_space / (n - 1) as f32)
+                } else {
+                    (content_y, 0.0)
+                }
+            }
+            Alignment::SpaceAround => {
+                if n > 0 {
+                    let space = free_space / n as f32;
+                    (content_y + space / 2.0, space)
+                } else {
+                    (content_y, 0.0)
+                }
+            }
+        };
+
+        // =====================================================================
+        // Position pass: place children and flush to snapshot
+        // =====================================================================
         for (i, child) in self.children.into_iter().enumerate() {
-            let height = child_heights[i];
+            let mut height = child_heights[i];
+
+            // Helper: resolve cross-axis x position for a child of given width
+            let cross_x = |child_width: f32| -> f32 {
+                match self.cross_alignment {
+                    CrossAxisAlignment::Start | CrossAxisAlignment::Stretch => content_x,
+                    CrossAxisAlignment::End => content_x + content_width - child_width,
+                    CrossAxisAlignment::Center => content_x + (content_width - child_width) / 2.0,
+                }
+            };
 
             match child {
                 LayoutChild::Text(t) => {
-                    let size = t.estimate_size(char_width, line_height);
-                    let x = match self.cross_alignment {
-                        CrossAxisAlignment::Start => content_x,
-                        CrossAxisAlignment::End => content_x + content_width - size.width,
-                        CrossAxisAlignment::Center => content_x + (content_width - size.width) / 2.0,
-                        CrossAxisAlignment::Stretch => content_x,
-                    };
+                    let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
+                    let x = cross_x(size.width);
 
-                    // Register source for hit-testing if source_id is provided
                     use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
                         let text_layout = TextLayout::simple(
                             t.text.clone(),
                             t.color.pack(),
-                            x,
-                            y,
-                            char_width,
-                            line_height,
+                            x, y,
+                            CHAR_WIDTH, LINE_HEIGHT,
                         );
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
                     }
 
-                    // Always add to primitives for rendering
-                    // (sources are for hit-testing only, primitives are for rendering)
                     snapshot.primitives_mut().add_text_cached(
                         t.text,
                         crate::strata::primitives::Point::new(x, y),
@@ -464,61 +703,76 @@ impl Column {
                         t.cache_key,
                     );
 
-                    y += height + self.spacing;
+                    y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::Terminal(t) => {
                     let size = t.size();
-                    let x = match self.cross_alignment {
-                        CrossAxisAlignment::Start => content_x,
-                        CrossAxisAlignment::End => content_x + content_width - size.width,
-                        CrossAxisAlignment::Center => content_x + (content_width - size.width) / 2.0,
-                        CrossAxisAlignment::Stretch => content_x,
-                    };
+                    let x = cross_x(size.width);
 
-                    // Register grid with snapshot for hit-testing and rendering
                     use crate::strata::layout_snapshot::{GridLayout, GridRow, SourceLayout};
                     let rows_content: Vec<GridRow> = t.row_content.into_iter()
                         .map(|(text, color)| GridRow { text, color })
                         .collect();
                     let grid_layout = GridLayout::with_rows(
                         Rect::new(x, y, size.width, size.height),
-                        t.cell_width,
-                        t.cell_height,
-                        t.cols,
-                        t.rows,
+                        t.cell_width, t.cell_height,
+                        t.cols, t.rows,
                         rows_content,
                     );
                     snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
 
-                    y += height + self.spacing;
+                    y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
-                    let nested_bounds = Rect::new(content_x, y, content_width, height);
+                    // Resolve flex height for Fill children
+                    if nested.height.is_flex() && total_flex > 0.0 {
+                        height = (nested.height.flex() / total_flex) * available_flex;
+                    }
+                    // Resolve width
+                    let w = match nested.width {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) => content_width,
+                        Length::Shrink => nested.measure().width.min(content_width),
+                    };
+                    let x = cross_x(w);
+                    let nested_bounds = Rect::new(x, y, w, height);
                     nested.layout(snapshot, nested_bounds);
-                    y += height + self.spacing;
+                    y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::Row(nested) => {
-                    let nested_bounds = Rect::new(content_x, y, content_width, height);
+                    // Resolve flex height for Fill children
+                    if nested.height.is_flex() && total_flex > 0.0 {
+                        height = (nested.height.flex() / total_flex) * available_flex;
+                    }
+                    // Resolve width
+                    let w = match nested.width {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) => content_width,
+                        Length::Shrink => nested.measure().width.min(content_width),
+                    };
+                    let x = cross_x(w);
+                    let nested_bounds = Rect::new(x, y, w, height);
                     nested.layout(snapshot, nested_bounds);
-                    y += height + self.spacing;
+                    y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::Spacer { flex } => {
-                    // Calculate flex space
                     if total_flex > 0.0 {
-                        let available = bounds.height
-                            - self.padding.vertical()
-                            - total_fixed_height;
-                        let space = (flex / total_flex) * available.max(0.0);
+                        let space = (flex / total_flex) * available_flex;
                         y += space;
                     }
+                    y += alignment_gap;
                 }
                 LayoutChild::FixedSpacer { size } => {
-                    y += size;
+                    y += size + alignment_gap;
                 }
             }
         }
     }
 }
+
+// =========================================================================
+// Row
+// =========================================================================
 
 /// A horizontal layout container (children flow left to right).
 pub struct Row {
@@ -536,6 +790,16 @@ pub struct Row {
     background: Option<Color>,
     /// Corner radius for background.
     corner_radius: f32,
+    /// Width sizing mode.
+    pub(crate) width: Length,
+    /// Height sizing mode.
+    pub(crate) height: Length,
+    /// Border color (optional).
+    border_color: Option<Color>,
+    /// Border width.
+    border_width: f32,
+    /// Shadow: (blur_radius, color).
+    shadow: Option<(f32, Color)>,
 }
 
 impl Default for Row {
@@ -555,6 +819,11 @@ impl Row {
             cross_alignment: CrossAxisAlignment::Start,
             background: None,
             corner_radius: 0.0,
+            width: Length::Shrink,
+            height: Length::Shrink,
+            border_color: None,
+            border_width: 0.0,
+            shadow: None,
         }
     }
 
@@ -600,6 +869,31 @@ impl Row {
         self
     }
 
+    /// Set width sizing mode.
+    pub fn width(mut self, width: Length) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Set height sizing mode.
+    pub fn height(mut self, height: Length) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// Set border (color + width).
+    pub fn border(mut self, color: Color, width: f32) -> Self {
+        self.border_color = Some(color);
+        self.border_width = width;
+        self
+    }
+
+    /// Set drop shadow (blur_radius, color).
+    pub fn shadow(mut self, blur: f32, color: Color) -> Self {
+        self.shadow = Some((blur, color));
+        self
+    }
+
     /// Add a text element.
     pub fn text(mut self, element: TextElement) -> Self {
         self.children.push(LayoutChild::Text(element));
@@ -636,28 +930,77 @@ impl Row {
         self
     }
 
+    /// Compute intrinsic size (content size + padding).
+    ///
+    /// Short-circuits on Fixed axes.
+    pub fn measure(&self) -> Size {
+        let intrinsic_width = match self.width {
+            Length::Fixed(px) => px,
+            _ => {
+                let mut total_width: f32 = 0.0;
+                for child in &self.children {
+                    if child.flex_factor(false) > 0.0 {
+                        continue;
+                    }
+                    total_width += child.measure_main(false);
+                }
+                // Spacing between all children (flex children still occupy a slot)
+                if self.children.len() > 1 {
+                    total_width += self.spacing * (self.children.len() - 1) as f32;
+                }
+                total_width + self.padding.horizontal()
+            }
+        };
+
+        let intrinsic_height = match self.height {
+            Length::Fixed(px) => px,
+            _ => {
+                let mut max_child_height: f32 = 0.0;
+                for child in &self.children {
+                    max_child_height = max_child_height.max(child.measure_cross(false));
+                }
+                max_child_height + self.padding.vertical()
+            }
+        };
+
+        Size::new(intrinsic_width, intrinsic_height)
+    }
+
     /// Compute layout and flush to snapshot.
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
-        // Layout metrics
-        let char_width = 8.4;
-        let line_height = 18.0;
-
         // Available space after padding
         let content_x = bounds.x + self.padding.left;
         let content_y = bounds.y + self.padding.top;
-        let _content_width = bounds.width - self.padding.horizontal();
         let content_height = bounds.height - self.padding.vertical();
 
-        // Draw background if set
+        // Draw shadow → background → border
+        if let Some((blur, color)) = self.shadow {
+            snapshot.primitives_mut().add_shadow(
+                Rect::new(bounds.x + 4.0, bounds.y + 4.0, bounds.width, bounds.height),
+                self.corner_radius,
+                blur,
+                color,
+            );
+        }
         if let Some(bg) = self.background {
             if self.corner_radius > 0.0 {
-                snapshot.add_rounded_rect(bounds, self.corner_radius, bg);
+                snapshot.primitives_mut().add_rounded_rect(bounds, self.corner_radius, bg);
             } else {
-                snapshot.add_solid_rect(bounds, bg);
+                snapshot.primitives_mut().add_solid_rect(bounds, bg);
             }
         }
+        if let Some(border_color) = self.border_color {
+            snapshot.primitives_mut().add_border(
+                bounds,
+                self.corner_radius,
+                self.border_width,
+                border_color,
+            );
+        }
 
-        // Calculate total fixed width and flex factor
+        // =====================================================================
+        // Measurement pass: compute child widths and flex factors
+        // =====================================================================
         let mut total_fixed_width = 0.0;
         let mut total_flex = 0.0;
         let mut child_widths: Vec<f32> = Vec::with_capacity(self.children.len());
@@ -665,18 +1008,48 @@ impl Row {
         for child in &self.children {
             match child {
                 LayoutChild::Text(t) => {
-                    let size = t.estimate_size(char_width, line_height);
-                    child_widths.push(size.width);
-                    total_fixed_width += size.width;
+                    let w = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).width;
+                    child_widths.push(w);
+                    total_fixed_width += w;
                 }
                 LayoutChild::Terminal(t) => {
-                    let size = t.size();
-                    child_widths.push(size.width);
-                    total_fixed_width += size.width;
+                    let w = t.size().width;
+                    child_widths.push(w);
+                    total_fixed_width += w;
                 }
-                LayoutChild::Column(_) | LayoutChild::Row(_) => {
-                    child_widths.push(100.0);
-                    total_fixed_width += 100.0;
+                LayoutChild::Column(c) => {
+                    match c.width {
+                        Length::Fixed(px) => {
+                            child_widths.push(px);
+                            total_fixed_width += px;
+                        }
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_widths.push(0.0);
+                            total_flex += c.width.flex();
+                        }
+                        Length::Shrink => {
+                            let w = c.measure().width;
+                            child_widths.push(w);
+                            total_fixed_width += w;
+                        }
+                    }
+                }
+                LayoutChild::Row(r) => {
+                    match r.width {
+                        Length::Fixed(px) => {
+                            child_widths.push(px);
+                            total_fixed_width += px;
+                        }
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_widths.push(0.0);
+                            total_flex += r.width.flex();
+                        }
+                        Length::Shrink => {
+                            let w = r.measure().width;
+                            child_widths.push(w);
+                            total_fixed_width += w;
+                        }
+                    }
                 }
                 LayoutChild::Spacer { flex } => {
                     child_widths.push(0.0);
@@ -694,39 +1067,71 @@ impl Row {
             total_fixed_width += self.spacing * (self.children.len() - 1) as f32;
         }
 
-        // Position children
-        let mut x = content_x;
+        let available_flex = (bounds.width - self.padding.horizontal() - total_fixed_width).max(0.0);
 
+        // Compute total consumed width (flex children consume available_flex)
+        let total_flex_consumed = if total_flex > 0.0 { available_flex } else { 0.0 };
+        let used_width = total_fixed_width + total_flex_consumed;
+        let free_space = (bounds.width - self.padding.horizontal() - used_width).max(0.0);
+
+        // =====================================================================
+        // Main axis alignment: compute starting x and extra per-gap spacing
+        // =====================================================================
+        let n = self.children.len();
+        let (mut x, alignment_gap) = match self.alignment {
+            Alignment::Start => (content_x, 0.0),
+            Alignment::End => (content_x + free_space, 0.0),
+            Alignment::Center => (content_x + free_space / 2.0, 0.0),
+            Alignment::SpaceBetween => {
+                if n > 1 {
+                    (content_x, free_space / (n - 1) as f32)
+                } else {
+                    (content_x, 0.0)
+                }
+            }
+            Alignment::SpaceAround => {
+                if n > 0 {
+                    let space = free_space / n as f32;
+                    (content_x + space / 2.0, space)
+                } else {
+                    (content_x, 0.0)
+                }
+            }
+        };
+
+        // =====================================================================
+        // Position pass: place children and flush to snapshot
+        // =====================================================================
         for (i, child) in self.children.into_iter().enumerate() {
-            let width = child_widths[i];
+            let mut width = child_widths[i];
+
+            // Helper: resolve cross-axis y position for a child of given height
+            let cross_y = |child_height: f32| -> f32 {
+                match self.cross_alignment {
+                    CrossAxisAlignment::Start | CrossAxisAlignment::Stretch => content_y,
+                    CrossAxisAlignment::End => content_y + content_height - child_height,
+                    CrossAxisAlignment::Center => {
+                        content_y + (content_height - child_height) / 2.0
+                    }
+                }
+            };
 
             match child {
                 LayoutChild::Text(t) => {
-                    let size = t.estimate_size(char_width, line_height);
-                    let y = match self.cross_alignment {
-                        CrossAxisAlignment::Start => content_y,
-                        CrossAxisAlignment::End => content_y + content_height - size.height,
-                        CrossAxisAlignment::Center => {
-                            content_y + (content_height - size.height) / 2.0
-                        }
-                        CrossAxisAlignment::Stretch => content_y,
-                    };
+                    let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
+                    let y = cross_y(size.height);
 
-                    // Register source for hit-testing if source_id is provided
                     use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
                         let text_layout = TextLayout::simple(
                             t.text.clone(),
                             t.color.pack(),
-                            x,
-                            y,
-                            char_width,
-                            line_height,
+                            x, y,
+                            CHAR_WIDTH, LINE_HEIGHT,
                         );
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
                     }
 
-                    // Always add to primitives for rendering
                     snapshot.primitives_mut().add_text_cached(
                         t.text,
                         crate::strata::primitives::Point::new(x, y),
@@ -734,51 +1139,67 @@ impl Row {
                         t.cache_key,
                     );
 
-                    x += width + self.spacing;
+                    x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::Terminal(t) => {
                     let size = t.size();
-                    let y = match self.cross_alignment {
-                        CrossAxisAlignment::Start => content_y,
-                        CrossAxisAlignment::End => content_y + content_height - size.height,
-                        CrossAxisAlignment::Center => {
-                            content_y + (content_height - size.height) / 2.0
-                        }
-                        CrossAxisAlignment::Stretch => content_y,
-                    };
+                    let y = cross_y(size.height);
 
-                    use crate::strata::layout_snapshot::{GridLayout, SourceLayout};
-                    let grid_layout = GridLayout::new(
+                    use crate::strata::layout_snapshot::{GridLayout, GridRow, SourceLayout};
+                    let rows_content: Vec<GridRow> = t.row_content.into_iter()
+                        .map(|(text, color)| GridRow { text, color })
+                        .collect();
+                    let grid_layout = GridLayout::with_rows(
                         Rect::new(x, y, size.width, size.height),
-                        t.cell_width,
-                        t.cell_height,
-                        t.cols,
-                        t.rows,
+                        t.cell_width, t.cell_height,
+                        t.cols, t.rows,
+                        rows_content,
                     );
                     snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
 
-                    x += width + self.spacing;
+                    x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
-                    let nested_bounds = Rect::new(x, content_y, width, content_height);
+                    // Resolve flex width for Fill children
+                    if nested.width.is_flex() && total_flex > 0.0 {
+                        width = (nested.width.flex() / total_flex) * available_flex;
+                    }
+                    // Resolve height
+                    let h = match nested.height {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) => content_height,
+                        Length::Shrink => nested.measure().height.min(content_height),
+                    };
+                    let y = cross_y(h);
+                    let nested_bounds = Rect::new(x, y, width, h);
                     nested.layout(snapshot, nested_bounds);
-                    x += width + self.spacing;
+                    x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::Row(nested) => {
-                    let nested_bounds = Rect::new(x, content_y, width, content_height);
+                    // Resolve flex width for Fill children
+                    if nested.width.is_flex() && total_flex > 0.0 {
+                        width = (nested.width.flex() / total_flex) * available_flex;
+                    }
+                    // Resolve height
+                    let h = match nested.height {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) => content_height,
+                        Length::Shrink => nested.measure().height.min(content_height),
+                    };
+                    let y = cross_y(h);
+                    let nested_bounds = Rect::new(x, y, width, h);
                     nested.layout(snapshot, nested_bounds);
-                    x += width + self.spacing;
+                    x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::Spacer { flex } => {
                     if total_flex > 0.0 {
-                        let available =
-                            bounds.width - self.padding.horizontal() - total_fixed_width;
-                        let space = (flex / total_flex) * available.max(0.0);
+                        let space = (flex / total_flex) * available_flex;
                         x += space;
                     }
+                    x += alignment_gap;
                 }
                 LayoutChild::FixedSpacer { size } => {
-                    x += size;
+                    x += size + alignment_gap;
                 }
             }
         }

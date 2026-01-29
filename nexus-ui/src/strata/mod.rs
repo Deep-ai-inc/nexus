@@ -50,6 +50,7 @@ pub mod shell;
 
 // Demo application for testing
 pub mod demo;
+pub mod demo_widgets;
 
 // Widget system (legacy - being replaced by layout system)
 pub mod widget;
@@ -73,6 +74,6 @@ pub use widgets::{TextWidget, TerminalWidget};
 
 // Layout system exports
 pub use layout::{
-    Column, Row, Padding, Alignment, CrossAxisAlignment, LineStyle, PrimitiveBatch,
+    Column, Row, Padding, Alignment, CrossAxisAlignment, Length, LineStyle, PrimitiveBatch,
 };
 pub use layout::containers::{TextElement, TerminalElement};
