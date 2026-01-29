@@ -34,6 +34,10 @@ pub struct PrimitiveBatch {
 
     /// Drop shadows (soft SDF blur).
     pub(crate) shadows: Vec<Shadow>,
+
+    /// Clip stack for nested container clipping.
+    /// Each entry is a clip rect; the effective clip is the intersection of all.
+    clip_stack: Vec<Rect>,
 }
 
 /// A solid rectangle primitive.
@@ -41,6 +45,7 @@ pub struct PrimitiveBatch {
 pub struct SolidRect {
     pub rect: Rect,
     pub color: Color,
+    pub clip_rect: Option<Rect>,
 }
 
 /// A rounded rectangle primitive.
@@ -49,6 +54,7 @@ pub struct RoundedRect {
     pub rect: Rect,
     pub corner_radius: f32,
     pub color: Color,
+    pub clip_rect: Option<Rect>,
 }
 
 /// A circle primitive.
@@ -57,6 +63,7 @@ pub struct Circle {
     pub center: Point,
     pub radius: f32,
     pub color: Color,
+    pub clip_rect: Option<Rect>,
 }
 
 /// Line rendering style.
@@ -79,6 +86,7 @@ pub struct LineSegment {
     pub thickness: f32,
     pub color: Color,
     pub style: LineStyle,
+    pub clip_rect: Option<Rect>,
 }
 
 /// A polyline primitive (series of connected line segments).
@@ -88,6 +96,7 @@ pub struct Polyline {
     pub thickness: f32,
     pub color: Color,
     pub style: LineStyle,
+    pub clip_rect: Option<Rect>,
 }
 
 /// A pre-positioned text run (bypasses layout).
@@ -97,6 +106,7 @@ pub struct TextRun {
     pub position: Point,
     pub color: Color,
     pub cache_key: Option<u64>,
+    pub clip_rect: Option<Rect>,
 }
 
 /// A border/outline primitive (hollow rounded rect via SDF ring).
@@ -106,6 +116,7 @@ pub struct Border {
     pub corner_radius: f32,
     pub border_width: f32,
     pub color: Color,
+    pub clip_rect: Option<Rect>,
 }
 
 /// A drop shadow primitive (soft SDF-based blur).
@@ -115,6 +126,7 @@ pub struct Shadow {
     pub corner_radius: f32,
     pub blur_radius: f32,
     pub color: Color,
+    pub clip_rect: Option<Rect>,
 }
 
 impl PrimitiveBatch {
@@ -133,22 +145,78 @@ impl PrimitiveBatch {
         self.text_runs.clear();
         self.borders.clear();
         self.shadows.clear();
+        self.clip_stack.clear();
     }
+
+    // =========================================================================
+    // Clip stack
+    // =========================================================================
+
+    /// Push a clip rectangle. All subsequently added primitives will be clipped
+    /// to the intersection of all active clip rects.
+    pub fn push_clip(&mut self, rect: Rect) {
+        self.clip_stack.push(rect);
+    }
+
+    /// Pop the most recent clip rectangle.
+    pub fn pop_clip(&mut self) {
+        self.clip_stack.pop();
+    }
+
+    /// Get the current effective clip rect (public, for non-primitive paths).
+    #[inline]
+    pub fn current_clip_public(&self) -> Option<Rect> {
+        self.current_clip()
+    }
+
+    /// Sentinel clip rect that activates the shader's clip check (z > 0)
+    /// but clips everything (off-screen, tiny).
+    const CLIP_EVERYTHING: Rect = Rect { x: -1.0, y: -1.0, width: 0.001, height: 0.001 };
+
+    /// Get the current effective clip rect (intersection of all stack entries).
+    /// Returns `None` if no clip is active.
+    #[inline]
+    fn current_clip(&self) -> Option<Rect> {
+        if self.clip_stack.is_empty() {
+            return None;
+        }
+        let mut clip = self.clip_stack[0];
+        for r in &self.clip_stack[1..] {
+            match clip.intersection(r) {
+                Some(c) => clip = c,
+                // Empty intersection: clip everything.
+                None => return Some(Self::CLIP_EVERYTHING),
+            }
+        }
+        // Zero/negative dimensions would bypass the shader's `z > 0` check,
+        // so treat them as "clip everything".
+        if clip.width <= 0.0 || clip.height <= 0.0 {
+            return Some(Self::CLIP_EVERYTHING);
+        }
+        Some(clip)
+    }
+
+    // =========================================================================
+    // Primitive add methods
+    // =========================================================================
 
     /// Add a solid rectangle.
     #[inline]
     pub fn add_solid_rect(&mut self, rect: Rect, color: Color) -> &mut Self {
-        self.solid_rects.push(SolidRect { rect, color });
+        let clip_rect = self.current_clip();
+        self.solid_rects.push(SolidRect { rect, color, clip_rect });
         self
     }
 
     /// Add a rounded rectangle.
     #[inline]
     pub fn add_rounded_rect(&mut self, rect: Rect, corner_radius: f32, color: Color) -> &mut Self {
+        let clip_rect = self.current_clip();
         self.rounded_rects.push(RoundedRect {
             rect,
             corner_radius,
             color,
+            clip_rect,
         });
         self
     }
@@ -156,10 +224,12 @@ impl PrimitiveBatch {
     /// Add a circle.
     #[inline]
     pub fn add_circle(&mut self, center: Point, radius: f32, color: Color) -> &mut Self {
+        let clip_rect = self.current_clip();
         self.circles.push(Circle {
             center,
             radius,
             color,
+            clip_rect,
         });
         self
     }
@@ -167,14 +237,16 @@ impl PrimitiveBatch {
     /// Add a solid line segment.
     #[inline]
     pub fn add_line(&mut self, p1: Point, p2: Point, thickness: f32, color: Color) -> &mut Self {
-        self.lines.push(LineSegment { p1, p2, thickness, color, style: LineStyle::Solid });
+        let clip_rect = self.current_clip();
+        self.lines.push(LineSegment { p1, p2, thickness, color, style: LineStyle::Solid, clip_rect });
         self
     }
 
     /// Add a styled line segment (solid, dashed, or dotted).
     #[inline]
     pub fn add_line_styled(&mut self, p1: Point, p2: Point, thickness: f32, color: Color, style: LineStyle) -> &mut Self {
-        self.lines.push(LineSegment { p1, p2, thickness, color, style });
+        let clip_rect = self.current_clip();
+        self.lines.push(LineSegment { p1, p2, thickness, color, style, clip_rect });
         self
     }
 
@@ -184,7 +256,8 @@ impl PrimitiveBatch {
     #[inline]
     pub fn add_polyline(&mut self, points: Vec<Point>, thickness: f32, color: Color) -> &mut Self {
         if points.len() >= 2 {
-            self.polylines.push(Polyline { points, thickness, color, style: LineStyle::Solid });
+            let clip_rect = self.current_clip();
+            self.polylines.push(Polyline { points, thickness, color, style: LineStyle::Solid, clip_rect });
         }
         self
     }
@@ -193,7 +266,8 @@ impl PrimitiveBatch {
     #[inline]
     pub fn add_polyline_styled(&mut self, points: Vec<Point>, thickness: f32, color: Color, style: LineStyle) -> &mut Self {
         if points.len() >= 2 {
-            self.polylines.push(Polyline { points, thickness, color, style });
+            let clip_rect = self.current_clip();
+            self.polylines.push(Polyline { points, thickness, color, style, clip_rect });
         }
         self
     }
@@ -204,11 +278,13 @@ impl PrimitiveBatch {
     /// This enables the text engine to skip reshaping if nothing changed.
     #[inline]
     pub fn add_text(&mut self, text: impl Into<String>, position: Point, color: Color) -> &mut Self {
+        let clip_rect = self.current_clip();
         self.text_runs.push(TextRun {
             text: text.into(),
             position,
             color,
             cache_key: None,
+            clip_rect,
         });
         self
     }
@@ -225,11 +301,13 @@ impl PrimitiveBatch {
         color: Color,
         cache_key: u64,
     ) -> &mut Self {
+        let clip_rect = self.current_clip();
         self.text_runs.push(TextRun {
             text: text.into(),
             position,
             color,
             cache_key: Some(cache_key),
+            clip_rect,
         });
         self
     }
@@ -243,11 +321,13 @@ impl PrimitiveBatch {
         border_width: f32,
         color: Color,
     ) -> &mut Self {
+        let clip_rect = self.current_clip();
         self.borders.push(Border {
             rect,
             corner_radius,
             border_width,
             color,
+            clip_rect,
         });
         self
     }
@@ -263,11 +343,13 @@ impl PrimitiveBatch {
         blur_radius: f32,
         color: Color,
     ) -> &mut Self {
+        let clip_rect = self.current_clip();
         self.shadows.push(Shadow {
             rect,
             corner_radius,
             blur_radius,
             color,
+            clip_rect,
         });
         self
     }

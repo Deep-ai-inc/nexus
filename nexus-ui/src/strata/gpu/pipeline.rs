@@ -391,6 +391,20 @@ impl StrataPipeline {
         self.instances.clear();
     }
 
+    /// Return the current instance count (used to mark a range start).
+    #[inline]
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Apply a clip rect to all instances added since `start`.
+    #[inline]
+    pub fn apply_clip_since(&mut self, start: usize, clip: [f32; 4]) {
+        for inst in &mut self.instances[start..] {
+            inst.clip_rect = clip;
+        }
+    }
+
     // =========================================================================
     // Mode 0: Quad (text, solid rects, rounded rects, circles)
     // =========================================================================

@@ -212,6 +212,9 @@ pub struct GridLayout {
 
     /// Row content for rendering.
     pub rows_content: Vec<GridRow>,
+
+    /// Clip rectangle for this grid (from container clipping).
+    pub clip_rect: Option<Rect>,
 }
 
 impl GridLayout {
@@ -224,6 +227,7 @@ impl GridLayout {
             cols,
             rows,
             rows_content: Vec::new(),
+            clip_rect: None,
         }
     }
 
@@ -243,6 +247,7 @@ impl GridLayout {
             cols,
             rows,
             rows_content,
+            clip_rect: None,
         }
     }
 
@@ -402,6 +407,14 @@ impl LayoutSnapshot {
     /// Primitives added here bypass the widget system entirely.
     pub fn primitives_mut(&mut self) -> &mut PrimitiveBatch {
         &mut self.primitives
+    }
+
+    /// Get the current clip rect from the primitive batch's clip stack.
+    ///
+    /// Used by layout containers to propagate clip info to non-primitive
+    /// render paths (e.g., GridLayout for terminal content).
+    pub fn current_clip(&self) -> Option<Rect> {
+        self.primitives.current_clip_public()
     }
 
     /// Add a background decoration (rendered behind text).

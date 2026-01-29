@@ -540,6 +540,7 @@ impl Column {
         let content_width = bounds.width - self.padding.horizontal();
 
         // Draw shadow → background → border (correct z-order)
+        // These are drawn OUTSIDE the clip rect (they ARE the container chrome).
         if let Some((blur, color)) = self.shadow {
             snapshot.primitives_mut().add_shadow(
                 Rect::new(bounds.x + 4.0, bounds.y + 4.0, bounds.width, bounds.height),
@@ -562,6 +563,18 @@ impl Column {
                 self.border_width,
                 border_color,
             );
+        }
+
+        // Clip when the container has visual chrome (background/border) or when
+        // the allocated bounds can't fit content (e.g. window resized very small).
+        // The parent's clip stack already handles ancestry, but structural containers
+        // must also clip when their bounds are smaller than their intrinsic size.
+        let has_chrome = self.background.is_some() || self.border_color.is_some();
+        let intrinsic = self.measure();
+        let content_overflows = bounds.width < intrinsic.width || bounds.height < intrinsic.height;
+        let clips = has_chrome || content_overflows;
+        if clips {
+            snapshot.primitives_mut().push_clip(bounds);
         }
 
         // =====================================================================
@@ -713,12 +726,13 @@ impl Column {
                     let rows_content: Vec<GridRow> = t.row_content.into_iter()
                         .map(|(text, color)| GridRow { text, color })
                         .collect();
-                    let grid_layout = GridLayout::with_rows(
+                    let mut grid_layout = GridLayout::with_rows(
                         Rect::new(x, y, size.width, size.height),
                         t.cell_width, t.cell_height,
                         t.cols, t.rows,
                         rows_content,
                     );
+                    grid_layout.clip_rect = snapshot.current_clip();
                     snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
 
                     y += height + self.spacing + alignment_gap;
@@ -766,6 +780,10 @@ impl Column {
                     y += size + alignment_gap;
                 }
             }
+        }
+
+        if clips {
+            snapshot.primitives_mut().pop_clip();
         }
     }
 }
@@ -973,7 +991,7 @@ impl Row {
         let content_y = bounds.y + self.padding.top;
         let content_height = bounds.height - self.padding.vertical();
 
-        // Draw shadow → background → border
+        // Draw shadow → background → border (outside clip)
         if let Some((blur, color)) = self.shadow {
             snapshot.primitives_mut().add_shadow(
                 Rect::new(bounds.x + 4.0, bounds.y + 4.0, bounds.width, bounds.height),
@@ -996,6 +1014,15 @@ impl Row {
                 self.border_width,
                 border_color,
             );
+        }
+
+        // Clip when the container has visual chrome or when bounds overflow.
+        let has_chrome = self.background.is_some() || self.border_color.is_some();
+        let intrinsic = self.measure();
+        let content_overflows = bounds.width < intrinsic.width || bounds.height < intrinsic.height;
+        let clips = has_chrome || content_overflows;
+        if clips {
+            snapshot.primitives_mut().push_clip(bounds);
         }
 
         // =====================================================================
@@ -1149,12 +1176,13 @@ impl Row {
                     let rows_content: Vec<GridRow> = t.row_content.into_iter()
                         .map(|(text, color)| GridRow { text, color })
                         .collect();
-                    let grid_layout = GridLayout::with_rows(
+                    let mut grid_layout = GridLayout::with_rows(
                         Rect::new(x, y, size.width, size.height),
                         t.cell_width, t.cell_height,
                         t.cols, t.rows,
                         rows_content,
                     );
+                    grid_layout.clip_rect = snapshot.current_clip();
                     snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
 
                     x += width + self.spacing + alignment_gap;
@@ -1202,6 +1230,10 @@ impl Row {
                     x += size + alignment_gap;
                 }
             }
+        }
+
+        if clips {
+            snapshot.primitives_mut().pop_clip();
         }
     }
 }

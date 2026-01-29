@@ -123,15 +123,23 @@ impl StrataApp for DemoApp {
     }
 
     fn view(state: &Self::State, snapshot: &mut LayoutSnapshot) {
-        let vw = 1050.0;
-        let vh = 672.0;
+        // Dynamic viewport — reflows on window resize
+        let vp = snapshot.viewport();
+        let vw = vp.width;
+        let vh = vp.height;
+
+        let outer_padding = 16.0;
+        let col_spacing = 20.0;
+
+        // Right column: 30% of viewport, clamped to reasonable range
+        let right_col_width = (vw * 0.3).clamp(300.0, 420.0);
 
         // =================================================================
         // MAIN LAYOUT: Row with two columns
         // =================================================================
         Row::new()
-            .padding(16.0)
-            .spacing(20.0)
+            .padding(outer_padding)
+            .spacing(col_spacing)
             .width(Length::Fixed(vw))
             .height(Length::Fixed(vh))
             // =============================================================
@@ -236,7 +244,7 @@ impl StrataApp for DemoApp {
             .column(
                 Column::new()
                     .spacing(16.0)
-                    .width(Length::Fixed(330.0))
+                    .width(Length::Fixed(right_col_width))
                     // Status Indicators
                     .column(
                         StatusPanel {
@@ -297,17 +305,20 @@ impl StrataApp for DemoApp {
         // =================================================================
         // OVERLAYS (absolute positioned, not in flow layout)
         // =================================================================
-        // Right column panels end at ~y=160 (StatusPanel 62px + gap 16 + JobPanel 66px + top 16)
-        let rx = 706.0;
+        // Right column x: viewport - outer padding - right column width
+        let rx = vw - outer_padding - right_col_width;
+        // Right column panels end at ~y=160 (StatusPanel ~62 + gap 16 + JobPanel ~66 + top padding 16)
         view_context_menu(snapshot, rx, 166.0);
         view_completion_popup(snapshot, rx, 344.0);
-        view_table(snapshot, rx, 524.0, 330.0);
+        view_table(snapshot, rx, 524.0, right_col_width);
 
         // Cursor blinking block (escape hatch — added after layout)
-        // Position: InputBar at y≈614, padding_top=8, text center offset=2 → text y≈624
-        // x: padding 28 + "~/Desktop/nexus"(126) + spacing(10) + pill(37) + spacing(10) + "$"(8.4) + spacing(10) ≈ 229
+        // InputBar is 38px tall at the bottom of the left column.
+        // cursor y = vh - outer_padding - 38(inputbar) + 8(pad_top) + 2(center_offset) = vh - 44
+        // cursor x = outer_padding + 12(row_pad) + "~/Desktop/nexus"(126) + 10 + pill(37) + 10 + "$"(8.4) + 10 ≈ 229
+        let cursor_y = vh - outer_padding - 38.0 + 8.0 + 2.0;
         snapshot.primitives_mut().add_rounded_rect(
-            Rect::new(229.0, 624.0, 8.0, 18.0),
+            Rect::new(229.0, cursor_y, 8.0, 18.0),
             1.0,
             colors::CURSOR,
         );
@@ -438,7 +449,7 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
 // =========================================================================
 
 fn view_completion_popup(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
-    let w = 200.0;
+    let w = 220.0;
     let item_h = 24.0;
     let items = 6;
     let h = items as f32 * item_h + 12.0;
@@ -481,10 +492,10 @@ fn view_completion_popup(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
             Color::rgba(0.6, 0.4, 0.9, 0.3)
         };
         p.add_rounded_rect(
-            Rect::new(ix + iw - 48.0, iy + 2.0, 40.0, 18.0),
+            Rect::new(ix + iw - 56.0, iy + 2.0, 48.0, 18.0),
             4.0, badge_color,
         );
-        p.add_text(*kind, Point::new(ix + iw - 42.0, iy + 2.0), colors::TEXT_SECONDARY);
+        p.add_text(*kind, Point::new(ix + iw - 48.0, iy + 2.0), colors::TEXT_SECONDARY);
     }
 }
 

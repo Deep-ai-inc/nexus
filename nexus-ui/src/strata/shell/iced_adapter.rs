@@ -570,6 +570,25 @@ impl PipelineWrapper {
 
         let primitives = snapshot.primitives();
 
+        /// Convert an optional clip rect to GPU format [x, y, w, h] with scaling.
+        #[inline]
+        fn clip_to_gpu(clip: &Option<crate::strata::primitives::Rect>, scale: f32) -> Option<[f32; 4]> {
+            clip.map(|c| [c.x * scale, c.y * scale, c.width * scale, c.height * scale])
+        }
+
+        /// Apply clip from a primitive to the pipeline instances added since `start`.
+        #[inline]
+        fn maybe_clip(
+            pipeline: &mut crate::strata::gpu::StrataPipeline,
+            start: usize,
+            clip: &Option<crate::strata::primitives::Rect>,
+            scale: f32,
+        ) {
+            if let Some(gpu_clip) = clip_to_gpu(clip, scale) {
+                pipeline.apply_clip_since(start, gpu_clip);
+            }
+        }
+
         // 1. Background decorations
         for decoration in snapshot.background_decorations() {
             render_decoration(pipeline, decoration, scale);
@@ -577,6 +596,7 @@ impl PipelineWrapper {
 
         // 2. Shadows (behind everything they shadow)
         for prim in &primitives.shadows {
+            let start = pipeline.instance_count();
             pipeline.add_shadow(
                 prim.rect.x * scale,
                 prim.rect.y * scale,
@@ -586,10 +606,12 @@ impl PipelineWrapper {
                 prim.blur_radius * scale,
                 prim.color,
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
         // 2b. Primitive backgrounds (solid rects, rounded rects, circles)
         for prim in &primitives.solid_rects {
+            let start = pipeline.instance_count();
             pipeline.add_solid_rect(
                 prim.rect.x * scale,
                 prim.rect.y * scale,
@@ -597,8 +619,10 @@ impl PipelineWrapper {
                 prim.rect.height * scale,
                 prim.color,
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
         for prim in &primitives.rounded_rects {
+            let start = pipeline.instance_count();
             pipeline.add_rounded_rect(
                 prim.rect.x * scale,
                 prim.rect.y * scale,
@@ -607,18 +631,22 @@ impl PipelineWrapper {
                 prim.corner_radius * scale,
                 prim.color,
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
         for prim in &primitives.circles {
+            let start = pipeline.instance_count();
             pipeline.add_circle(
                 prim.center.x * scale,
                 prim.center.y * scale,
                 prim.radius * scale,
                 prim.color,
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
         // 2c. Borders (outlines)
         for prim in &primitives.borders {
+            let start = pipeline.instance_count();
             pipeline.add_border(
                 prim.rect.x * scale,
                 prim.rect.y * scale,
@@ -628,10 +656,12 @@ impl PipelineWrapper {
                 prim.border_width * scale,
                 prim.color,
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
         // 2d. Line segments
         for prim in &primitives.lines {
+            let start = pipeline.instance_count();
             pipeline.add_line_styled(
                 prim.p1.x * scale,
                 prim.p1.y * scale,
@@ -641,9 +671,11 @@ impl PipelineWrapper {
                 prim.color,
                 convert_line_style(prim.style),
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
-        // 2c. Polylines (each expands to N-1 line segment instances)
+        // 2e. Polylines (each expands to N-1 line segment instances)
         for prim in &primitives.polylines {
+            let start = pipeline.instance_count();
             let scaled_points: Vec<[f32; 2]> = prim
                 .points
                 .iter()
@@ -655,6 +687,7 @@ impl PipelineWrapper {
                 prim.color,
                 convert_line_style(prim.style),
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
         // 3. Selection highlight (on top of backgrounds, behind text)
@@ -678,14 +711,17 @@ impl PipelineWrapper {
         for (_source_id, source_layout) in snapshot.sources_in_order() {
             for item in &source_layout.items {
                 if let crate::strata::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
+                    let grid_clip = &grid_layout.clip_rect;
                     for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
                         if row.text.trim().is_empty() {
                             continue;
                         }
+                        let start = pipeline.instance_count();
                         let x = grid_layout.bounds.x * scale;
                         let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
                         let color = crate::strata::primitives::Color::unpack(row.color);
                         pipeline.add_text(&row.text, x, y, color);
+                        maybe_clip(pipeline, start, grid_clip, scale);
                     }
                 }
             }
@@ -693,12 +729,14 @@ impl PipelineWrapper {
 
         // 5. Primitive text runs
         for prim in &primitives.text_runs {
+            let start = pipeline.instance_count();
             pipeline.add_text(
                 &prim.text,
                 prim.position.x * scale,
                 prim.position.y * scale,
                 prim.color,
             );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
         // Render foreground decorations LAST (on top of everything).
