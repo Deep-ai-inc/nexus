@@ -229,6 +229,7 @@ pub struct ContextMenuState {
     pub y: f32,
     pub items: Vec<ContextMenuItem>,
     pub target: ContextTarget,
+    pub hovered_item: Cell<Option<usize>>,
 }
 
 // =========================================================================
@@ -982,7 +983,7 @@ impl StrataApp for NexusApp {
             // Context menu
             // =============================================================
             NexusMessage::ShowContextMenu(x, y, items, target) => {
-                state.context_menu = Some(ContextMenuState { x, y, items, target });
+                state.context_menu = Some(ContextMenuState { x, y, items, target, hovered_item: Cell::new(None) });
             }
             NexusMessage::ContextMenuAction(item) => {
                 let target = state.context_menu.as_ref().map(|m| m.target.clone());
@@ -1340,6 +1341,18 @@ impl StrataApp for NexusApp {
                         ContextTarget::AgentBlock(block.id),
                     ));
                 }
+            }
+        }
+
+        // Context menu hover tracking
+        if let MouseEvent::CursorMoved { .. } = &event {
+            if let Some(ref menu) = state.context_menu {
+                let idx = if let Some(HitResult::Widget(id)) = &hit {
+                    (0..menu.items.len()).find(|i| *id == SourceId::named(&format!("ctx_menu_{}", i)))
+                } else {
+                    None
+                };
+                menu.hovered_item.set(idx);
             }
         }
 
@@ -2242,6 +2255,8 @@ fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuState) {
     let ix = x + padding;
     let iw = w - padding * 2.0;
 
+    let hovered = menu.hovered_item.get();
+
     for (i, item) in menu.items.iter().enumerate() {
         let iy = y + padding + i as f32 * row_h;
         let item_rect = Rect::new(ix, iy, iw, row_h - 2.0);
@@ -2252,8 +2267,13 @@ fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuState) {
 
         let p = snapshot.overlay_primitives_mut();
 
-        // Item background — visible against dark menu
-        p.add_rounded_rect(item_rect, 4.0, Color::rgb(0.15, 0.15, 0.18));
+        // Item background — highlight on hover
+        let bg = if hovered == Some(i) {
+            Color::rgb(0.25, 0.35, 0.55)
+        } else {
+            Color::rgb(0.15, 0.15, 0.18)
+        };
+        p.add_rounded_rect(item_rect, 4.0, bg);
 
         // Label
         p.add_text(item.label(), Point::new(ix + 10.0, iy + 6.0), Color::rgb(0.92, 0.92, 0.92));
