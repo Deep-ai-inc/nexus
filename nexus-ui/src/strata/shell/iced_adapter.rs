@@ -5,6 +5,7 @@
 //!
 //! **This is the ONLY file in Strata that imports iced.**
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use iced::widget::shader::{self, wgpu};
@@ -82,6 +83,10 @@ struct ShellState<A: StrataApp> {
 
     /// Shared image store for dynamic image loading.
     image_store: crate::strata::gpu::ImageStore,
+
+    /// Cached layout snapshot from the most recent view() call.
+    /// Reused by update() for hit-testing to avoid rebuilding layout twice per frame.
+    cached_snapshot: RefCell<Option<Arc<LayoutSnapshot>>>,
 }
 
 /// Messages handled by the shell.
@@ -120,6 +125,7 @@ fn init<A: StrataApp>() -> (ShellState<A>, Task<ShellMessage<A::Message>>) {
         cursor_position: None,
         frame: 0,
         image_store,
+        cached_snapshot: RefCell::new(None),
     };
 
     // Convert app command to shell tasks, and send initial tick to trigger first render
@@ -161,20 +167,30 @@ fn update<A: StrataApp>(
                 // Convert to Strata mouse event and dispatch
                 if let Some(strata_event) = convert_mouse_event(mouse_event, state.cursor_position)
                 {
-                    // Build snapshot for hit-testing
-                    let mut snapshot = LayoutSnapshot::new();
-                    snapshot.set_viewport(Rect::new(
-                        0.0,
-                        0.0,
-                        state.window_size.0,
-                        state.window_size.1,
-                    ));
-                    A::view(&state.app, &mut snapshot);
-
-                    // Hit-test at cursor position → HitResult
-                    let hit: Option<HitResult> = state
-                        .cursor_position
-                        .and_then(|pos| snapshot.hit_test(pos));
+                    // Reuse previous frame's cached snapshot for hit-testing
+                    // (avoids rebuilding layout twice per frame)
+                    let hit: Option<HitResult> = {
+                        let cache = state.cached_snapshot.borrow();
+                        match cache.as_ref() {
+                            Some(snapshot) => {
+                                state.cursor_position.and_then(|pos| snapshot.hit_test(pos))
+                            }
+                            None => {
+                                // First frame before any view() call — build once
+                                drop(cache);
+                                let mut snapshot = LayoutSnapshot::new();
+                                snapshot.set_viewport(Rect::new(
+                                    0.0, 0.0,
+                                    state.window_size.0, state.window_size.1,
+                                ));
+                                A::view(&state.app, &mut snapshot);
+                                let hit = state.cursor_position
+                                    .and_then(|pos| snapshot.hit_test(pos));
+                                *state.cached_snapshot.borrow_mut() = Some(Arc::new(snapshot));
+                                hit
+                            }
+                        }
+                    };
 
                     // CAPTURE LOGIC FIX:
                     // If pointer is captured, we MUST dispatch the event even if hit is None.
@@ -254,6 +270,9 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
     // Wrap in Arc to prevent deep copying when iced clones the primitive.
     // The shader only needs read access.
     let snapshot = Arc::new(snapshot);
+
+    // Cache for next frame's hit-testing in update() (avoids double layout rebuild)
+    *state.cached_snapshot.borrow_mut() = Some(snapshot.clone());
 
     // Drain any pending image uploads from the image store.
     // These will be uploaded to the GPU atlas during prepare().
