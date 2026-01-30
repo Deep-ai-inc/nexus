@@ -10,9 +10,10 @@ use nexus_kernel::{Completion, CompletionKind};
 use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus};
 use crate::blocks::Block;
 use crate::strata::content_address::SourceId;
+use crate::strata::gpu::ImageHandle;
 use crate::strata::layout::containers::{
-    ButtonElement, Column, CrossAxisAlignment, LayoutChild, Length, Padding, Row, TableCell,
-    TableElement, TerminalElement, TextElement, Widget,
+    ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
+    TableCell, TableElement, TerminalElement, TextElement, Widget,
 };
 use crate::strata::primitives::Color;
 use crate::widgets::job_indicator::{VisualJob, VisualJobState};
@@ -26,6 +27,7 @@ use super::nexus_app::colors;
 pub struct ShellBlockWidget<'a> {
     pub block: &'a Block,
     pub kill_id: SourceId,
+    pub image_info: Option<(ImageHandle, u32, u32)>,
 }
 
 impl Widget for ShellBlockWidget<'_> {
@@ -85,7 +87,7 @@ impl Widget for ShellBlockWidget<'_> {
 
         // Render output: native structured data takes priority over terminal
         if let Some(value) = &block.native_output {
-            content = render_native_value(content, value, block);
+            content = render_native_value(content, value, block, self.image_info);
         } else if content_rows > 0 {
             let source_id = SourceId::named(&format!("shell_term_{}", block.id.0));
             let mut term = TerminalElement::new(source_id, cols, content_rows)
@@ -790,10 +792,52 @@ fn term_color_to_strata(c: nexus_term::Color) -> Color {
 }
 
 /// Render a structured Value from a native (kernel) command into the layout.
-fn render_native_value(mut parent: Column, value: &Value, block: &Block) -> Column {
+fn render_native_value(
+    mut parent: Column,
+    value: &Value,
+    block: &Block,
+    image_info: Option<(ImageHandle, u32, u32)>,
+) -> Column {
     let block_id = block.id;
     match value {
         Value::Unit => parent,
+
+        Value::Media { content_type, metadata, .. } => {
+            if content_type.starts_with("image/") {
+                if let Some((handle, orig_w, orig_h)) = image_info {
+                    // Scale down to fit, max 600px wide, 400px tall
+                    let max_w = 600.0_f32;
+                    let max_h = 400.0_f32;
+                    let scale = (max_w / orig_w as f32).min(max_h / orig_h as f32).min(1.0);
+                    let w = orig_w as f32 * scale;
+                    let h = orig_h as f32 * scale;
+
+                    parent = parent.image(
+                        ImageElement::new(handle, w, h).corner_radius(4.0),
+                    );
+
+                    // Label
+                    let label = if let Some(ref name) = metadata.filename {
+                        format!("{} ({})", name, content_type)
+                    } else {
+                        format!("{} {}x{}", content_type, orig_w, orig_h)
+                    };
+                    parent = parent.push(TextElement::new(label).color(colors::TEXT_MUTED));
+                } else {
+                    // Image not yet loaded
+                    parent = parent.push(TextElement::new(format!("[{}: loading...]", content_type)).color(colors::TEXT_MUTED));
+                }
+            } else {
+                // Non-image media
+                let label = if let Some(ref name) = metadata.filename {
+                    format!("[{}: {}]", content_type, name)
+                } else {
+                    format!("[{}]", content_type)
+                };
+                parent = parent.push(TextElement::new(label).color(colors::TEXT_MUTED));
+            }
+            parent
+        }
 
         Value::Table { columns, rows } => {
             let source_id = SourceId::named(&format!("table_{}", block_id.0));

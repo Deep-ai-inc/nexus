@@ -36,7 +36,7 @@ use crate::strata::nexus_widgets::{
 };
 use crate::strata::primitives::Rect;
 use crate::strata::{
-    AppConfig, Column, Command, ImageStore, LayoutSnapshot, Length,
+    AppConfig, Column, Command, ImageHandle, ImageStore, LayoutSnapshot, Length,
     MouseResponse, Padding, ScrollAction, ScrollColumn, ScrollState, Selection, StrataApp,
     Subscription, TextInputAction, TextInputMouseAction, TextInputState,
 };
@@ -227,6 +227,9 @@ pub struct NexusState {
     pub history_search_results: Vec<String>,
     pub history_search_index: usize,
 
+    // --- Images ---
+    pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
+
     // --- Window ---
     pub exit_requested: bool,
 
@@ -388,6 +391,7 @@ impl StrataApp for NexusApp {
             history_search_results: Vec::new(),
             history_search_index: 0,
 
+            image_handles: HashMap::new(),
             exit_requested: false,
 
             context,
@@ -399,7 +403,7 @@ impl StrataApp for NexusApp {
     fn update(
         state: &mut Self::State,
         message: Self::Message,
-        _images: &mut ImageStore,
+        images: &mut ImageStore,
     ) -> Command<Self::Message> {
         // Reset cursor blink on input activity
         if matches!(&message, NexusMessage::InputKey(_) | NexusMessage::InputMouse(_)) {
@@ -535,7 +539,7 @@ impl StrataApp for NexusApp {
                 }
             }
             NexusMessage::KernelEvent(evt) => {
-                return handle_kernel_event(state, evt);
+                return handle_kernel_event(state, evt, images);
             }
             NexusMessage::SendInterrupt => {
                 // Send SIGINT (Ctrl+C) to focused PTY block or last running PTY
@@ -876,9 +880,11 @@ impl StrataApp for NexusApp {
                 match block_ref {
                     UnifiedBlockRef::Shell(block) => {
                         let kill_id = SourceId::named(&format!("kill_{}", block.id.0));
+                        let image_info = state.image_handles.get(&block.id).copied();
                         scroll = scroll.push(ShellBlockWidget {
                             block,
                             kill_id,
+                            image_info,
                         });
                     }
                     UnifiedBlockRef::Agent(block) => {
@@ -1378,7 +1384,7 @@ fn execute_command(state: &mut NexusState, command: String) -> Command<NexusMess
 // Kernel event handler
 // =========================================================================
 
-fn handle_kernel_event(state: &mut NexusState, evt: ShellEvent) -> Command<NexusMessage> {
+fn handle_kernel_event(state: &mut NexusState, evt: ShellEvent, images: &mut ImageStore) -> Command<NexusMessage> {
     match evt {
         ShellEvent::CommandStarted { block_id, command, .. } => {
             if !state.block_index.contains_key(&block_id) {
@@ -1400,6 +1406,17 @@ fn handle_kernel_event(state: &mut NexusState, evt: ShellEvent) -> Command<Nexus
             state.terminal_dirty = true;
         }
         ShellEvent::CommandOutput { block_id, value } => {
+            // If it's an image, decode and load into GPU
+            if let Value::Media { ref data, ref content_type, .. } = value {
+                if content_type.starts_with("image/") {
+                    if let Ok(img) = image::load_from_memory(data) {
+                        let rgba = img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        let handle = images.load_rgba(w, h, rgba.into_raw());
+                        state.image_handles.insert(block_id, (handle, w, h));
+                    }
+                }
+            }
             if let Some(&idx) = state.block_index.get(&block_id) {
                 if let Some(block) = state.blocks.get_mut(idx) {
                     block.native_output = Some(value);
