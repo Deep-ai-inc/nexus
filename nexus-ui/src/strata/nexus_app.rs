@@ -106,7 +106,7 @@ pub enum NexusMessage {
     // Input
     InputKey(KeyEvent),
     InputMouse(TextInputMouseAction),
-    Submit,
+    Submit(String),
     ToggleMode,
 
     // Terminal / PTY
@@ -364,8 +364,8 @@ impl StrataApp for NexusApp {
             // =============================================================
             NexusMessage::InputKey(event) => {
                 match state.input.handle_key(&event, false) {
-                    TextInputAction::Submit(_) => {
-                        return Command::message(NexusMessage::Submit);
+                    TextInputAction::Submit(text) => {
+                        return Command::message(NexusMessage::Submit(text));
                     }
                     _ => {}
                 }
@@ -374,8 +374,8 @@ impl StrataApp for NexusApp {
                 state.input.focused = true;
                 state.input.apply_mouse(action);
             }
-            NexusMessage::Submit => {
-                let text = state.input.text.trim().to_string();
+            NexusMessage::Submit(submitted_text) => {
+                let text = submitted_text.trim().to_string();
                 if text.is_empty() {
                     return Command::none();
                 }
@@ -393,10 +393,7 @@ impl StrataApp for NexusApp {
                 // Record history
                 state.push_history(&text);
 
-                // Clear input
-                state.input.text.clear();
-                state.input.cursor = 0;
-                state.input.selection = None;
+                // Input already cleared by handle_key's Submit
 
                 if is_agent_query {
                     return spawn_agent(state, query);
