@@ -1,20 +1,16 @@
-//! Demo application exercising all Strata rendering features needed for Nexus.
+//! Nexus Strata Application
 //!
-//! Features demonstrated:
-//! - **Async Commands**: Submit triggers a `Command::message` round-trip
-//! - **Dynamic Lists**: Chat history grows at runtime with stable SourceIds
-//! - **Centralized Focus**: Single `focused_id` governs all widget focus state
-//! - **Stateful Buttons**: Hover highlight via `Cell<Option<SourceId>>` tracking
-//! - **Zero-allocation Event Routing**: Composable `handle_mouse` + `map`
+//! The Strata-based Nexus UI, built on the GPU-accelerated layout system.
+//! This is the replacement for the legacy Iced widget-based UI.
 //!
-//! Run with: `cargo run -p nexus-ui --example strata_demo`
+//! Run with: `cargo run -p nexus-ui -- --strata`
 
 use std::cell::Cell;
 use std::time::Instant;
 
 use crate::route_mouse;
 use crate::strata::content_address::{ContentAddress, SourceId};
-use crate::strata::demo_widgets::{Card, ShellBlock, StatusIndicator, StatusPanel};
+use crate::strata::nexus_widgets::{Card, ShellBlock, StatusIndicator, StatusPanel};
 use crate::strata::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
@@ -954,7 +950,7 @@ impl StrataApp for DemoApp {
     }
 
     fn title(_state: &Self::State) -> String {
-        String::from("Strata — Nexus Widget Demo")
+        String::from("Nexus (Strata)")
     }
 }
 
@@ -1108,7 +1104,7 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
 /// Run the demo application.
 pub fn run() -> Result<(), crate::strata::shell::Error> {
     crate::strata::shell::run_with_config::<DemoApp>(AppConfig {
-        title: String::from("Strata — Nexus Widget Demo"),
+        title: String::from("Nexus (Strata)"),
         window_size: (1050.0, 672.0),
         antialiasing: true,
         background_color: colors::BG_APP,

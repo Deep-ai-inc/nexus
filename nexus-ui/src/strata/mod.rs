@@ -56,6 +56,10 @@ pub mod shell;
 pub mod demo;
 pub mod demo_widgets;
 
+// Strata-based Nexus application (replacing legacy Iced UI)
+pub mod nexus_app;
+pub mod nexus_widgets;
+
 // Widget system (legacy - being replaced by layout system)
 pub mod widget;
 pub mod widgets;
