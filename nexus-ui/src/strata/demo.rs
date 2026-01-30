@@ -122,7 +122,12 @@ impl StrataApp for DemoApp {
     type Message = DemoMessage;
 
     fn init(images: &mut ImageStore) -> (Self::State, Command<Self::Message>) {
-        let test_image = images.load_test_gradient(128, 128);
+        let test_image = images
+            .load_png("nexus-ui/assets/demo.png")
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to load demo.png: {e}");
+                images.load_test_gradient(128, 128)
+            });
         let state = DemoState {
             query_source: SourceId::new(),
             response_source: SourceId::new(),
@@ -236,12 +241,12 @@ impl StrataApp for DemoApp {
                     .spacing(16.0)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    // Test image (loaded via ImageStore in init)
+                    // Test image (loaded from demo.png via ImageStore)
                     .image(
                         crate::strata::layout::containers::ImageElement::new(
                             state.test_image,
-                            128.0,
-                            128.0,
+                            336.0,
+                            296.0,
                         )
                         .corner_radius(8.0),
                     )
