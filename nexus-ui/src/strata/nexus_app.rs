@@ -110,10 +110,14 @@ pub enum NexusMessage {
     InputMouse(TextInputMouseAction),
     Submit(String),
     ToggleMode,
+    HistoryUp,
+    HistoryDown,
 
     // Terminal / PTY
     PtyOutput(BlockId, Vec<u8>),
     PtyExited(BlockId, i32),
+    PtyInput(KeyEvent),
+    SendInterrupt,
     KernelEvent(ShellEvent),
     KillBlock(BlockId),
 
@@ -451,6 +455,47 @@ impl StrataApp for NexusApp {
                     InputMode::Agent => InputMode::Shell,
                 };
             }
+            NexusMessage::HistoryUp => {
+                let history = state.current_history();
+                let history_len = history.len();
+                if history_len == 0 {
+                    return Command::none();
+                }
+                let idx = state.current_history_index();
+                let new_index = match idx {
+                    None => {
+                        state.saved_input = state.input.text.clone();
+                        Some(history_len - 1)
+                    }
+                    Some(0) => Some(0),
+                    Some(i) => Some(i - 1),
+                };
+                state.set_history_index(new_index);
+                if let Some(i) = new_index {
+                    let text = state.current_history()[i].clone();
+                    state.input.text = text;
+                    state.input.cursor = state.input.text.len();
+                }
+            }
+            NexusMessage::HistoryDown => {
+                let history_len = state.current_history().len();
+                let idx = state.current_history_index();
+                match idx {
+                    None => {}
+                    Some(i) if i >= history_len - 1 => {
+                        state.set_history_index(None);
+                        state.input.text = state.saved_input.clone();
+                        state.input.cursor = state.input.text.len();
+                        state.saved_input.clear();
+                    }
+                    Some(i) => {
+                        state.set_history_index(Some(i + 1));
+                        let text = state.current_history()[i + 1].clone();
+                        state.input.text = text;
+                        state.input.cursor = state.input.text.len();
+                    }
+                }
+            }
 
             // =============================================================
             // Terminal / PTY
@@ -492,10 +537,37 @@ impl StrataApp for NexusApp {
             NexusMessage::KernelEvent(evt) => {
                 return handle_kernel_event(state, evt);
             }
+            NexusMessage::SendInterrupt => {
+                // Send SIGINT (Ctrl+C) to focused PTY block or last running PTY
+                let target = match state.focus {
+                    Focus::Block(id) => Some(id),
+                    Focus::Input => state.blocks.iter().rev()
+                        .find(|b| b.is_running())
+                        .map(|b| b.id),
+                };
+                if let Some(id) = target {
+                    if let Some(handle) = state.pty_handles.iter().find(|h| h.block_id == id) {
+                        let _ = handle.send_interrupt();
+                    }
+                }
+            }
             NexusMessage::KillBlock(id) => {
                 if let Some(handle) = state.pty_handles.iter().find(|h| h.block_id == id) {
                     let _ = handle.send_interrupt();
                     handle.kill();
+                }
+            }
+            NexusMessage::PtyInput(event) => {
+                if let Focus::Block(block_id) = state.focus {
+                    if let Some(handle) = state.pty_handles.iter().find(|h| h.block_id == block_id) {
+                        if let Some(bytes) = strata_key_to_bytes(&event) {
+                            let _ = handle.write(&bytes);
+                        }
+                    } else {
+                        // PTY gone (finished block) — return to input
+                        state.focus = Focus::Input;
+                        state.input.focused = true;
+                    }
                 }
             }
 
@@ -750,7 +822,8 @@ impl StrataApp for NexusApp {
                 state.exit_requested = true;
             }
             NexusMessage::BlurAll => {
-                state.input.focused = false;
+                state.focus = Focus::Input;
+                state.input.focused = true;
             }
             NexusMessage::Tick => {
                 if state.is_dirty() {
@@ -1057,35 +1130,52 @@ impl StrataApp for NexusApp {
                 };
             }
 
-            // Cmd shortcuts
+            // Cmd shortcuts (global)
             if modifiers.meta {
                 if let Key::Character(c) = key {
                     match c.as_str() {
                         "k" => return Some(NexusMessage::ClearScreen),
                         "w" => return Some(NexusMessage::CloseWindow),
                         "c" => return Some(NexusMessage::Copy),
+                        "." => return Some(NexusMessage::ToggleMode),
                         _ => {}
                     }
                 }
             }
 
-            // Ctrl+R: reverse history search
+            // Ctrl shortcuts (global)
             if modifiers.ctrl {
                 if let Key::Character(c) = key {
-                    if c == "r" {
-                        return Some(NexusMessage::HistorySearchToggle);
+                    match c.as_str() {
+                        "r" => return Some(NexusMessage::HistorySearchToggle),
+                        "c" => {
+                            // Ctrl+C: interrupt agent or send SIGINT to focused/last running PTY
+                            if state.active_agent.is_some() {
+                                return Some(NexusMessage::AgentInterrupt);
+                            }
+                            return Some(NexusMessage::SendInterrupt);
+                        }
+                        _ => {}
                     }
                 }
             }
 
-            // Escape: interrupt agent or clear selection
+            // Escape: interrupt agent, leave PTY focus, or clear selection
             if matches!(key, Key::Named(NamedKey::Escape)) {
                 if state.active_agent.is_some() {
                     return Some(NexusMessage::AgentInterrupt);
                 }
+                if matches!(state.focus, Focus::Block(_)) {
+                    return Some(NexusMessage::BlurAll);
+                }
                 if state.selection.is_some() {
                     return Some(NexusMessage::ClearSelection);
                 }
+            }
+
+            // When a PTY block is focused, forward keys to it
+            if let Focus::Block(_) = state.focus {
+                return Some(NexusMessage::PtyInput(event));
             }
 
             // When input is focused, route keys
@@ -1095,17 +1185,19 @@ impl StrataApp for NexusApp {
                     return Some(NexusMessage::TabComplete);
                 }
 
+                // Arrow Up/Down → history navigation
+                if matches!(key, Key::Named(NamedKey::ArrowUp)) {
+                    return Some(NexusMessage::HistoryUp);
+                }
+                if matches!(key, Key::Named(NamedKey::ArrowDown)) {
+                    return Some(NexusMessage::HistoryDown);
+                }
+
                 return Some(NexusMessage::InputKey(event));
             }
 
             // Global shortcuts when input not focused
             match key {
-                Key::Named(NamedKey::ArrowUp) => {
-                    return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(60.0)));
-                }
-                Key::Named(NamedKey::ArrowDown) => {
-                    return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(-60.0)));
-                }
                 Key::Named(NamedKey::PageUp) => {
                     return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(300.0)));
                 }
@@ -1517,6 +1609,84 @@ fn spawn_agent(state: &mut NexusState, query: String) -> Command<NexusMessage> {
 
     state.history_scroll.offset = state.history_scroll.max.get();
     Command::none()
+}
+
+// =========================================================================
+// Key-to-bytes conversion for PTY input
+// =========================================================================
+
+/// Convert a Strata KeyEvent to bytes suitable for writing to a PTY.
+fn strata_key_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
+    let (key, modifiers, text) = match event {
+        KeyEvent::Pressed { key, modifiers, text } => (key, modifiers, text.as_deref()),
+        KeyEvent::Released { .. } => return None,
+    };
+
+    match key {
+        Key::Character(c) => {
+            if modifiers.ctrl && c.len() == 1 {
+                // Ctrl+letter = ASCII 1-26
+                let ch = c.chars().next()?;
+                if ch.is_ascii_alphabetic() {
+                    let ctrl_code = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
+                    return Some(vec![ctrl_code]);
+                }
+            }
+            // Use OS-provided text if available (handles shift correctly)
+            if let Some(t) = text {
+                if !t.is_empty() {
+                    return Some(t.as_bytes().to_vec());
+                }
+            }
+            Some(c.as_bytes().to_vec())
+        }
+        Key::Named(named) => {
+            if modifiers.ctrl {
+                match named {
+                    NamedKey::ArrowLeft => return Some(vec![0x1b, b'[', b'1', b';', b'5', b'D']),
+                    NamedKey::ArrowRight => return Some(vec![0x1b, b'[', b'1', b';', b'5', b'C']),
+                    NamedKey::ArrowUp => return Some(vec![0x1b, b'[', b'1', b';', b'5', b'A']),
+                    NamedKey::ArrowDown => return Some(vec![0x1b, b'[', b'1', b';', b'5', b'B']),
+                    _ => {}
+                }
+            }
+            if modifiers.shift {
+                match named {
+                    NamedKey::ArrowLeft => return Some(vec![0x1b, b'[', b'1', b';', b'2', b'D']),
+                    NamedKey::ArrowRight => return Some(vec![0x1b, b'[', b'1', b';', b'2', b'C']),
+                    NamedKey::ArrowUp => return Some(vec![0x1b, b'[', b'1', b';', b'2', b'A']),
+                    NamedKey::ArrowDown => return Some(vec![0x1b, b'[', b'1', b';', b'2', b'B']),
+                    _ => {}
+                }
+            }
+            if modifiers.alt {
+                match named {
+                    NamedKey::ArrowLeft => return Some(vec![0x1b, b'[', b'1', b';', b'3', b'D']),
+                    NamedKey::ArrowRight => return Some(vec![0x1b, b'[', b'1', b';', b'3', b'C']),
+                    NamedKey::ArrowUp => return Some(vec![0x1b, b'[', b'1', b';', b'3', b'A']),
+                    NamedKey::ArrowDown => return Some(vec![0x1b, b'[', b'1', b';', b'3', b'B']),
+                    _ => {}
+                }
+            }
+            match named {
+                NamedKey::Enter => Some(vec![b'\r']),
+                NamedKey::Backspace => Some(vec![0x7f]),
+                NamedKey::Tab => Some(vec![b'\t']),
+                NamedKey::Escape => Some(vec![0x1b]),
+                NamedKey::Space => Some(vec![b' ']),
+                NamedKey::ArrowUp => Some(vec![0x1b, b'[', b'A']),
+                NamedKey::ArrowDown => Some(vec![0x1b, b'[', b'B']),
+                NamedKey::ArrowRight => Some(vec![0x1b, b'[', b'C']),
+                NamedKey::ArrowLeft => Some(vec![0x1b, b'[', b'D']),
+                NamedKey::Home => Some(vec![0x1b, b'[', b'H']),
+                NamedKey::End => Some(vec![0x1b, b'[', b'F']),
+                NamedKey::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
+                NamedKey::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
+                NamedKey::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
+                _ => None,
+            }
+        }
+    }
 }
 
 // =========================================================================
