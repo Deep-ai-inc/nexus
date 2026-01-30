@@ -1,9 +1,11 @@
 //! Demo application exercising all Strata rendering features needed for Nexus.
 //!
-//! Uses composed widget structs (from `demo_widgets`) for the main UI blocks,
-//! proving that the layout engine handles real nexus layouts. Overlay elements
-//! (context menu, completion popup, table) remain as free functions since
-//! they are absolutely positioned and don't participate in flex layout.
+//! Features demonstrated:
+//! - **Async Commands**: Submit triggers a `Command::message` round-trip
+//! - **Dynamic Lists**: Chat history grows at runtime with stable SourceIds
+//! - **Centralized Focus**: Single `focused_id` governs all widget focus state
+//! - **Stateful Buttons**: Hover highlight via `Cell<Option<SourceId>>` tracking
+//! - **Zero-allocation Event Routing**: Composable `handle_mouse` + `map`
 //!
 //! Run with: `cargo run -p nexus-ui --example strata_demo`
 
@@ -13,16 +15,19 @@ use std::time::Instant;
 use crate::strata::content_address::{ContentAddress, SourceId};
 use crate::strata::layout_snapshot::HitResult;
 use crate::strata::demo_widgets::{
-    AgentBlock, JobPanel, JobPill, PermissionDialog, ShellBlock, StatusIndicator,
-    StatusPanel, ToolInvocation,
+    ShellBlock, StatusIndicator, StatusPanel,
 };
-use crate::strata::event_context::{CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey};
-use crate::strata::layout::containers::Length;
+use crate::strata::event_context::{
+    CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
+};
+use crate::strata::layout::containers::{
+    ButtonElement, CrossAxisAlignment, Length, Padding,
+};
 use crate::strata::layout::primitives::LineStyle;
 use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::gpu::{ImageHandle, ImageStore};
 use crate::strata::scroll_state::{ScrollAction, ScrollState};
-use crate::strata::text_input_state::{TextInputMouseAction, TextInputState};
+use crate::strata::text_input_state::{TextInputAction, TextInputMouseAction, TextInputState};
 use crate::strata::{
     AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, ScrollColumn, Selection,
     StrataApp, Subscription, TableCell, TableElement, TextElement, TextInputElement,
@@ -55,8 +60,8 @@ pub(crate) mod colors {
     pub const TEXT_SECONDARY: Color = Color { r: 0.55, g: 0.55, b: 0.60, a: 1.0 };
     pub const TEXT_MUTED: Color = Color { r: 0.40, g: 0.40, b: 0.45, a: 1.0 };
     pub const TEXT_PATH: Color = Color { r: 0.39, g: 0.58, b: 0.93, a: 1.0 };
-    pub const TEXT_QUERY: Color = Color { r: 0.5, g: 0.7, b: 1.0, a: 1.0 };
     pub const TEXT_PURPLE: Color = Color { r: 0.6, g: 0.4, b: 0.9, a: 1.0 };
+    pub const TEXT_QUERY: Color = Color { r: 0.5, g: 0.7, b: 1.0, a: 1.0 };
 
     // Buttons
     pub const BTN_DENY: Color = Color { r: 0.6, g: 0.15, b: 0.15, a: 1.0 };
@@ -73,6 +78,21 @@ pub(crate) mod colors {
     pub const CURSOR: Color = Color { r: 0.85, g: 0.85, b: 0.88, a: 0.8 };
 }
 
+// =========================================================================
+// Dynamic chat item (proves Vec<T> in view)
+// =========================================================================
+
+struct ChatItem {
+    /// Stable ID for this item — survives across frames.
+    source: SourceId,
+    role: &'static str,
+    text: String,
+}
+
+// =========================================================================
+// Message type
+// =========================================================================
+
 /// Demo message type.
 #[derive(Debug, Clone)]
 pub enum DemoMessage {
@@ -87,18 +107,31 @@ pub enum DemoMessage {
     LeftScroll(ScrollAction),
     RightScroll(ScrollAction),
 
-    // Widget actions
-    ButtonClicked(SourceId),
-    TableSort(SourceId),
-    TimerTick,
-
     // Text input events (routed from on_key/on_mouse)
     InputKey(KeyEvent),
     InputMouse(TextInputMouseAction),
     EditorKey(KeyEvent),
     EditorMouse(TextInputMouseAction),
+
+    // Dynamic list: submit command from input bar
+    SubmitCommand,
+
+    // Buttons
+    ButtonClicked(SourceId),
+
+    // Table
+    TableSort(SourceId),
+
+    // Timer subscription
+    TimerTick,
+
+    // Focus management
     BlurAll,
 }
+
+// =========================================================================
+// Application state
+// =========================================================================
 
 /// Demo application state.
 pub struct DemoState {
@@ -108,6 +141,19 @@ pub struct DemoState {
     // Text inputs
     input: TextInputState,
     editor: TextInputState,
+
+    // --- Focus Management (centralized) ---
+    /// The currently focused widget, or None if nothing focused.
+    focused_id: Option<SourceId>,
+
+    // --- Dynamic List ---
+    /// Chat history — grows at runtime when commands are submitted.
+    chat_history: Vec<ChatItem>,
+
+    // --- Hover Tracking (Cell for interior mutability in on_mouse/view) ---
+    /// SourceId of the widget currently under the cursor.
+    hovered_widget: Cell<Option<SourceId>>,
+
     // Content selection (cross-widget)
     selection: Option<Selection>,
     is_selecting: bool,
@@ -128,6 +174,169 @@ pub struct DemoState {
     table_rows: Vec<(&'static str, &'static str, u32, &'static str, Color)>,
 }
 
+impl DemoState {
+    // ------------------------------------------------------------------
+    // Centralized focus helpers
+    // ------------------------------------------------------------------
+
+    /// Focus a specific widget. Automatically blurs all others.
+    fn focus(&mut self, id: SourceId) {
+        self.focused_id = Some(id);
+        // Propagate to widget states
+        self.input.focused = self.input.id() == id;
+        self.editor.focused = self.editor.id() == id;
+    }
+
+    /// Blur all widgets.
+    fn blur_all(&mut self) {
+        self.focused_id = None;
+        self.input.focused = false;
+        self.editor.focused = false;
+    }
+}
+
+// =========================================================================
+// Button helper — hover-aware, zero allocation
+// =========================================================================
+
+/// Create a ButtonElement with hover highlight.
+///
+/// Reads the hovered_widget Cell to determine if this button is hovered,
+/// and adjusts the background color accordingly. No heap allocation —
+/// just a conditional color tweak on the existing ButtonElement.
+fn hover_button(id: SourceId, label: &str, bg: Color, hovered: Option<SourceId>) -> ButtonElement {
+    let is_hovered = hovered == Some(id);
+    let actual_bg = if is_hovered {
+        // Lighten by blending towards white
+        Color {
+            r: (bg.r + 0.15).min(1.0),
+            g: (bg.g + 0.15).min(1.0),
+            b: (bg.b + 0.15).min(1.0),
+            a: bg.a,
+        }
+    } else {
+        bg
+    };
+    ButtonElement::new(id, label).background(actual_bg)
+}
+
+// =========================================================================
+// Virtualized list helpers
+// =========================================================================
+
+/// Line height used by TextElement (must match containers.rs).
+const LINE_HEIGHT: f32 = 18.0;
+
+/// Estimate the laid-out height of a chat item card.
+///
+/// Must match the padding/spacing/font sizes used in the view() builder.
+/// This is cheap: just counts newlines in the text, no allocation.
+fn chat_item_height(item: &ChatItem) -> f32 {
+    let padding = 20.0;            // 10 top + 10 bottom
+    let role_height = 14.0;        // 12pt font, ~14px
+    let inner_spacing = 4.0;       // Column spacing between role and body lines
+    let line_count = item.text.lines().count().max(1) as f32;
+    let body_height = line_count * LINE_HEIGHT;
+    let body_spacing = (line_count - 1.0).max(0.0) * inner_spacing;
+    padding + role_height + inner_spacing + body_height + body_spacing
+}
+
+/// Compute the visible range and spacer heights for a virtualized list.
+///
+/// Returns `(first_index, last_index, top_spacer_px, bottom_spacer_px)`.
+/// The caller should lay out `items[first..last]` and insert fixed spacers
+/// for the skipped regions to preserve total content height.
+///
+/// `content_above` is the estimated height of scroll column children that
+/// appear before the chat list (image, shell block, etc.).
+fn virtualize_chat(
+    items: &[ChatItem],
+    scroll_offset: f32,
+    viewport_height: f32,
+    spacing: f32,
+) -> (usize, usize, f32, f32) {
+    if items.is_empty() || viewport_height <= 0.0 {
+        return (0, 0, 0.0, 0.0);
+    }
+
+    // Extra items rendered above/below viewport to prevent pop-in
+    const OVERSCAN: usize = 3;
+
+    // Compute all item heights upfront (cheap: just counts newlines)
+    let heights: Vec<f32> = items.iter().map(|item| chat_item_height(item)).collect();
+
+    let mut y = 0.0_f32;
+    let mut first = items.len();
+    let mut last = items.len();
+
+    for (i, h) in heights.iter().enumerate() {
+        let item_bottom = y + h;
+
+        // First item whose bottom edge is past the scroll top
+        if first == items.len() && item_bottom > scroll_offset {
+            first = i.saturating_sub(OVERSCAN);
+        }
+
+        // First item whose top edge is past the scroll bottom
+        if first != items.len() && y > scroll_offset + viewport_height {
+            last = (i + OVERSCAN).min(items.len());
+            break;
+        }
+
+        y += h + spacing;
+    }
+
+    let first = first.min(items.len());
+
+    // Spacer heights from precomputed per-item heights
+    let top_spacer: f32 = heights[..first].iter().sum::<f32>()
+        + if first > 0 { first as f32 * spacing } else { 0.0 };
+    let bottom_spacer: f32 = heights[last..].iter().sum::<f32>()
+        + if last < items.len() { (items.len() - last) as f32 * spacing } else { 0.0 };
+
+    (first, last, top_spacer, bottom_spacer)
+}
+
+/// Generate N demo chat items with realistic variety.
+fn generate_demo_chat(count: usize) -> Vec<ChatItem> {
+    let commands = [
+        ("ls -la", "total 32\ndrwxr-xr-x  8 kevin staff  256 Jan 29 src/\n-rw-r--r--  1 kevin staff  420 Jan 29 main.rs"),
+        ("cargo build", "   Compiling nexus-ui v0.1.0\n    Finished dev [unoptimized + debuginfo] target(s)"),
+        ("git status", "On branch main\nnothing to commit, working tree clean"),
+        ("cat README.md", "# Nexus\n\nA GPU-accelerated terminal emulator."),
+        ("echo hello", "hello"),
+        ("pwd", "/Users/kevin/Desktop/nexus"),
+        ("wc -l src/*.rs", "  142 src/main.rs\n  867 src/lib.rs\n 1009 total"),
+        ("date", "Thu Jan 30 09:45:00 PST 2026"),
+        ("cargo test", "running 47 tests\ntest result: ok. 47 passed; 0 failed"),
+        ("ps aux | head -5", "USER  PID %CPU %MEM   VSZ    RSS  TT  STAT STARTED  TIME COMMAND\nroot    1  0.0  0.1 34292   9280  ??  Ss   Jan29   0:42 /sbin/launchd"),
+    ];
+
+    let mut items = Vec::with_capacity(count);
+    for i in 0..count {
+        let (cmd, output) = commands[i % commands.len()];
+        items.push(ChatItem {
+            source: SourceId::new(),
+            role: "user",
+            text: format!("{cmd} # run {}", i / 2 + 1),
+        });
+        items.push(ChatItem {
+            source: SourceId::new(),
+            role: "system",
+            text: output.into(),
+        });
+        if items.len() >= count {
+            break;
+        }
+    }
+    items.truncate(count);
+    items
+}
+
+// =========================================================================
+// StrataApp implementation
+// =========================================================================
+
 /// Demo application.
 pub struct DemoApp;
 
@@ -142,14 +351,24 @@ impl StrataApp for DemoApp {
                 eprintln!("Failed to load demo.png: {e}");
                 images.load_test_gradient(128, 128)
             });
+
+        let input = TextInputState::single_line("input");
+        let input_id = input.id();
+
         let state = DemoState {
             left_scroll: ScrollState::new(),
             right_scroll: ScrollState::new(),
-            input: TextInputState::single_line("input"),
+            input,
             editor: TextInputState::multi_line_with_text(
                 "editor",
                 "Hello, world!\nThis is a multi-line editor.\n\nTry typing here.",
             ),
+            // Start with input focused
+            focused_id: Some(input_id),
+            // Seed with 200 chat items to demonstrate virtualized scrolling.
+            // Only ~10-15 items are laid out per frame regardless of list size.
+            chat_history: generate_demo_chat(200),
+            hovered_widget: Cell::new(None),
             selection: None,
             is_selecting: false,
             last_edit_time: Instant::now(),
@@ -168,6 +387,12 @@ impl StrataApp for DemoApp {
                 ("README.md",  "2.4K", 2400, "md",   colors::TEXT_PRIMARY),
             ],
         };
+
+        // Focus the input widget
+        // (can't call focus() before state is created, so set focused directly)
+        let mut state = state;
+        state.input.focused = true;
+
         (state, Command::none())
     }
 
@@ -180,7 +405,69 @@ impl StrataApp for DemoApp {
             }
             _ => {}
         }
+
         match message {
+            // =============================================================
+            // Dynamic list: command submission via async Command round-trip
+            // =============================================================
+            DemoMessage::SubmitCommand => {
+                let text = state.input.text.trim().to_string();
+                if !text.is_empty() {
+                    // Append user message
+                    state.chat_history.push(ChatItem {
+                        source: SourceId::new(),
+                        role: "user",
+                        text: text.clone(),
+                    });
+                    // Append mock system response
+                    state.chat_history.push(ChatItem {
+                        source: SourceId::new(),
+                        role: "system",
+                        text: format!("$ {text}\ncommand not found: {text}"),
+                    });
+                    // Clear input
+                    state.input.text.clear();
+                    state.input.cursor = 0;
+                    state.input.selection = None;
+                    // Auto-scroll to bottom
+                    state.left_scroll.offset = state.left_scroll.max.get();
+                }
+            }
+
+            // =============================================================
+            // Text inputs — key events routed from on_key
+            // =============================================================
+            DemoMessage::InputKey(event) => {
+                match state.input.handle_key(&event, false) {
+                    TextInputAction::Submit(_) => {
+                        // Prove the Command pipeline: round-trip through Command::message
+                        return Command::message(DemoMessage::SubmitCommand);
+                    }
+                    _ => {}
+                }
+            }
+            DemoMessage::EditorKey(event) => {
+                state.editor.handle_key(&event, true);
+            }
+
+            // =============================================================
+            // Text inputs — mouse events (focus managed centrally)
+            // =============================================================
+            DemoMessage::InputMouse(action) => {
+                state.focus(state.input.id());
+                state.input.apply_mouse(action);
+            }
+            DemoMessage::EditorMouse(action) => {
+                state.focus(state.editor.id());
+                state.editor.apply_mouse(action);
+            }
+            DemoMessage::BlurAll => {
+                state.blur_all();
+            }
+
+            // =============================================================
+            // Content selection
+            // =============================================================
             DemoMessage::SelectionStart(addr) => {
                 state.selection = Some(Selection::new(addr.clone(), addr));
                 state.is_selecting = true;
@@ -205,17 +492,31 @@ impl StrataApp for DemoApp {
                         sel.anchor.content_offset,
                         sel.focus.content_offset,
                     );
+                    // In production: return Command::perform(clipboard_write_future)
                 }
             }
+
+            // =============================================================
+            // Scroll panels
+            // =============================================================
             DemoMessage::LeftScroll(action) => state.left_scroll.apply(action),
             DemoMessage::RightScroll(action) => state.right_scroll.apply(action),
+
+            // =============================================================
+            // Buttons
+            // =============================================================
             DemoMessage::ButtonClicked(id) => {
-                let label = if id == SourceId::named("deny_btn") { "Deny" }
-                    else if id == SourceId::named("allow_btn") { "Allow Once" }
-                    else if id == SourceId::named("always_btn") { "Allow Always" }
-                    else { "Unknown" };
-                eprintln!("[demo] Button clicked: {label}");
+                if id == SourceId::named("clear_btn") {
+                    state.chat_history.clear();
+                    eprintln!("[demo] Chat cleared");
+                } else {
+                    eprintln!("[demo] Button clicked: {:?}", id);
+                }
             }
+
+            // =============================================================
+            // Table sorting
+            // =============================================================
             DemoMessage::TableSort(id) => {
                 let col = if id == SourceId::named("sort_name") { 0 } else { 1 };
                 if state.table_sort_col == col {
@@ -233,31 +534,12 @@ impl StrataApp for DemoApp {
                     }),
                 }
             }
+
+            // =============================================================
+            // Timer
+            // =============================================================
             DemoMessage::TimerTick => {
                 state.elapsed_seconds += 1;
-            }
-            // Text inputs — key events routed from on_key
-            DemoMessage::InputKey(event) => {
-                let action = state.input.handle_key(&event, false);
-                if let crate::strata::text_input_state::TextInputAction::Submit(text) = action {
-                    eprintln!("[demo] Input submitted: {:?}", text);
-                }
-            }
-            DemoMessage::EditorKey(event) => {
-                state.editor.handle_key(&event, true);
-            }
-            // Text inputs — mouse events routed from on_mouse via handle_mouse()
-            DemoMessage::InputMouse(action) => {
-                state.editor.blur();
-                state.input.apply_mouse(action);
-            }
-            DemoMessage::EditorMouse(action) => {
-                state.input.blur();
-                state.editor.apply_mouse(action);
-            }
-            DemoMessage::BlurAll => {
-                state.input.blur();
-                state.editor.blur();
             }
         }
         Command::none()
@@ -282,30 +564,97 @@ impl StrataApp for DemoApp {
         let vw = vp.width;
         let vh = vp.height;
 
-        let outer_padding = 16.0;
-        let col_spacing = 20.0;
-
-        // Right column: 30% of viewport, clamped to reasonable range
+        // Right column: 30% of viewport, clamped
         let right_col_width = (vw * 0.3).clamp(300.0, 420.0);
+
+        // Read hover state for button rendering
+        let hovered = state.hovered_widget.get();
+
+        // =================================================================
+        // BUILD VIRTUALIZED CHAT LIST
+        // =================================================================
+        // Only lay out items visible in the scroll viewport. Items above
+        // and below are replaced by fixed spacers to preserve total height
+        // and correct scrollbar proportions. O(n) height scan, O(visible)
+        // layout — scales to thousands of items.
+
+        let chat_spacing = 8.0;
+
+        // Height of scroll column children above the chat list:
+        // image (296) + shell block (~90) + 2× scroll spacing (16)
+        // The chat list doesn't start scrolling out until this content
+        // has scrolled past, so subtract it from the scroll offset.
+        let content_above_chat = 296.0 + 90.0 + 16.0 * 2.0;
+        let chat_scroll = (state.left_scroll.offset - content_above_chat).max(0.0);
+
+        // Compute visible range using scroll state from previous frame.
+        let (first, last, top_spacer, bottom_spacer) = virtualize_chat(
+            &state.chat_history,
+            chat_scroll,
+            state.left_scroll.bounds.get().height,
+            chat_spacing,
+        );
+
+        let mut chat_col = Column::new()
+            .spacing(chat_spacing)
+            .width(Length::Fill);
+
+        // Top spacer replaces items above the viewport
+        if top_spacer > 0.0 {
+            chat_col = chat_col.fixed_spacer(top_spacer);
+        }
+
+        // Only lay out visible items
+        for item in &state.chat_history[first..last] {
+            let (role_color, text_color) = if item.role == "user" {
+                (colors::SUCCESS, colors::TEXT_PRIMARY)
+            } else {
+                (colors::RUNNING, colors::TEXT_SECONDARY)
+            };
+
+            let mut card = Column::new()
+                .padding(10.0)
+                .spacing(4.0)
+                .background(colors::BG_BLOCK)
+                .corner_radius(6.0)
+                .width(Length::Fill)
+                .text(TextElement::new(item.role).color(role_color).size(12.0));
+
+            // Split multi-line text into separate TextElements so layout
+            // allocates correct height for each line.
+            for line in item.text.lines() {
+                card = card.text(
+                    TextElement::new(line)
+                        .source(item.source)
+                        .color(text_color),
+                );
+            }
+
+            chat_col = chat_col.column(card);
+        }
+
+        // Bottom spacer replaces items below the viewport
+        if bottom_spacer > 0.0 {
+            chat_col = chat_col.fixed_spacer(bottom_spacer);
+        }
 
         // =================================================================
         // MAIN LAYOUT: Row with two columns
         // =================================================================
         Row::new()
-            .padding(outer_padding)
-            .spacing(col_spacing)
+            .padding(16.0)
+            .spacing(20.0)
             .width(Length::Fixed(vw))
             .height(Length::Fixed(vh))
             // =============================================================
-            // LEFT COLUMN: Scrollable Nexus App Mockup
+            // LEFT COLUMN: Chat History + Shell Block + Input Bar
             // =============================================================
             .scroll_column(
-                ScrollColumn::new(state.left_scroll.id(), state.left_scroll.thumb_id())
-                    .scroll_offset(state.left_scroll.offset)
+                ScrollColumn::from_state(&state.left_scroll)
                     .spacing(16.0)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    // Test image (loaded from demo.png via ImageStore)
+                    // Test image
                     .image(
                         crate::strata::layout::containers::ImageElement::new(
                             state.test_image,
@@ -314,7 +663,7 @@ impl StrataApp for DemoApp {
                         )
                         .corner_radius(8.0),
                     )
-                    // Shell Block
+                    // Static shell block (proves composed widgets alongside dynamic list)
                     .column(
                         ShellBlock {
                             cmd: "ls -la",
@@ -323,121 +672,49 @@ impl StrataApp for DemoApp {
                             terminal_source: SourceId::named("terminal"),
                             rows: vec![
                                 ("total 32", Color::rgb(0.7, 0.7, 0.7)),
-                                (
-                                    "drwxr-xr-x  8 kevin staff  256 Jan 29 src/",
-                                    Color::rgb(0.4, 0.6, 1.0),
-                                ),
-                                (
-                                    "-rw-r--r--  1 kevin staff  420 Jan 29 main.rs",
-                                    Color::rgb(0.7, 0.7, 0.7),
-                                ),
-                                (
-                                    "-rw-r--r--  1 kevin staff 1247 Jan 29 lib.rs",
-                                    Color::rgb(0.7, 0.7, 0.7),
-                                ),
-                                (
-                                    "-rw-r--r--  1 kevin staff  890 Jan 29 Cargo.toml",
-                                    Color::rgb(0.7, 0.7, 0.7),
-                                ),
+                                ("drwxr-xr-x  8 kevin staff  256 Jan 29 src/", Color::rgb(0.4, 0.6, 1.0)),
+                                ("-rw-r--r--  1 kevin staff  420 Jan 29 main.rs", Color::rgb(0.7, 0.7, 0.7)),
                             ],
                             cols: 75,
-                            row_count: 5,
+                            row_count: 3,
                         }
                         .build(),
                     )
-                    // Agent Block
-                    .column(
-                        AgentBlock {
-                            query: "How do I parse JSON in Rust?",
-                            query_source: SourceId::named("query"),
-                            tools: vec![
-                                ToolInvocation {
-                                    icon: "\u{25B6}",
-                                    status_icon: "\u{2713}",
-                                    label: "Read src/parser.rs",
-                                    color: colors::SUCCESS,
-                                    expanded: false,
-                                    output_source: None,
-                                    output_rows: vec![],
-                                    output_cols: 65,
-                                },
-                                ToolInvocation {
-                                    icon: "\u{25BC}",
-                                    status_icon: "\u{25CF}",
-                                    label: "Running bash",
-                                    color: colors::RUNNING,
-                                    expanded: true,
-                                    output_source: Some(SourceId::named("tool_output")),
-                                    output_rows: vec![
-                                        ("  $ cargo test", Color::rgb(0.6, 0.6, 0.6)),
-                                        (
-                                            "  running 3 tests... ok",
-                                            Color::rgb(0.6, 0.6, 0.6),
-                                        ),
-                                    ],
-                                    output_cols: 65,
-                                },
-                            ],
-                            response_lines: vec![
-                                "You can parse JSON in Rust using the serde_json crate.",
-                                "Add serde_json = \"1.0\" to your Cargo.toml, then use",
-                                "serde_json::from_str() to deserialize a JSON string",
-                                "into any type that implements Deserialize.",
-                            ],
-                            response_source: SourceId::named("response"),
-                            status_text: "\u{2713} Completed \u{00B7} 2.3s",
-                            status_color: colors::SUCCESS,
-                        }
-                        .build(),
-                    )
-                    // Permission Dialog
-                    .column(PermissionDialog {
-                        command: "rm -rf /tmp/cache",
-                        deny_id: SourceId::named("deny_btn"),
-                        allow_id: SourceId::named("allow_btn"),
-                        always_id: SourceId::named("always_btn"),
-                    }.build())
-                    // Input Bar (with real TextInput)
+                    // Dynamic chat history
+                    .column(chat_col)
+                    // Input bar with submit button (hover-aware)
                     .row(
                         Row::new()
-                            .padding_custom(crate::strata::layout::containers::Padding::new(8.0, 12.0, 8.0, 12.0))
+                            .padding_custom(Padding::new(8.0, 12.0, 8.0, 12.0))
                             .spacing(10.0)
                             .background(colors::BG_INPUT)
                             .corner_radius(6.0)
                             .border(colors::BORDER_INPUT, 1.0)
                             .width(Length::Fill)
-                            .cross_align(crate::strata::layout::containers::CrossAxisAlignment::Center)
-                            .text(TextElement::new("~/Desktop/nexus").color(colors::TEXT_PATH))
-                            .column(
-                                Column::new()
-                                    .padding_custom(crate::strata::layout::containers::Padding::new(1.0, 8.0, 1.0, 8.0))
-                                    .background(colors::BTN_MODE_SH)
-                                    .corner_radius(3.0)
-                                    .text(TextElement::new("SH").color(colors::SUCCESS).size(12.0)),
-                            )
+                            .cross_align(CrossAxisAlignment::Center)
                             .text(TextElement::new("$").color(colors::SUCCESS))
                             .text_input(
-                                TextInputElement::new(
-                                    state.input.id(),
-                                    &state.input.text,
-                                )
-                                .cursor(state.input.cursor)
-                                .selection(state.input.selection)
-                                .focused(state.input.focused)
-                                .placeholder("Type a command...")
-                                .background(Color::rgba(0.0, 0.0, 0.0, 0.0))
-                                .border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
-                                .focus_border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
-                                .corner_radius(0.0)
-                                .padding(crate::strata::layout::containers::Padding::new(0.0, 4.0, 0.0, 4.0))
-                                .width(Length::Fill)
-                                .cursor_visible(cursor_visible),
-                            ),
-                    )
-                    ,
+                                TextInputElement::from_state(&state.input)
+                                    .placeholder("Type a command...")
+                                    .background(Color::rgba(0.0, 0.0, 0.0, 0.0))
+                                    .border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
+                                    .focus_border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
+                                    .corner_radius(0.0)
+                                    .padding(Padding::new(0.0, 4.0, 0.0, 4.0))
+                                    .width(Length::Fill)
+                                    .cursor_visible(cursor_visible),
+                            )
+                            // Submit button with hover highlight
+                            .button(hover_button(
+                                SourceId::named("submit_btn"),
+                                "Send",
+                                colors::BTN_ALLOW,
+                                hovered,
+                            )),
+                    ),
             )
             // =============================================================
-            // RIGHT COLUMN: Scrollable Component Catalog
+            // RIGHT COLUMN: Component Catalog
             // =============================================================
             .scroll_column({
                 let arrow = if state.table_sort_asc { " \u{25B2}" } else { " \u{25BC}" };
@@ -457,69 +734,25 @@ impl StrataApp for DemoApp {
                     ]);
                 }
 
-                ScrollColumn::new(state.right_scroll.id(), state.right_scroll.thumb_id())
-                    .scroll_offset(state.right_scroll.offset)
+                ScrollColumn::from_state(&state.right_scroll)
                     .spacing(16.0)
                     .width(Length::Fixed(right_col_width))
                     .height(Length::Fill)
-                    // Status Indicators
+                    // Status indicators
                     .column(
                         StatusPanel {
                             indicators: vec![
-                                StatusIndicator {
-                                    icon: "\u{25CF}",
-                                    label: "Running",
-                                    color: colors::RUNNING,
-                                },
-                                StatusIndicator {
-                                    icon: "\u{2713}",
-                                    label: "Success",
-                                    color: colors::SUCCESS,
-                                },
-                                StatusIndicator {
-                                    icon: "\u{2717}",
-                                    label: "Error",
-                                    color: colors::ERROR,
-                                },
-                                StatusIndicator {
-                                    icon: "\u{2620}",
-                                    label: "Killed",
-                                    color: colors::KILLED,
-                                },
+                                StatusIndicator { icon: "\u{25CF}", label: "Running", color: colors::RUNNING },
+                                StatusIndicator { icon: "\u{2713}", label: "Success", color: colors::SUCCESS },
+                                StatusIndicator { icon: "\u{2717}", label: "Error", color: colors::ERROR },
+                                StatusIndicator { icon: "\u{2620}", label: "Killed", color: colors::KILLED },
                             ],
                             uptime_seconds: state.elapsed_seconds,
                         }
                         .build()
                         .id(SourceId::named("status_panel")),
                     )
-                    // Job Pills
-                    .column(
-                        JobPanel {
-                            jobs: vec![
-                                JobPill {
-                                    name: "vim",
-                                    prefix: "\u{25CF} ",
-                                    text_color: colors::SUCCESS,
-                                    bg_color: Color::rgba(0.15, 0.35, 0.18, 0.8),
-                                },
-                                JobPill {
-                                    name: "top",
-                                    prefix: "\u{23F8} ",
-                                    text_color: colors::PENDING,
-                                    bg_color: Color::rgba(0.35, 0.30, 0.10, 0.8),
-                                },
-                                JobPill {
-                                    name: "cargo",
-                                    prefix: "\u{25CF} ",
-                                    text_color: colors::RUNNING,
-                                    bg_color: Color::rgba(0.15, 0.25, 0.40, 0.8),
-                                },
-                            ],
-                        }
-                        .build()
-                        .id(SourceId::named("job_panel")),
-                    )
-                    // Multi-line Editor
+                    // Multi-line editor
                     .column(
                         Column::new()
                             .padding(10.0)
@@ -529,19 +762,32 @@ impl StrataApp for DemoApp {
                             .width(Length::Fill)
                             .text(TextElement::new("Multi-line Editor").color(colors::TEXT_SECONDARY))
                             .text_input(
-                                TextInputElement::new(state.editor.id(), &state.editor.text)
-                                    .multiline(true)
+                                TextInputElement::from_state(&state.editor)
                                     .height(Length::Fixed(120.0))
-                                    .cursor(state.editor.cursor)
-                                    .selection(state.editor.selection)
-                                    .focused(state.editor.focused)
                                     .placeholder("Multi-line editor...")
-                                    .scroll_offset(state.editor.scroll_offset)
                                     .cursor_visible(cursor_visible),
                             )
                             .id(SourceId::named("editor_panel")),
                     )
-                    // Context menu placeholder (fixed height, rendered as primitives after layout)
+                    // Action buttons (hover-aware)
+                    .row(
+                        Row::new()
+                            .spacing(8.0)
+                            .width(Length::Fill)
+                            .button(hover_button(
+                                SourceId::named("copy_btn"),
+                                "Copy",
+                                colors::BG_CARD,
+                                hovered,
+                            ))
+                            .button(hover_button(
+                                SourceId::named("clear_btn"),
+                                "Clear Chat",
+                                colors::BTN_DENY,
+                                hovered,
+                            )),
+                    )
+                    // Context menu placeholder
                     .column(
                         Column::new()
                             .width(Length::Fill)
@@ -555,7 +801,7 @@ impl StrataApp for DemoApp {
                             .height(Length::Fixed(180.0))
                             .id(SourceId::named("draw_styles")),
                     )
-                    // Table (fully layout-driven)
+                    // Table
                     .column(
                         Column::new()
                             .padding(10.0)
@@ -580,20 +826,17 @@ impl StrataApp for DemoApp {
         // =================================================================
         let anim_t = now.duration_since(state.start_time).as_secs_f32();
 
-        // Render context menu at its placeholder position
         if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("ctx_menu")) {
             view_context_menu(snapshot, bounds.x, bounds.y);
         }
 
-        // Render drawing styles at placeholder position
         if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("draw_styles")) {
             view_drawing_styles(snapshot, bounds.x, bounds.y, bounds.width, anim_t);
         }
 
         // FPS counter (top-right corner)
-        let fps_text = format!("{:.0} FPS", fps);
         snapshot.primitives_mut().add_text(
-            fps_text,
+            format!("{:.0} FPS", fps),
             Point::new(vw - 70.0, 4.0),
             colors::TEXT_MUTED,
         );
@@ -609,6 +852,14 @@ impl StrataApp for DemoApp {
         hit: Option<HitResult>,
         capture: &CaptureState,
     ) -> MouseResponse<Self::Message> {
+        // Track hovered widget for button hover effects (Cell = zero-cost interior mutability)
+        if let MouseEvent::CursorMoved { .. } = &event {
+            state.hovered_widget.set(match &hit {
+                Some(HitResult::Widget(id)) => Some(*id),
+                _ => None,
+            });
+        }
+
         // Composable handlers: scroll panels
         if let Some(r) = state.left_scroll.handle_mouse(&event, &hit, capture) {
             return r.map(DemoMessage::LeftScroll);
@@ -627,12 +878,17 @@ impl StrataApp for DemoApp {
         // Button clicks and table sort headers
         if let MouseEvent::ButtonPressed { button: MouseButton::Left, .. } = &event {
             if let Some(HitResult::Widget(id)) = &hit {
-                if *id == SourceId::named("deny_btn")
-                    || *id == SourceId::named("allow_btn")
-                    || *id == SourceId::named("always_btn")
-                {
+                // Buttons
+                if *id == SourceId::named("submit_btn") {
+                    return MouseResponse::message(DemoMessage::SubmitCommand);
+                }
+                if *id == SourceId::named("copy_btn") {
+                    return MouseResponse::message(DemoMessage::Copy);
+                }
+                if *id == SourceId::named("clear_btn") {
                     return MouseResponse::message(DemoMessage::ButtonClicked(*id));
                 }
+                // Table sort
                 if *id == SourceId::named("sort_name") || *id == SourceId::named("sort_size") {
                     return MouseResponse::message(DemoMessage::TableSort(*id));
                 }
@@ -681,7 +937,7 @@ impl StrataApp for DemoApp {
         if matches!(&event, KeyEvent::Released { .. }) {
             return None;
         }
-        // Route to focused input
+        // Route to focused input (centralized focus check)
         if state.editor.focused {
             return Some(DemoMessage::EditorKey(event));
         }
@@ -844,7 +1100,7 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
     let ly = ly + 28.0;
     p.add_text("Curve", Point::new(lx, ly), colors::TEXT_MUTED);
     let curve_w = lw - 50.0;
-    let phase = time * 2.0; // scrolling phase
+    let phase = time * 2.0;
     let curve: Vec<Point> = (0..40)
         .map(|i| {
             let t = i as f32 / 39.0;

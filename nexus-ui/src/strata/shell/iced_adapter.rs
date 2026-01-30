@@ -14,7 +14,7 @@ use iced::{Element, Event, Length, Subscription, Task, Theme};
 use crate::strata::app::{AppConfig, Command, StrataApp};
 use crate::strata::content_address::Selection;
 use crate::strata::layout_snapshot::HitResult;
-use crate::strata::gpu::{PendingImage, StrataPipeline};
+use crate::strata::gpu::{ImageHandle, PendingImage, StrataPipeline};
 use crate::strata::event_context::{
     CaptureState, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey, ScrollDelta,
 };
@@ -192,10 +192,12 @@ fn update<A: StrataApp>(
                         }
                     };
 
-                    // CAPTURE LOGIC FIX:
-                    // If pointer is captured, we MUST dispatch the event even if hit is None.
-                    // This allows dragging outside the widget/window bounds.
-                    let should_dispatch = hit.is_some() || state.capture.is_captured();
+                    // Dispatch when:
+                    // 1. Hit something — normal interaction
+                    // 2. Captured — dragging outside widget/window bounds
+                    // 3. CursorMoved — always, so apps can clear hover state on empty space
+                    let is_cursor_moved = matches!(strata_event, MouseEvent::CursorMoved { .. });
+                    let should_dispatch = hit.is_some() || state.capture.is_captured() || is_cursor_moved;
 
                     if should_dispatch {
                         let response = A::on_mouse(&state.app, strata_event, hit, &state.capture);
@@ -274,10 +276,12 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
     // Cache for next frame's hit-testing in update() (avoids double layout rebuild)
     *state.cached_snapshot.borrow_mut() = Some(snapshot.clone());
 
-    // Drain any pending image uploads from the image store.
-    // These will be uploaded to the GPU atlas during prepare().
+    // Drain any pending image uploads/unloads from the image store.
+    // These will be applied to the GPU atlas during prepare().
     let pending = state.image_store.drain_pending();
     let pending_images = Arc::new(Mutex::new(pending));
+    let pending_unloads = state.image_store.drain_pending_unloads();
+    let pending_image_unloads = Arc::new(Mutex::new(pending_unloads));
 
     // Create the shader widget that will render Strata content
     let program = StrataShaderProgram {
@@ -286,6 +290,7 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
         background: crate::strata::primitives::Color::rgb(0.1, 0.1, 0.1),
         frame: state.frame,
         pending_images,
+        pending_image_unloads,
     };
 
     shader::Shader::new(program)
@@ -500,6 +505,8 @@ struct StrataShaderProgram {
     frame: u64,
     /// Pending image uploads (drained by prepare on first access).
     pending_images: Arc<Mutex<Vec<PendingImage>>>,
+    /// Pending image unloads (drained by prepare on first access).
+    pending_image_unloads: Arc<Mutex<Vec<ImageHandle>>>,
 }
 
 /// Primitive passed to the GPU.
@@ -512,6 +519,8 @@ struct StrataPrimitive {
     frame: u64,
     /// Pending image uploads (drained by prepare on first access).
     pending_images: Arc<Mutex<Vec<PendingImage>>>,
+    /// Pending image unloads (drained by prepare on first access).
+    pending_image_unloads: Arc<Mutex<Vec<ImageHandle>>>,
 }
 
 impl std::fmt::Debug for StrataPrimitive {
@@ -538,6 +547,7 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             background: self.background,
             frame: self.frame,
             pending_images: self.pending_images.clone(),
+            pending_image_unloads: self.pending_image_unloads.clone(),
         }
     }
 }
@@ -560,9 +570,10 @@ impl shader::Primitive for StrataPrimitive {
 
         let wrapper = storage.get_mut::<PipelineWrapper>().unwrap();
 
-        // Drain pending images — pass them into prepare() so they're uploaded
-        // after the pipeline is guaranteed to exist.
+        // Drain pending image loads/unloads — pass them into prepare() so they're
+        // applied after the pipeline is guaranteed to exist.
         let pending = std::mem::take(&mut *self.pending_images.lock().unwrap());
+        let pending_unloads = std::mem::take(&mut *self.pending_image_unloads.lock().unwrap());
 
         wrapper.prepare(
             device,
@@ -573,6 +584,7 @@ impl shader::Primitive for StrataPrimitive {
             viewport,
             self.background,
             pending,
+            pending_unloads,
         );
     }
 
@@ -625,6 +637,7 @@ impl PipelineWrapper {
         viewport: &iced::advanced::graphics::Viewport,
         background: crate::strata::primitives::Color,
         pending_images: Vec<PendingImage>,
+        pending_unloads: Vec<ImageHandle>,
     ) {
         let scale = viewport.scale_factor() as f32;
 
@@ -638,6 +651,15 @@ impl PipelineWrapper {
         // Upload pending images now that the pipeline is guaranteed to exist.
         if !pending_images.is_empty() {
             self.upload_pending_images(device, queue, pending_images);
+        }
+
+        // Apply pending image unloads.
+        if !pending_unloads.is_empty() {
+            if let Some(pipeline) = self.pipeline.as_mut() {
+                for handle in pending_unloads {
+                    pipeline.unload_image(handle);
+                }
+            }
         }
 
         let pipeline = self.pipeline.as_mut().unwrap();

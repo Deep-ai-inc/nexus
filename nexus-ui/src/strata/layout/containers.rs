@@ -8,6 +8,8 @@ use crate::strata::content_address::SourceId;
 use crate::strata::gpu::ImageHandle;
 use crate::strata::layout_snapshot::LayoutSnapshot;
 use crate::strata::primitives::{Color, Rect, Size};
+use crate::strata::scroll_state::ScrollState;
+use crate::strata::text_input_state::TextInputState;
 
 // Layout metrics (centralized; will come from font system in production)
 const CHAR_WIDTH: f32 = 8.4;
@@ -721,6 +723,20 @@ impl TextInputElement {
             cursor_visible: true,
             cache_key,
         }
+    }
+
+    /// Create from a `TextInputState`, copying all state-driven fields.
+    ///
+    /// This pulls id, text, cursor, selection, focused, scroll_offset, and
+    /// multiline from the state, so you only need to chain visual overrides.
+    pub fn from_state(state: &TextInputState) -> Self {
+        let mut el = Self::new(state.id(), &state.text);
+        el.cursor = state.cursor;
+        el.selection = state.selection;
+        el.focused = state.focused;
+        el.scroll_offset = state.scroll_offset;
+        el.multiline = state.is_multiline();
+        el
     }
 
     pub fn cursor(mut self, pos: usize) -> Self { self.cursor = pos; self }
@@ -2180,6 +2196,15 @@ impl ScrollColumn {
             border_color: None,
             border_width: 0.0,
         }
+    }
+
+    /// Create from a `ScrollState`, copying id, thumb_id, and offset.
+    ///
+    /// This pulls all state-driven fields so you only chain layout props.
+    pub fn from_state(state: &ScrollState) -> Self {
+        let mut sc = Self::new(state.id(), state.thumb_id());
+        sc.scroll_offset = state.offset;
+        sc
     }
 
     /// Set the scroll offset (from app state).
