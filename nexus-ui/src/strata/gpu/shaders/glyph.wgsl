@@ -194,11 +194,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let inner = 1.0 - smoothstep(-aa, aa, dist + width);
         shape_alpha = outer - inner;
     } else {
-        // Solid / Image: Standard AA edge
-        // Only apply if we actually have a radius or need AA, otherwise it's a solid quad
-        // (fwidth is cheap enough to just always apply for nice edges)
-        let aa = fwidth(dist);
-        shape_alpha = 1.0 - smoothstep(-aa, aa, dist);
+        // Mode 0 (Quad) & Mode 4 (Image)
+        // Only apply SDF AA if we actually have rounded corners.
+        // This preserves perfect seams for tiled rectangular geometry.
+        if (in.corner_radius > 0.0) {
+            let aa = fwidth(dist);
+            shape_alpha = 1.0 - smoothstep(-aa, aa, dist);
+        }
     }
 
     // 3. Apply Texture / Color
