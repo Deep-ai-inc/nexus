@@ -21,6 +21,8 @@ use crate::strata::layout::containers::Length;
 use crate::strata::layout::primitives::LineStyle;
 use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::gpu::{ImageHandle, ImageStore};
+use crate::strata::scroll_state::{ScrollAction, ScrollState};
+use crate::strata::text_input_state::{TextInputMouseAction, TextInputState};
 use crate::strata::{
     AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, ScrollColumn, Selection,
     StrataApp, Subscription, TableCell, TableElement, TextElement, TextInputElement,
@@ -71,142 +73,59 @@ pub(crate) mod colors {
     pub const CURSOR: Color = Color { r: 0.85, g: 0.85, b: 0.88, a: 0.8 };
 }
 
-/// Monospace character width (must match containers.rs CHAR_WIDTH).
-const CHAR_WIDTH: f32 = 8.4;
-/// Line height (must match containers.rs LINE_HEIGHT).
-const LINE_HEIGHT: f32 = 18.0;
-
 /// Demo message type.
 #[derive(Debug, Clone)]
 pub enum DemoMessage {
+    // Content selection (cross-widget text selection)
     SelectionStart(ContentAddress),
     SelectionExtend(ContentAddress),
     SelectionEnd,
-    Scroll(f32),
-    /// Start dragging the scrollbar thumb. Carries the mouse Y at click time.
-    ScrollDragStart(f32),
-    ScrollDragMove(f32),
-    ScrollDragEnd,
     ClearSelection,
-    ScrollByKey(f32),
-    ButtonClicked(SourceId),
-    InputFocus(SourceId),
-    InputBlur,
-    InputChar(String),
-    InputBackspace,
-    InputDelete,
-    InputLeft,
-    InputRight,
-    InputHome,
-    InputEnd,
-    InputSelectLeft,
-    InputSelectRight,
-    InputSelectAll,
-    InputSubmit,
-    /// Click in input at x offset (relative to input start)
-    InputClickAt(SourceId, f32),
-    /// Drag selection in input to x offset
-    InputDragTo(f32),
-    TimerTick,
     Copy,
+
+    // Scroll panels
+    LeftScroll(ScrollAction),
+    RightScroll(ScrollAction),
+
+    // Widget actions
+    ButtonClicked(SourceId),
     TableSort(SourceId),
-    // Right panel scroll
-    RightScroll(f32),
-    RightScrollDragStart(f32),
-    RightScrollDragMove(f32),
-    RightScrollDragEnd,
-    // Multi-line editor messages
-    EditorChar(String),
-    EditorBackspace,
-    EditorDelete,
-    EditorLeft,
-    EditorRight,
-    EditorUp,
-    EditorDown,
-    EditorHome,
-    EditorEnd,
-    EditorEnter,
-    EditorScroll(f32),
-    /// Click in editor at (x, y) relative to editor widget
-    EditorClickAt(f32, f32),
-    /// Drag in editor to (x, y) relative to editor widget
-    EditorDragTo(f32, f32),
-    EditorSelectAll,
+    TimerTick,
+
+    // Text input events (routed from on_key/on_mouse)
+    InputKey(KeyEvent),
+    InputMouse(TextInputMouseAction),
+    EditorKey(KeyEvent),
+    EditorMouse(TextInputMouseAction),
+    BlurAll,
 }
 
 /// Demo application state.
 pub struct DemoState {
-    // Stable source IDs for selectable content
-    query_source: SourceId,
-    response_source: SourceId,
-    terminal_source: SourceId,
-    tool_output_source: SourceId,
-    // Widget IDs
-    scroll_id: SourceId,
-    scroll_thumb_id: SourceId,
-    status_panel_id: SourceId,
-    job_panel_id: SourceId,
-    // Scroll state
-    scroll_offset: f32,
-    scroll_max: Cell<f32>,
-    scroll_track: Cell<Option<crate::strata::layout_snapshot::ScrollTrackInfo>>,
-    /// Distance from mouse click to top of thumb when drag started.
-    scroll_grab_offset: f32,
-    // Selection state
+    // Scroll panels
+    left_scroll: ScrollState,
+    right_scroll: ScrollState,
+    // Text inputs
+    input: TextInputState,
+    editor: TextInputState,
+    // Content selection (cross-widget)
     selection: Option<Selection>,
     is_selecting: bool,
+    // Cursor blink
+    last_edit_time: Instant,
     // FPS tracking (Cell for interior mutability in view())
     last_frame: Cell<Instant>,
     fps_smooth: Cell<f32>,
     // Animation start time
     start_time: Instant,
-    // Button IDs
-    deny_btn_id: SourceId,
-    allow_btn_id: SourceId,
-    always_btn_id: SourceId,
-    // Text input state
-    input_id: SourceId,
-    input_text: String,
-    input_cursor: usize,
-    input_selection: Option<(usize, usize)>,
-    focused_input: Option<SourceId>,
-    /// Last time the cursor moved or text was edited (for blink reset)
-    last_edit_time: Instant,
     // Test image handle
     test_image: ImageHandle,
     // Subscription demo
     elapsed_seconds: u32,
-    // Right panel scroll
-    right_scroll_id: SourceId,
-    right_scroll_thumb_id: SourceId,
-    right_scroll_offset: f32,
-    right_scroll_max: Cell<f32>,
-    right_scroll_track: Cell<Option<crate::strata::layout_snapshot::ScrollTrackInfo>>,
-    right_scroll_grab_offset: f32,
-    right_scroll_bounds: Cell<Rect>,
-    // Right panel overlay placeholder IDs
-    context_menu_placeholder_id: SourceId,
-    drawing_styles_placeholder_id: SourceId,
     // Table state
-    sort_name_btn: SourceId,
-    sort_size_btn: SourceId,
-    table_source: SourceId,
-    /// Which column is sorted: 0 = NAME, 1 = SIZE
     table_sort_col: usize,
-    /// Sort ascending?
     table_sort_asc: bool,
-    /// Table rows: (name, size_display, size_bytes, type)
     table_rows: Vec<(&'static str, &'static str, u32, &'static str, Color)>,
-    // Multi-line editor state
-    editor_panel_id: SourceId,
-    editor_id: SourceId,
-    editor_text: String,
-    editor_cursor: usize,
-    editor_selection: Option<(usize, usize)>,
-    editor_scroll_offset: f32,
-    // Widget bounds for mouse click → relative position
-    input_bounds: Cell<Rect>,
-    editor_bounds: Cell<Rect>,
 }
 
 /// Demo application.
@@ -224,46 +143,21 @@ impl StrataApp for DemoApp {
                 images.load_test_gradient(128, 128)
             });
         let state = DemoState {
-            query_source: SourceId::new(),
-            response_source: SourceId::new(),
-            terminal_source: SourceId::new(),
-            tool_output_source: SourceId::new(),
-            scroll_id: SourceId::new(),
-            scroll_thumb_id: SourceId::new(),
-            status_panel_id: SourceId::new(),
-            job_panel_id: SourceId::new(),
-            deny_btn_id: SourceId::new(),
-            allow_btn_id: SourceId::new(),
-            always_btn_id: SourceId::new(),
-            input_id: SourceId::new(),
-            input_text: String::new(),
-            input_cursor: 0,
-            input_selection: None,
-            focused_input: None,
-            last_edit_time: Instant::now(),
-            scroll_offset: 0.0,
-            scroll_max: Cell::new(f32::MAX),
-            scroll_track: Cell::new(None),
-            scroll_grab_offset: 0.0,
+            left_scroll: ScrollState::new(),
+            right_scroll: ScrollState::new(),
+            input: TextInputState::single_line("input"),
+            editor: TextInputState::multi_line_with_text(
+                "editor",
+                "Hello, world!\nThis is a multi-line editor.\n\nTry typing here.",
+            ),
             selection: None,
             is_selecting: false,
+            last_edit_time: Instant::now(),
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             start_time: Instant::now(),
             test_image,
             elapsed_seconds: 0,
-            right_scroll_id: SourceId::new(),
-            right_scroll_thumb_id: SourceId::new(),
-            right_scroll_offset: 0.0,
-            right_scroll_max: Cell::new(f32::MAX),
-            right_scroll_track: Cell::new(None),
-            right_scroll_grab_offset: 0.0,
-            right_scroll_bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
-            context_menu_placeholder_id: SourceId::new(),
-            drawing_styles_placeholder_id: SourceId::new(),
-            sort_name_btn: SourceId::new(),
-            sort_size_btn: SourceId::new(),
-            table_source: SourceId::new(),
             table_sort_col: 0,
             table_sort_asc: true,
             table_rows: vec![
@@ -273,14 +167,6 @@ impl StrataApp for DemoApp {
                 ("Cargo.toml", "890B", 890,  "toml", colors::TEXT_PRIMARY),
                 ("README.md",  "2.4K", 2400, "md",   colors::TEXT_PRIMARY),
             ],
-            editor_panel_id: SourceId::new(),
-            editor_id: SourceId::new(),
-            editor_text: "Hello, world!\nThis is a multi-line editor.\n\nTry typing here.".to_string(),
-            editor_cursor: 0,
-            editor_selection: None,
-            editor_scroll_offset: 0.0,
-            input_bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
-            editor_bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
         };
         (state, Command::none())
     }
@@ -288,14 +174,8 @@ impl StrataApp for DemoApp {
     fn update(state: &mut Self::State, message: Self::Message, _images: &mut ImageStore) -> Command<Self::Message> {
         // Reset cursor blink on any edit/cursor action
         match &message {
-            DemoMessage::InputChar(_) | DemoMessage::InputBackspace | DemoMessage::InputDelete
-            | DemoMessage::InputLeft | DemoMessage::InputRight | DemoMessage::InputHome
-            | DemoMessage::InputEnd | DemoMessage::InputSelectLeft | DemoMessage::InputSelectRight
-            | DemoMessage::InputSelectAll | DemoMessage::InputFocus(_) | DemoMessage::InputClickAt(..)
-            | DemoMessage::EditorChar(_) | DemoMessage::EditorBackspace | DemoMessage::EditorDelete
-            | DemoMessage::EditorLeft | DemoMessage::EditorRight | DemoMessage::EditorUp
-            | DemoMessage::EditorDown | DemoMessage::EditorHome | DemoMessage::EditorEnd
-            | DemoMessage::EditorEnter | DemoMessage::EditorClickAt(..) | DemoMessage::EditorSelectAll => {
+            DemoMessage::InputKey(_) | DemoMessage::InputMouse(_)
+            | DemoMessage::EditorKey(_) | DemoMessage::EditorMouse(_) => {
                 state.last_edit_time = Instant::now();
             }
             _ => {}
@@ -313,230 +193,31 @@ impl StrataApp for DemoApp {
             DemoMessage::SelectionEnd => {
                 state.is_selecting = false;
             }
-            DemoMessage::Scroll(delta) => {
-                let max = state.scroll_max.get();
-                state.scroll_offset = (state.scroll_offset - delta).clamp(0.0, max);
-            }
-            DemoMessage::ScrollDragStart(mouse_y) => {
-                if let Some(track) = state.scroll_track.get() {
-                    let effective_offset = state.scroll_offset.clamp(0.0, state.scroll_max.get());
-                    let thumb_top = track.thumb_y(effective_offset);
-                    let thumb_bottom = thumb_top + track.thumb_height;
-
-                    // Tolerance absorbs float rounding between layout and event frames.
-                    const GRAB_TOLERANCE: f32 = 4.0;
-                    if mouse_y >= (thumb_top - GRAB_TOLERANCE) && mouse_y <= (thumb_bottom + GRAB_TOLERANCE) {
-                        // Clicked on the thumb: preserve grab offset so it doesn't jump.
-                        state.scroll_grab_offset = mouse_y - thumb_top;
-                    } else {
-                        // Clicked on the track: jump thumb center to click point.
-                        state.scroll_grab_offset = track.thumb_height / 2.0;
-                        let new_offset = track.offset_from_y(mouse_y, state.scroll_grab_offset);
-                        state.scroll_offset = new_offset.clamp(0.0, state.scroll_max.get());
-                    }
-                }
-            }
-            DemoMessage::ScrollDragMove(mouse_y) => {
-                // Clamp output to prevent dead zones when dragging past edges.
-                if let Some(track) = state.scroll_track.get() {
-                    let new_offset = track.offset_from_y(mouse_y, state.scroll_grab_offset);
-                    state.scroll_offset = new_offset.clamp(0.0, state.scroll_max.get());
-                }
-            }
-            DemoMessage::ScrollDragEnd => {
-                state.scroll_grab_offset = 0.0;
-            }
-            DemoMessage::RightScroll(delta) => {
-                let max = state.right_scroll_max.get();
-                state.right_scroll_offset = (state.right_scroll_offset - delta).clamp(0.0, max);
-            }
-            DemoMessage::RightScrollDragStart(mouse_y) => {
-                if let Some(track) = state.right_scroll_track.get() {
-                    let effective_offset = state.right_scroll_offset.clamp(0.0, state.right_scroll_max.get());
-                    let thumb_top = track.thumb_y(effective_offset);
-                    let thumb_bottom = thumb_top + track.thumb_height;
-                    const GRAB_TOLERANCE: f32 = 4.0;
-                    if mouse_y >= (thumb_top - GRAB_TOLERANCE) && mouse_y <= (thumb_bottom + GRAB_TOLERANCE) {
-                        state.right_scroll_grab_offset = mouse_y - thumb_top;
-                    } else {
-                        state.right_scroll_grab_offset = track.thumb_height / 2.0;
-                        let new_offset = track.offset_from_y(mouse_y, state.right_scroll_grab_offset);
-                        state.right_scroll_offset = new_offset.clamp(0.0, state.right_scroll_max.get());
-                    }
-                }
-            }
-            DemoMessage::RightScrollDragMove(mouse_y) => {
-                if let Some(track) = state.right_scroll_track.get() {
-                    let new_offset = track.offset_from_y(mouse_y, state.right_scroll_grab_offset);
-                    state.right_scroll_offset = new_offset.clamp(0.0, state.right_scroll_max.get());
-                }
-            }
-            DemoMessage::RightScrollDragEnd => {
-                state.right_scroll_grab_offset = 0.0;
-            }
             DemoMessage::ClearSelection => {
                 state.selection = None;
                 state.is_selecting = false;
             }
-            DemoMessage::ScrollByKey(delta) => {
-                let max = state.scroll_max.get();
-                state.scroll_offset = (state.scroll_offset - delta).clamp(0.0, max);
+            DemoMessage::Copy => {
+                if let Some(sel) = &state.selection {
+                    eprintln!(
+                        "[demo] Copy: source={:?} offsets={}..{}",
+                        sel.anchor.source_id,
+                        sel.anchor.content_offset,
+                        sel.focus.content_offset,
+                    );
+                }
             }
+            DemoMessage::LeftScroll(action) => state.left_scroll.apply(action),
+            DemoMessage::RightScroll(action) => state.right_scroll.apply(action),
             DemoMessage::ButtonClicked(id) => {
-                if id == state.deny_btn_id {
-                    eprintln!("[demo] Button clicked: Deny");
-                } else if id == state.allow_btn_id {
-                    eprintln!("[demo] Button clicked: Allow Once");
-                } else if id == state.always_btn_id {
-                    eprintln!("[demo] Button clicked: Allow Always");
-                }
-            }
-            DemoMessage::InputFocus(id) => {
-                state.focused_input = Some(id);
-                state.input_selection = None;
-            }
-            DemoMessage::InputBlur => {
-                state.focused_input = None;
-                state.input_selection = None;
-            }
-            DemoMessage::InputChar(c) => {
-                // Delete selection first
-                if let Some((s, e)) = state.input_selection.take() {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let lo_byte = state.input_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                    let hi_byte = state.input_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                    state.input_text.replace_range(lo_byte..hi_byte, "");
-                    state.input_cursor = lo;
-                }
-                let byte_pos = state.input_text.char_indices().nth(state.input_cursor).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                state.input_text.insert_str(byte_pos, &c);
-                state.input_cursor += c.chars().count();
-            }
-            DemoMessage::InputBackspace => {
-                if let Some((s, e)) = state.input_selection.take() {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let lo_byte = state.input_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                    let hi_byte = state.input_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                    state.input_text.replace_range(lo_byte..hi_byte, "");
-                    state.input_cursor = lo;
-                } else if state.input_cursor > 0 {
-                    state.input_cursor -= 1;
-                    let byte_pos = state.input_text.char_indices().nth(state.input_cursor).map(|(i, _)| i).unwrap_or(0);
-                    let next = state.input_text.char_indices().nth(state.input_cursor + 1).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                    state.input_text.replace_range(byte_pos..next, "");
-                }
-            }
-            DemoMessage::InputDelete => {
-                if let Some((s, e)) = state.input_selection.take() {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let lo_byte = state.input_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                    let hi_byte = state.input_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                    state.input_text.replace_range(lo_byte..hi_byte, "");
-                    state.input_cursor = lo;
-                } else {
-                    let char_count = state.input_text.chars().count();
-                    if state.input_cursor < char_count {
-                        let byte_pos = state.input_text.char_indices().nth(state.input_cursor).map(|(i, _)| i).unwrap_or(0);
-                        let next = state.input_text.char_indices().nth(state.input_cursor + 1).map(|(i, _)| i).unwrap_or(state.input_text.len());
-                        state.input_text.replace_range(byte_pos..next, "");
-                    }
-                }
-            }
-            DemoMessage::InputLeft => {
-                state.input_selection = None;
-                if state.input_cursor > 0 { state.input_cursor -= 1; }
-            }
-            DemoMessage::InputRight => {
-                state.input_selection = None;
-                let len = state.input_text.chars().count();
-                if state.input_cursor < len { state.input_cursor += 1; }
-            }
-            DemoMessage::InputHome => {
-                state.input_selection = None;
-                state.input_cursor = 0;
-            }
-            DemoMessage::InputEnd => {
-                state.input_selection = None;
-                state.input_cursor = state.input_text.chars().count();
-            }
-            DemoMessage::InputSelectLeft => {
-                let anchor = match state.input_selection {
-                    Some((a, _)) => a,
-                    None => state.input_cursor,
-                };
-                if state.input_cursor > 0 {
-                    state.input_cursor -= 1;
-                    state.input_selection = Some((anchor, state.input_cursor));
-                }
-            }
-            DemoMessage::InputSelectRight => {
-                let anchor = match state.input_selection {
-                    Some((a, _)) => a,
-                    None => state.input_cursor,
-                };
-                let len = state.input_text.chars().count();
-                if state.input_cursor < len {
-                    state.input_cursor += 1;
-                    state.input_selection = Some((anchor, state.input_cursor));
-                }
-            }
-            DemoMessage::InputSelectAll => {
-                let len = state.input_text.chars().count();
-                state.input_selection = Some((0, len));
-                state.input_cursor = len;
-            }
-            DemoMessage::InputSubmit => {
-                eprintln!("[demo] Input submitted: {:?}", state.input_text);
-                state.input_text.clear();
-                state.input_cursor = 0;
-                state.input_selection = None;
-            }
-            DemoMessage::InputClickAt(id, rel_x) => {
-                state.focused_input = Some(id);
-                let char_count = if id == state.editor_id {
-                    state.editor_text.chars().count()
-                } else {
-                    state.input_text.chars().count()
-                };
-                let pos = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
-                let pos = pos.min(char_count);
-                if id == state.editor_id {
-                    state.editor_cursor = pos;
-                    state.editor_selection = None;
-                } else {
-                    state.input_cursor = pos;
-                    state.input_selection = None;
-                }
-            }
-            DemoMessage::InputDragTo(rel_x) => {
-                let pos = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
-                if state.focused_input == Some(state.editor_id) {
-                    let len = state.editor_text.chars().count();
-                    let pos = pos.min(len);
-                    let anchor = state.editor_selection
-                        .map(|(a, _)| a)
-                        .unwrap_or(state.editor_cursor);
-                    if pos != anchor {
-                        state.editor_selection = Some((anchor, pos));
-                        state.editor_cursor = pos;
-                    }
-                } else {
-                    let len = state.input_text.chars().count();
-                    let pos = pos.min(len);
-                    let anchor = state.input_selection
-                        .map(|(a, _)| a)
-                        .unwrap_or(state.input_cursor);
-                    if pos != anchor {
-                        state.input_selection = Some((anchor, pos));
-                        state.input_cursor = pos;
-                    }
-                }
-            }
-            DemoMessage::TimerTick => {
-                state.elapsed_seconds += 1;
+                let label = if id == SourceId::named("deny_btn") { "Deny" }
+                    else if id == SourceId::named("allow_btn") { "Allow Once" }
+                    else if id == SourceId::named("always_btn") { "Allow Always" }
+                    else { "Unknown" };
+                eprintln!("[demo] Button clicked: {label}");
             }
             DemoMessage::TableSort(id) => {
-                let col = if id == state.sort_name_btn { 0 } else { 1 };
+                let col = if id == SourceId::named("sort_name") { 0 } else { 1 };
                 if state.table_sort_col == col {
                     state.table_sort_asc = !state.table_sort_asc;
                 } else {
@@ -552,145 +233,31 @@ impl StrataApp for DemoApp {
                     }),
                 }
             }
-            DemoMessage::Copy => {
-                if let Some(sel) = &state.selection {
-                    eprintln!(
-                        "[demo] Copy: source={:?} offsets={}..{}",
-                        sel.anchor.source_id,
-                        sel.anchor.content_offset,
-                        sel.focus.content_offset,
-                    );
+            DemoMessage::TimerTick => {
+                state.elapsed_seconds += 1;
+            }
+            // Text inputs — key events routed from on_key
+            DemoMessage::InputKey(event) => {
+                let action = state.input.handle_key(&event, false);
+                if let crate::strata::text_input_state::TextInputAction::Submit(text) = action {
+                    eprintln!("[demo] Input submitted: {:?}", text);
                 }
             }
-            // Multi-line editor messages
-            DemoMessage::EditorChar(c) => {
-                if let Some((s, e)) = state.editor_selection.take() {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    state.editor_text.replace_range(lo_byte..hi_byte, "");
-                    state.editor_cursor = lo;
-                }
-                let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                state.editor_text.insert_str(byte_pos, &c);
-                state.editor_cursor += c.chars().count();
+            DemoMessage::EditorKey(event) => {
+                state.editor.handle_key(&event, true);
             }
-            DemoMessage::EditorEnter => {
-                if let Some((s, e)) = state.editor_selection.take() {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    state.editor_text.replace_range(lo_byte..hi_byte, "");
-                    state.editor_cursor = lo;
-                }
-                let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                state.editor_text.insert(byte_pos, '\n');
-                state.editor_cursor += 1;
+            // Text inputs — mouse events routed from on_mouse via handle_mouse()
+            DemoMessage::InputMouse(action) => {
+                state.editor.blur();
+                state.input.apply_mouse(action);
             }
-            DemoMessage::EditorBackspace => {
-                if let Some((s, e)) = state.editor_selection.take() {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    state.editor_text.replace_range(lo_byte..hi_byte, "");
-                    state.editor_cursor = lo;
-                } else if state.editor_cursor > 0 {
-                    state.editor_cursor -= 1;
-                    let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(0);
-                    let next = state.editor_text.char_indices().nth(state.editor_cursor + 1).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    state.editor_text.replace_range(byte_pos..next, "");
-                }
+            DemoMessage::EditorMouse(action) => {
+                state.input.blur();
+                state.editor.apply_mouse(action);
             }
-            DemoMessage::EditorDelete => {
-                if let Some((s, e)) = state.editor_selection.take() {
-                    let (lo, hi) = (s.min(e), s.max(e));
-                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                    state.editor_text.replace_range(lo_byte..hi_byte, "");
-                    state.editor_cursor = lo;
-                } else {
-                    let char_count = state.editor_text.chars().count();
-                    if state.editor_cursor < char_count {
-                        let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(0);
-                        let next = state.editor_text.char_indices().nth(state.editor_cursor + 1).map(|(i, _)| i).unwrap_or(state.editor_text.len());
-                        state.editor_text.replace_range(byte_pos..next, "");
-                    }
-                }
-            }
-            DemoMessage::EditorLeft => {
-                state.editor_selection = None;
-                if state.editor_cursor > 0 { state.editor_cursor -= 1; }
-            }
-            DemoMessage::EditorRight => {
-                state.editor_selection = None;
-                let len = state.editor_text.chars().count();
-                if state.editor_cursor < len { state.editor_cursor += 1; }
-            }
-            DemoMessage::EditorHome => {
-                state.editor_selection = None;
-                // Move to start of current line
-                let (line, _col) = editor_line_col(&state.editor_text, state.editor_cursor);
-                let mut offset = 0;
-                for (i, ch) in state.editor_text.chars().enumerate() {
-                    if i == state.editor_cursor { break; }
-                    if ch == '\n' { offset = i + 1; }
-                }
-                let _ = line; // used indirectly
-                state.editor_cursor = offset;
-            }
-            DemoMessage::EditorEnd => {
-                state.editor_selection = None;
-                // Move to end of current line
-                let mut pos = state.editor_cursor;
-                for ch in state.editor_text.chars().skip(state.editor_cursor) {
-                    if ch == '\n' { break; }
-                    pos += 1;
-                }
-                state.editor_cursor = pos;
-            }
-            DemoMessage::EditorUp => {
-                state.editor_selection = None;
-                let (line, col) = editor_line_col(&state.editor_text, state.editor_cursor);
-                if line > 0 {
-                    state.editor_cursor = editor_line_col_to_offset(&state.editor_text, line - 1, col);
-                }
-            }
-            DemoMessage::EditorDown => {
-                state.editor_selection = None;
-                let (line, col) = editor_line_col(&state.editor_text, state.editor_cursor);
-                let line_count = state.editor_text.split('\n').count();
-                if line + 1 < line_count {
-                    state.editor_cursor = editor_line_col_to_offset(&state.editor_text, line + 1, col);
-                }
-            }
-            DemoMessage::EditorScroll(delta) => {
-                state.editor_scroll_offset = (state.editor_scroll_offset - delta).max(0.0);
-                let line_count = state.editor_text.split('\n').count() as f32;
-                let max_scroll = (line_count * 18.0 - 80.0).max(0.0); // LINE_HEIGHT = 18
-                state.editor_scroll_offset = state.editor_scroll_offset.min(max_scroll);
-            }
-            DemoMessage::EditorClickAt(rel_x, rel_y) => {
-                state.focused_input = Some(state.editor_id);
-                let line = ((rel_y + state.editor_scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
-                let col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
-                state.editor_cursor = editor_line_col_to_offset(&state.editor_text, line, col);
-                state.editor_selection = None;
-            }
-            DemoMessage::EditorDragTo(rel_x, rel_y) => {
-                let line = ((rel_y + state.editor_scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
-                let col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
-                let pos = editor_line_col_to_offset(&state.editor_text, line, col);
-                let anchor = state.editor_selection
-                    .map(|(a, _)| a)
-                    .unwrap_or(state.editor_cursor);
-                if pos != anchor {
-                    state.editor_selection = Some((anchor, pos));
-                    state.editor_cursor = pos;
-                }
-            }
-            DemoMessage::EditorSelectAll => {
-                state.editor_selection = Some((0, state.editor_text.chars().count()));
-                state.editor_cursor = state.editor_text.chars().count();
+            DemoMessage::BlurAll => {
+                state.input.blur();
+                state.editor.blur();
             }
         }
         Command::none()
@@ -703,7 +270,6 @@ impl StrataApp for DemoApp {
         state.last_frame.set(now);
         let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
         let prev = state.fps_smooth.get();
-        // Smoothing: 95% old + 5% new (avoids flicker)
         let fps = if prev == 0.0 { instant_fps } else { prev * 0.95 + instant_fps * 0.05 };
         state.fps_smooth.set(fps);
 
@@ -734,8 +300,8 @@ impl StrataApp for DemoApp {
             // LEFT COLUMN: Scrollable Nexus App Mockup
             // =============================================================
             .scroll_column(
-                ScrollColumn::new(state.scroll_id, state.scroll_thumb_id)
-                    .scroll_offset(state.scroll_offset)
+                ScrollColumn::new(state.left_scroll.id(), state.left_scroll.thumb_id())
+                    .scroll_offset(state.left_scroll.offset)
                     .spacing(16.0)
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -754,7 +320,7 @@ impl StrataApp for DemoApp {
                             cmd: "ls -la",
                             status_icon: "\u{2713}",
                             status_color: colors::SUCCESS,
-                            terminal_source: state.terminal_source,
+                            terminal_source: SourceId::named("terminal"),
                             rows: vec![
                                 ("total 32", Color::rgb(0.7, 0.7, 0.7)),
                                 (
@@ -783,7 +349,7 @@ impl StrataApp for DemoApp {
                     .column(
                         AgentBlock {
                             query: "How do I parse JSON in Rust?",
-                            query_source: state.query_source,
+                            query_source: SourceId::named("query"),
                             tools: vec![
                                 ToolInvocation {
                                     icon: "\u{25B6}",
@@ -801,7 +367,7 @@ impl StrataApp for DemoApp {
                                     label: "Running bash",
                                     color: colors::RUNNING,
                                     expanded: true,
-                                    output_source: Some(state.tool_output_source),
+                                    output_source: Some(SourceId::named("tool_output")),
                                     output_rows: vec![
                                         ("  $ cargo test", Color::rgb(0.6, 0.6, 0.6)),
                                         (
@@ -818,7 +384,7 @@ impl StrataApp for DemoApp {
                                 "serde_json::from_str() to deserialize a JSON string",
                                 "into any type that implements Deserialize.",
                             ],
-                            response_source: state.response_source,
+                            response_source: SourceId::named("response"),
                             status_text: "\u{2713} Completed \u{00B7} 2.3s",
                             status_color: colors::SUCCESS,
                         }
@@ -827,9 +393,9 @@ impl StrataApp for DemoApp {
                     // Permission Dialog
                     .column(PermissionDialog {
                         command: "rm -rf /tmp/cache",
-                        deny_id: state.deny_btn_id,
-                        allow_id: state.allow_btn_id,
-                        always_id: state.always_btn_id,
+                        deny_id: SourceId::named("deny_btn"),
+                        allow_id: SourceId::named("allow_btn"),
+                        always_id: SourceId::named("always_btn"),
                     }.build())
                     // Input Bar (with real TextInput)
                     .row(
@@ -852,12 +418,12 @@ impl StrataApp for DemoApp {
                             .text(TextElement::new("$").color(colors::SUCCESS))
                             .text_input(
                                 TextInputElement::new(
-                                    state.input_id,
-                                    &state.input_text,
+                                    state.input.id(),
+                                    &state.input.text,
                                 )
-                                .cursor(state.input_cursor)
-                                .selection(state.input_selection)
-                                .focused(state.focused_input == Some(state.input_id))
+                                .cursor(state.input.cursor)
+                                .selection(state.input.selection)
+                                .focused(state.input.focused)
                                 .placeholder("Type a command...")
                                 .background(Color::rgba(0.0, 0.0, 0.0, 0.0))
                                 .border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
@@ -878,9 +444,9 @@ impl StrataApp for DemoApp {
                 let name_header: String = if state.table_sort_col == 0 { format!("NAME{}", arrow) } else { "NAME".into() };
                 let size_header: String = if state.table_sort_col == 1 { format!("SIZE{}", arrow) } else { "SIZE".into() };
 
-                let mut table = TableElement::new(state.table_source)
-                    .column_sortable(&name_header, 140.0, state.sort_name_btn)
-                    .column_sortable(&size_header, 70.0, state.sort_size_btn)
+                let mut table = TableElement::new(SourceId::named("table"))
+                    .column_sortable(&name_header, 140.0, SourceId::named("sort_name"))
+                    .column_sortable(&size_header, 70.0, SourceId::named("sort_size"))
                     .column("TYPE", 70.0);
 
                 for &(name, size_str, _size_bytes, kind, name_color) in &state.table_rows {
@@ -891,8 +457,8 @@ impl StrataApp for DemoApp {
                     ]);
                 }
 
-                ScrollColumn::new(state.right_scroll_id, state.right_scroll_thumb_id)
-                    .scroll_offset(state.right_scroll_offset)
+                ScrollColumn::new(state.right_scroll.id(), state.right_scroll.thumb_id())
+                    .scroll_offset(state.right_scroll.offset)
                     .spacing(16.0)
                     .width(Length::Fixed(right_col_width))
                     .height(Length::Fill)
@@ -924,7 +490,7 @@ impl StrataApp for DemoApp {
                             uptime_seconds: state.elapsed_seconds,
                         }
                         .build()
-                        .id(state.status_panel_id),
+                        .id(SourceId::named("status_panel")),
                     )
                     // Job Pills
                     .column(
@@ -951,7 +517,7 @@ impl StrataApp for DemoApp {
                             ],
                         }
                         .build()
-                        .id(state.job_panel_id),
+                        .id(SourceId::named("job_panel")),
                     )
                     // Multi-line Editor
                     .column(
@@ -963,31 +529,31 @@ impl StrataApp for DemoApp {
                             .width(Length::Fill)
                             .text(TextElement::new("Multi-line Editor").color(colors::TEXT_SECONDARY))
                             .text_input(
-                                TextInputElement::new(state.editor_id, &state.editor_text)
+                                TextInputElement::new(state.editor.id(), &state.editor.text)
                                     .multiline(true)
                                     .height(Length::Fixed(120.0))
-                                    .cursor(state.editor_cursor)
-                                    .selection(state.editor_selection)
-                                    .focused(state.focused_input == Some(state.editor_id))
+                                    .cursor(state.editor.cursor)
+                                    .selection(state.editor.selection)
+                                    .focused(state.editor.focused)
                                     .placeholder("Multi-line editor...")
-                                    .scroll_offset(state.editor_scroll_offset)
+                                    .scroll_offset(state.editor.scroll_offset)
                                     .cursor_visible(cursor_visible),
                             )
-                            .id(state.editor_panel_id),
+                            .id(SourceId::named("editor_panel")),
                     )
                     // Context menu placeholder (fixed height, rendered as primitives after layout)
                     .column(
                         Column::new()
                             .width(Length::Fill)
-                            .height(Length::Fixed(194.0)) // "Context Menu" label + menu box
-                            .id(state.context_menu_placeholder_id),
+                            .height(Length::Fixed(194.0))
+                            .id(SourceId::named("ctx_menu")),
                     )
                     // Drawing styles placeholder
                     .column(
                         Column::new()
                             .width(Length::Fill)
                             .height(Length::Fixed(180.0))
-                            .id(state.drawing_styles_placeholder_id),
+                            .id(SourceId::named("draw_styles")),
                     )
                     // Table (fully layout-driven)
                     .column(
@@ -1003,29 +569,11 @@ impl StrataApp for DemoApp {
             })
             .layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
 
-        // Update scroll limits from layout
-        if let Some(max) = snapshot.scroll_limit(&state.scroll_id) {
-            state.scroll_max.set(max);
-        }
-        if let Some(track) = snapshot.scroll_track(&state.scroll_id) {
-            state.scroll_track.set(Some(*track));
-        }
-        if let Some(max) = snapshot.scroll_limit(&state.right_scroll_id) {
-            state.right_scroll_max.set(max);
-        }
-        if let Some(track) = snapshot.scroll_track(&state.right_scroll_id) {
-            state.right_scroll_track.set(Some(*track));
-        }
-        if let Some(bounds) = snapshot.widget_bounds(&state.right_scroll_id) {
-            state.right_scroll_bounds.set(bounds);
-        }
-        // Save input/editor widget bounds for mouse hit → relative position
-        if let Some(bounds) = snapshot.widget_bounds(&state.input_id) {
-            state.input_bounds.set(bounds);
-        }
-        if let Some(bounds) = snapshot.widget_bounds(&state.editor_id) {
-            state.editor_bounds.set(bounds);
-        }
+        // Sync state helpers from layout snapshot
+        state.left_scroll.sync_from_snapshot(snapshot);
+        state.right_scroll.sync_from_snapshot(snapshot);
+        state.input.sync_from_snapshot(snapshot);
+        state.editor.sync_from_snapshot(snapshot);
 
         // =================================================================
         // POST-LAYOUT: Render primitives into placeholder positions
@@ -1033,12 +581,12 @@ impl StrataApp for DemoApp {
         let anim_t = now.duration_since(state.start_time).as_secs_f32();
 
         // Render context menu at its placeholder position
-        if let Some(bounds) = snapshot.widget_bounds(&state.context_menu_placeholder_id) {
+        if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("ctx_menu")) {
             view_context_menu(snapshot, bounds.x, bounds.y);
         }
 
         // Render drawing styles at placeholder position
-        if let Some(bounds) = snapshot.widget_bounds(&state.drawing_styles_placeholder_id) {
+        if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("draw_styles")) {
             view_drawing_styles(snapshot, bounds.x, bounds.y, bounds.width, anim_t);
         }
 
@@ -1061,140 +609,67 @@ impl StrataApp for DemoApp {
         hit: Option<HitResult>,
         capture: &CaptureState,
     ) -> MouseResponse<Self::Message> {
-        use crate::strata::event_context::ScrollDelta;
-
-        match event {
-            MouseEvent::ButtonPressed {
-                button: MouseButton::Left,
-                position,
-            } => {
-                if let Some(HitResult::Widget(id)) = &hit {
-                    // Text input click: focus + position cursor
-                    if *id == state.input_id {
-                        let bounds = state.input_bounds.get();
-                        let padding_left = 6.0; // text padding inside input
-                        let rel_x = (position.x - bounds.x - padding_left).max(0.0);
-                        return MouseResponse::message_and_capture(
-                            DemoMessage::InputClickAt(state.input_id, rel_x),
-                            state.input_id,
-                        );
-                    }
-                    // Multi-line editor click: focus + position cursor
-                    if *id == state.editor_id {
-                        let bounds = state.editor_bounds.get();
-                        let padding = 6.0;
-                        let rel_x = (position.x - bounds.x - padding).max(0.0);
-                        let rel_y = (position.y - bounds.y - padding).max(0.0);
-                        return MouseResponse::message_and_capture(
-                            DemoMessage::EditorClickAt(rel_x, rel_y),
-                            state.editor_id,
-                        );
-                    }
-                    // Button clicks
-                    if *id == state.deny_btn_id || *id == state.allow_btn_id || *id == state.always_btn_id {
-                        return MouseResponse::message(DemoMessage::ButtonClicked(*id));
-                    }
-                    // Table sort header clicks
-                    if *id == state.sort_name_btn || *id == state.sort_size_btn {
-                        return MouseResponse::message(DemoMessage::TableSort(*id));
-                    }
-                    // Scrollbar thumb drag (left panel)
-                    if *id == state.scroll_thumb_id {
-                        return MouseResponse::message_and_capture(
-                            DemoMessage::ScrollDragStart(position.y),
-                            state.scroll_thumb_id,
-                        );
-                    }
-                    // Scrollbar thumb drag (right panel)
-                    if *id == state.right_scroll_thumb_id {
-                        return MouseResponse::message_and_capture(
-                            DemoMessage::RightScrollDragStart(position.y),
-                            state.right_scroll_thumb_id,
-                        );
-                    }
-                }
-                // Text / grid cell selection
-                if let Some(HitResult::Content(addr)) = hit {
-                    if state.focused_input.is_some() {
-                        return MouseResponse::message(DemoMessage::InputBlur);
-                    }
-                    let capture_source = addr.source_id;
-                    return MouseResponse::message_and_capture(
-                        DemoMessage::SelectionStart(addr),
-                        capture_source,
-                    );
-                }
-                // Clicked on empty space: blur input
-                if state.focused_input.is_some() {
-                    return MouseResponse::message(DemoMessage::InputBlur);
-                }
-            }
-            MouseEvent::CursorMoved { position } => {
-                if let CaptureState::Captured(id) = capture {
-                    // Scrollbar thumb drag (left)
-                    if *id == state.scroll_thumb_id {
-                        return MouseResponse::message(DemoMessage::ScrollDragMove(position.y));
-                    }
-                    // Scrollbar thumb drag (right)
-                    if *id == state.right_scroll_thumb_id {
-                        return MouseResponse::message(DemoMessage::RightScrollDragMove(position.y));
-                    }
-                    // Input drag selection
-                    if *id == state.input_id {
-                        let bounds = state.input_bounds.get();
-                        let padding_left = 6.0;
-                        let rel_x = (position.x - bounds.x - padding_left).max(0.0);
-                        return MouseResponse::message(DemoMessage::InputDragTo(rel_x));
-                    }
-                    // Editor drag selection
-                    if *id == state.editor_id {
-                        let bounds = state.editor_bounds.get();
-                        let padding = 6.0;
-                        let rel_x = (position.x - bounds.x - padding).max(0.0);
-                        let rel_y = (position.y - bounds.y - padding).max(0.0);
-                        return MouseResponse::message(DemoMessage::EditorDragTo(rel_x, rel_y));
-                    }
-                    // Text/grid selection
-                    if let Some(HitResult::Content(addr)) = hit {
-                        return MouseResponse::message(DemoMessage::SelectionExtend(addr));
-                    }
-                }
-            }
-            MouseEvent::ButtonReleased {
-                button: MouseButton::Left,
-                ..
-            } => {
-                if let CaptureState::Captured(id) = capture {
-                    if *id == state.scroll_thumb_id {
-                        return MouseResponse::message_and_release(DemoMessage::ScrollDragEnd);
-                    }
-                    if *id == state.right_scroll_thumb_id {
-                        return MouseResponse::message_and_release(DemoMessage::RightScrollDragEnd);
-                    }
-                    // Input/editor: just release capture (selection already set via drag)
-                    if *id == state.input_id || *id == state.editor_id {
-                        return MouseResponse::release();
-                    }
-                    return MouseResponse::message_and_release(DemoMessage::SelectionEnd);
-                }
-            }
-            MouseEvent::WheelScrolled { delta, position } => {
-                let dy = match delta {
-                    ScrollDelta::Lines { y, .. } => y * 40.0,
-                    ScrollDelta::Pixels { y, .. } => y,
-                };
-                // Route based on cursor position over scroll containers
-                let right_bounds = state.right_scroll_bounds.get();
-                if right_bounds.contains_xy(position.x, position.y) {
-                    return MouseResponse::message(DemoMessage::RightScroll(dy));
-                }
-                // Default: left panel scroll
-                if hit.is_some() {
-                    return MouseResponse::message(DemoMessage::Scroll(dy));
-                }
-            }
-            _ => {}
+        // Composable handlers: scroll panels
+        if let Some(r) = state.left_scroll.handle_mouse(&event, &hit, capture) {
+            return r.map(DemoMessage::LeftScroll);
         }
+        if let Some(r) = state.right_scroll.handle_mouse(&event, &hit, capture) {
+            return r.map(DemoMessage::RightScroll);
+        }
+        // Composable handlers: text inputs
+        if let Some(r) = state.input.handle_mouse(&event, &hit, capture) {
+            return r.map(DemoMessage::InputMouse);
+        }
+        if let Some(r) = state.editor.handle_mouse(&event, &hit, capture) {
+            return r.map(DemoMessage::EditorMouse);
+        }
+
+        // Button clicks and table sort headers
+        if let MouseEvent::ButtonPressed { button: MouseButton::Left, .. } = &event {
+            if let Some(HitResult::Widget(id)) = &hit {
+                if *id == SourceId::named("deny_btn")
+                    || *id == SourceId::named("allow_btn")
+                    || *id == SourceId::named("always_btn")
+                {
+                    return MouseResponse::message(DemoMessage::ButtonClicked(*id));
+                }
+                if *id == SourceId::named("sort_name") || *id == SourceId::named("sort_size") {
+                    return MouseResponse::message(DemoMessage::TableSort(*id));
+                }
+            }
+            // Text / grid cell selection
+            if let Some(HitResult::Content(addr)) = hit {
+                if state.input.focused || state.editor.focused {
+                    return MouseResponse::message(DemoMessage::BlurAll);
+                }
+                let capture_source = addr.source_id;
+                return MouseResponse::message_and_capture(
+                    DemoMessage::SelectionStart(addr),
+                    capture_source,
+                );
+            }
+            // Clicked on empty space: blur inputs
+            if state.input.focused || state.editor.focused {
+                return MouseResponse::message(DemoMessage::BlurAll);
+            }
+        }
+
+        // Content selection drag
+        if let MouseEvent::CursorMoved { .. } = &event {
+            if let CaptureState::Captured(_) = capture {
+                if let Some(HitResult::Content(addr)) = hit {
+                    return MouseResponse::message(DemoMessage::SelectionExtend(addr));
+                }
+            }
+        }
+
+        // Content selection release
+        if let MouseEvent::ButtonReleased { button: MouseButton::Left, .. } = &event {
+            if let CaptureState::Captured(_) = capture {
+                return MouseResponse::message_and_release(DemoMessage::SelectionEnd);
+            }
+        }
+
         MouseResponse::none()
     }
 
@@ -1202,53 +677,34 @@ impl StrataApp for DemoApp {
         state: &Self::State,
         event: KeyEvent,
     ) -> Option<Self::Message> {
-        if let KeyEvent::Pressed { key, modifiers } = event {
-            // Route to focused input first
-            if state.focused_input == Some(state.editor_id) {
-                // Multi-line editor: Enter inserts newline, Up/Down navigate lines
-                match (&key, modifiers.shift, modifiers.meta || modifiers.ctrl) {
-                    (Key::Named(NamedKey::Escape), _, _) => return Some(DemoMessage::InputBlur),
-                    (Key::Named(NamedKey::Enter), _, _) => return Some(DemoMessage::EditorEnter),
-                    (Key::Named(NamedKey::Backspace), _, _) => return Some(DemoMessage::EditorBackspace),
-                    (Key::Named(NamedKey::Delete), _, _) => return Some(DemoMessage::EditorDelete),
-                    (Key::Named(NamedKey::ArrowLeft), _, _) => return Some(DemoMessage::EditorLeft),
-                    (Key::Named(NamedKey::ArrowRight), _, _) => return Some(DemoMessage::EditorRight),
-                    (Key::Named(NamedKey::ArrowUp), _, _) => return Some(DemoMessage::EditorUp),
-                    (Key::Named(NamedKey::ArrowDown), _, _) => return Some(DemoMessage::EditorDown),
-                    (Key::Named(NamedKey::Home), _, _) => return Some(DemoMessage::EditorHome),
-                    (Key::Named(NamedKey::End), _, _) => return Some(DemoMessage::EditorEnd),
-                    (Key::Character(c), _, true) if c == "a" => return Some(DemoMessage::EditorSelectAll),
-                    (Key::Character(c), _, false) => return Some(DemoMessage::EditorChar(c.clone())),
-                    (Key::Named(NamedKey::Space), _, false) => return Some(DemoMessage::EditorChar(" ".into())),
-                    _ => return None,
-                }
-            } else if state.focused_input.is_some() {
-                // Single-line input
-                match (&key, modifiers.shift, modifiers.meta || modifiers.ctrl) {
-                    (Key::Named(NamedKey::Escape), _, _) => return Some(DemoMessage::InputBlur),
-                    (Key::Named(NamedKey::Enter), _, _) => return Some(DemoMessage::InputSubmit),
-                    (Key::Named(NamedKey::Backspace), _, _) => return Some(DemoMessage::InputBackspace),
-                    (Key::Named(NamedKey::Delete), _, _) => return Some(DemoMessage::InputDelete),
-                    (Key::Named(NamedKey::ArrowLeft), true, _) => return Some(DemoMessage::InputSelectLeft),
-                    (Key::Named(NamedKey::ArrowRight), true, _) => return Some(DemoMessage::InputSelectRight),
-                    (Key::Named(NamedKey::ArrowLeft), _, _) => return Some(DemoMessage::InputLeft),
-                    (Key::Named(NamedKey::ArrowRight), _, _) => return Some(DemoMessage::InputRight),
-                    (Key::Named(NamedKey::Home), _, _) => return Some(DemoMessage::InputHome),
-                    (Key::Named(NamedKey::End), _, _) => return Some(DemoMessage::InputEnd),
-                    (Key::Character(c), _, true) if c == "a" => return Some(DemoMessage::InputSelectAll),
-                    (Key::Character(c), _, false) => return Some(DemoMessage::InputChar(c.clone())),
-                    (Key::Named(NamedKey::Space), _, false) => return Some(DemoMessage::InputChar(" ".into())),
-                    _ => return None, // Swallow unhandled keys when focused
-                }
-            }
-            // Global shortcuts
-            match (&key, modifiers.meta) {
+        // Only handle key presses
+        if matches!(&event, KeyEvent::Released { .. }) {
+            return None;
+        }
+        // Route to focused input
+        if state.editor.focused {
+            return Some(DemoMessage::EditorKey(event));
+        }
+        if state.input.focused {
+            return Some(DemoMessage::InputKey(event));
+        }
+        // Global shortcuts
+        if let KeyEvent::Pressed { ref key, ref modifiers } = event {
+            match (key, modifiers.meta) {
                 (Key::Character(c), true) if c == "c" => return Some(DemoMessage::Copy),
                 (Key::Named(NamedKey::Escape), _) => return Some(DemoMessage::ClearSelection),
-                (Key::Named(NamedKey::ArrowUp), _) => return Some(DemoMessage::ScrollByKey(60.0)),
-                (Key::Named(NamedKey::ArrowDown), _) => return Some(DemoMessage::ScrollByKey(-60.0)),
-                (Key::Named(NamedKey::PageUp), _) => return Some(DemoMessage::ScrollByKey(300.0)),
-                (Key::Named(NamedKey::PageDown), _) => return Some(DemoMessage::ScrollByKey(-300.0)),
+                (Key::Named(NamedKey::ArrowUp), _) => {
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(60.0)));
+                }
+                (Key::Named(NamedKey::ArrowDown), _) => {
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(-60.0)));
+                }
+                (Key::Named(NamedKey::PageUp), _) => {
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(300.0)));
+                }
+                (Key::Named(NamedKey::PageDown), _) => {
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(-300.0)));
+                }
                 _ => {}
             }
         }
@@ -1422,35 +878,4 @@ pub fn run() -> Result<(), crate::strata::shell::Error> {
         antialiasing: true,
         background_color: colors::BG_APP,
     })
-}
-
-/// Convert a char offset to (line, col) in newline-delimited text.
-fn editor_line_col(text: &str, char_offset: usize) -> (usize, usize) {
-    let mut line = 0;
-    let mut col = 0;
-    for (i, ch) in text.chars().enumerate() {
-        if i == char_offset {
-            return (line, col);
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-/// Convert (line, col) back to a char offset, clamping col to line length.
-fn editor_line_col_to_offset(text: &str, target_line: usize, target_col: usize) -> usize {
-    let mut offset = 0;
-    for (line_idx, line) in text.split('\n').enumerate() {
-        if line_idx == target_line {
-            let line_len = line.chars().count();
-            return offset + target_col.min(line_len);
-        }
-        offset += line.chars().count() + 1; // +1 for '\n'
-    }
-    text.chars().count() // past end
 }

@@ -42,6 +42,10 @@ pub mod layout;
 // Text engine (cosmic-text integration)
 pub mod text_engine;
 
+// State helpers
+pub mod text_input_state;
+pub mod scroll_state;
+
 // Application trait
 pub mod app;
 
@@ -78,3 +82,5 @@ pub use layout::{
 };
 pub use layout::containers::{TextElement, TerminalElement, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell};
 pub use gpu::{ImageHandle, ImageStore};
+pub use text_input_state::{TextInputState, TextInputAction, TextInputMouseAction};
+pub use scroll_state::{ScrollState, ScrollAction};

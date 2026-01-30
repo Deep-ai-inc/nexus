@@ -72,6 +72,22 @@ impl<M> MouseResponse<M> {
             capture: CaptureRequest::Release,
         }
     }
+
+    /// Transform the message type, preserving capture state.
+    ///
+    /// This enables composable mouse handling: widget-level handlers return
+    /// `MouseResponse<WidgetAction>`, and the app maps to its message type:
+    /// ```ignore
+    /// if let Some(r) = state.scroll.handle_mouse(&event, &hit, capture) {
+    ///     return r.map(AppMessage::Scroll);
+    /// }
+    /// ```
+    pub fn map<N>(self, f: impl FnOnce(M) -> N) -> MouseResponse<N> {
+        MouseResponse {
+            message: self.message.map(f),
+            capture: self.capture,
+        }
+    }
 }
 
 impl<M> Default for MouseResponse<M> {

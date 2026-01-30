@@ -41,6 +41,17 @@ impl SourceId {
         Self(SOURCE_ID_COUNTER.fetch_add(1, AtomicOrdering::Relaxed))
     }
 
+    /// Create a stable source ID from a name.
+    ///
+    /// Deterministic: same name always produces the same ID.
+    /// Uses high bit to avoid collision with the atomic counter.
+    pub fn named(name: &str) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        Self(hasher.finish() | (1 << 63))
+    }
+
     /// Create a source ID from an existing value.
     ///
     /// Use this for deterministic IDs (e.g., derived from block IDs).
