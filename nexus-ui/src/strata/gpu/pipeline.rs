@@ -42,13 +42,16 @@ pub struct PendingImage {
     pub data: Vec<u8>,
 }
 
-/// CPU-side image store for dynamic loading.
+/// CPU-side image store for dynamic loading and unloading.
 ///
 /// Call `load_rgba()` or `load_png()` at any time to get a handle immediately.
 /// Decoded pixel data is queued internally; the shell adapter drains pending
 /// uploads each frame and pushes them to the GPU atlas during `prepare()`.
+///
+/// Call `unload()` to release an image from the GPU atlas.
 pub struct ImageStore {
     pending: std::sync::Mutex<Vec<PendingImage>>,
+    pending_unloads: std::sync::Mutex<Vec<ImageHandle>>,
     next_handle: u32,
 }
 
@@ -57,6 +60,7 @@ impl ImageStore {
     pub fn new() -> Self {
         Self {
             pending: std::sync::Mutex::new(Vec::new()),
+            pending_unloads: std::sync::Mutex::new(Vec::new()),
             next_handle: 0,
         }
     }
@@ -101,12 +105,25 @@ impl ImageStore {
         self.load_rgba(width, height, data)
     }
 
+    /// Queue an image for unloading from the GPU atlas.
+    ///
+    /// The actual GPU-side removal happens on the next frame's prepare pass.
+    /// After unloading, the handle becomes invalid and `add_image` will skip it.
+    pub fn unload(&self, handle: ImageHandle) {
+        self.pending_unloads.lock().unwrap().push(handle);
+    }
+
     /// Drain all pending image uploads (called by the shell adapter).
     ///
     /// Uses `&self` with internal locking so it can be called from contexts
     /// that only have shared access (e.g., view → StrataPrimitive → prepare).
     pub(crate) fn drain_pending(&self) -> Vec<PendingImage> {
         std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+
+    /// Drain all pending image unloads (called by the shell adapter).
+    pub(crate) fn drain_pending_unloads(&self) -> Vec<ImageHandle> {
+        std::mem::take(&mut *self.pending_unloads.lock().unwrap())
     }
 }
 
@@ -132,8 +149,8 @@ struct ImageAtlas {
     shelf_height: u32,
     /// Raw RGBA pixel data (kept for atlas regrow/reupload).
     data: Vec<u8>,
-    /// Loaded image metadata.
-    images: Vec<LoadedImage>,
+    /// Loaded image metadata (`None` = unloaded / slot freed).
+    images: Vec<Option<LoadedImage>>,
 }
 
 /// Instance for GPU rendering (64 bytes — one cache line).
@@ -820,8 +837,8 @@ impl StrataPipeline {
         corner_radius: f32,
         tint: Color,
     ) {
-        let Some(img) = self.image_atlas.images.get(handle.0 as usize) else {
-            return; // Image not yet uploaded to GPU; will render next frame.
+        let Some(Some(img)) = self.image_atlas.images.get(handle.0 as usize) else {
+            return; // Image not yet uploaded or has been unloaded.
         };
         self.instances.push(GpuInstance {
             pos: [x, y],
@@ -918,7 +935,7 @@ impl StrataPipeline {
         ];
 
         let handle = ImageHandle(atlas.images.len() as u32);
-        atlas.images.push(LoadedImage { uv_tl, uv_br, width, height });
+        atlas.images.push(Some(LoadedImage { uv_tl, uv_br, width, height }));
 
         // Advance shelf packer
         atlas.cursor_x += width;
@@ -927,10 +944,21 @@ impl StrataPipeline {
         handle
     }
 
-    /// Query image dimensions.
-    pub fn image_size(&self, handle: ImageHandle) -> (u32, u32) {
-        let img = &self.image_atlas.images[handle.0 as usize];
-        (img.width, img.height)
+    /// Query image dimensions. Returns `None` if the image has been unloaded.
+    pub fn image_size(&self, handle: ImageHandle) -> Option<(u32, u32)> {
+        self.image_atlas.images.get(handle.0 as usize)
+            .and_then(|slot| slot.as_ref())
+            .map(|img| (img.width, img.height))
+    }
+
+    /// Unload an image from the atlas. The handle becomes invalid and
+    /// `add_image` will silently skip it. The atlas space is not reclaimed
+    /// (shelf packing doesn't support holes), but the pixel data and metadata
+    /// are freed.
+    pub fn unload_image(&mut self, handle: ImageHandle) {
+        if let Some(slot) = self.image_atlas.images.get_mut(handle.0 as usize) {
+            *slot = None;
+        }
     }
 
     /// Grow the image atlas to a new size, preserving existing data.
@@ -993,7 +1021,8 @@ impl StrataPipeline {
         );
 
         // Recompute UV regions for all loaded images
-        for img in &mut atlas.images {
+        for slot in &mut atlas.images {
+            let Some(img) = slot.as_mut() else { continue };
             // UVs were based on old atlas dimensions — need to recompute from pixel positions.
             // We don't store pixel positions separately, so derive them from old UVs.
             let px_x = img.uv_tl[0] * old_width as f32;
@@ -1075,10 +1104,10 @@ impl StrataPipeline {
         if self.glyph_atlas.was_resized() {
             self.recreate_atlas_texture(device, queue);
             self.glyph_atlas.ack_resize();
-            self.glyph_atlas.mark_clean();
-        } else if self.glyph_atlas.is_dirty() {
-            self.upload_atlas(queue);
-            self.glyph_atlas.mark_clean();
+            // Drain dirty region — full atlas was already uploaded by recreate
+            self.glyph_atlas.take_dirty_region();
+        } else if let Some(dirty) = self.glyph_atlas.take_dirty_region() {
+            self.upload_atlas_region(queue, dirty);
         }
 
         // Update globals
@@ -1189,7 +1218,7 @@ impl StrataPipeline {
             view_formats: &[],
         });
 
-        self.upload_atlas(queue);
+        self.upload_atlas_full(queue);
         self.rebuild_combined_bind_group(device);
     }
 
@@ -1222,7 +1251,42 @@ impl StrataPipeline {
         });
     }
 
-    fn upload_atlas(&self, queue: &wgpu::Queue) {
+    /// Upload only the dirty region of the glyph atlas to the GPU.
+    fn upload_atlas_region(&self, queue: &wgpu::Queue, region: (u32, u32, u32, u32)) {
+        let (min_x, min_y, max_x, max_y) = region;
+        let atlas_width = self.glyph_atlas.atlas_width;
+        let region_w = max_x - min_x;
+        let region_h = max_y - min_y;
+        let data = self.glyph_atlas.atlas_data();
+
+        // Offset into atlas_data for the first pixel of the dirty rect.
+        let byte_offset = ((min_y * atlas_width + min_x) * 4) as u64;
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: min_x, y: min_y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::ImageDataLayout {
+                offset: byte_offset,
+                bytes_per_row: Some(atlas_width * 4), // stride = full atlas row width
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: region_w,
+                height: region_h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Upload the entire glyph atlas (used after resize/recreate).
+    fn upload_atlas_full(&self, queue: &wgpu::Queue) {
+        let atlas_width = self.glyph_atlas.atlas_width;
+        let atlas_height = self.glyph_atlas.atlas_height;
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.atlas_texture,
@@ -1233,12 +1297,12 @@ impl StrataPipeline {
             self.glyph_atlas.atlas_data(),
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(self.glyph_atlas.atlas_width * 4),
-                rows_per_image: Some(self.glyph_atlas.atlas_height),
+                bytes_per_row: Some(atlas_width * 4),
+                rows_per_image: Some(atlas_height),
             },
             wgpu::Extent3d {
-                width: self.glyph_atlas.atlas_width,
-                height: self.glyph_atlas.atlas_height,
+                width: atlas_width,
+                height: atlas_height,
                 depth_or_array_layers: 1,
             },
         );

@@ -53,8 +53,10 @@ pub struct GlyphAtlas {
     pack_x: u32,
     pack_y: u32,
     row_height: u32,
-    /// Flags for GPU sync.
-    dirty: bool,
+    /// Dirty region for partial GPU upload (pixel coords, exclusive max).
+    /// `None` means clean; `Some((min_x, min_y, max_x, max_y))` is the bounding box
+    /// of all glyph writes since last upload.
+    dirty_region: Option<(u32, u32, u32, u32)>,
     resized: bool,
     /// Font metrics.
     pub cell_width: f32,
@@ -97,7 +99,7 @@ impl GlyphAtlas {
             pack_x: 1,  // Start packing after the white pixel
             pack_y: 1,
             row_height: 0,
-            dirty: true, // Mark dirty so white pixel gets uploaded
+            dirty_region: Some((0, 0, 1, 1)), // Mark white pixel dirty for initial upload
             resized: false,
             cell_width,
             cell_height,
@@ -185,7 +187,7 @@ impl GlyphAtlas {
             }
         }
 
-        self.dirty = true;
+        self.mark_dirty(atlas_x, atlas_y, atlas_x + width, atlas_y + height);
 
         // Pre-calculate UVs
         let inv_w = 65535.0 / self.atlas_width as f32;
@@ -266,7 +268,8 @@ impl GlyphAtlas {
         self.pack_x = 1;
         self.pack_y = 1;
         self.row_height = 0;
-        self.dirty = true;
+        // Full atlas is dirty after clear (white pixel + all re-rasterized glyphs)
+        self.dirty_region = Some((0, 0, self.atlas_width, self.atlas_height));
     }
 
     /// Get the atlas texture data.
@@ -274,14 +277,17 @@ impl GlyphAtlas {
         &self.atlas_data
     }
 
-    /// Check if atlas needs upload.
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
+    /// Expand the dirty region to include the given pixel rect.
+    fn mark_dirty(&mut self, min_x: u32, min_y: u32, max_x: u32, max_y: u32) {
+        self.dirty_region = Some(match self.dirty_region {
+            Some((ox, oy, ow, oh)) => (ox.min(min_x), oy.min(min_y), ow.max(max_x), oh.max(max_y)),
+            None => (min_x, min_y, max_x, max_y),
+        });
     }
 
-    /// Mark atlas as uploaded.
-    pub fn mark_clean(&mut self) {
-        self.dirty = false;
+    /// Take the dirty region (returns `None` if clean, resets to clean).
+    pub fn take_dirty_region(&mut self) -> Option<(u32, u32, u32, u32)> {
+        self.dirty_region.take()
     }
 
     /// Check if atlas was resized.

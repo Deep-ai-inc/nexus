@@ -219,6 +219,96 @@ impl LayoutChild {
 
 }
 
+// =========================================================================
+// From impls for LayoutChild — enables generic `.push()` on containers
+// =========================================================================
+
+impl From<TextElement> for LayoutChild {
+    fn from(v: TextElement) -> Self { Self::Text(v) }
+}
+impl From<TerminalElement> for LayoutChild {
+    fn from(v: TerminalElement) -> Self { Self::Terminal(v) }
+}
+impl From<ImageElement> for LayoutChild {
+    fn from(v: ImageElement) -> Self { Self::Image(v) }
+}
+impl From<Column> for LayoutChild {
+    fn from(v: Column) -> Self { Self::Column(v) }
+}
+impl From<Row> for LayoutChild {
+    fn from(v: Row) -> Self { Self::Row(v) }
+}
+impl From<ScrollColumn> for LayoutChild {
+    fn from(v: ScrollColumn) -> Self { Self::ScrollColumn(v) }
+}
+impl From<ButtonElement> for LayoutChild {
+    fn from(v: ButtonElement) -> Self { Self::Button(v) }
+}
+impl From<TextInputElement> for LayoutChild {
+    fn from(v: TextInputElement) -> Self { Self::TextInput(v) }
+}
+impl From<TableElement> for LayoutChild {
+    fn from(v: TableElement) -> Self { Self::Table(v) }
+}
+
+// =========================================================================
+// Widget trait — zero-cost reusable components
+// =========================================================================
+
+/// Trait for reusable, composable UI components.
+///
+/// Implementors produce a `LayoutChild` from existing primitives (Column, Row, etc.).
+/// The blanket `From` impl means any `Widget` works with `.push()` on all containers.
+///
+/// # Zero-cost
+///
+/// `build()` consumes `self` by value. The widget struct lives on the stack,
+/// and the returned `LayoutChild` is an enum variant — no heap allocation.
+///
+/// # Example
+///
+/// ```ignore
+/// struct Card { inner: Column }
+///
+/// impl Card {
+///     fn new(title: &str) -> Self {
+///         Card {
+///             inner: Column::new()
+///                 .padding(10.0)
+///                 .background(Color::rgb(0.1, 0.1, 0.1))
+///                 .push(TextElement::new(title))
+///         }
+///     }
+///
+///     fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+///         self.inner = self.inner.push(child);
+///         self
+///     }
+/// }
+///
+/// impl Widget for Card {
+///     fn build(self) -> LayoutChild { self.inner.into() }
+/// }
+///
+/// // Works with .push() on any container:
+/// scroll_col.push(Card::new("Settings").push(some_input))
+/// ```
+pub trait Widget {
+    /// Consume this widget and produce a layout node.
+    fn build(self) -> LayoutChild;
+}
+
+/// Blanket impl: any `Widget` can be used with `.push()` on containers.
+///
+/// This does NOT conflict with the explicit `From` impls above because
+/// built-in types (Column, Row, TextElement, etc.) do not implement `Widget`.
+impl<W: Widget> From<W> for LayoutChild {
+    #[inline(always)]
+    fn from(w: W) -> LayoutChild {
+        w.build()
+    }
+}
+
 /// A text element descriptor.
 ///
 /// This is declarative - it doesn't compute layout until the container does.
@@ -1122,6 +1212,17 @@ impl Column {
         self
     }
 
+    /// Add any child element using `From<T> for LayoutChild`.
+    ///
+    /// This is a generic alternative to the type-specific methods above.
+    /// The compiler resolves the `Into` conversion at compile time, so this
+    /// generates identical code to calling `.text()`, `.button()`, etc. directly.
+    #[inline(always)]
+    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+        self.children.push(child.into());
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes — does not recurse into children
@@ -1727,6 +1828,13 @@ impl Row {
         self
     }
 
+    /// Add any child element using `From<T> for LayoutChild`.
+    #[inline(always)]
+    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+        self.children.push(child.into());
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes.
@@ -2319,6 +2427,13 @@ impl ScrollColumn {
     /// Add a table element.
     pub fn table(mut self, element: TableElement) -> Self {
         self.children.push(LayoutChild::Table(element));
+        self
+    }
+
+    /// Add any child element using `From<T> for LayoutChild`.
+    #[inline(always)]
+    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+        self.children.push(child.into());
         self
     }
 

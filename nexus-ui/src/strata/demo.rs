@@ -12,25 +12,19 @@
 use std::cell::Cell;
 use std::time::Instant;
 
+use crate::route_mouse;
 use crate::strata::content_address::{ContentAddress, SourceId};
-use crate::strata::layout_snapshot::HitResult;
-use crate::strata::demo_widgets::{
-    ShellBlock, StatusIndicator, StatusPanel,
-};
+use crate::strata::demo_widgets::{Card, ShellBlock, StatusIndicator, StatusPanel};
 use crate::strata::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
-use crate::strata::layout::containers::{
-    ButtonElement, CrossAxisAlignment, Length, Padding,
-};
-use crate::strata::layout::primitives::LineStyle;
+use crate::strata::layout_snapshot::HitResult;
 use crate::strata::primitives::{Color, Point, Rect};
-use crate::strata::gpu::{ImageHandle, ImageStore};
-use crate::strata::scroll_state::{ScrollAction, ScrollState};
-use crate::strata::text_input_state::{TextInputAction, TextInputMouseAction, TextInputState};
 use crate::strata::{
-    AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, ScrollColumn, Selection,
-    StrataApp, Subscription, TableCell, TableElement, TextElement, TextInputElement,
+    AppConfig, ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
+    ImageStore, LayoutSnapshot, Length, LineStyle, MouseResponse, Padding, Row, ScrollAction,
+    ScrollColumn, ScrollState, Selection, StrataApp, Subscription, TableCell, TableElement,
+    TextElement, TextInputAction, TextInputElement, TextInputMouseAction, TextInputState,
 };
 
 // =========================================================================
@@ -52,7 +46,6 @@ pub(crate) mod colors {
     pub const ERROR: Color = Color { r: 0.8, g: 0.3, b: 0.3, a: 1.0 };
     pub const WARNING: Color = Color { r: 0.8, g: 0.5, b: 0.2, a: 1.0 };
     pub const RUNNING: Color = Color { r: 0.3, g: 0.7, b: 1.0, a: 1.0 };
-    pub const PENDING: Color = Color { r: 0.6, g: 0.6, b: 0.3, a: 1.0 };
     pub const KILLED: Color = Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
 
     // Text
@@ -68,8 +61,6 @@ pub(crate) mod colors {
     pub const BTN_ALLOW: Color = Color { r: 0.15, g: 0.5, b: 0.25, a: 1.0 };
     pub const BTN_ALWAYS: Color = Color { r: 0.1, g: 0.35, b: 0.18, a: 1.0 };
     pub const BTN_KILL: Color = Color { r: 0.6, g: 0.2, b: 0.2, a: 1.0 };
-    pub const BTN_MODE_SH: Color = Color { r: 0.12, g: 0.35, b: 0.18, a: 1.0 };
-
     // Borders
     pub const BORDER_SUBTLE: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 };
     pub const BORDER_INPUT: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.12 };
@@ -218,6 +209,39 @@ fn hover_button(id: SourceId, label: &str, bg: Color, hovered: Option<SourceId>)
         bg
     };
     ButtonElement::new(id, label).background(actual_bg)
+}
+
+// =========================================================================
+// Component: Chat Bubble (zero-cost view fragment)
+// =========================================================================
+
+/// Build a single chat item card as a Column.
+///
+/// Returns a concrete `Column` — no trait objects, no heap allocation.
+/// The caller pushes this into the parent container.
+fn chat_bubble(item: &ChatItem) -> Column {
+    let (role_color, text_color) = if item.role == "user" {
+        (colors::SUCCESS, colors::TEXT_PRIMARY)
+    } else {
+        (colors::RUNNING, colors::TEXT_SECONDARY)
+    };
+
+    let mut card = Column::new()
+        .padding(10.0)
+        .spacing(4.0)
+        .background(colors::BG_BLOCK)
+        .corner_radius(6.0)
+        .width(Length::Fill)
+        .push(TextElement::new(item.role).color(role_color).size(12.0));
+
+    for line in item.text.lines() {
+        card = card.push(
+            TextElement::new(line)
+                .source(item.source)
+                .color(text_color),
+        );
+    }
+    card
 }
 
 // =========================================================================
@@ -604,33 +628,9 @@ impl StrataApp for DemoApp {
             chat_col = chat_col.fixed_spacer(top_spacer);
         }
 
-        // Only lay out visible items
+        // Only lay out visible items (uses chat_bubble component function)
         for item in &state.chat_history[first..last] {
-            let (role_color, text_color) = if item.role == "user" {
-                (colors::SUCCESS, colors::TEXT_PRIMARY)
-            } else {
-                (colors::RUNNING, colors::TEXT_SECONDARY)
-            };
-
-            let mut card = Column::new()
-                .padding(10.0)
-                .spacing(4.0)
-                .background(colors::BG_BLOCK)
-                .corner_radius(6.0)
-                .width(Length::Fill)
-                .text(TextElement::new(item.role).color(role_color).size(12.0));
-
-            // Split multi-line text into separate TextElements so layout
-            // allocates correct height for each line.
-            for line in item.text.lines() {
-                card = card.text(
-                    TextElement::new(line)
-                        .source(item.source)
-                        .color(text_color),
-                );
-            }
-
-            chat_col = chat_col.column(card);
+            chat_col = chat_col.push(chat_bubble(item));
         }
 
         // Bottom spacer replaces items below the viewport
@@ -649,41 +649,34 @@ impl StrataApp for DemoApp {
             // =============================================================
             // LEFT COLUMN: Chat History + Shell Block + Input Bar
             // =============================================================
-            .scroll_column(
+            .push(
                 ScrollColumn::from_state(&state.left_scroll)
                     .spacing(16.0)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     // Test image
-                    .image(
-                        crate::strata::layout::containers::ImageElement::new(
-                            state.test_image,
-                            336.0,
-                            296.0,
-                        )
-                        .corner_radius(8.0),
+                    .push(
+                        ImageElement::new(state.test_image, 336.0, 296.0)
+                            .corner_radius(8.0),
                     )
-                    // Static shell block (proves composed widgets alongside dynamic list)
-                    .column(
-                        ShellBlock {
-                            cmd: "ls -la",
-                            status_icon: "\u{2713}",
-                            status_color: colors::SUCCESS,
-                            terminal_source: SourceId::named("terminal"),
-                            rows: vec![
-                                ("total 32", Color::rgb(0.7, 0.7, 0.7)),
-                                ("drwxr-xr-x  8 kevin staff  256 Jan 29 src/", Color::rgb(0.4, 0.6, 1.0)),
-                                ("-rw-r--r--  1 kevin staff  420 Jan 29 main.rs", Color::rgb(0.7, 0.7, 0.7)),
-                            ],
-                            cols: 75,
-                            row_count: 3,
-                        }
-                        .build(),
-                    )
+                    // Static shell block
+                    .push(ShellBlock {
+                        cmd: "ls -la",
+                        status_icon: "\u{2713}",
+                        status_color: colors::SUCCESS,
+                        terminal_source: SourceId::named("terminal"),
+                        rows: vec![
+                            ("total 32", Color::rgb(0.7, 0.7, 0.7)),
+                            ("drwxr-xr-x  8 kevin staff  256 Jan 29 src/", Color::rgb(0.4, 0.6, 1.0)),
+                            ("-rw-r--r--  1 kevin staff  420 Jan 29 main.rs", Color::rgb(0.7, 0.7, 0.7)),
+                        ],
+                        cols: 75,
+                        row_count: 3,
+                    })
                     // Dynamic chat history
-                    .column(chat_col)
-                    // Input bar with submit button (hover-aware)
-                    .row(
+                    .push(chat_col)
+                    // Input bar
+                    .push(
                         Row::new()
                             .padding_custom(Padding::new(8.0, 12.0, 8.0, 12.0))
                             .spacing(10.0)
@@ -692,8 +685,8 @@ impl StrataApp for DemoApp {
                             .border(colors::BORDER_INPUT, 1.0)
                             .width(Length::Fill)
                             .cross_align(CrossAxisAlignment::Center)
-                            .text(TextElement::new("$").color(colors::SUCCESS))
-                            .text_input(
+                            .push(TextElement::new("$").color(colors::SUCCESS))
+                            .push(
                                 TextInputElement::from_state(&state.input)
                                     .placeholder("Type a command...")
                                     .background(Color::rgba(0.0, 0.0, 0.0, 0.0))
@@ -704,8 +697,7 @@ impl StrataApp for DemoApp {
                                     .width(Length::Fill)
                                     .cursor_visible(cursor_visible),
                             )
-                            // Submit button with hover highlight
-                            .button(hover_button(
+                            .push(hover_button(
                                 SourceId::named("submit_btn"),
                                 "Send",
                                 colors::BTN_ALLOW,
@@ -716,7 +708,7 @@ impl StrataApp for DemoApp {
             // =============================================================
             // RIGHT COLUMN: Component Catalog
             // =============================================================
-            .scroll_column({
+            .push({
                 let arrow = if state.table_sort_asc { " \u{25B2}" } else { " \u{25BC}" };
                 let name_header: String = if state.table_sort_col == 0 { format!("NAME{}", arrow) } else { "NAME".into() };
                 let size_header: String = if state.table_sort_col == 1 { format!("SIZE{}", arrow) } else { "SIZE".into() };
@@ -739,29 +731,22 @@ impl StrataApp for DemoApp {
                     .width(Length::Fixed(right_col_width))
                     .height(Length::Fill)
                     // Status indicators
-                    .column(
-                        StatusPanel {
-                            indicators: vec![
+                    .push(
+                        StatusPanel::new(
+                            vec![
                                 StatusIndicator { icon: "\u{25CF}", label: "Running", color: colors::RUNNING },
                                 StatusIndicator { icon: "\u{2713}", label: "Success", color: colors::SUCCESS },
                                 StatusIndicator { icon: "\u{2717}", label: "Error", color: colors::ERROR },
                                 StatusIndicator { icon: "\u{2620}", label: "Killed", color: colors::KILLED },
                             ],
-                            uptime_seconds: state.elapsed_seconds,
-                        }
-                        .build()
+                            state.elapsed_seconds,
+                        )
                         .id(SourceId::named("status_panel")),
                     )
                     // Multi-line editor
-                    .column(
-                        Column::new()
-                            .padding(10.0)
-                            .spacing(6.0)
-                            .background(colors::BG_BLOCK)
-                            .corner_radius(6.0)
-                            .width(Length::Fill)
-                            .text(TextElement::new("Multi-line Editor").color(colors::TEXT_SECONDARY))
-                            .text_input(
+                    .push(
+                        Card::new("Multi-line Editor")
+                            .push(
                                 TextInputElement::from_state(&state.editor)
                                     .height(Length::Fixed(120.0))
                                     .placeholder("Multi-line editor...")
@@ -770,17 +755,17 @@ impl StrataApp for DemoApp {
                             .id(SourceId::named("editor_panel")),
                     )
                     // Action buttons (hover-aware)
-                    .row(
+                    .push(
                         Row::new()
                             .spacing(8.0)
                             .width(Length::Fill)
-                            .button(hover_button(
+                            .push(hover_button(
                                 SourceId::named("copy_btn"),
                                 "Copy",
                                 colors::BG_CARD,
                                 hovered,
                             ))
-                            .button(hover_button(
+                            .push(hover_button(
                                 SourceId::named("clear_btn"),
                                 "Clear Chat",
                                 colors::BTN_DENY,
@@ -788,30 +773,21 @@ impl StrataApp for DemoApp {
                             )),
                     )
                     // Context menu placeholder
-                    .column(
+                    .push(
                         Column::new()
                             .width(Length::Fill)
                             .height(Length::Fixed(194.0))
                             .id(SourceId::named("ctx_menu")),
                     )
                     // Drawing styles placeholder
-                    .column(
+                    .push(
                         Column::new()
                             .width(Length::Fill)
                             .height(Length::Fixed(180.0))
                             .id(SourceId::named("draw_styles")),
                     )
                     // Table
-                    .column(
-                        Column::new()
-                            .padding(10.0)
-                            .spacing(6.0)
-                            .background(colors::BG_BLOCK)
-                            .corner_radius(6.0)
-                            .width(Length::Fill)
-                            .text(TextElement::new("Table").color(colors::TEXT_SECONDARY))
-                            .table(table),
-                    )
+                    .push(Card::new("Table").push(table))
             })
             .layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
 
@@ -860,20 +836,13 @@ impl StrataApp for DemoApp {
             });
         }
 
-        // Composable handlers: scroll panels
-        if let Some(r) = state.left_scroll.handle_mouse(&event, &hit, capture) {
-            return r.map(DemoMessage::LeftScroll);
-        }
-        if let Some(r) = state.right_scroll.handle_mouse(&event, &hit, capture) {
-            return r.map(DemoMessage::RightScroll);
-        }
-        // Composable handlers: text inputs
-        if let Some(r) = state.input.handle_mouse(&event, &hit, capture) {
-            return r.map(DemoMessage::InputMouse);
-        }
-        if let Some(r) = state.editor.handle_mouse(&event, &hit, capture) {
-            return r.map(DemoMessage::EditorMouse);
-        }
+        // Composable handlers: scroll panels + text inputs
+        route_mouse!(&event, &hit, capture, [
+            state.left_scroll  => DemoMessage::LeftScroll,
+            state.right_scroll => DemoMessage::RightScroll,
+            state.input        => DemoMessage::InputMouse,
+            state.editor       => DemoMessage::EditorMouse,
+        ]);
 
         // Button clicks and table sort headers
         if let MouseEvent::ButtonPressed { button: MouseButton::Left, .. } = &event {

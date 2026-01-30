@@ -96,6 +96,30 @@ impl<M> Default for MouseResponse<M> {
     }
 }
 
+/// Zero-cost mouse event router for composable handlers.
+///
+/// Expands at compile time into a flat sequence of `if let Some(r) = ... { return r.map(...) }`
+/// checks. No tree traversal, no heap allocation — identical assembly to hand-written chains.
+///
+/// # Usage
+/// ```ignore
+/// route_mouse!(event, hit, capture, [
+///     state.left_scroll  => DemoMessage::LeftScroll,
+///     state.right_scroll => DemoMessage::RightScroll,
+///     state.input        => DemoMessage::InputMouse,
+/// ]);
+/// ```
+#[macro_export]
+macro_rules! route_mouse {
+    ($event:expr, $hit:expr, $capture:expr, [ $($target:expr => $msg:expr),* $(,)? ]) => {
+        $(
+            if let Some(r) = $target.handle_mouse($event, $hit, $capture) {
+                return r.map($msg);
+            }
+        )*
+    };
+}
+
 /// Request to change pointer capture state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureRequest {
