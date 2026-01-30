@@ -226,10 +226,11 @@ fn update<A: StrataApp>(
             // Handle keyboard events
             if let Event::Keyboard(keyboard_event) = &event {
                 match keyboard_event {
-                    iced::keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                    iced::keyboard::Event::KeyPressed { key, modifiers, text, .. } => {
                         let strata_event = KeyEvent::Pressed {
                             key: convert_key(key),
                             modifiers: convert_modifiers(*modifiers),
+                            text: text.as_ref().map(|s| s.to_string()),
                         };
                         if let Some(msg) = A::on_key(&state.app, strata_event) {
                             let cmd = A::update(&mut state.app, msg, &mut state.image_store);
@@ -388,10 +389,11 @@ fn convert_event(event: &Event) -> Option<crate::strata::event_context::Event> {
 
         Event::Keyboard(keyboard_event) => {
             let strata_event = match keyboard_event {
-                iced::keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                iced::keyboard::Event::KeyPressed { key, modifiers, text, .. } => {
                     KeyEvent::Pressed {
                         key: convert_key(key),
                         modifiers: convert_modifiers(*modifiers),
+                        text: text.as_ref().map(|s| s.to_string()),
                     }
                 }
                 iced::keyboard::Event::KeyReleased { key, modifiers, .. } => {

@@ -773,8 +773,8 @@ impl StrataApp for NexusApp {
         // Recalculate terminal size from viewport
         let char_width = crate::constants::DEFAULT_FONT_SIZE * crate::constants::CHAR_WIDTH_RATIO;
         let line_height = crate::constants::DEFAULT_FONT_SIZE * crate::constants::LINE_HEIGHT_FACTOR;
-        let h_padding = 16.0 + 12.0 * 2.0; // outer padding + block padding
-        let v_padding = 60.0;
+        let h_padding = 4.0 + 6.0 * 2.0; // outer padding + block padding
+        let v_padding = 44.0;
         let cols = ((vw - h_padding) / char_width) as u16;
         let rows = ((vh - v_padding) / line_height) as u16;
         state.terminal_size.set((cols.max(40).min(500), rows.max(5).min(200)));
@@ -790,7 +790,7 @@ impl StrataApp for NexusApp {
 
         // Build history content
         let mut scroll = ScrollColumn::from_state(&state.history_scroll)
-            .spacing(8.0)
+            .spacing(4.0)
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -830,7 +830,7 @@ impl StrataApp for NexusApp {
         // History area (takes remaining space)
         main_col = main_col.push(
             Column::new()
-                .padding_custom(Padding::new(8.0, 16.0, 0.0, 16.0))
+                .padding_custom(Padding::new(2.0, 4.0, 0.0, 4.0))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .push(scroll),
@@ -866,7 +866,7 @@ impl StrataApp for NexusApp {
         // Input bar
         main_col = main_col.push(
             Column::new()
-                .padding_custom(Padding::new(8.0, 16.0, 12.0, 16.0))
+                .padding_custom(Padding::new(2.0, 4.0, 4.0, 4.0))
                 .width(Length::Fill)
                 .push(NexusInputBar {
                     input: &state.input,
@@ -1019,7 +1019,7 @@ impl StrataApp for NexusApp {
             return None;
         }
 
-        if let KeyEvent::Pressed { ref key, ref modifiers } = event {
+        if let KeyEvent::Pressed { ref key, ref modifiers, .. } = event {
             // History search mode intercepts most keys
             if state.history_search_active {
                 if modifiers.ctrl {

@@ -509,8 +509,8 @@ impl TextInputState {
     /// - Enter triggers `TextInputAction::Submit`
     /// - Up/Down are ignored
     pub fn handle_key(&mut self, event: &KeyEvent, multiline: bool) -> TextInputAction {
-        let (key, modifiers) = match event {
-            KeyEvent::Pressed { key, modifiers } => (key, modifiers),
+        let (key, modifiers, text) = match event {
+            KeyEvent::Pressed { key, modifiers, text } => (key, modifiers, text.as_deref()),
             KeyEvent::Released { .. } => return TextInputAction::Noop,
         };
 
@@ -526,11 +526,11 @@ impl TextInputState {
                     self.insert_newline();
                     TextInputAction::Changed
                 } else {
-                    let text = self.text.clone();
+                    let t = self.text.clone();
                     self.text.clear();
                     self.cursor = 0;
                     self.selection = None;
-                    TextInputAction::Submit(text)
+                    TextInputAction::Submit(t)
                 }
             }
             (Key::Named(NamedKey::Backspace), _, _) => {
@@ -577,12 +577,20 @@ impl TextInputState {
                 self.select_all();
                 TextInputAction::Changed
             }
-            (Key::Character(c), _, false) => {
-                self.insert_str(c);
-                TextInputAction::Changed
-            }
-            (Key::Named(NamedKey::Space), _, false) => {
-                self.insert_str(" ");
+            // Use OS-provided text for character insertion (handles shift, compose, dead keys)
+            (Key::Character(_), _, false) | (Key::Named(NamedKey::Space), _, false) => {
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        self.insert_str(t);
+                        return TextInputAction::Changed;
+                    }
+                }
+                // Fallback: use logical key directly
+                if let Key::Character(c) = key {
+                    self.insert_str(c);
+                } else {
+                    self.insert_str(" ");
+                }
                 TextInputAction::Changed
             }
             _ => TextInputAction::Noop,

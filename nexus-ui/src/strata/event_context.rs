@@ -306,6 +306,8 @@ pub enum KeyEvent {
     Pressed {
         key: Key,
         modifiers: Modifiers,
+        /// The text produced by the key press (OS-level, handles shift/compose/dead keys).
+        text: Option<String>,
     },
 
     /// A key was released.

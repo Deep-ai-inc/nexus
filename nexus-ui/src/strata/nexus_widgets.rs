@@ -76,10 +76,10 @@ impl Widget for ShellBlockWidget<'_> {
         let cols = grid.cols();
 
         let mut content = Column::new()
-            .padding(12.0)
-            .spacing(6.0)
+            .padding(6.0)
+            .spacing(4.0)
             .background(colors::BG_BLOCK)
-            .corner_radius(6.0)
+            .corner_radius(4.0)
             .width(Length::Fill)
             .push(header);
 
@@ -152,10 +152,10 @@ impl Widget for AgentBlockWidget<'_> {
         let block = self.block;
 
         let mut content = Column::new()
-            .padding(12.0)
-            .spacing(4.0)
+            .padding(6.0)
+            .spacing(3.0)
             .background(colors::BG_BLOCK)
-            .corner_radius(6.0)
+            .corner_radius(4.0)
             .width(Length::Fill);
 
         // Query line
@@ -334,8 +334,8 @@ fn build_permission_dialog(
 
     // Permission dialog colors from agent_widgets.rs
     let mut dialog = Column::new()
-        .padding(14.0)
-        .spacing(8.0)
+        .padding(8.0)
+        .spacing(4.0)
         .background(Color::rgb(0.15, 0.1, 0.05))
         .corner_radius(8.0)
         .border(Color::rgb(0.8, 0.5, 0.2), 1.0)
@@ -383,7 +383,7 @@ fn build_response_text(response: &str) -> Column {
             if in_code_block {
                 // End code block
                 let code_col = Column::new()
-                    .padding_custom(Padding::new(6.0, 12.0, 6.0, 12.0))
+                    .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
                     .background(colors::CODE_BG)
                     .corner_radius(4.0)
                     .width(Length::Fill);
@@ -481,10 +481,10 @@ impl Widget for WelcomeScreen<'_> {
 
         // Tips card
         let tips = Column::new()
-            .padding(12.0)
+            .padding(8.0)
             .spacing(2.0)
             .background(colors::CARD_BG)
-            .corner_radius(6.0)
+            .corner_radius(4.0)
             .border(colors::CARD_BORDER, 1.0)
             .width(Length::Fill)
             .push(TextElement::new("Getting Started").color(colors::WELCOME_HEADING))
@@ -499,10 +499,10 @@ impl Widget for WelcomeScreen<'_> {
 
         // Shortcuts card
         let shortcuts = Column::new()
-            .padding(12.0)
+            .padding(8.0)
             .spacing(2.0)
             .background(colors::CARD_BG)
-            .corner_radius(6.0)
+            .corner_radius(4.0)
             .border(colors::CARD_BORDER, 1.0)
             .width(Length::Fill)
             .push(TextElement::new("Shortcuts").color(colors::WELCOME_HEADING))
@@ -520,8 +520,8 @@ impl Widget for WelcomeScreen<'_> {
             .push(shortcuts);
 
         Row::new()
-            .padding(20.0)
-            .spacing(40.0)
+            .padding(12.0)
+            .spacing(20.0)
             .width(Length::Fill)
             .push(left)
             .push(right)
@@ -549,7 +549,7 @@ impl Widget for JobBar<'_> {
             let name = job.display_name();
             row = row.push(
                 Column::new()
-                    .padding_custom(Padding::new(4.0, 10.0, 4.0, 10.0))
+                    .padding_custom(Padding::new(2.0, 6.0, 2.0, 6.0))
                     .background(bg)
                     .corner_radius(12.0)
                     .border(Color::rgba(0.5, 0.5, 0.5, 0.3), 1.0)
@@ -558,7 +558,7 @@ impl Widget for JobBar<'_> {
         }
 
         Row::new()
-            .padding_custom(Padding::new(4.0, 15.0, 4.0, 15.0))
+            .padding_custom(Padding::new(2.0, 4.0, 2.0, 4.0))
             .width(Length::Fill)
             .push(Row::new().spacer(1.0).push(row))
             .into()
@@ -611,8 +611,8 @@ impl Widget for NexusInputBar<'_> {
         };
 
         Row::new()
-            .padding_custom(Padding::new(8.0, 12.0, 8.0, 12.0))
-            .spacing(10.0)
+            .padding_custom(Padding::new(4.0, 6.0, 4.0, 6.0))
+            .spacing(6.0)
             .background(colors::BG_INPUT)
             .corner_radius(6.0)
             .border(colors::BORDER_INPUT, 1.0)
@@ -649,10 +649,10 @@ impl Widget for CompletionPopup<'_> {
     fn build(self) -> LayoutChild {
         // Completion popup colors from input.rs
         let mut col = Column::new()
-            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+            .padding_custom(Padding::new(2.0, 4.0, 2.0, 4.0))
             .spacing(0.0)
             .background(Color::rgb(0.12, 0.12, 0.15))
-            .corner_radius(6.0)
+            .corner_radius(4.0)
             .border(Color::rgb(0.3, 0.3, 0.35), 1.0)
             .width(Length::Fill);
 
@@ -696,7 +696,7 @@ impl Widget for CompletionPopup<'_> {
         }
 
         Column::new()
-            .padding_custom(Padding::new(0.0, 16.0, 4.0, 16.0))
+            .padding_custom(Padding::new(0.0, 4.0, 2.0, 4.0))
             .width(Length::Fill)
             .push(col)
             .into()
@@ -726,10 +726,10 @@ impl Widget for HistorySearchBar<'_> {
 
         // History search colors from input.rs
         let mut row = Row::new()
-            .padding_custom(Padding::new(6.0, 12.0, 6.0, 12.0))
-            .spacing(8.0)
+            .padding_custom(Padding::new(4.0, 6.0, 4.0, 6.0))
+            .spacing(6.0)
             .background(Color::rgb(0.1, 0.1, 0.12))
-            .corner_radius(6.0)
+            .corner_radius(4.0)
             .border(Color::rgb(0.3, 0.5, 0.7), 1.0)
             .width(Length::Fill)
             .cross_align(CrossAxisAlignment::Center);
@@ -745,7 +745,7 @@ impl Widget for HistorySearchBar<'_> {
         }
 
         Column::new()
-            .padding_custom(Padding::new(0.0, 16.0, 4.0, 16.0))
+            .padding_custom(Padding::new(0.0, 4.0, 2.0, 4.0))
             .width(Length::Fill)
             .push(row)
             .into()

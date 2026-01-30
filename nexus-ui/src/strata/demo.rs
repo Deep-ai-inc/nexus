@@ -924,7 +924,7 @@ impl StrataApp for DemoApp {
             return Some(DemoMessage::InputKey(event));
         }
         // Global shortcuts
-        if let KeyEvent::Pressed { ref key, ref modifiers } = event {
+        if let KeyEvent::Pressed { ref key, ref modifiers, .. } = event {
             match (key, modifiers.meta) {
                 (Key::Character(c), true) if c == "c" => return Some(DemoMessage::Copy),
                 (Key::Named(NamedKey::Escape), _) => return Some(DemoMessage::ClearSelection),
