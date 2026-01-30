@@ -290,8 +290,8 @@ fn render_text_input(
         );
     }
 
-    // Cursor
-    if input.focused {
+    // Cursor (blinking)
+    if input.focused && input.cursor_visible {
         let cursor_x = text_x + input.cursor as f32 * CHAR_WIDTH;
         snapshot.primitives_mut().add_solid_rect(
             Rect::new(cursor_x, text_y, 2.0, LINE_HEIGHT),
@@ -396,8 +396,8 @@ fn render_text_input_multiline(
         }
     }
 
-    // Cursor
-    if input.focused {
+    // Cursor (blinking)
+    if input.focused && input.cursor_visible {
         let cursor_x = text_x + cursor_col as f32 * CHAR_WIDTH;
         let cursor_y = text_y + cursor_line as f32 * LINE_HEIGHT - input.scroll_offset;
         snapshot.primitives_mut().add_solid_rect(
@@ -691,6 +691,7 @@ pub struct TextInputElement {
     pub multiline: bool,
     pub height: Length,
     pub scroll_offset: f32,
+    pub cursor_visible: bool,
     cache_key: u64,
 }
 
@@ -717,6 +718,7 @@ impl TextInputElement {
             multiline: false,
             height: Length::Shrink,
             scroll_offset: 0.0,
+            cursor_visible: true,
             cache_key,
         }
     }
@@ -735,6 +737,7 @@ impl TextInputElement {
     pub fn multiline(mut self, multiline: bool) -> Self { self.multiline = multiline; self }
     pub fn height(mut self, height: Length) -> Self { self.height = height; self }
     pub fn scroll_offset(mut self, offset: f32) -> Self { self.scroll_offset = offset; self }
+    pub fn cursor_visible(mut self, visible: bool) -> Self { self.cursor_visible = visible; self }
 
     fn estimate_size(&self) -> Size {
         let text_w = self.text.chars().count().max(20) as f32 * CHAR_WIDTH;

@@ -71,6 +71,11 @@ pub(crate) mod colors {
     pub const CURSOR: Color = Color { r: 0.85, g: 0.85, b: 0.88, a: 0.8 };
 }
 
+/// Monospace character width (must match containers.rs CHAR_WIDTH).
+const CHAR_WIDTH: f32 = 8.4;
+/// Line height (must match containers.rs LINE_HEIGHT).
+const LINE_HEIGHT: f32 = 18.0;
+
 /// Demo message type.
 #[derive(Debug, Clone)]
 pub enum DemoMessage {
@@ -98,6 +103,10 @@ pub enum DemoMessage {
     InputSelectRight,
     InputSelectAll,
     InputSubmit,
+    /// Click in input at x offset (relative to input start)
+    InputClickAt(SourceId, f32),
+    /// Drag selection in input to x offset
+    InputDragTo(f32),
     TimerTick,
     Copy,
     TableSort(SourceId),
@@ -118,6 +127,11 @@ pub enum DemoMessage {
     EditorEnd,
     EditorEnter,
     EditorScroll(f32),
+    /// Click in editor at (x, y) relative to editor widget
+    EditorClickAt(f32, f32),
+    /// Drag in editor to (x, y) relative to editor widget
+    EditorDragTo(f32, f32),
+    EditorSelectAll,
 }
 
 /// Demo application state.
@@ -156,6 +170,8 @@ pub struct DemoState {
     input_cursor: usize,
     input_selection: Option<(usize, usize)>,
     focused_input: Option<SourceId>,
+    /// Last time the cursor moved or text was edited (for blink reset)
+    last_edit_time: Instant,
     // Test image handle
     test_image: ImageHandle,
     // Subscription demo
@@ -188,6 +204,9 @@ pub struct DemoState {
     editor_cursor: usize,
     editor_selection: Option<(usize, usize)>,
     editor_scroll_offset: f32,
+    // Widget bounds for mouse click → relative position
+    input_bounds: Cell<Rect>,
+    editor_bounds: Cell<Rect>,
 }
 
 /// Demo application.
@@ -221,6 +240,7 @@ impl StrataApp for DemoApp {
             input_cursor: 0,
             input_selection: None,
             focused_input: None,
+            last_edit_time: Instant::now(),
             scroll_offset: 0.0,
             scroll_max: Cell::new(f32::MAX),
             scroll_track: Cell::new(None),
@@ -259,11 +279,27 @@ impl StrataApp for DemoApp {
             editor_cursor: 0,
             editor_selection: None,
             editor_scroll_offset: 0.0,
+            input_bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
+            editor_bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
         };
         (state, Command::none())
     }
 
     fn update(state: &mut Self::State, message: Self::Message, _images: &mut ImageStore) -> Command<Self::Message> {
+        // Reset cursor blink on any edit/cursor action
+        match &message {
+            DemoMessage::InputChar(_) | DemoMessage::InputBackspace | DemoMessage::InputDelete
+            | DemoMessage::InputLeft | DemoMessage::InputRight | DemoMessage::InputHome
+            | DemoMessage::InputEnd | DemoMessage::InputSelectLeft | DemoMessage::InputSelectRight
+            | DemoMessage::InputSelectAll | DemoMessage::InputFocus(_) | DemoMessage::InputClickAt(..)
+            | DemoMessage::EditorChar(_) | DemoMessage::EditorBackspace | DemoMessage::EditorDelete
+            | DemoMessage::EditorLeft | DemoMessage::EditorRight | DemoMessage::EditorUp
+            | DemoMessage::EditorDown | DemoMessage::EditorHome | DemoMessage::EditorEnd
+            | DemoMessage::EditorEnter | DemoMessage::EditorClickAt(..) | DemoMessage::EditorSelectAll => {
+                state.last_edit_time = Instant::now();
+            }
+            _ => {}
+        }
         match message {
             DemoMessage::SelectionStart(addr) => {
                 state.selection = Some(Selection::new(addr.clone(), addr));
@@ -455,6 +491,43 @@ impl StrataApp for DemoApp {
                 state.input_cursor = 0;
                 state.input_selection = None;
             }
+            DemoMessage::InputClickAt(id, rel_x) => {
+                state.focused_input = Some(id);
+                let char_count = if id == state.editor_id {
+                    state.editor_text.chars().count()
+                } else {
+                    state.input_text.chars().count()
+                };
+                let pos = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
+                let pos = pos.min(char_count);
+                if id == state.editor_id {
+                    state.editor_cursor = pos;
+                    state.editor_selection = None;
+                } else {
+                    state.input_cursor = pos;
+                    state.input_selection = None;
+                }
+            }
+            DemoMessage::InputDragTo(rel_x) => {
+                let pos = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
+                if state.focused_input == Some(state.editor_id) {
+                    let len = state.editor_text.chars().count();
+                    let pos = pos.min(len);
+                    let anchor = state.editor_selection
+                        .map(|(a, _)| a)
+                        .unwrap_or(state.editor_cursor);
+                    state.editor_selection = Some((anchor, pos));
+                    state.editor_cursor = pos;
+                } else {
+                    let len = state.input_text.chars().count();
+                    let pos = pos.min(len);
+                    let anchor = state.input_selection
+                        .map(|(a, _)| a)
+                        .unwrap_or(state.input_cursor);
+                    state.input_selection = Some((anchor, pos));
+                    state.input_cursor = pos;
+                }
+            }
             DemoMessage::TimerTick => {
                 state.elapsed_seconds += 1;
             }
@@ -592,6 +665,27 @@ impl StrataApp for DemoApp {
                 let max_scroll = (line_count * 18.0 - 80.0).max(0.0); // LINE_HEIGHT = 18
                 state.editor_scroll_offset = state.editor_scroll_offset.min(max_scroll);
             }
+            DemoMessage::EditorClickAt(rel_x, rel_y) => {
+                state.focused_input = Some(state.editor_id);
+                let line = ((rel_y + state.editor_scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
+                let col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
+                state.editor_cursor = editor_line_col_to_offset(&state.editor_text, line, col);
+                state.editor_selection = None;
+            }
+            DemoMessage::EditorDragTo(rel_x, rel_y) => {
+                let line = ((rel_y + state.editor_scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
+                let col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
+                let pos = editor_line_col_to_offset(&state.editor_text, line, col);
+                let anchor = state.editor_selection
+                    .map(|(a, _)| a)
+                    .unwrap_or(state.editor_cursor);
+                state.editor_selection = Some((anchor, pos));
+                state.editor_cursor = pos;
+            }
+            DemoMessage::EditorSelectAll => {
+                state.editor_selection = Some((0, state.editor_text.chars().count()));
+                state.editor_cursor = state.editor_text.chars().count();
+            }
         }
         Command::none()
     }
@@ -606,6 +700,10 @@ impl StrataApp for DemoApp {
         // Smoothing: 95% old + 5% new (avoids flicker)
         let fps = if prev == 0.0 { instant_fps } else { prev * 0.95 + instant_fps * 0.05 };
         state.fps_smooth.set(fps);
+
+        // Cursor blink: 500ms on / 500ms off, reset on edit
+        let blink_elapsed = now.duration_since(state.last_edit_time).as_millis();
+        let cursor_visible = (blink_elapsed / 500) % 2 == 0;
 
         // Dynamic viewport — reflows on window resize
         let vp = snapshot.viewport();
@@ -760,7 +858,8 @@ impl StrataApp for DemoApp {
                                 .focus_border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
                                 .corner_radius(0.0)
                                 .padding(crate::strata::layout::containers::Padding::new(0.0, 4.0, 0.0, 4.0))
-                                .width(Length::Fill),
+                                .width(Length::Fill)
+                                .cursor_visible(cursor_visible),
                             ),
                     )
                     ,
@@ -865,7 +964,8 @@ impl StrataApp for DemoApp {
                                     .selection(state.editor_selection)
                                     .focused(state.focused_input == Some(state.editor_id))
                                     .placeholder("Multi-line editor...")
-                                    .scroll_offset(state.editor_scroll_offset),
+                                    .scroll_offset(state.editor_scroll_offset)
+                                    .cursor_visible(cursor_visible),
                             )
                             .id(state.editor_panel_id),
                     )
@@ -913,6 +1013,13 @@ impl StrataApp for DemoApp {
         if let Some(bounds) = snapshot.widget_bounds(&state.right_scroll_id) {
             state.right_scroll_bounds.set(bounds);
         }
+        // Save input/editor widget bounds for mouse hit → relative position
+        if let Some(bounds) = snapshot.widget_bounds(&state.input_id) {
+            state.input_bounds.set(bounds);
+        }
+        if let Some(bounds) = snapshot.widget_bounds(&state.editor_id) {
+            state.editor_bounds.set(bounds);
+        }
 
         // =================================================================
         // POST-LAYOUT: Render primitives into placeholder positions
@@ -956,9 +1063,26 @@ impl StrataApp for DemoApp {
                 position,
             } => {
                 if let Some(HitResult::Widget(id)) = &hit {
-                    // Text input / editor focus
-                    if *id == state.input_id || *id == state.editor_id {
-                        return MouseResponse::message(DemoMessage::InputFocus(*id));
+                    // Text input click: focus + position cursor
+                    if *id == state.input_id {
+                        let bounds = state.input_bounds.get();
+                        let padding_left = 6.0; // text padding inside input
+                        let rel_x = (position.x - bounds.x - padding_left).max(0.0);
+                        return MouseResponse::message_and_capture(
+                            DemoMessage::InputClickAt(state.input_id, rel_x),
+                            state.input_id,
+                        );
+                    }
+                    // Multi-line editor click: focus + position cursor
+                    if *id == state.editor_id {
+                        let bounds = state.editor_bounds.get();
+                        let padding = 6.0;
+                        let rel_x = (position.x - bounds.x - padding).max(0.0);
+                        let rel_y = (position.y - bounds.y - padding).max(0.0);
+                        return MouseResponse::message_and_capture(
+                            DemoMessage::EditorClickAt(rel_x, rel_y),
+                            state.editor_id,
+                        );
                     }
                     // Button clicks
                     if *id == state.deny_btn_id || *id == state.allow_btn_id || *id == state.always_btn_id {
@@ -1009,7 +1133,22 @@ impl StrataApp for DemoApp {
                     if *id == state.right_scroll_thumb_id {
                         return MouseResponse::message(DemoMessage::RightScrollDragMove(position.y));
                     }
-                    // Text selection
+                    // Input drag selection
+                    if *id == state.input_id {
+                        let bounds = state.input_bounds.get();
+                        let padding_left = 6.0;
+                        let rel_x = (position.x - bounds.x - padding_left).max(0.0);
+                        return MouseResponse::message(DemoMessage::InputDragTo(rel_x));
+                    }
+                    // Editor drag selection
+                    if *id == state.editor_id {
+                        let bounds = state.editor_bounds.get();
+                        let padding = 6.0;
+                        let rel_x = (position.x - bounds.x - padding).max(0.0);
+                        let rel_y = (position.y - bounds.y - padding).max(0.0);
+                        return MouseResponse::message(DemoMessage::EditorDragTo(rel_x, rel_y));
+                    }
+                    // Text/grid selection
                     if let Some(HitResult::Content(addr)) = hit {
                         return MouseResponse::message(DemoMessage::SelectionExtend(addr));
                     }
@@ -1025,6 +1164,10 @@ impl StrataApp for DemoApp {
                     }
                     if *id == state.right_scroll_thumb_id {
                         return MouseResponse::message_and_release(DemoMessage::RightScrollDragEnd);
+                    }
+                    // Input/editor: just release capture (selection already set via drag)
+                    if *id == state.input_id || *id == state.editor_id {
+                        return MouseResponse::release();
                     }
                     return MouseResponse::message_and_release(DemoMessage::SelectionEnd);
                 }
@@ -1068,6 +1211,7 @@ impl StrataApp for DemoApp {
                     (Key::Named(NamedKey::ArrowDown), _, _) => return Some(DemoMessage::EditorDown),
                     (Key::Named(NamedKey::Home), _, _) => return Some(DemoMessage::EditorHome),
                     (Key::Named(NamedKey::End), _, _) => return Some(DemoMessage::EditorEnd),
+                    (Key::Character(c), _, true) if c == "a" => return Some(DemoMessage::EditorSelectAll),
                     (Key::Character(c), _, false) => return Some(DemoMessage::EditorChar(c.clone())),
                     (Key::Named(NamedKey::Space), _, false) => return Some(DemoMessage::EditorChar(" ".into())),
                     _ => return None,

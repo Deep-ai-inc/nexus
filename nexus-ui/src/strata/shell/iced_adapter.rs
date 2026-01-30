@@ -684,18 +684,7 @@ impl PipelineWrapper {
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
-        // 2b. Primitive backgrounds (solid rects, rounded rects, circles)
-        for prim in &primitives.solid_rects {
-            let start = pipeline.instance_count();
-            pipeline.add_solid_rect(
-                prim.rect.x * scale,
-                prim.rect.y * scale,
-                prim.rect.width * scale,
-                prim.rect.height * scale,
-                prim.color,
-            );
-            maybe_clip(pipeline, start, &prim.clip_rect, scale);
-        }
+        // 2b. Primitive backgrounds (rounded rects first, then solid rects on top)
         for prim in &primitives.rounded_rects {
             let start = pipeline.instance_count();
             pipeline.add_rounded_rect(
@@ -714,6 +703,18 @@ impl PipelineWrapper {
                 prim.center.x * scale,
                 prim.center.y * scale,
                 prim.radius * scale,
+                prim.color,
+            );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
+        }
+        // Solid rects (selection highlights, cursors) — after rounded rect backgrounds
+        for prim in &primitives.solid_rects {
+            let start = pipeline.instance_count();
+            pipeline.add_solid_rect(
+                prim.rect.x * scale,
+                prim.rect.y * scale,
+                prim.rect.width * scale,
+                prim.rect.height * scale,
                 prim.color,
             );
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
