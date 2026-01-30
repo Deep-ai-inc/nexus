@@ -145,7 +145,7 @@ fn update<A: StrataApp>(
         ShellMessage::App(msg) => {
             let cmd = A::update(&mut state.app, msg, &mut state.image_store);
             state.frame = state.frame.wrapping_add(1); // Trigger redraw
-            command_to_task(cmd)
+            maybe_exit::<A>(&state.app, command_to_task(cmd))
         }
 
         ShellMessage::Event(event, _window_id) => {
@@ -233,7 +233,7 @@ fn update<A: StrataApp>(
                         };
                         if let Some(msg) = A::on_key(&state.app, strata_event) {
                             let cmd = A::update(&mut state.app, msg, &mut state.image_store);
-                            return command_to_task(cmd);
+                            return maybe_exit::<A>(&state.app, command_to_task(cmd));
                         }
                     }
                     iced::keyboard::Event::KeyReleased { key, modifiers, .. } => {
@@ -243,7 +243,7 @@ fn update<A: StrataApp>(
                         };
                         if let Some(msg) = A::on_key(&state.app, strata_event) {
                             let cmd = A::update(&mut state.app, msg, &mut state.image_store);
-                            return command_to_task(cmd);
+                            return maybe_exit::<A>(&state.app, command_to_task(cmd));
                         }
                     }
                     _ => {}
@@ -321,6 +321,18 @@ fn subscription<A: StrataApp>(state: &ShellState<A>) -> Subscription<ShellMessag
     let mut all_subs = vec![events, tick];
     all_subs.extend(app_subs);
     Subscription::batch(all_subs)
+}
+
+/// If the app wants to exit, batch the given task with a window-close task.
+fn maybe_exit<A: StrataApp>(
+    app: &A::State,
+    task: Task<ShellMessage<A::Message>>,
+) -> Task<ShellMessage<A::Message>> {
+    if A::should_exit(app) {
+        Task::batch([task, iced::window::get_oldest().and_then(iced::window::close)])
+    } else {
+        task
+    }
 }
 
 /// Convert a Strata Command to an iced Task.

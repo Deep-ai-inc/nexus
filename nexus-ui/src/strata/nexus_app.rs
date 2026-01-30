@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use nexus_api::{BlockId, BlockState, ShellEvent};
-use nexus_kernel::{CommandClassification, CommandRegistry, Kernel};
+use nexus_api::{BlockId, BlockState, ShellEvent, Value};
+use nexus_kernel::{CommandClassification, CommandRegistry, Completion, Kernel};
 use nexus_term::TerminalParser;
 
 use crate::agent_adapter::{AgentEvent, PermissionResponse};
@@ -31,7 +31,8 @@ use crate::strata::event_context::{
 };
 use crate::strata::layout_snapshot::HitResult;
 use crate::strata::nexus_widgets::{
-    AgentBlockWidget, JobBar, NexusInputBar, ShellBlockWidget, WelcomeScreen,
+    AgentBlockWidget, CompletionPopup, HistorySearchBar, JobBar, NexusInputBar,
+    ShellBlockWidget, WelcomeScreen,
 };
 use crate::strata::primitives::Rect;
 use crate::strata::{
@@ -134,7 +135,24 @@ pub enum NexusMessage {
     ClearSelection,
     Copy,
 
+    // Table sorting
+    SortTable(BlockId, usize),
+
+    // Completions
+    TabComplete,
+    CompletionNav(isize),
+    CompletionAccept,
+    CompletionDismiss,
+
+    // History search (Ctrl+R)
+    HistorySearchToggle,
+    HistorySearchKey(KeyEvent),
+    HistorySearchAccept,
+    HistorySearchDismiss,
+
     // Window
+    ClearScreen,
+    CloseWindow,
     BlurAll,
     Tick,
 }
@@ -192,6 +210,20 @@ pub struct NexusState {
 
     // --- Cursor blink ---
     pub last_edit_time: Instant,
+
+    // --- Completions ---
+    pub completions: Vec<Completion>,
+    pub completion_index: Option<usize>,
+    pub completion_anchor: usize,
+
+    // --- History search ---
+    pub history_search_active: bool,
+    pub history_search_query: String,
+    pub history_search_results: Vec<String>,
+    pub history_search_index: usize,
+
+    // --- Window ---
+    pub exit_requested: bool,
 
     // --- Context ---
     pub context: NexusContext,
@@ -341,6 +373,17 @@ impl StrataApp for NexusApp {
             is_selecting: false,
 
             last_edit_time: Instant::now(),
+
+            completions: Vec::new(),
+            completion_index: None,
+            completion_anchor: 0,
+
+            history_search_active: false,
+            history_search_query: String::new(),
+            history_search_results: Vec::new(),
+            history_search_index: 0,
+
+            exit_requested: false,
 
             context,
         };
@@ -548,8 +591,163 @@ impl StrataApp for NexusApp {
             }
 
             // =============================================================
+            // Table sorting
+            // =============================================================
+            NexusMessage::SortTable(block_id, col_idx) => {
+                if let Some(&idx) = state.block_index.get(&block_id) {
+                    if let Some(block) = state.blocks.get_mut(idx) {
+                        block.table_sort.toggle(col_idx);
+                        // Sort the table rows in native_output
+                        if let Some(Value::Table { ref mut rows, .. }) = block.native_output {
+                            let ascending = block.table_sort.ascending;
+                            rows.sort_by(|a, b| {
+                                let va = a.get(col_idx).map(|v| v.to_text()).unwrap_or_default();
+                                let vb = b.get(col_idx).map(|v| v.to_text()).unwrap_or_default();
+                                // Try numeric comparison first
+                                if let (Ok(na), Ok(nb)) = (va.parse::<f64>(), vb.parse::<f64>()) {
+                                    let cmp = na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal);
+                                    if ascending { cmp } else { cmp.reverse() }
+                                } else {
+                                    let cmp = va.cmp(&vb);
+                                    if ascending { cmp } else { cmp.reverse() }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+
+            // =============================================================
+            // Completions
+            // =============================================================
+            NexusMessage::TabComplete => {
+                let text = state.input.text.clone();
+                let cursor = state.input.cursor;
+                let (completions, anchor) = state.kernel.blocking_lock().complete(&text, cursor);
+                if completions.len() == 1 {
+                    // Single completion: apply immediately
+                    let comp = &completions[0];
+                    let mut t = text;
+                    let end = cursor.min(t.len());
+                    t.replace_range(anchor..end, &comp.text);
+                    state.input.cursor = anchor + comp.text.len();
+                    state.input.text = t;
+                    state.completions.clear();
+                    state.completion_index = None;
+                } else if !completions.is_empty() {
+                    state.completions = completions;
+                    state.completion_index = Some(0);
+                    state.completion_anchor = anchor;
+                }
+            }
+            NexusMessage::CompletionNav(delta) => {
+                if !state.completions.is_empty() {
+                    let len = state.completions.len() as isize;
+                    let current = state.completion_index.unwrap_or(0) as isize;
+                    let new_idx = ((current + delta) % len + len) % len;
+                    state.completion_index = Some(new_idx as usize);
+                }
+            }
+            NexusMessage::CompletionAccept => {
+                if let Some(idx) = state.completion_index {
+                    if let Some(comp) = state.completions.get(idx) {
+                        let mut t = state.input.text.clone();
+                        let cursor = state.input.cursor;
+                        let end = cursor.min(t.len());
+                        t.replace_range(state.completion_anchor..end, &comp.text);
+                        state.input.cursor = state.completion_anchor + comp.text.len();
+                        state.input.text = t;
+                    }
+                }
+                state.completions.clear();
+                state.completion_index = None;
+            }
+            NexusMessage::CompletionDismiss => {
+                state.completions.clear();
+                state.completion_index = None;
+            }
+
+            // =============================================================
+            // History search (Ctrl+R)
+            // =============================================================
+            NexusMessage::HistorySearchToggle => {
+                if state.history_search_active {
+                    // Cycle to next result
+                    if !state.history_search_results.is_empty() {
+                        state.history_search_index = (state.history_search_index + 1) % state.history_search_results.len();
+                    }
+                } else {
+                    state.history_search_active = true;
+                    state.history_search_query.clear();
+                    state.history_search_results.clear();
+                    state.history_search_index = 0;
+                }
+            }
+            NexusMessage::HistorySearchKey(key_event) => {
+                if let KeyEvent::Pressed { key, .. } = key_event {
+                    match key {
+                        Key::Character(c) => {
+                            state.history_search_query.push_str(&c);
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            state.history_search_query.pop();
+                        }
+                        _ => {}
+                    }
+                    // Re-search
+                    if state.history_search_query.is_empty() {
+                        state.history_search_results.clear();
+                    } else {
+                        let results = state.kernel.blocking_lock()
+                            .search_history(&state.history_search_query, 50);
+                        state.history_search_results = results.into_iter().map(|e| e.command).collect();
+                    }
+                    state.history_search_index = 0;
+                }
+            }
+            NexusMessage::HistorySearchAccept => {
+                if let Some(result) = state.history_search_results.get(state.history_search_index) {
+                    state.input.text = result.clone();
+                    state.input.cursor = result.len();
+                }
+                state.history_search_active = false;
+                state.history_search_query.clear();
+                state.history_search_results.clear();
+            }
+            NexusMessage::HistorySearchDismiss => {
+                state.history_search_active = false;
+                state.history_search_query.clear();
+                state.history_search_results.clear();
+            }
+
+            // =============================================================
             // Window
             // =============================================================
+            NexusMessage::ClearScreen => {
+                // Kill all PTYs
+                for handle in &state.pty_handles {
+                    let _ = handle.send_interrupt();
+                    handle.kill();
+                }
+                state.pty_handles.clear();
+                // Cancel active agent
+                if state.active_agent.is_some() {
+                    state.agent_cancel_flag.store(true, Ordering::SeqCst);
+                    state.active_agent = None;
+                }
+                // Clear all blocks
+                state.blocks.clear();
+                state.block_index.clear();
+                state.agent_blocks.clear();
+                state.agent_block_index.clear();
+                state.jobs.clear();
+                state.history_scroll.offset = 0.0;
+                state.focus = Focus::Input;
+                state.input.focused = true;
+            }
+            NexusMessage::CloseWindow => {
+                state.exit_requested = true;
+            }
             NexusMessage::BlurAll => {
                 state.input.focused = false;
             }
@@ -640,6 +838,28 @@ impl StrataApp for NexusApp {
         // Job bar (only if jobs exist)
         if !state.jobs.is_empty() {
             main_col = main_col.push(JobBar { jobs: &state.jobs });
+        }
+
+        // Completion popup (above input bar)
+        if !state.completions.is_empty() {
+            main_col = main_col.push(CompletionPopup {
+                completions: &state.completions,
+                selected_index: state.completion_index,
+            });
+        }
+
+        // History search bar (replaces input bar when active)
+        if state.history_search_active {
+            let current_match = state.history_search_results
+                .get(state.history_search_index)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            main_col = main_col.push(HistorySearchBar {
+                query: &state.history_search_query,
+                current_match,
+                result_count: state.history_search_results.len(),
+                result_index: state.history_search_index,
+            });
         }
 
         // Input bar
@@ -737,6 +957,18 @@ impl StrataApp for NexusApp {
                     }
                 }
 
+                // Table sort header clicks
+                for block in &state.blocks {
+                    if let Some(Value::Table { columns, .. }) = &block.native_output {
+                        for col_idx in 0..columns.len() {
+                            let sort_id = SourceId::named(&format!("sort_{}_{}", block.id.0, col_idx));
+                            if *id == sort_id {
+                                return MouseResponse::message(NexusMessage::SortTable(block.id, col_idx));
+                            }
+                        }
+                    }
+                }
+
                 // Content selection start (clicked text)
             }
 
@@ -787,16 +1019,60 @@ impl StrataApp for NexusApp {
         }
 
         if let KeyEvent::Pressed { ref key, ref modifiers } = event {
-            // Cmd+K: clear screen
+            // History search mode intercepts most keys
+            if state.history_search_active {
+                if modifiers.ctrl {
+                    if let Key::Character(c) = key {
+                        if c == "r" {
+                            return Some(NexusMessage::HistorySearchToggle);
+                        }
+                    }
+                }
+                return match key {
+                    Key::Named(NamedKey::Enter) => Some(NexusMessage::HistorySearchAccept),
+                    Key::Named(NamedKey::Escape) => Some(NexusMessage::HistorySearchDismiss),
+                    _ => Some(NexusMessage::HistorySearchKey(event)),
+                };
+            }
+
+            // Completion popup intercepts keys when visible
+            if !state.completions.is_empty() {
+                return match key {
+                    Key::Named(NamedKey::Tab) if modifiers.shift => Some(NexusMessage::CompletionNav(-1)),
+                    Key::Named(NamedKey::Tab) => Some(NexusMessage::CompletionNav(1)),
+                    Key::Named(NamedKey::ArrowDown) => Some(NexusMessage::CompletionNav(1)),
+                    Key::Named(NamedKey::ArrowUp) => Some(NexusMessage::CompletionNav(-1)),
+                    Key::Named(NamedKey::Enter) => Some(NexusMessage::CompletionAccept),
+                    Key::Named(NamedKey::Escape) => Some(NexusMessage::CompletionDismiss),
+                    _ => {
+                        // Dismiss completions, then handle the key normally
+                        // We can't send two messages from on_key, so dismiss is a side-effect
+                        // and we return the normal key handling.
+                        // Actually, we need to dismiss first. Return dismiss and the key
+                        // will be re-sent on next frame... or just dismiss and pass through.
+                        // Simplest: dismiss. User types again and re-triggers if needed.
+                        Some(NexusMessage::CompletionDismiss)
+                    }
+                };
+            }
+
+            // Cmd shortcuts
             if modifiers.meta {
                 if let Key::Character(c) = key {
                     match c.as_str() {
-                        "k" => {
-                            // TODO: implement clear all
-                            return None;
-                        }
+                        "k" => return Some(NexusMessage::ClearScreen),
+                        "w" => return Some(NexusMessage::CloseWindow),
                         "c" => return Some(NexusMessage::Copy),
                         _ => {}
+                    }
+                }
+            }
+
+            // Ctrl+R: reverse history search
+            if modifiers.ctrl {
+                if let Key::Character(c) = key {
+                    if c == "r" {
+                        return Some(NexusMessage::HistorySearchToggle);
                     }
                 }
             }
@@ -813,22 +1089,9 @@ impl StrataApp for NexusApp {
 
             // When input is focused, route keys
             if state.input.focused {
-                // History navigation
-                if matches!(key, Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown)) {
-                    // Handle history in on_key since TextInputState doesn't know about history
-                    let history = state.current_history();
-                    if history.is_empty() {
-                        return None;
-                    }
-
-                    let is_up = matches!(key, Key::Named(NamedKey::ArrowUp));
-
-                    // For single-line input, up/down navigate history
-                    if is_up {
-                        // In on_key we can't mutate state, so we need to do
-                        // history navigation via a key event that gets handled in update.
-                        // For now, pass the key event to the input handler
-                    }
+                // Tab → trigger completion
+                if matches!(key, Key::Named(NamedKey::Tab)) {
+                    return Some(NexusMessage::TabComplete);
                 }
 
                 return Some(NexusMessage::InputKey(event));
@@ -892,6 +1155,10 @@ impl StrataApp for NexusApp {
 
     fn title(_state: &Self::State) -> String {
         String::from("Nexus (Strata)")
+    }
+
+    fn should_exit(state: &Self::State) -> bool {
+        state.exit_requested
     }
 }
 

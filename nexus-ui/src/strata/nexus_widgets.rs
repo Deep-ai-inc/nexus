@@ -5,6 +5,7 @@
 //! data models and builds a layout tree.
 
 use nexus_api::{BlockId, BlockState, FileType, Value};
+use nexus_kernel::{Completion, CompletionKind};
 
 use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus};
 use crate::blocks::Block;
@@ -84,7 +85,7 @@ impl Widget for ShellBlockWidget<'_> {
 
         // Render output: native structured data takes priority over terminal
         if let Some(value) = &block.native_output {
-            content = render_native_value(content, value, block.id);
+            content = render_native_value(content, value, block);
         } else if content_rows > 0 {
             let source_id = SourceId::named(&format!("shell_term_{}", block.id.0));
             let mut term = TerminalElement::new(source_id, cols, content_rows)
@@ -633,6 +634,119 @@ impl Widget for NexusInputBar<'_> {
 }
 
 // =========================================================================
+// Completion Popup — shows tab completion results
+// =========================================================================
+
+pub struct CompletionPopup<'a> {
+    pub completions: &'a [Completion],
+    pub selected_index: Option<usize>,
+}
+
+impl Widget for CompletionPopup<'_> {
+    fn build(self) -> LayoutChild {
+        let mut col = Column::new()
+            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+            .spacing(0.0)
+            .background(colors::BG_CARD)
+            .corner_radius(6.0)
+            .border(colors::BORDER_INPUT, 1.0)
+            .width(Length::Fill);
+
+        // Show max 10 completions
+        let display_count = self.completions.len().min(10);
+        for (i, comp) in self.completions.iter().take(display_count).enumerate() {
+            let is_selected = self.selected_index == Some(i);
+
+            let icon = match comp.kind {
+                CompletionKind::Directory => "\u{1F4C1} ",   // folder
+                CompletionKind::File => "\u{1F4C4} ",        // file
+                CompletionKind::Executable => "\u{2699} ",   // gear
+                CompletionKind::Builtin => "\u{26A1} ",      // zap
+                CompletionKind::NativeCommand => "\u{2726} ", // star
+                _ => "  ",
+            };
+
+            let text_color = if is_selected { colors::TEXT_PRIMARY } else { colors::TEXT_SECONDARY };
+            let bg = if is_selected {
+                Color::rgba(0.3, 0.4, 0.8, 0.3)
+            } else {
+                Color::TRANSPARENT
+            };
+
+            col = col.push(
+                Row::new()
+                    .padding_custom(Padding::new(2.0, 6.0, 2.0, 6.0))
+                    .background(bg)
+                    .corner_radius(3.0)
+                    .push(TextElement::new(icon).color(colors::TEXT_MUTED))
+                    .push(TextElement::new(&comp.display).color(text_color)),
+            );
+        }
+
+        if self.completions.len() > display_count {
+            col = col.push(
+                TextElement::new(format!("... and {} more", self.completions.len() - display_count))
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+
+        Column::new()
+            .padding_custom(Padding::new(0.0, 16.0, 4.0, 16.0))
+            .width(Length::Fill)
+            .push(col)
+            .into()
+    }
+}
+
+// =========================================================================
+// History Search Bar — Ctrl+R reverse-i-search
+// =========================================================================
+
+pub struct HistorySearchBar<'a> {
+    pub query: &'a str,
+    pub current_match: &'a str,
+    pub result_count: usize,
+    pub result_index: usize,
+}
+
+impl Widget for HistorySearchBar<'_> {
+    fn build(self) -> LayoutChild {
+        let status = if self.result_count > 0 {
+            format!("{}/{}", self.result_index + 1, self.result_count)
+        } else if !self.query.is_empty() {
+            "no match".to_string()
+        } else {
+            String::new()
+        };
+
+        let mut row = Row::new()
+            .padding_custom(Padding::new(6.0, 12.0, 6.0, 12.0))
+            .spacing(8.0)
+            .background(colors::BG_INPUT)
+            .corner_radius(6.0)
+            .border(colors::BORDER_INPUT, 1.0)
+            .width(Length::Fill)
+            .cross_align(CrossAxisAlignment::Center);
+
+        row = row.push(TextElement::new("(reverse-i-search)").color(colors::TEXT_MUTED));
+        row = row.push(TextElement::new(format!("'{}'", self.query)).color(colors::TEXT_QUERY));
+        row = row.push(TextElement::new(": ").color(colors::TEXT_MUTED));
+        row = row.push(TextElement::new(self.current_match).color(colors::TEXT_PRIMARY));
+
+        if !status.is_empty() {
+            row = row.spacer(1.0);
+            row = row.push(TextElement::new(status).color(colors::TEXT_MUTED));
+        }
+
+        Column::new()
+            .padding_custom(Padding::new(0.0, 16.0, 4.0, 16.0))
+            .width(Length::Fill)
+            .push(row)
+            .into()
+    }
+}
+
+// =========================================================================
 // Helpers
 // =========================================================================
 
@@ -683,7 +797,8 @@ fn term_color_to_strata(c: nexus_term::Color) -> Color {
 }
 
 /// Render a structured Value from a native (kernel) command into the layout.
-fn render_native_value(mut parent: Column, value: &Value, block_id: BlockId) -> Column {
+fn render_native_value(mut parent: Column, value: &Value, block: &Block) -> Column {
+    let block_id = block.id;
     match value {
         Value::Unit => parent,
 
@@ -694,9 +809,19 @@ fn render_native_value(mut parent: Column, value: &Value, block_id: BlockId) -> 
             // Estimate column widths from data
             let col_widths = estimate_column_widths(columns, rows);
 
-            // Add column headers
+            // Add column headers with sort support
             for (i, col) in columns.iter().enumerate() {
-                table = table.column(&col.name, col_widths[i]);
+                let sort_id = SourceId::named(&format!("sort_{}_{}", block_id.0, i));
+                let header_name = if block.table_sort.column == Some(i) {
+                    if block.table_sort.ascending {
+                        format!("{} \u{25B2}", col.name) // ▲
+                    } else {
+                        format!("{} \u{25BC}", col.name) // ▼
+                    }
+                } else {
+                    col.name.clone()
+                };
+                table = table.column_sortable(&header_name, col_widths[i], sort_id);
             }
 
             // Add data rows
