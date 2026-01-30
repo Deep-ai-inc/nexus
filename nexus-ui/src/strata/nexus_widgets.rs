@@ -661,6 +661,7 @@ impl Widget for NexusInputBar<'_> {
 pub struct CompletionPopup<'a> {
     pub completions: &'a [Completion],
     pub selected_index: Option<usize>,
+    pub hovered_index: Option<usize>,
     pub scroll: &'a ScrollState,
 }
 
@@ -684,6 +685,7 @@ impl Widget for CompletionPopup<'_> {
 
         for (i, comp) in self.completions.iter().enumerate() {
             let is_selected = self.selected_index == Some(i);
+            let is_hovered = self.hovered_index == Some(i) && !is_selected;
 
             // Icon from CompletionKind (matches kernel's icon() method)
             let icon = comp.kind.icon();
@@ -701,6 +703,8 @@ impl Widget for CompletionPopup<'_> {
             let text_color = if is_selected { Color::WHITE } else { Color::rgb(0.8, 0.8, 0.8) };
             let bg = if is_selected {
                 Color::rgb(0.2, 0.4, 0.6)
+            } else if is_hovered {
+                Color::rgb(0.22, 0.22, 0.28)
             } else {
                 Color::rgb(0.15, 0.15, 0.18)
             };
@@ -735,6 +739,7 @@ pub struct HistorySearchBar<'a> {
     pub query: &'a str,
     pub results: &'a [String],
     pub result_index: usize,
+    pub hovered_index: Option<usize>,
     pub scroll: &'a ScrollState,
 }
 
@@ -790,9 +795,12 @@ impl Widget for HistorySearchBar<'_> {
 
             for (i, result) in self.results.iter().enumerate() {
                 let is_selected = i == self.result_index;
+                let is_hovered = self.hovered_index == Some(i) && !is_selected;
                 let text_color = if is_selected { Color::WHITE } else { Color::rgb(0.8, 0.8, 0.8) };
                 let bg = if is_selected {
                     Color::rgb(0.2, 0.4, 0.6)
+                } else if is_hovered {
+                    Color::rgb(0.20, 0.20, 0.25)
                 } else {
                     Color::rgb(0.12, 0.12, 0.15)
                 };

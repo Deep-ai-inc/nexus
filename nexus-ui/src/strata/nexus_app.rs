@@ -302,6 +302,7 @@ pub struct NexusState {
     pub completion_index: Option<usize>,
     pub completion_anchor: usize,
     pub completion_scroll: ScrollState,
+    pub hovered_completion: Cell<Option<usize>>,
 
     // --- History search ---
     pub history_search_active: bool,
@@ -309,6 +310,7 @@ pub struct NexusState {
     pub history_search_results: Vec<String>,
     pub history_search_index: usize,
     pub history_search_scroll: ScrollState,
+    pub hovered_history_result: Cell<Option<usize>>,
 
     // --- Context menu ---
     pub context_menu: Option<ContextMenuState>,
@@ -478,12 +480,14 @@ impl StrataApp for NexusApp {
             completion_index: None,
             completion_anchor: 0,
             completion_scroll: ScrollState::new(),
+            hovered_completion: Cell::new(None),
 
             history_search_active: false,
             history_search_query: String::new(),
             history_search_results: Vec::new(),
             history_search_index: 0,
             history_search_scroll: ScrollState::new(),
+            hovered_history_result: Cell::new(None),
 
             context_menu: None,
             attachments: Vec::new(),
@@ -1200,6 +1204,7 @@ impl StrataApp for NexusApp {
             main_col = main_col.push(CompletionPopup {
                 completions: &state.completions,
                 selected_index: state.completion_index,
+                hovered_index: state.hovered_completion.get(),
                 scroll: &state.completion_scroll,
             });
         }
@@ -1210,6 +1215,7 @@ impl StrataApp for NexusApp {
                 query: &state.history_search_query,
                 results: &state.history_search_results,
                 result_index: state.history_search_index,
+                hovered_index: state.hovered_history_result.get(),
                 scroll: &state.history_search_scroll,
             });
         }
@@ -1344,7 +1350,7 @@ impl StrataApp for NexusApp {
             }
         }
 
-        // Context menu hover tracking
+        // Hover tracking for popups
         if let MouseEvent::CursorMoved { .. } = &event {
             if let Some(ref menu) = state.context_menu {
                 let idx = if let Some(HitResult::Widget(id)) = &hit {
@@ -1353,6 +1359,26 @@ impl StrataApp for NexusApp {
                     None
                 };
                 menu.hovered_item.set(idx);
+            }
+
+            // Completion popup hover
+            if !state.completions.is_empty() {
+                let idx = if let Some(HitResult::Widget(id)) = &hit {
+                    (0..state.completions.len().min(10)).find(|i| *id == CompletionPopup::item_id(*i))
+                } else {
+                    None
+                };
+                state.hovered_completion.set(idx);
+            }
+
+            // History search hover
+            if state.history_search_active {
+                let idx = if let Some(HitResult::Widget(id)) = &hit {
+                    (0..state.history_search_results.len().min(10)).find(|i| *id == HistorySearchBar::result_id(*i))
+                } else {
+                    None
+                };
+                state.hovered_history_result.set(idx);
             }
         }
 
