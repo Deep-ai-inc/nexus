@@ -540,6 +540,12 @@ pub struct JobBar<'a> {
     pub jobs: &'a [VisualJob],
 }
 
+impl JobBar<'_> {
+    pub fn job_pill_id(job_id: u32) -> SourceId {
+        SourceId::named(&format!("job_{}", job_id))
+    }
+}
+
 impl Widget for JobBar<'_> {
     fn build(self) -> LayoutChild {
         let mut row = Row::new().spacing(8.0);
@@ -550,8 +556,10 @@ impl Widget for JobBar<'_> {
                 VisualJobState::Stopped => ("\u{23F8}", Color::rgb(0.9, 0.7, 0.2), Color::rgba(0.4, 0.35, 0.1, 0.6)),
             };
             let name = job.display_name();
+            let click_id = Self::job_pill_id(job.id);
             row = row.push(
-                Column::new()
+                Row::new()
+                    .id(click_id)
                     .padding_custom(Padding::new(2.0, 6.0, 2.0, 6.0))
                     .background(bg)
                     .corner_radius(12.0)
@@ -579,6 +587,7 @@ pub struct NexusInputBar<'a> {
     pub last_exit_code: Option<i32>,
     pub cursor_visible: bool,
     pub mode_toggle_id: SourceId,
+    pub line_count: usize,
 }
 
 impl Widget for NexusInputBar<'_> {
@@ -624,8 +633,8 @@ impl Widget for NexusInputBar<'_> {
             .push(mode_btn)
             .push(TextElement::new(display_cwd).color(colors::TEXT_PATH))
             .push(TextElement::new(prompt_char).color(prompt_color))
-            .push(
-                TextInputElement::from_state(self.input)
+            .push({
+                let mut elem = TextInputElement::from_state(self.input)
                     .placeholder("Type a command...")
                     .background(Color::TRANSPARENT)
                     .border_color(Color::TRANSPARENT)
@@ -633,8 +642,14 @@ impl Widget for NexusInputBar<'_> {
                     .corner_radius(0.0)
                     .padding(Padding::new(0.0, 4.0, 0.0, 4.0))
                     .width(Length::Fill)
-                    .cursor_visible(self.cursor_visible),
-            )
+                    .cursor_visible(self.cursor_visible);
+                if self.line_count > 1 {
+                    let line_height = 18.0_f32;
+                    let input_height = self.line_count as f32 * line_height + 4.0;
+                    elem = elem.multiline(true).height(Length::Fixed(input_height));
+                }
+                elem
+            })
             .into()
     }
 }

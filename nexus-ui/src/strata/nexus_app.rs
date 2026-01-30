@@ -36,9 +36,10 @@ use crate::strata::nexus_widgets::{
 };
 use crate::strata::primitives::Rect;
 use crate::strata::{
-    AppConfig, Column, Command, ImageHandle, ImageStore, LayoutSnapshot, Length,
-    MouseResponse, Padding, ScrollAction, ScrollColumn, ScrollState, Selection, StrataApp,
-    Subscription, TextInputAction, TextInputMouseAction, TextInputState,
+    AppConfig, ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
+    ImageStore, LayoutSnapshot, Length, MouseResponse, Padding, Row, ScrollAction, ScrollColumn,
+    ScrollState, Selection, StrataApp, Subscription, TextInputAction, TextInputMouseAction,
+    TextInputState,
 };
 use crate::systems::{agent_subscription, kernel_subscription, pty_subscription, spawn_agent_task};
 use crate::widgets::job_indicator::{VisualJob, VisualJobState};
@@ -162,11 +163,75 @@ pub enum NexusMessage {
     // Completion click
     CompletionSelect(usize),
 
+    // Job indicator
+    ScrollToJob(u32),
+
+    // Clipboard
+    Paste,
+    RemoveAttachment(usize),
+
+    // Context menu
+    ShowContextMenu(f32, f32, Vec<ContextMenuItem>),
+    ContextMenuAction(ContextMenuItem),
+    DismissContextMenu,
+
+    // Multiline input
+    InsertNewline,
+
     // Window
     ClearScreen,
     CloseWindow,
     BlurAll,
     Tick,
+}
+
+// =========================================================================
+// Context menu
+// =========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuItem {
+    Copy,
+    Paste,
+    SelectAll,
+    Clear,
+}
+
+impl ContextMenuItem {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Copy => "Copy",
+            Self::Paste => "Paste",
+            Self::SelectAll => "Select All",
+            Self::Clear => "Clear",
+        }
+    }
+
+    fn shortcut(&self) -> &'static str {
+        match self {
+            Self::Copy => "\u{2318}C",
+            Self::Paste => "\u{2318}V",
+            Self::SelectAll => "\u{2318}A",
+            Self::Clear => "",
+        }
+    }
+}
+
+pub struct ContextMenuState {
+    pub x: f32,
+    pub y: f32,
+    pub items: Vec<ContextMenuItem>,
+}
+
+// =========================================================================
+// Attachment (clipboard image paste)
+// =========================================================================
+
+pub struct Attachment {
+    pub data: Vec<u8>,       // PNG bytes
+    pub image_handle: ImageHandle,
+    pub width: u32,
+    pub height: u32,
 }
 
 // =========================================================================
@@ -235,6 +300,15 @@ pub struct NexusState {
     pub history_search_results: Vec<String>,
     pub history_search_index: usize,
     pub history_search_scroll: ScrollState,
+
+    // --- Context menu ---
+    pub context_menu: Option<ContextMenuState>,
+
+    // --- Attachments ---
+    pub attachments: Vec<Attachment>,
+
+    // --- Terminal resize ---
+    pub last_terminal_size: (u16, u16),
 
     // --- Images ---
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
@@ -402,6 +476,10 @@ impl StrataApp for NexusApp {
             history_search_index: 0,
             history_search_scroll: ScrollState::new(),
 
+            context_menu: None,
+            attachments: Vec::new(),
+            last_terminal_size: (120, 24),
+
             image_handles: HashMap::new(),
             exit_requested: false,
 
@@ -459,8 +537,17 @@ impl StrataApp for NexusApp {
                 // Input already cleared by handle_key's Submit
 
                 if is_agent_query {
-                    return spawn_agent(state, query);
+                    // Collect attachments as Value::Media
+                    let attachments: Vec<Value> = state.attachments.drain(..).map(|a| {
+                        Value::Media {
+                            data: a.data,
+                            content_type: "image/png".to_string(),
+                            metadata: Default::default(),
+                        }
+                    }).collect();
+                    return spawn_agent(state, query, attachments);
                 } else {
+                    state.attachments.clear();
                     return execute_command(state, text);
                 }
             }
@@ -846,6 +933,101 @@ impl StrataApp for NexusApp {
             }
 
             // =============================================================
+            // Job indicator
+            // =============================================================
+            NexusMessage::ScrollToJob(_job_id) => {
+                // Scroll to bottom where running blocks are
+                state.history_scroll.offset = state.history_scroll.max.get();
+            }
+
+            // =============================================================
+            // Context menu
+            // =============================================================
+            NexusMessage::ShowContextMenu(x, y, items) => {
+                state.context_menu = Some(ContextMenuState { x, y, items });
+            }
+            NexusMessage::ContextMenuAction(item) => {
+                state.context_menu = None;
+                match item {
+                    ContextMenuItem::Copy => {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            if let Some((sel_start, sel_end)) = state.input.selection {
+                                let start = sel_start.min(sel_end);
+                                let end = sel_start.max(sel_end);
+                                let selected: String = state.input.text.chars().skip(start).take(end - start).collect();
+                                if !selected.is_empty() {
+                                    let _ = clipboard.set_text(&selected);
+                                }
+                            }
+                        }
+                    }
+                    ContextMenuItem::Paste => {
+                        return Command::message(NexusMessage::Paste);
+                    }
+                    ContextMenuItem::SelectAll => {
+                        state.input.select_all();
+                    }
+                    ContextMenuItem::Clear => {
+                        state.input.text.clear();
+                        state.input.cursor = 0;
+                        state.input.selection = None;
+                    }
+                }
+            }
+            NexusMessage::DismissContextMenu => {
+                state.context_menu = None;
+            }
+
+            // =============================================================
+            // Clipboard
+            // =============================================================
+            NexusMessage::Paste => {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    // Try image first
+                    if let Ok(img) = clipboard.get_image() {
+                        let width = img.width as u32;
+                        let height = img.height as u32;
+                        let rgba_data = img.bytes.into_owned();
+
+                        // Convert to PNG for storage
+                        let mut png_data = Vec::new();
+                        if let Some(img_buf) = image::RgbaImage::from_raw(width, height, rgba_data.clone()) {
+                            let _ = img_buf.write_to(
+                                &mut std::io::Cursor::new(&mut png_data),
+                                image::ImageFormat::Png,
+                            );
+                        }
+
+                        if !png_data.is_empty() {
+                            let handle = images.load_rgba(width, height, rgba_data);
+                            state.attachments.push(Attachment {
+                                data: png_data,
+                                image_handle: handle,
+                                width,
+                                height,
+                            });
+                        }
+                    } else if let Ok(text) = clipboard.get_text() {
+                        if !text.is_empty() {
+                            state.input.insert_str(&text);
+                        }
+                    }
+                }
+            }
+            NexusMessage::RemoveAttachment(idx) => {
+                if idx < state.attachments.len() {
+                    state.attachments.remove(idx);
+                }
+            }
+
+            // =============================================================
+            // Multiline
+            // =============================================================
+            NexusMessage::InsertNewline => {
+                state.input.insert_newline();
+            }
+
+            // =============================================================
             // Window
             // =============================================================
             NexusMessage::ClearScreen => {
@@ -884,6 +1066,16 @@ impl StrataApp for NexusApp {
                     // Auto-scroll to bottom on new content
                     state.history_scroll.offset = state.history_scroll.max.get();
                 }
+            }
+        }
+
+        // Propagate terminal size changes to running PTY handles
+        let current_size = state.terminal_size.get();
+        if current_size != state.last_terminal_size {
+            state.last_terminal_size = current_size;
+            let (cols, rows) = current_size;
+            for handle in &state.pty_handles {
+                let _ = handle.resize(cols, rows);
             }
         }
 
@@ -987,6 +1179,34 @@ impl StrataApp for NexusApp {
             });
         }
 
+        // Attachment thumbnails (above input bar)
+        if !state.attachments.is_empty() {
+            let mut attach_row = Row::new().spacing(8.0).padding(4.0);
+            for (i, attachment) in state.attachments.iter().enumerate() {
+                let scale = (60.0_f32 / attachment.width as f32).min(60.0 / attachment.height as f32).min(1.0);
+                let w = attachment.width as f32 * scale;
+                let h = attachment.height as f32 * scale;
+                let remove_id = SourceId::named(&format!("remove_attach_{}", i));
+                attach_row = attach_row.push(
+                    Column::new()
+                        .spacing(2.0)
+                        .cross_align(CrossAxisAlignment::Center)
+                        .image(ImageElement::new(attachment.image_handle, w, h).corner_radius(4.0))
+                        .push(
+                            ButtonElement::new(remove_id, "\u{2715}")
+                                .background(colors::BTN_DENY)
+                                .corner_radius(4.0),
+                        ),
+                );
+            }
+            main_col = main_col.push(
+                Column::new()
+                    .padding_custom(Padding::new(2.0, 4.0, 0.0, 4.0))
+                    .width(Length::Fill)
+                    .push(attach_row),
+            );
+        }
+
         // Input bar
         main_col = main_col.push(
             Column::new()
@@ -999,6 +1219,11 @@ impl StrataApp for NexusApp {
                     last_exit_code: state.last_exit_code,
                     cursor_visible,
                     mode_toggle_id: SourceId::named("mode_toggle"),
+                    line_count: {
+                        let count = state.input.text.lines().count()
+                            + if state.input.text.ends_with('\n') { 1 } else { 0 };
+                        count.max(1).min(6)
+                    },
                 }),
         );
 
@@ -1009,6 +1234,11 @@ impl StrataApp for NexusApp {
         state.completion_scroll.sync_from_snapshot(snapshot);
         state.history_search_scroll.sync_from_snapshot(snapshot);
         state.input.sync_from_snapshot(snapshot);
+
+        // Context menu overlay (rendered after layout, absolute positioned)
+        if let Some(ref menu) = state.context_menu {
+            render_context_menu(snapshot, menu);
+        }
     }
 
     fn selection(state: &Self::State) -> Option<&Selection> {
@@ -1028,6 +1258,42 @@ impl StrataApp for NexusApp {
             state.history_scroll          => NexusMessage::HistoryScroll,
             state.input                   => NexusMessage::InputMouse,
         ]);
+
+        // Right-click → context menu
+        if let MouseEvent::ButtonPressed { button: MouseButton::Right, position, .. } = &event {
+            if let Some(ref _hit) = hit {
+                // Check if hit is on input
+                let input_bounds = state.input.bounds();
+                if position.x >= input_bounds.x && position.x <= input_bounds.x + input_bounds.width
+                    && position.y >= input_bounds.y && position.y <= input_bounds.y + input_bounds.height
+                {
+                    return MouseResponse::message(NexusMessage::ShowContextMenu(
+                        position.x, position.y,
+                        vec![ContextMenuItem::Paste, ContextMenuItem::SelectAll, ContextMenuItem::Clear],
+                    ));
+                }
+                // Otherwise show terminal context menu
+                return MouseResponse::message(NexusMessage::ShowContextMenu(
+                    position.x, position.y,
+                    vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                ));
+            }
+        }
+
+        // Context menu item clicks
+        if let MouseEvent::ButtonPressed { button: MouseButton::Left, .. } = &event {
+            if let Some(ref menu) = state.context_menu {
+                if let Some(HitResult::Widget(id)) = &hit {
+                    for (i, item) in menu.items.iter().enumerate() {
+                        if *id == SourceId::named(&format!("ctx_menu_{}", i)) {
+                            return MouseResponse::message(NexusMessage::ContextMenuAction(*item));
+                        }
+                    }
+                }
+                // Click anywhere when menu is open → dismiss
+                return MouseResponse::message(NexusMessage::DismissContextMenu);
+            }
+        }
 
         // Button clicks
         if let MouseEvent::ButtonPressed { button: MouseButton::Left, .. } = &event {
@@ -1051,6 +1317,21 @@ impl StrataApp for NexusApp {
                             // Click selects the index, then accept is handled via update
                             return MouseResponse::message(NexusMessage::HistorySearchAcceptIndex(i));
                         }
+                    }
+                }
+
+                // Attachment remove buttons
+                for i in 0..state.attachments.len() {
+                    let remove_id = SourceId::named(&format!("remove_attach_{}", i));
+                    if *id == remove_id {
+                        return MouseResponse::message(NexusMessage::RemoveAttachment(i));
+                    }
+                }
+
+                // Job pill clicks
+                for job in &state.jobs {
+                    if *id == JobBar::job_pill_id(job.id) {
+                        return MouseResponse::message(NexusMessage::ScrollToJob(job.id));
                     }
                 }
 
@@ -1225,6 +1506,7 @@ impl StrataApp for NexusApp {
                         "k" => return Some(NexusMessage::ClearScreen),
                         "w" => return Some(NexusMessage::CloseWindow),
                         "c" => return Some(NexusMessage::Copy),
+                        "v" => return Some(NexusMessage::Paste),
                         "." => return Some(NexusMessage::ToggleMode),
                         _ => {}
                     }
@@ -1268,12 +1550,17 @@ impl StrataApp for NexusApp {
 
             // When input is focused, route keys
             if state.input.focused {
+                // Shift+Enter → insert newline (multiline input)
+                if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.shift {
+                    return Some(NexusMessage::InsertNewline);
+                }
+
                 // Tab → trigger completion
                 if matches!(key, Key::Named(NamedKey::Tab)) {
                     return Some(NexusMessage::TabComplete);
                 }
 
-                // Arrow Up/Down → history navigation
+                // Arrow Up/Down → history navigation (only if single-line or cursor on first/last line)
                 if matches!(key, Key::Named(NamedKey::ArrowUp)) {
                     return Some(NexusMessage::HistoryUp);
                 }
@@ -1647,7 +1934,7 @@ fn handle_agent_event(state: &mut NexusState, event: AgentEvent) -> Command<Nexu
 // Agent spawning
 // =========================================================================
 
-fn spawn_agent(state: &mut NexusState, query: String) -> Command<NexusMessage> {
+fn spawn_agent(state: &mut NexusState, query: String, attachments: Vec<Value>) -> Command<NexusMessage> {
     let is_continuation = state.agent_session_id.is_some();
     let current_cwd = &state.cwd;
 
@@ -1683,7 +1970,7 @@ fn spawn_agent(state: &mut NexusState, query: String) -> Command<NexusMessage> {
             cancel_flag,
             contextualized_query,
             cwd,
-            Vec::new(), // No attachments in V1
+            attachments,
             session_id,
         )
         .await
@@ -1708,6 +1995,60 @@ fn spawn_agent(state: &mut NexusState, query: String) -> Command<NexusMessage> {
 
     state.history_scroll.offset = state.history_scroll.max.get();
     Command::none()
+}
+
+// =========================================================================
+// Context menu rendering
+// =========================================================================
+
+fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuState) {
+    use crate::strata::primitives::{Color, Point, Rect};
+
+    let w = 180.0_f32;
+    let row_h = 28.0_f32;
+    let h = menu.items.len() as f32 * row_h + 8.0;
+
+    let x = menu.x;
+    let y = menu.y;
+
+    let p = snapshot.primitives_mut();
+
+    // Shadow
+    p.add_shadow(
+        Rect::new(x + 4.0, y + 4.0, w, h),
+        8.0, 12.0,
+        Color::rgba(0.0, 0.0, 0.0, 0.5),
+    );
+    // Background
+    p.add_rounded_rect(Rect::new(x, y, w, h), 8.0, Color::rgb(0.14, 0.14, 0.16));
+    // Border
+    p.add_border(Rect::new(x, y, w, h), 8.0, 1.0, Color::rgba(1.0, 1.0, 1.0, 0.1));
+
+    let ix = x + 4.0;
+    let iw = w - 8.0;
+
+    for (i, item) in menu.items.iter().enumerate() {
+        let iy = y + 4.0 + i as f32 * row_h;
+        let item_rect = Rect::new(ix, iy, iw, row_h - 2.0);
+
+        // Register as clickable widget
+        let item_id = SourceId::named(&format!("ctx_menu_{}", i));
+        snapshot.register_widget(item_id, item_rect);
+
+        let p = snapshot.primitives_mut();
+
+        // Hover background
+        p.add_rounded_rect(item_rect, 4.0, Color::rgba(1.0, 1.0, 1.0, 0.05));
+
+        // Label
+        p.add_text(item.label(), Point::new(ix + 8.0, iy + 5.0), Color::rgb(0.9, 0.9, 0.9));
+
+        // Shortcut
+        let shortcut = item.shortcut();
+        if !shortcut.is_empty() {
+            p.add_text(shortcut, Point::new(ix + iw - 32.0, iy + 5.0), Color::rgb(0.5, 0.5, 0.5));
+        }
+    }
 }
 
 // =========================================================================
