@@ -132,6 +132,8 @@ pub enum NexusMessage {
 
     // Scroll
     HistoryScroll(ScrollAction),
+    CompletionScroll(ScrollAction),
+    HistorySearchScroll(ScrollAction),
 
     // Selection
     SelectionStart(ContentAddress),
@@ -154,6 +156,11 @@ pub enum NexusMessage {
     HistorySearchKey(KeyEvent),
     HistorySearchAccept,
     HistorySearchDismiss,
+    HistorySearchSelect(usize),
+    HistorySearchAcceptIndex(usize),
+
+    // Completion click
+    CompletionSelect(usize),
 
     // Window
     ClearScreen,
@@ -220,12 +227,14 @@ pub struct NexusState {
     pub completions: Vec<Completion>,
     pub completion_index: Option<usize>,
     pub completion_anchor: usize,
+    pub completion_scroll: ScrollState,
 
     // --- History search ---
     pub history_search_active: bool,
     pub history_search_query: String,
     pub history_search_results: Vec<String>,
     pub history_search_index: usize,
+    pub history_search_scroll: ScrollState,
 
     // --- Images ---
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
@@ -385,11 +394,13 @@ impl StrataApp for NexusApp {
             completions: Vec::new(),
             completion_index: None,
             completion_anchor: 0,
+            completion_scroll: ScrollState::new(),
 
             history_search_active: false,
             history_search_query: String::new(),
             history_search_results: Vec::new(),
             history_search_index: 0,
+            history_search_scroll: ScrollState::new(),
 
             image_handles: HashMap::new(),
             exit_requested: false,
@@ -643,6 +654,12 @@ impl StrataApp for NexusApp {
             NexusMessage::HistoryScroll(action) => {
                 state.history_scroll.apply(action);
             }
+            NexusMessage::CompletionScroll(action) => {
+                state.completion_scroll.apply(action);
+            }
+            NexusMessage::HistorySearchScroll(action) => {
+                state.history_search_scroll.apply(action);
+            }
 
             // =============================================================
             // Selection
@@ -715,6 +732,7 @@ impl StrataApp for NexusApp {
                     state.completions = completions;
                     state.completion_index = Some(0);
                     state.completion_anchor = anchor;
+                    state.completion_scroll.offset = 0.0;
                 }
             }
             NexusMessage::CompletionNav(delta) => {
@@ -723,6 +741,7 @@ impl StrataApp for NexusApp {
                     let current = state.completion_index.unwrap_or(0) as isize;
                     let new_idx = ((current + delta) % len + len) % len;
                     state.completion_index = Some(new_idx as usize);
+                    scroll_to_index(&mut state.completion_scroll, new_idx as usize, 26.0, 300.0);
                 }
             }
             NexusMessage::CompletionAccept => {
@@ -743,6 +762,18 @@ impl StrataApp for NexusApp {
                 state.completions.clear();
                 state.completion_index = None;
             }
+            NexusMessage::CompletionSelect(index) => {
+                if let Some(comp) = state.completions.get(index) {
+                    let mut t = state.input.text.clone();
+                    let cursor = state.input.cursor;
+                    let end = cursor.min(t.len());
+                    t.replace_range(state.completion_anchor..end, &comp.text);
+                    state.input.cursor = state.completion_anchor + comp.text.len();
+                    state.input.text = t;
+                }
+                state.completions.clear();
+                state.completion_index = None;
+            }
 
             // =============================================================
             // History search (Ctrl+R)
@@ -752,12 +783,14 @@ impl StrataApp for NexusApp {
                     // Cycle to next result
                     if !state.history_search_results.is_empty() {
                         state.history_search_index = (state.history_search_index + 1) % state.history_search_results.len();
+                        scroll_to_index(&mut state.history_search_scroll, state.history_search_index, 30.0, 300.0);
                     }
                 } else {
                     state.history_search_active = true;
                     state.history_search_query.clear();
                     state.history_search_results.clear();
                     state.history_search_index = 0;
+                    state.history_search_scroll.offset = 0.0;
                 }
             }
             NexusMessage::HistorySearchKey(key_event) => {
@@ -792,6 +825,21 @@ impl StrataApp for NexusApp {
                 state.history_search_results.clear();
             }
             NexusMessage::HistorySearchDismiss => {
+                state.history_search_active = false;
+                state.history_search_query.clear();
+                state.history_search_results.clear();
+            }
+            NexusMessage::HistorySearchSelect(index) => {
+                if index < state.history_search_results.len() {
+                    state.history_search_index = index;
+                    scroll_to_index(&mut state.history_search_scroll, index, 30.0, 300.0);
+                }
+            }
+            NexusMessage::HistorySearchAcceptIndex(index) => {
+                if let Some(result) = state.history_search_results.get(index) {
+                    state.input.text = result.clone();
+                    state.input.cursor = result.len();
+                }
                 state.history_search_active = false;
                 state.history_search_query.clear();
                 state.history_search_results.clear();
@@ -925,20 +973,17 @@ impl StrataApp for NexusApp {
             main_col = main_col.push(CompletionPopup {
                 completions: &state.completions,
                 selected_index: state.completion_index,
+                scroll: &state.completion_scroll,
             });
         }
 
-        // History search bar (replaces input bar when active)
+        // History search overlay (above input bar when active)
         if state.history_search_active {
-            let current_match = state.history_search_results
-                .get(state.history_search_index)
-                .map(|s| s.as_str())
-                .unwrap_or("");
             main_col = main_col.push(HistorySearchBar {
                 query: &state.history_search_query,
-                current_match,
-                result_count: state.history_search_results.len(),
+                results: &state.history_search_results,
                 result_index: state.history_search_index,
+                scroll: &state.history_search_scroll,
             });
         }
 
@@ -961,6 +1006,8 @@ impl StrataApp for NexusApp {
 
         // Sync layout state
         state.history_scroll.sync_from_snapshot(snapshot);
+        state.completion_scroll.sync_from_snapshot(snapshot);
+        state.history_search_scroll.sync_from_snapshot(snapshot);
         state.input.sync_from_snapshot(snapshot);
     }
 
@@ -976,8 +1023,10 @@ impl StrataApp for NexusApp {
     ) -> MouseResponse<Self::Message> {
         // Composable scroll + input handlers
         route_mouse!(&event, &hit, capture, [
-            state.history_scroll => NexusMessage::HistoryScroll,
-            state.input          => NexusMessage::InputMouse,
+            state.completion_scroll       => NexusMessage::CompletionScroll,
+            state.history_search_scroll   => NexusMessage::HistorySearchScroll,
+            state.history_scroll          => NexusMessage::HistoryScroll,
+            state.input                   => NexusMessage::InputMouse,
         ]);
 
         // Button clicks
@@ -986,6 +1035,23 @@ impl StrataApp for NexusApp {
                 // Mode toggle
                 if *id == SourceId::named("mode_toggle") {
                     return MouseResponse::message(NexusMessage::ToggleMode);
+                }
+
+                // Completion item clicks
+                for i in 0..state.completions.len().min(10) {
+                    if *id == CompletionPopup::item_id(i) {
+                        return MouseResponse::message(NexusMessage::CompletionSelect(i));
+                    }
+                }
+
+                // History search result clicks — select and accept
+                if state.history_search_active {
+                    for i in 0..state.history_search_results.len().min(10) {
+                        if *id == HistorySearchBar::result_id(i) {
+                            // Click selects the index, then accept is handled via update
+                            return MouseResponse::message(NexusMessage::HistorySearchAcceptIndex(i));
+                        }
+                    }
                 }
 
                 // Kill buttons
@@ -1111,6 +1177,22 @@ impl StrataApp for NexusApp {
                 return match key {
                     Key::Named(NamedKey::Enter) => Some(NexusMessage::HistorySearchAccept),
                     Key::Named(NamedKey::Escape) => Some(NexusMessage::HistorySearchDismiss),
+                    Key::Named(NamedKey::ArrowDown) => {
+                        if !state.history_search_results.is_empty()
+                            && state.history_search_index < state.history_search_results.len() - 1
+                        {
+                            Some(NexusMessage::HistorySearchSelect(state.history_search_index + 1))
+                        } else {
+                            None
+                        }
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        if state.history_search_index > 0 {
+                            Some(NexusMessage::HistorySearchSelect(state.history_search_index - 1))
+                        } else {
+                            None
+                        }
+                    }
                     _ => Some(NexusMessage::HistorySearchKey(event)),
                 };
             }
@@ -1703,6 +1785,23 @@ fn strata_key_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
                 _ => None,
             }
         }
+    }
+}
+
+// =========================================================================
+// Scroll helpers
+// =========================================================================
+
+/// Scroll a `ScrollState` so that the item at `index` is visible within a
+/// viewport of `viewport_height`.  Each item is assumed to be `item_height`
+/// pixels tall.
+fn scroll_to_index(scroll: &mut ScrollState, index: usize, item_height: f32, viewport_height: f32) {
+    let item_top = index as f32 * item_height;
+    let item_bottom = item_top + item_height;
+    if item_top < scroll.offset {
+        scroll.offset = item_top;
+    } else if item_bottom > scroll.offset + viewport_height {
+        scroll.offset = item_bottom - viewport_height;
     }
 }
 

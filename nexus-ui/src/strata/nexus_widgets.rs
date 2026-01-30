@@ -13,9 +13,10 @@ use crate::strata::content_address::SourceId;
 use crate::strata::gpu::ImageHandle;
 use crate::strata::layout::containers::{
     ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
-    TableCell, TableElement, TerminalElement, TextElement, Widget,
+    ScrollColumn, TableCell, TableElement, TerminalElement, TextElement, Widget,
 };
 use crate::strata::primitives::Color;
+use crate::strata::scroll_state::ScrollState;
 use crate::widgets::job_indicator::{VisualJob, VisualJobState};
 
 use super::nexus_app::colors;
@@ -645,32 +646,41 @@ impl Widget for NexusInputBar<'_> {
 pub struct CompletionPopup<'a> {
     pub completions: &'a [Completion],
     pub selected_index: Option<usize>,
+    pub scroll: &'a ScrollState,
+}
+
+impl CompletionPopup<'_> {
+    /// Generate a stable SourceId for clicking a completion item.
+    pub fn item_id(index: usize) -> SourceId {
+        SourceId::named(&format!("comp_item_{}", index))
+    }
 }
 
 impl Widget for CompletionPopup<'_> {
     fn build(self) -> LayoutChild {
-        // Completion popup colors from input.rs
-        let mut col = Column::new()
-            .padding_custom(Padding::new(2.0, 4.0, 2.0, 4.0))
+        // Scrollable list of completions, max 300px tall
+        let mut scroll = ScrollColumn::from_state(self.scroll)
             .spacing(0.0)
+            .width(Length::Fixed(300.0))
+            .height(Length::Fixed(300.0_f32.min(self.completions.len() as f32 * 26.0 + 8.0)))
             .background(Color::rgb(0.12, 0.12, 0.15))
             .corner_radius(4.0)
-            .border(Color::rgb(0.3, 0.3, 0.35), 1.0)
-            .width(Length::Fill);
+            .border(Color::rgb(0.3, 0.3, 0.35), 1.0);
 
-        // Show max 10 completions
-        let display_count = self.completions.len().min(10);
-        for (i, comp) in self.completions.iter().take(display_count).enumerate() {
+        for (i, comp) in self.completions.iter().enumerate() {
             let is_selected = self.selected_index == Some(i);
 
-            // Icon colors from input.rs completion_icon_color
-            let icon = match comp.kind {
-                CompletionKind::Directory => "\u{1F4C1} ",
-                CompletionKind::File => "\u{1F4C4} ",
-                CompletionKind::Executable => "\u{2699} ",
-                CompletionKind::Builtin => "\u{26A1} ",
-                CompletionKind::NativeCommand => "\u{2726} ",
-                _ => "  ",
+            // Icon from CompletionKind (matches kernel's icon() method)
+            let icon = comp.kind.icon();
+
+            // Icon colors matched from old UI input.rs completion_icon_color
+            let icon_color = match comp.kind {
+                CompletionKind::Directory => Color::rgb(0.4, 0.7, 1.0),
+                CompletionKind::Executable | CompletionKind::NativeCommand => Color::rgb(0.4, 0.9, 0.4),
+                CompletionKind::Builtin => Color::rgb(1.0, 0.8, 0.4),
+                CompletionKind::Function => Color::rgb(0.8, 0.6, 1.0),
+                CompletionKind::Variable => Color::rgb(1.0, 0.6, 0.6),
+                _ => Color::rgb(0.7, 0.7, 0.7),
             };
 
             let text_color = if is_selected { Color::WHITE } else { Color::rgb(0.8, 0.8, 0.8) };
@@ -680,27 +690,24 @@ impl Widget for CompletionPopup<'_> {
                 Color::rgb(0.15, 0.15, 0.18)
             };
 
-            col = col.push(
+            let click_id = Self::item_id(i);
+            scroll = scroll.push(
                 Row::new()
-                    .padding_custom(Padding::new(2.0, 6.0, 2.0, 6.0))
+                    .id(click_id)
+                    .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+                    .spacing(4.0)
                     .background(bg)
                     .corner_radius(3.0)
-                    .push(TextElement::new(icon).color(colors::TEXT_MUTED))
+                    .cross_align(CrossAxisAlignment::Center)
+                    .push(TextElement::new(format!("{} ", icon)).color(icon_color))
                     .push(TextElement::new(&comp.display).color(text_color)),
-            );
-        }
-
-        if self.completions.len() > display_count {
-            col = col.push(
-                TextElement::new(format!("... and {} more", self.completions.len() - display_count))
-                    .color(colors::TEXT_MUTED),
             );
         }
 
         Column::new()
             .padding_custom(Padding::new(0.0, 4.0, 2.0, 4.0))
             .width(Length::Fill)
-            .push(col)
+            .push(scroll)
             .into()
     }
 }
@@ -711,45 +718,106 @@ impl Widget for CompletionPopup<'_> {
 
 pub struct HistorySearchBar<'a> {
     pub query: &'a str,
-    pub current_match: &'a str,
-    pub result_count: usize,
+    pub results: &'a [String],
     pub result_index: usize,
+    pub scroll: &'a ScrollState,
+}
+
+impl HistorySearchBar<'_> {
+    /// Generate a stable SourceId for clicking a history result item.
+    pub fn result_id(index: usize) -> SourceId {
+        SourceId::named(&format!("hist_result_{}", index))
+    }
 }
 
 impl Widget for HistorySearchBar<'_> {
     fn build(self) -> LayoutChild {
-        let status = if self.result_count > 0 {
-            format!("{}/{}", self.result_index + 1, self.result_count)
-        } else if !self.query.is_empty() {
-            "no match".to_string()
-        } else {
-            String::new()
-        };
-
-        // History search colors from input.rs
-        let mut row = Row::new()
-            .padding_custom(Padding::new(4.0, 6.0, 4.0, 6.0))
+        // History search overlay matched from old UI input.rs
+        let mut container = Column::new()
+            .padding(10.0)
             .spacing(6.0)
             .background(Color::rgb(0.1, 0.1, 0.12))
-            .corner_radius(4.0)
+            .corner_radius(6.0)
             .border(Color::rgb(0.3, 0.5, 0.7), 1.0)
-            .width(Length::Fill)
-            .cross_align(CrossAxisAlignment::Center);
+            .width(Length::Fill);
 
-        row = row.push(TextElement::new("(reverse-i-search)").color(Color::rgb(0.6, 0.6, 0.6)));
-        row = row.push(TextElement::new(format!("'{}'", self.query)).color(colors::TEXT_QUERY));
-        row = row.push(TextElement::new(": ").color(colors::TEXT_MUTED));
-        row = row.push(TextElement::new(self.current_match).color(colors::TEXT_PRIMARY));
+        // Search header: label + query display
+        let header = Row::new()
+            .spacing(8.0)
+            .cross_align(CrossAxisAlignment::Center)
+            .push(TextElement::new("(reverse-i-search)").color(Color::rgb(0.6, 0.6, 0.6)))
+            .push(
+                // Styled query input area
+                Row::new()
+                    .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+                    .background(Color::rgb(0.15, 0.15, 0.18))
+                    .corner_radius(4.0)
+                    .border(Color::rgb(0.4, 0.6, 0.8), 1.0)
+                    .width(Length::Fill)
+                    .push(if self.query.is_empty() {
+                        TextElement::new("Type to search...").color(Color::rgb(0.4, 0.4, 0.4))
+                    } else {
+                        TextElement::new(self.query).color(Color::rgb(0.9, 0.9, 0.9))
+                    }),
+            );
 
-        if !status.is_empty() {
-            row = row.spacer(1.0);
-            row = row.push(TextElement::new(status).color(colors::TEXT_MUTED));
+        container = container.push(header);
+
+        // Scrollable results list, max 300px tall
+        if !self.results.is_empty() {
+            let row_height = 30.0_f32;
+            let max_height = 300.0_f32.min(self.results.len() as f32 * row_height + 4.0);
+
+            let mut scroll = ScrollColumn::from_state(self.scroll)
+                .spacing(0.0)
+                .width(Length::Fill)
+                .height(Length::Fixed(max_height));
+
+            for (i, result) in self.results.iter().enumerate() {
+                let is_selected = i == self.result_index;
+                let text_color = if is_selected { Color::WHITE } else { Color::rgb(0.8, 0.8, 0.8) };
+                let bg = if is_selected {
+                    Color::rgb(0.2, 0.4, 0.6)
+                } else {
+                    Color::rgb(0.12, 0.12, 0.15)
+                };
+
+                let click_id = Self::result_id(i);
+                scroll = scroll.push(
+                    Row::new()
+                        .id(click_id)
+                        .padding_custom(Padding::new(6.0, 10.0, 6.0, 10.0))
+                        .background(bg)
+                        .corner_radius(3.0)
+                        .width(Length::Fill)
+                        .push(TextElement::new(result).color(text_color)),
+                );
+            }
+
+            container = container.push(scroll);
+        } else if !self.query.is_empty() {
+            container = container.push(
+                Row::new()
+                    .padding_custom(Padding::new(4.0, 10.0, 4.0, 10.0))
+                    .push(TextElement::new("No matches found").color(colors::TEXT_MUTED)),
+            );
+        }
+
+        // Status line
+        if !self.results.is_empty() {
+            let status = format!("{}/{}", self.result_index + 1, self.results.len());
+            container = container.push(
+                Row::new()
+                    .push(TextElement::new("Esc to close, Enter to select, Ctrl+R for next").color(colors::TEXT_MUTED))
+                    .spacer(1.0)
+                    .push(TextElement::new(status).color(colors::TEXT_MUTED)),
+            );
         }
 
         Column::new()
             .padding_custom(Padding::new(0.0, 4.0, 2.0, 4.0))
             .width(Length::Fill)
-            .push(row)
+            .push(container)
             .into()
     }
 }
