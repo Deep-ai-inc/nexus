@@ -1605,6 +1605,7 @@ impl StrataApp for NexusApp {
             if modifiers.meta {
                 if let Key::Character(c) = key {
                     match c.as_str() {
+                        "q" => return Some(NexusMessage::CloseWindow),
                         "k" => return Some(NexusMessage::ClearScreen),
                         "w" => return Some(NexusMessage::CloseWindow),
                         "c" => return Some(NexusMessage::Copy),
@@ -1632,8 +1633,11 @@ impl StrataApp for NexusApp {
                 }
             }
 
-            // Escape: interrupt agent, leave PTY focus, or clear selection
+            // Escape: dismiss overlays, interrupt agent, leave PTY focus, clear selection
             if matches!(key, Key::Named(NamedKey::Escape)) {
+                if state.context_menu.is_some() {
+                    return Some(NexusMessage::DismissContextMenu);
+                }
                 if state.active_agent.is_some() {
                     return Some(NexusMessage::AgentInterrupt);
                 }

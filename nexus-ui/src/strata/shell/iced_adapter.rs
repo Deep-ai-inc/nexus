@@ -152,9 +152,18 @@ fn update<A: StrataApp>(
             // Increment frame counter to trigger redraw
             state.frame = state.frame.wrapping_add(1);
 
-            // Handle window resize
-            if let Event::Window(iced::window::Event::Resized(size)) = event {
-                state.window_size = (size.width, size.height);
+            // Handle window events
+            if let Event::Window(ref win_event) = event {
+                match win_event {
+                    iced::window::Event::Resized(size) => {
+                        state.window_size = (size.width, size.height);
+                    }
+                    iced::window::Event::CloseRequested => {
+                        // Cmd+Q on macOS triggers CloseRequested
+                        std::process::exit(0);
+                    }
+                    _ => {}
+                }
             }
 
             // Handle mouse events
