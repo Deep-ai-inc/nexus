@@ -516,16 +516,20 @@ impl StrataApp for DemoApp {
                     let anchor = state.editor_selection
                         .map(|(a, _)| a)
                         .unwrap_or(state.editor_cursor);
-                    state.editor_selection = Some((anchor, pos));
-                    state.editor_cursor = pos;
+                    if pos != anchor {
+                        state.editor_selection = Some((anchor, pos));
+                        state.editor_cursor = pos;
+                    }
                 } else {
                     let len = state.input_text.chars().count();
                     let pos = pos.min(len);
                     let anchor = state.input_selection
                         .map(|(a, _)| a)
                         .unwrap_or(state.input_cursor);
-                    state.input_selection = Some((anchor, pos));
-                    state.input_cursor = pos;
+                    if pos != anchor {
+                        state.input_selection = Some((anchor, pos));
+                        state.input_cursor = pos;
+                    }
                 }
             }
             DemoMessage::TimerTick => {
@@ -679,8 +683,10 @@ impl StrataApp for DemoApp {
                 let anchor = state.editor_selection
                     .map(|(a, _)| a)
                     .unwrap_or(state.editor_cursor);
-                state.editor_selection = Some((anchor, pos));
-                state.editor_cursor = pos;
+                if pos != anchor {
+                    state.editor_selection = Some((anchor, pos));
+                    state.editor_cursor = pos;
+                }
             }
             DemoMessage::EditorSelectAll => {
                 state.editor_selection = Some((0, state.editor_text.chars().count()));
