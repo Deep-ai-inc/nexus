@@ -878,6 +878,8 @@ pub struct TableColumn {
 /// A cell in a table row.
 pub struct TableCell {
     pub text: String,
+    /// Pre-wrapped lines. If empty, `text` is rendered as a single line.
+    pub lines: Vec<String>,
     pub color: Color,
 }
 
@@ -892,6 +894,8 @@ pub struct TableElement {
     pub header_bg: Color,
     pub header_text_color: Color,
     pub row_height: f32,
+    pub line_height: f32,
+    pub row_padding: f32,
     pub header_height: f32,
     pub stripe_color: Option<Color>,
     pub separator_color: Color,
@@ -907,6 +911,8 @@ impl TableElement {
             header_bg: Color::rgba(0.15, 0.15, 0.2, 1.0),
             header_text_color: Color::rgba(0.6, 0.6, 0.65, 1.0),
             row_height: 22.0,
+            line_height: 18.0,
+            row_padding: 4.0,
             header_height: 26.0,
             stripe_color: Some(Color::rgba(1.0, 1.0, 1.0, 0.02)),
             separator_color: Color::rgba(1.0, 1.0, 1.0, 0.12),
@@ -938,8 +944,22 @@ impl TableElement {
 
     fn estimate_size(&self) -> Size {
         let w: f32 = self.columns.iter().map(|c| c.width).sum();
-        let h = self.header_height + 1.0 + self.rows.len() as f32 * self.row_height;
+        let rows_h: f32 = self.rows.iter().map(|row| self.row_height_for(row)).sum();
+        let h = self.header_height + 1.0 + rows_h;
         Size::new(w, h)
+    }
+
+    /// Compute the height for a single row based on the tallest cell.
+    fn row_height_for(&self, row: &[TableCell]) -> f32 {
+        let max_lines = row.iter()
+            .map(|cell| if cell.lines.is_empty() { 1 } else { cell.lines.len() })
+            .max()
+            .unwrap_or(1);
+        if max_lines <= 1 {
+            self.row_height // fast path: single-line rows use the fixed height
+        } else {
+            max_lines as f32 * self.line_height + self.row_padding
+        }
     }
 }
 
@@ -983,16 +1003,17 @@ fn render_table(
         table.separator_color,
     );
 
-    // Data rows
+    // Data rows — variable height based on wrapped line count
     let data_y = sep_y + 1.0;
+    let mut ry = data_y;
     for (row_idx, row) in table.rows.iter().enumerate() {
-        let ry = data_y + row_idx as f32 * table.row_height;
+        let rh = table.row_height_for(row);
 
         // Stripe background for odd rows
         if row_idx % 2 == 1 {
             if let Some(stripe) = table.stripe_color {
                 snapshot.primitives_mut().add_solid_rect(
-                    Rect::new(x, ry, w, table.row_height),
+                    Rect::new(x, ry, w, rh),
                     stripe,
                 );
             }
@@ -1001,15 +1022,32 @@ fn render_table(
         let mut col_x = x;
         for (col_idx, cell) in row.iter().enumerate() {
             if col_idx < table.columns.len() {
-                snapshot.primitives_mut().add_text_cached(
-                    cell.text.clone(),
-                    Point::new(col_x + cell_pad, ry + 2.0),
-                    cell.color,
-                    hash_text(&cell.text) ^ (row_idx as u64),
-                );
+                if cell.lines.len() <= 1 {
+                    // Single line (fast path)
+                    let text = if cell.lines.len() == 1 { &cell.lines[0] } else { &cell.text };
+                    snapshot.primitives_mut().add_text_cached(
+                        text.clone(),
+                        Point::new(col_x + cell_pad, ry + 2.0),
+                        cell.color,
+                        hash_text(text) ^ (row_idx as u64),
+                    );
+                } else {
+                    // Multi-line wrapped cell
+                    for (line_idx, line) in cell.lines.iter().enumerate() {
+                        let ly = ry + 2.0 + line_idx as f32 * table.line_height;
+                        snapshot.primitives_mut().add_text_cached(
+                            line.clone(),
+                            Point::new(col_x + cell_pad, ly),
+                            cell.color,
+                            hash_text(line) ^ (row_idx as u64) ^ ((line_idx as u64) << 32),
+                        );
+                    }
+                }
                 col_x += table.columns[col_idx].width;
             }
         }
+
+        ry += rh;
     }
 
 }

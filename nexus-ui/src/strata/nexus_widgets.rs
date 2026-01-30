@@ -952,11 +952,18 @@ fn render_native_value(
                 table = table.column_sortable(&header_name, col_widths[i], sort_id);
             }
 
-            // Add data rows
+            // Add data rows with line wrapping
+            let char_w = 8.4_f32;
+            let cell_padding = 16.0_f32;
             for row in rows {
-                let cells: Vec<TableCell> = row.iter().map(|cell| {
+                let cells: Vec<TableCell> = row.iter().enumerate().map(|(col_idx, cell)| {
+                    let text = cell.to_text();
+                    let col_width = col_widths.get(col_idx).copied().unwrap_or(400.0);
+                    let max_chars = ((col_width - cell_padding) / char_w).max(1.0) as usize;
+                    let lines = wrap_cell_text(&text, max_chars);
                     TableCell {
-                        text: cell.to_text(),
+                        text,
+                        lines,
                         color: value_text_color(cell),
                     }
                 }).collect();
@@ -1054,6 +1061,9 @@ fn value_text_color(value: &Value) -> Color {
 }
 
 /// Estimate column widths based on header names and data content.
+///
+/// Uses the widest *line* (splitting on newlines) rather than total text length,
+/// so multi-line content doesn't inflate column widths.
 fn estimate_column_widths(columns: &[nexus_api::TableColumn], rows: &[Vec<Value>]) -> Vec<f32> {
     let char_w = 8.4; // approximate monospace character width
     let padding = 16.0;
@@ -1062,12 +1072,70 @@ fn estimate_column_widths(columns: &[nexus_api::TableColumn], rows: &[Vec<Value>
         let header_len = col.name.len();
         let max_data_len = rows.iter()
             .filter_map(|row| row.get(i))
-            .map(|v| v.to_text().len())
+            .map(|v| {
+                v.to_text()
+                    .lines()
+                    .map(|l| l.len())
+                    .max()
+                    .unwrap_or(0)
+            })
             .max()
             .unwrap_or(0);
         let max_len = header_len.max(max_data_len).max(4);
         (max_len as f32 * char_w + padding).min(400.0)
     }).collect()
+}
+
+/// Word-wrap text to fit within `max_chars` characters per line.
+///
+/// Preserves explicit newlines, breaks long lines at word boundaries,
+/// and force-breaks words exceeding `max_chars`.
+fn wrap_cell_text(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let mut result = Vec::new();
+
+    for paragraph in text.split('\n') {
+        if paragraph.len() <= max_chars {
+            result.push(paragraph.to_string());
+            continue;
+        }
+
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if word.len() > max_chars {
+                // Force-break long words
+                if !line.is_empty() {
+                    result.push(line);
+                    line = String::new();
+                }
+                let mut chars = word.chars().peekable();
+                while chars.peek().is_some() {
+                    let chunk: String = chars.by_ref().take(max_chars).collect();
+                    result.push(chunk);
+                }
+                // Last chunk becomes the current line to allow appending
+                if let Some(last) = result.pop() {
+                    line = last;
+                }
+            } else if line.is_empty() {
+                line = word.to_string();
+            } else if line.len() + 1 + word.len() <= max_chars {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                result.push(line);
+                line = word.to_string();
+            }
+        }
+        if !line.is_empty() || paragraph.is_empty() {
+            result.push(line);
+        }
+    }
+
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
 }
 
 /// Get display color for a file entry.

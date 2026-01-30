@@ -723,9 +723,9 @@ impl StrataApp for DemoApp {
 
                 for &(name, size_str, _size_bytes, kind, name_color) in &state.table_rows {
                     table = table.row(vec![
-                        TableCell { text: name.into(), color: name_color },
-                        TableCell { text: size_str.into(), color: colors::TEXT_SECONDARY },
-                        TableCell { text: kind.into(), color: colors::TEXT_MUTED },
+                        TableCell { text: name.into(), lines: vec![name.into()], color: name_color },
+                        TableCell { text: size_str.into(), lines: vec![size_str.into()], color: colors::TEXT_SECONDARY },
+                        TableCell { text: kind.into(), lines: vec![kind.into()], color: colors::TEXT_MUTED },
                     ]);
                 }
 
