@@ -1162,10 +1162,21 @@ impl StrataPipeline {
         target: &wgpu::TextureView,
         clip_bounds: &iced::Rectangle<u32>,
     ) {
+        // Background color is specified in sRGB but the render target is sRGB format,
+        // which means the GPU will apply linear→sRGB conversion on output. We must
+        // convert to linear here to avoid double-gamma (same as unpack_color in shader).
+        fn srgb_to_linear(c: f32) -> f64 {
+            let c = c as f64;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
         let clear_color = wgpu::Color {
-            r: self.background.r as f64,
-            g: self.background.g as f64,
-            b: self.background.b as f64,
+            r: srgb_to_linear(self.background.r),
+            g: srgb_to_linear(self.background.g),
+            b: srgb_to_linear(self.background.b),
             a: self.background.a as f64,
         };
 

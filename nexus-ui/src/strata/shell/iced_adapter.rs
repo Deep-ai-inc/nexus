@@ -287,7 +287,7 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
     let program = StrataShaderProgram {
         snapshot, // Cheap Arc clone
         selection: A::selection(&state.app).cloned(),
-        background: crate::strata::primitives::Color::rgb(0.1, 0.1, 0.1),
+        background: A::background_color(&state.app),
         frame: state.frame,
         pending_images,
         pending_image_unloads,

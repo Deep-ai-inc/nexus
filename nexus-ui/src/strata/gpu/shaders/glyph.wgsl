@@ -43,13 +43,30 @@ var<private> QUAD_VERTICES: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
     vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
 );
 
+fn srgb_to_linear(c: f32) -> f32 {
+    // Convert a single sRGB channel to linear.
+    // Instance colors are specified in sRGB but the pipeline operates in linear
+    // space (sRGB render target applies linear→sRGB on output).
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
 fn unpack_color(packed: u32) -> vec4<f32> {
-    return vec4<f32>(
+    let srgb = vec4<f32>(
         f32(packed & 0xFFu),
         f32((packed >> 8u) & 0xFFu),
         f32((packed >> 16u) & 0xFFu),
         f32((packed >> 24u) & 0xFFu)
     ) / 255.0;
+    // Convert RGB from sRGB to linear; alpha stays linear
+    return vec4<f32>(
+        srgb_to_linear(srgb.r),
+        srgb_to_linear(srgb.g),
+        srgb_to_linear(srgb.b),
+        srgb.a
+    );
 }
 
 @vertex

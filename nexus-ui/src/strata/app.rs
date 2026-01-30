@@ -309,6 +309,11 @@ pub trait StrataApp: Sized + 'static {
         String::from("Strata App")
     }
 
+    /// Background color for the application window.
+    fn background_color(_state: &Self::State) -> crate::strata::primitives::Color {
+        crate::strata::primitives::Color::BLACK
+    }
+
     /// Whether the application should exit.
     fn should_exit(_state: &Self::State) -> bool {
         false
