@@ -110,6 +110,14 @@ cargo build --release
 cargo run -p nexus-ui --release
 ```
 
+### Strata GUI Library Demo
+
+Nexus includes **Strata**, a custom GPU-accelerated GUI library. To run the demo:
+
+```bash
+cargo run -p nexus-ui --example strata_demo
+```
+
 ## License
 
 MIT
