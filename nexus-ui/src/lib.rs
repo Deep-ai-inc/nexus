@@ -47,10 +47,7 @@ pub mod keymap;
 // Message types (depends on agent_adapter, agent_block)
 pub mod msg;
 
-// Selection state (minimal dependencies)
-pub mod selection;
-
-// State (depends on agent_adapter, agent_block, blocks, selection)
+// State (depends on agent_adapter, agent_block, blocks)
 pub mod state;
 
 // PTY handling (depends on blocks)

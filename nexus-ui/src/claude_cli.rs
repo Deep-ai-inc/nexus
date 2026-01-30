@@ -245,6 +245,11 @@ impl ClaudeCli {
         self.cancel_flag.clone()
     }
 
+    /// Get the child process ID for direct signal sending.
+    pub fn child_pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Cancel the running CLI process.
     pub fn cancel(&mut self) {
         self.cancel_flag.store(true, Ordering::SeqCst);
@@ -483,6 +488,14 @@ impl ClaudeCli {
             }
         }
 
+        // Check if we were cancelled (SIGINT sent) - send Interrupted event
+        if self.cancel_flag.load(Ordering::Relaxed) {
+            let _ = event_tx.send(AgentEvent::Interrupted {
+                request_id,
+                messages: vec![],
+            });
+        }
+
         // Wait for process to exit
         let _ = self.child.wait();
 
@@ -553,16 +566,27 @@ pub async fn spawn_claude_cli_task(
     let result = spawn_blocking(move || {
         match ClaudeCli::spawn(&prompt, options) {
             Ok(cli) => {
+                // Get child PID for direct SIGINT
+                let child_pid = cli.child_pid();
+
                 // Share cancel flag
                 let cli_cancel = cli.cancel_flag();
 
-                // Set up cancellation forwarding
+                // Set up cancellation forwarding with direct SIGINT
                 let cancel_flag_clone = cancel_flag.clone();
                 std::thread::spawn(move || {
                     while !cancel_flag_clone.load(Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
+                    // Set the flag
                     cli_cancel.store(true, Ordering::SeqCst);
+                    // Also send SIGINT directly to unblock any waiting I/O
+                    #[cfg(unix)]
+                    {
+                        use nix::sys::signal::{kill, Signal};
+                        use nix::unistd::Pid;
+                        let _ = kill(Pid::from_raw(child_pid as i32), Signal::SIGINT);
+                    }
                 });
 
                 cli.process_stream(event_tx)
