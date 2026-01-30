@@ -76,5 +76,5 @@ pub use widgets::{TextWidget, TerminalWidget};
 pub use layout::{
     Column, Row, ScrollColumn, Padding, Alignment, CrossAxisAlignment, Length, LineStyle, PrimitiveBatch,
 };
-pub use layout::containers::{TextElement, TerminalElement, ImageElement, ButtonElement, TextInputElement};
+pub use layout::containers::{TextElement, TerminalElement, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell};
 pub use gpu::{ImageHandle, ImageStore};

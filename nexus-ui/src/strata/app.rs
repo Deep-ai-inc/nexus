@@ -151,32 +151,34 @@ impl<M> Default for Command<M> {
 
 /// A subscription to external events.
 ///
-/// Subscriptions are recreated each frame based on application state.
-/// They produce messages when external events occur.
+/// Thin wrapper around `iced::Subscription` for zero-overhead pass-through.
+/// Apps construct these using `from_iced()` and the adapter wires them directly
+/// into iced's subscription system.
 pub struct Subscription<M> {
-    /// Recipes for creating subscription streams.
-    /// Each recipe is identified by a type ID for deduplication.
-    recipes: Vec<Box<dyn SubscriptionRecipe<Output = M>>>,
+    pub(crate) subs: Vec<iced::Subscription<M>>,
 }
 
 impl<M> Subscription<M> {
     /// Create an empty subscription.
     pub fn none() -> Self {
-        Self {
-            recipes: Vec::new(),
-        }
+        Self { subs: Vec::new() }
+    }
+
+    /// Create a subscription from a native iced subscription.
+    pub fn from_iced(sub: iced::Subscription<M>) -> Self {
+        Self { subs: vec![sub] }
     }
 
     /// Batch multiple subscriptions together.
     pub fn batch(subscriptions: impl IntoIterator<Item = Subscription<M>>) -> Self {
         Self {
-            recipes: subscriptions.into_iter().flat_map(|s| s.recipes).collect(),
+            subs: subscriptions.into_iter().flat_map(|s| s.subs).collect(),
         }
     }
 
-    /// Check if this subscription has no recipes.
+    /// Check if this subscription is empty.
     pub fn is_empty(&self) -> bool {
-        self.recipes.is_empty()
+        self.subs.is_empty()
     }
 }
 
@@ -184,14 +186,6 @@ impl<M> Default for Subscription<M> {
     fn default() -> Self {
         Self::none()
     }
-}
-
-/// A recipe for creating a subscription stream.
-///
-/// This is a placeholder - the actual implementation will integrate
-/// with iced's subscription system.
-pub trait SubscriptionRecipe: Send {
-    type Output;
 }
 
 /// The main application trait for Strata.

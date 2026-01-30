@@ -23,7 +23,7 @@ use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::gpu::{ImageHandle, ImageStore};
 use crate::strata::{
     AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, ScrollColumn, Selection,
-    StrataApp, Subscription, TextElement, TextInputElement,
+    StrataApp, Subscription, TableCell, TableElement, TextElement, TextInputElement,
 };
 
 // =========================================================================
@@ -98,6 +98,26 @@ pub enum DemoMessage {
     InputSelectRight,
     InputSelectAll,
     InputSubmit,
+    TimerTick,
+    Copy,
+    TableSort(SourceId),
+    // Right panel scroll
+    RightScroll(f32),
+    RightScrollDragStart(f32),
+    RightScrollDragMove(f32),
+    RightScrollDragEnd,
+    // Multi-line editor messages
+    EditorChar(String),
+    EditorBackspace,
+    EditorDelete,
+    EditorLeft,
+    EditorRight,
+    EditorUp,
+    EditorDown,
+    EditorHome,
+    EditorEnd,
+    EditorEnter,
+    EditorScroll(f32),
 }
 
 /// Demo application state.
@@ -138,6 +158,36 @@ pub struct DemoState {
     focused_input: Option<SourceId>,
     // Test image handle
     test_image: ImageHandle,
+    // Subscription demo
+    elapsed_seconds: u32,
+    // Right panel scroll
+    right_scroll_id: SourceId,
+    right_scroll_thumb_id: SourceId,
+    right_scroll_offset: f32,
+    right_scroll_max: Cell<f32>,
+    right_scroll_track: Cell<Option<crate::strata::layout_snapshot::ScrollTrackInfo>>,
+    right_scroll_grab_offset: f32,
+    right_scroll_bounds: Cell<Rect>,
+    // Right panel overlay placeholder IDs
+    context_menu_placeholder_id: SourceId,
+    drawing_styles_placeholder_id: SourceId,
+    // Table state
+    sort_name_btn: SourceId,
+    sort_size_btn: SourceId,
+    table_source: SourceId,
+    /// Which column is sorted: 0 = NAME, 1 = SIZE
+    table_sort_col: usize,
+    /// Sort ascending?
+    table_sort_asc: bool,
+    /// Table rows: (name, size_display, size_bytes, type)
+    table_rows: Vec<(&'static str, &'static str, u32, &'static str, Color)>,
+    // Multi-line editor state
+    editor_panel_id: SourceId,
+    editor_id: SourceId,
+    editor_text: String,
+    editor_cursor: usize,
+    editor_selection: Option<(usize, usize)>,
+    editor_scroll_offset: f32,
 }
 
 /// Demo application.
@@ -181,6 +231,34 @@ impl StrataApp for DemoApp {
             fps_smooth: Cell::new(0.0),
             start_time: Instant::now(),
             test_image,
+            elapsed_seconds: 0,
+            right_scroll_id: SourceId::new(),
+            right_scroll_thumb_id: SourceId::new(),
+            right_scroll_offset: 0.0,
+            right_scroll_max: Cell::new(f32::MAX),
+            right_scroll_track: Cell::new(None),
+            right_scroll_grab_offset: 0.0,
+            right_scroll_bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
+            context_menu_placeholder_id: SourceId::new(),
+            drawing_styles_placeholder_id: SourceId::new(),
+            sort_name_btn: SourceId::new(),
+            sort_size_btn: SourceId::new(),
+            table_source: SourceId::new(),
+            table_sort_col: 0,
+            table_sort_asc: true,
+            table_rows: vec![
+                ("src/",       "256B", 256,  "dir",  colors::TEXT_PATH),
+                ("main.rs",    "420B", 420,  "rust", colors::TEXT_PRIMARY),
+                ("lib.rs",     "1.2K", 1200, "rust", colors::TEXT_PRIMARY),
+                ("Cargo.toml", "890B", 890,  "toml", colors::TEXT_PRIMARY),
+                ("README.md",  "2.4K", 2400, "md",   colors::TEXT_PRIMARY),
+            ],
+            editor_panel_id: SourceId::new(),
+            editor_id: SourceId::new(),
+            editor_text: "Hello, world!\nThis is a multi-line editor.\n\nTry typing here.".to_string(),
+            editor_cursor: 0,
+            editor_selection: None,
+            editor_scroll_offset: 0.0,
         };
         (state, Command::none())
     }
@@ -231,6 +309,34 @@ impl StrataApp for DemoApp {
             }
             DemoMessage::ScrollDragEnd => {
                 state.scroll_grab_offset = 0.0;
+            }
+            DemoMessage::RightScroll(delta) => {
+                let max = state.right_scroll_max.get();
+                state.right_scroll_offset = (state.right_scroll_offset - delta).clamp(0.0, max);
+            }
+            DemoMessage::RightScrollDragStart(mouse_y) => {
+                if let Some(track) = state.right_scroll_track.get() {
+                    let effective_offset = state.right_scroll_offset.clamp(0.0, state.right_scroll_max.get());
+                    let thumb_top = track.thumb_y(effective_offset);
+                    let thumb_bottom = thumb_top + track.thumb_height;
+                    const GRAB_TOLERANCE: f32 = 4.0;
+                    if mouse_y >= (thumb_top - GRAB_TOLERANCE) && mouse_y <= (thumb_bottom + GRAB_TOLERANCE) {
+                        state.right_scroll_grab_offset = mouse_y - thumb_top;
+                    } else {
+                        state.right_scroll_grab_offset = track.thumb_height / 2.0;
+                        let new_offset = track.offset_from_y(mouse_y, state.right_scroll_grab_offset);
+                        state.right_scroll_offset = new_offset.clamp(0.0, state.right_scroll_max.get());
+                    }
+                }
+            }
+            DemoMessage::RightScrollDragMove(mouse_y) => {
+                if let Some(track) = state.right_scroll_track.get() {
+                    let new_offset = track.offset_from_y(mouse_y, state.right_scroll_grab_offset);
+                    state.right_scroll_offset = new_offset.clamp(0.0, state.right_scroll_max.get());
+                }
+            }
+            DemoMessage::RightScrollDragEnd => {
+                state.right_scroll_grab_offset = 0.0;
             }
             DemoMessage::ClearSelection => {
                 state.selection = None;
@@ -348,6 +454,143 @@ impl StrataApp for DemoApp {
                 state.input_text.clear();
                 state.input_cursor = 0;
                 state.input_selection = None;
+            }
+            DemoMessage::TimerTick => {
+                state.elapsed_seconds += 1;
+            }
+            DemoMessage::TableSort(id) => {
+                let col = if id == state.sort_name_btn { 0 } else { 1 };
+                if state.table_sort_col == col {
+                    state.table_sort_asc = !state.table_sort_asc;
+                } else {
+                    state.table_sort_col = col;
+                    state.table_sort_asc = true;
+                }
+                match col {
+                    0 => state.table_rows.sort_by(|a, b| {
+                        if state.table_sort_asc { a.0.cmp(b.0) } else { b.0.cmp(a.0) }
+                    }),
+                    _ => state.table_rows.sort_by(|a, b| {
+                        if state.table_sort_asc { a.2.cmp(&b.2) } else { b.2.cmp(&a.2) }
+                    }),
+                }
+            }
+            DemoMessage::Copy => {
+                if let Some(sel) = &state.selection {
+                    eprintln!(
+                        "[demo] Copy: source={:?} offsets={}..{}",
+                        sel.anchor.source_id,
+                        sel.anchor.content_offset,
+                        sel.focus.content_offset,
+                    );
+                }
+            }
+            // Multi-line editor messages
+            DemoMessage::EditorChar(c) => {
+                if let Some((s, e)) = state.editor_selection.take() {
+                    let (lo, hi) = (s.min(e), s.max(e));
+                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    state.editor_text.replace_range(lo_byte..hi_byte, "");
+                    state.editor_cursor = lo;
+                }
+                let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                state.editor_text.insert_str(byte_pos, &c);
+                state.editor_cursor += c.chars().count();
+            }
+            DemoMessage::EditorEnter => {
+                if let Some((s, e)) = state.editor_selection.take() {
+                    let (lo, hi) = (s.min(e), s.max(e));
+                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    state.editor_text.replace_range(lo_byte..hi_byte, "");
+                    state.editor_cursor = lo;
+                }
+                let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                state.editor_text.insert(byte_pos, '\n');
+                state.editor_cursor += 1;
+            }
+            DemoMessage::EditorBackspace => {
+                if let Some((s, e)) = state.editor_selection.take() {
+                    let (lo, hi) = (s.min(e), s.max(e));
+                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    state.editor_text.replace_range(lo_byte..hi_byte, "");
+                    state.editor_cursor = lo;
+                } else if state.editor_cursor > 0 {
+                    state.editor_cursor -= 1;
+                    let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(0);
+                    let next = state.editor_text.char_indices().nth(state.editor_cursor + 1).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    state.editor_text.replace_range(byte_pos..next, "");
+                }
+            }
+            DemoMessage::EditorDelete => {
+                if let Some((s, e)) = state.editor_selection.take() {
+                    let (lo, hi) = (s.min(e), s.max(e));
+                    let lo_byte = state.editor_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    let hi_byte = state.editor_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                    state.editor_text.replace_range(lo_byte..hi_byte, "");
+                    state.editor_cursor = lo;
+                } else {
+                    let char_count = state.editor_text.chars().count();
+                    if state.editor_cursor < char_count {
+                        let byte_pos = state.editor_text.char_indices().nth(state.editor_cursor).map(|(i, _)| i).unwrap_or(0);
+                        let next = state.editor_text.char_indices().nth(state.editor_cursor + 1).map(|(i, _)| i).unwrap_or(state.editor_text.len());
+                        state.editor_text.replace_range(byte_pos..next, "");
+                    }
+                }
+            }
+            DemoMessage::EditorLeft => {
+                state.editor_selection = None;
+                if state.editor_cursor > 0 { state.editor_cursor -= 1; }
+            }
+            DemoMessage::EditorRight => {
+                state.editor_selection = None;
+                let len = state.editor_text.chars().count();
+                if state.editor_cursor < len { state.editor_cursor += 1; }
+            }
+            DemoMessage::EditorHome => {
+                state.editor_selection = None;
+                // Move to start of current line
+                let (line, _col) = editor_line_col(&state.editor_text, state.editor_cursor);
+                let mut offset = 0;
+                for (i, ch) in state.editor_text.chars().enumerate() {
+                    if i == state.editor_cursor { break; }
+                    if ch == '\n' { offset = i + 1; }
+                }
+                let _ = line; // used indirectly
+                state.editor_cursor = offset;
+            }
+            DemoMessage::EditorEnd => {
+                state.editor_selection = None;
+                // Move to end of current line
+                let mut pos = state.editor_cursor;
+                for ch in state.editor_text.chars().skip(state.editor_cursor) {
+                    if ch == '\n' { break; }
+                    pos += 1;
+                }
+                state.editor_cursor = pos;
+            }
+            DemoMessage::EditorUp => {
+                state.editor_selection = None;
+                let (line, col) = editor_line_col(&state.editor_text, state.editor_cursor);
+                if line > 0 {
+                    state.editor_cursor = editor_line_col_to_offset(&state.editor_text, line - 1, col);
+                }
+            }
+            DemoMessage::EditorDown => {
+                state.editor_selection = None;
+                let (line, col) = editor_line_col(&state.editor_text, state.editor_cursor);
+                let line_count = state.editor_text.split('\n').count();
+                if line + 1 < line_count {
+                    state.editor_cursor = editor_line_col_to_offset(&state.editor_text, line + 1, col);
+                }
+            }
+            DemoMessage::EditorScroll(delta) => {
+                state.editor_scroll_offset = (state.editor_scroll_offset - delta).max(0.0);
+                let line_count = state.editor_text.split('\n').count() as f32;
+                let max_scroll = (line_count * 18.0 - 80.0).max(0.0); // LINE_HEIGHT = 18
+                state.editor_scroll_offset = state.editor_scroll_offset.min(max_scroll);
             }
         }
         Command::none()
@@ -523,13 +766,32 @@ impl StrataApp for DemoApp {
                     ,
             )
             // =============================================================
-            // RIGHT COLUMN: Component Catalog
+            // RIGHT COLUMN: Scrollable Component Catalog
             // =============================================================
-            .column(
-                Column::new()
+            .scroll_column({
+                let arrow = if state.table_sort_asc { " \u{25B2}" } else { " \u{25BC}" };
+                let name_header: String = if state.table_sort_col == 0 { format!("NAME{}", arrow) } else { "NAME".into() };
+                let size_header: String = if state.table_sort_col == 1 { format!("SIZE{}", arrow) } else { "SIZE".into() };
+
+                let mut table = TableElement::new(state.table_source)
+                    .column_sortable(&name_header, 140.0, state.sort_name_btn)
+                    .column_sortable(&size_header, 70.0, state.sort_size_btn)
+                    .column("TYPE", 70.0);
+
+                for &(name, size_str, _size_bytes, kind, name_color) in &state.table_rows {
+                    table = table.row(vec![
+                        TableCell { text: name.into(), color: name_color },
+                        TableCell { text: size_str.into(), color: colors::TEXT_SECONDARY },
+                        TableCell { text: kind.into(), color: colors::TEXT_MUTED },
+                    ]);
+                }
+
+                ScrollColumn::new(state.right_scroll_id, state.right_scroll_thumb_id)
+                    .scroll_offset(state.right_scroll_offset)
                     .spacing(16.0)
                     .width(Length::Fixed(right_col_width))
-                    // Status Indicators (ID for overlay anchoring)
+                    .height(Length::Fill)
+                    // Status Indicators
                     .column(
                         StatusPanel {
                             indicators: vec![
@@ -554,6 +816,7 @@ impl StrataApp for DemoApp {
                                     color: colors::KILLED,
                                 },
                             ],
+                            uptime_seconds: state.elapsed_seconds,
                         }
                         .build()
                         .id(state.status_panel_id),
@@ -584,39 +847,86 @@ impl StrataApp for DemoApp {
                         }
                         .build()
                         .id(state.job_panel_id),
-                    ),
-            )
+                    )
+                    // Multi-line Editor
+                    .column(
+                        Column::new()
+                            .padding(10.0)
+                            .spacing(6.0)
+                            .background(colors::BG_BLOCK)
+                            .corner_radius(6.0)
+                            .width(Length::Fill)
+                            .text(TextElement::new("Multi-line Editor").color(colors::TEXT_SECONDARY))
+                            .text_input(
+                                TextInputElement::new(state.editor_id, &state.editor_text)
+                                    .multiline(true)
+                                    .height(Length::Fixed(120.0))
+                                    .cursor(state.editor_cursor)
+                                    .selection(state.editor_selection)
+                                    .focused(state.focused_input == Some(state.editor_id))
+                                    .placeholder("Multi-line editor...")
+                                    .scroll_offset(state.editor_scroll_offset),
+                            )
+                            .id(state.editor_panel_id),
+                    )
+                    // Context menu placeholder (fixed height, rendered as primitives after layout)
+                    .column(
+                        Column::new()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(194.0)) // "Context Menu" label + menu box
+                            .id(state.context_menu_placeholder_id),
+                    )
+                    // Drawing styles placeholder
+                    .column(
+                        Column::new()
+                            .width(Length::Fill)
+                            .height(Length::Fixed(180.0))
+                            .id(state.drawing_styles_placeholder_id),
+                    )
+                    // Table (fully layout-driven)
+                    .column(
+                        Column::new()
+                            .padding(10.0)
+                            .spacing(6.0)
+                            .background(colors::BG_BLOCK)
+                            .corner_radius(6.0)
+                            .width(Length::Fill)
+                            .text(TextElement::new("Table").color(colors::TEXT_SECONDARY))
+                            .table(table),
+                    )
+            })
             .layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
 
-        // Update scroll limits from layout (for clamping in update())
+        // Update scroll limits from layout
         if let Some(max) = snapshot.scroll_limit(&state.scroll_id) {
             state.scroll_max.set(max);
         }
         if let Some(track) = snapshot.scroll_track(&state.scroll_id) {
             state.scroll_track.set(Some(*track));
         }
+        if let Some(max) = snapshot.scroll_limit(&state.right_scroll_id) {
+            state.right_scroll_max.set(max);
+        }
+        if let Some(track) = snapshot.scroll_track(&state.right_scroll_id) {
+            state.right_scroll_track.set(Some(*track));
+        }
+        if let Some(bounds) = snapshot.widget_bounds(&state.right_scroll_id) {
+            state.right_scroll_bounds.set(bounds);
+        }
 
         // =================================================================
-        // OVERLAYS (anchored to widgets via layout snapshot)
+        // POST-LAYOUT: Render primitives into placeholder positions
         // =================================================================
-        let rx = vw - outer_padding - right_col_width;
         let anim_t = now.duration_since(state.start_time).as_secs_f32();
 
-        // Context menu anchored below the job panel
-        use crate::strata::layout_snapshot::Anchor;
-        if let Some(job_bottom) = snapshot.anchor_to(
-            &state.job_panel_id,
-            Anchor::Below,
-            crate::strata::primitives::Size::new(right_col_width, 0.0),
-        ) {
-            let menu_y = job_bottom.y + 16.0;
-            view_context_menu(snapshot, job_bottom.x, menu_y);
+        // Render context menu at its placeholder position
+        if let Some(bounds) = snapshot.widget_bounds(&state.context_menu_placeholder_id) {
+            view_context_menu(snapshot, bounds.x, bounds.y);
+        }
 
-            let drawing_y = menu_y + 178.0;
-            view_drawing_styles(snapshot, job_bottom.x, drawing_y, right_col_width, anim_t);
-
-            let table_y = drawing_y + 196.0;
-            view_table(snapshot, job_bottom.x, table_y, right_col_width);
+        // Render drawing styles at placeholder position
+        if let Some(bounds) = snapshot.widget_bounds(&state.drawing_styles_placeholder_id) {
+            view_drawing_styles(snapshot, bounds.x, bounds.y, bounds.width, anim_t);
         }
 
         // FPS counter (top-right corner)
@@ -646,30 +956,42 @@ impl StrataApp for DemoApp {
                 position,
             } => {
                 if let Some(HitResult::Widget(id)) = &hit {
-                    // Text input focus
-                    if *id == state.input_id {
+                    // Text input / editor focus
+                    if *id == state.input_id || *id == state.editor_id {
                         return MouseResponse::message(DemoMessage::InputFocus(*id));
                     }
                     // Button clicks
                     if *id == state.deny_btn_id || *id == state.allow_btn_id || *id == state.always_btn_id {
                         return MouseResponse::message(DemoMessage::ButtonClicked(*id));
                     }
-                    // Scrollbar thumb drag
+                    // Table sort header clicks
+                    if *id == state.sort_name_btn || *id == state.sort_size_btn {
+                        return MouseResponse::message(DemoMessage::TableSort(*id));
+                    }
+                    // Scrollbar thumb drag (left panel)
                     if *id == state.scroll_thumb_id {
                         return MouseResponse::message_and_capture(
                             DemoMessage::ScrollDragStart(position.y),
                             state.scroll_thumb_id,
                         );
                     }
+                    // Scrollbar thumb drag (right panel)
+                    if *id == state.right_scroll_thumb_id {
+                        return MouseResponse::message_and_capture(
+                            DemoMessage::RightScrollDragStart(position.y),
+                            state.right_scroll_thumb_id,
+                        );
+                    }
                 }
-                // Text selection
+                // Text / grid cell selection
                 if let Some(HitResult::Content(addr)) = hit {
                     if state.focused_input.is_some() {
                         return MouseResponse::message(DemoMessage::InputBlur);
                     }
+                    let capture_source = addr.source_id;
                     return MouseResponse::message_and_capture(
                         DemoMessage::SelectionStart(addr),
-                        state.query_source,
+                        capture_source,
                     );
                 }
                 // Clicked on empty space: blur input
@@ -679,9 +1001,13 @@ impl StrataApp for DemoApp {
             }
             MouseEvent::CursorMoved { position } => {
                 if let CaptureState::Captured(id) = capture {
-                    // Scrollbar thumb drag
+                    // Scrollbar thumb drag (left)
                     if *id == state.scroll_thumb_id {
                         return MouseResponse::message(DemoMessage::ScrollDragMove(position.y));
+                    }
+                    // Scrollbar thumb drag (right)
+                    if *id == state.right_scroll_thumb_id {
+                        return MouseResponse::message(DemoMessage::RightScrollDragMove(position.y));
                     }
                     // Text selection
                     if let Some(HitResult::Content(addr)) = hit {
@@ -697,26 +1023,24 @@ impl StrataApp for DemoApp {
                     if *id == state.scroll_thumb_id {
                         return MouseResponse::message_and_release(DemoMessage::ScrollDragEnd);
                     }
+                    if *id == state.right_scroll_thumb_id {
+                        return MouseResponse::message_and_release(DemoMessage::RightScrollDragEnd);
+                    }
                     return MouseResponse::message_and_release(DemoMessage::SelectionEnd);
                 }
             }
-            MouseEvent::WheelScrolled { delta } => {
-                // Route scroll events to the scroll container
-                if let Some(HitResult::Widget(id)) = &hit {
-                    if *id == state.scroll_id {
-                        let dy = match delta {
-                            ScrollDelta::Lines { y, .. } => y * 40.0,
-                            ScrollDelta::Pixels { y, .. } => y,
-                        };
-                        return MouseResponse::message(DemoMessage::Scroll(dy));
-                    }
+            MouseEvent::WheelScrolled { delta, position } => {
+                let dy = match delta {
+                    ScrollDelta::Lines { y, .. } => y * 40.0,
+                    ScrollDelta::Pixels { y, .. } => y,
+                };
+                // Route based on cursor position over scroll containers
+                let right_bounds = state.right_scroll_bounds.get();
+                if right_bounds.contains_xy(position.x, position.y) {
+                    return MouseResponse::message(DemoMessage::RightScroll(dy));
                 }
-                // Also scroll if hovering content inside the scroll container
-                if let Some(HitResult::Content(_)) = &hit {
-                    let dy = match delta {
-                        ScrollDelta::Lines { y, .. } => y * 40.0,
-                        ScrollDelta::Pixels { y, .. } => y,
-                    };
+                // Default: left panel scroll
+                if hit.is_some() {
                     return MouseResponse::message(DemoMessage::Scroll(dy));
                 }
             }
@@ -731,7 +1055,25 @@ impl StrataApp for DemoApp {
     ) -> Option<Self::Message> {
         if let KeyEvent::Pressed { key, modifiers } = event {
             // Route to focused input first
-            if state.focused_input.is_some() {
+            if state.focused_input == Some(state.editor_id) {
+                // Multi-line editor: Enter inserts newline, Up/Down navigate lines
+                match (&key, modifiers.shift, modifiers.meta || modifiers.ctrl) {
+                    (Key::Named(NamedKey::Escape), _, _) => return Some(DemoMessage::InputBlur),
+                    (Key::Named(NamedKey::Enter), _, _) => return Some(DemoMessage::EditorEnter),
+                    (Key::Named(NamedKey::Backspace), _, _) => return Some(DemoMessage::EditorBackspace),
+                    (Key::Named(NamedKey::Delete), _, _) => return Some(DemoMessage::EditorDelete),
+                    (Key::Named(NamedKey::ArrowLeft), _, _) => return Some(DemoMessage::EditorLeft),
+                    (Key::Named(NamedKey::ArrowRight), _, _) => return Some(DemoMessage::EditorRight),
+                    (Key::Named(NamedKey::ArrowUp), _, _) => return Some(DemoMessage::EditorUp),
+                    (Key::Named(NamedKey::ArrowDown), _, _) => return Some(DemoMessage::EditorDown),
+                    (Key::Named(NamedKey::Home), _, _) => return Some(DemoMessage::EditorHome),
+                    (Key::Named(NamedKey::End), _, _) => return Some(DemoMessage::EditorEnd),
+                    (Key::Character(c), _, false) => return Some(DemoMessage::EditorChar(c.clone())),
+                    (Key::Named(NamedKey::Space), _, false) => return Some(DemoMessage::EditorChar(" ".into())),
+                    _ => return None,
+                }
+            } else if state.focused_input.is_some() {
+                // Single-line input
                 match (&key, modifiers.shift, modifiers.meta || modifiers.ctrl) {
                     (Key::Named(NamedKey::Escape), _, _) => return Some(DemoMessage::InputBlur),
                     (Key::Named(NamedKey::Enter), _, _) => return Some(DemoMessage::InputSubmit),
@@ -750,12 +1092,13 @@ impl StrataApp for DemoApp {
                 }
             }
             // Global shortcuts
-            match key {
-                Key::Named(NamedKey::Escape) => return Some(DemoMessage::ClearSelection),
-                Key::Named(NamedKey::ArrowUp) => return Some(DemoMessage::ScrollByKey(60.0)),
-                Key::Named(NamedKey::ArrowDown) => return Some(DemoMessage::ScrollByKey(-60.0)),
-                Key::Named(NamedKey::PageUp) => return Some(DemoMessage::ScrollByKey(300.0)),
-                Key::Named(NamedKey::PageDown) => return Some(DemoMessage::ScrollByKey(-300.0)),
+            match (&key, modifiers.meta) {
+                (Key::Character(c), true) if c == "c" => return Some(DemoMessage::Copy),
+                (Key::Named(NamedKey::Escape), _) => return Some(DemoMessage::ClearSelection),
+                (Key::Named(NamedKey::ArrowUp), _) => return Some(DemoMessage::ScrollByKey(60.0)),
+                (Key::Named(NamedKey::ArrowDown), _) => return Some(DemoMessage::ScrollByKey(-60.0)),
+                (Key::Named(NamedKey::PageUp), _) => return Some(DemoMessage::ScrollByKey(300.0)),
+                (Key::Named(NamedKey::PageDown), _) => return Some(DemoMessage::ScrollByKey(-300.0)),
                 _ => {}
             }
         }
@@ -763,7 +1106,10 @@ impl StrataApp for DemoApp {
     }
 
     fn subscription(_state: &Self::State) -> Subscription<Self::Message> {
-        Subscription::none()
+        Subscription::from_iced(
+            iced::time::every(std::time::Duration::from_secs(1))
+                .map(|_| DemoMessage::TimerTick),
+        )
     }
 
     fn title(_state: &Self::State) -> String {
@@ -838,56 +1184,6 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
     let iy = iy + sep_gap;
     p.add_text("Search", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY);
     p.add_text("\u{2318}F", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
-}
-
-// =========================================================================
-// Overlay: Table (absolute positioned)
-// =========================================================================
-
-fn view_table(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32) {
-    let p = snapshot.primitives_mut();
-
-    p.add_rounded_rect(Rect::new(x, y, width, 160.0), 6.0, colors::BG_BLOCK);
-    p.add_text("Table", Point::new(x + 10.0, y + 6.0), colors::TEXT_SECONDARY);
-
-    let tx = x + 14.0;
-    let ty = y + 30.0;
-    let col1 = tx;
-    let col2 = tx + 140.0;
-    let col3 = tx + 210.0;
-
-    p.add_text("NAME", Point::new(col1, ty), colors::TEXT_SECONDARY);
-    p.add_text("SIZE \u{25BC}", Point::new(col2, ty), colors::TEXT_PATH);
-    p.add_text("TYPE", Point::new(col3, ty), colors::TEXT_SECONDARY);
-
-    p.add_line(
-        Point::new(tx, ty + 20.0),
-        Point::new(tx + width - 28.0, ty + 20.0),
-        1.0, Color::rgba(1.0, 1.0, 1.0, 0.12),
-    );
-
-    let rows: &[(&str, &str, &str, Color)] = &[
-        ("src/", "256B", "dir", colors::TEXT_PATH),
-        ("main.rs", "420B", "rust", colors::TEXT_PRIMARY),
-        ("lib.rs", "1.2K", "rust", colors::TEXT_PRIMARY),
-        ("Cargo.toml", "890B", "toml", colors::TEXT_PRIMARY),
-        ("README.md", "2.4K", "md", colors::TEXT_PRIMARY),
-    ];
-
-    for (i, (name, size, kind, color)) in rows.iter().enumerate() {
-        let ry = ty + 26.0 + i as f32 * 22.0;
-
-        if i == 0 {
-            p.add_rounded_rect(
-                Rect::new(tx - 4.0, ry - 2.0, width - 20.0, 20.0),
-                3.0, Color::rgba(1.0, 1.0, 1.0, 0.04),
-            );
-        }
-
-        p.add_text(*name, Point::new(col1, ry), *color);
-        p.add_text(*size, Point::new(col2, ry), colors::TEXT_SECONDARY);
-        p.add_text(*kind, Point::new(col3, ry), colors::TEXT_MUTED);
-    }
 }
 
 // =========================================================================
@@ -976,4 +1272,35 @@ pub fn run() -> Result<(), crate::strata::shell::Error> {
         antialiasing: true,
         background_color: colors::BG_APP,
     })
+}
+
+/// Convert a char offset to (line, col) in newline-delimited text.
+fn editor_line_col(text: &str, char_offset: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+    for (i, ch) in text.chars().enumerate() {
+        if i == char_offset {
+            return (line, col);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Convert (line, col) back to a char offset, clamping col to line length.
+fn editor_line_col_to_offset(text: &str, target_line: usize, target_col: usize) -> usize {
+    let mut offset = 0;
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx == target_line {
+            let line_len = line.chars().count();
+            return offset + target_col.min(line_len);
+        }
+        offset += line.chars().count() + 1; // +1 for '\n'
+    }
+    text.chars().count() // past end
 }

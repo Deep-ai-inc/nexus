@@ -667,11 +667,18 @@ impl LayoutSnapshot {
         }
 
         // 2. Fallback: Check widget bounds (buttons, panels, etc.)
-        // Reverse iteration so later-registered (top-most) widgets win.
+        // Prefer the smallest matching widget (most specific hit target).
+        let mut best: Option<(SourceId, f32)> = None;
         for (id, rect) in &self.widget_bounds {
             if rect.contains_xy(x, y) {
-                return Some(HitResult::Widget(*id));
+                let area = rect.width * rect.height;
+                if best.is_none() || area < best.unwrap().1 {
+                    best = Some((*id, area));
+                }
             }
+        }
+        if let Some((id, _)) = best {
+            return Some(HitResult::Widget(id));
         }
 
         None

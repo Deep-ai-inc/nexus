@@ -266,6 +266,7 @@ pub struct StatusIndicator {
 
 pub struct StatusPanel {
     pub indicators: Vec<StatusIndicator>,
+    pub uptime_seconds: u32,
 }
 
 impl StatusPanel {
@@ -277,6 +278,8 @@ impl StatusPanel {
             );
         }
 
+        let uptime = format!("Uptime: {}s", self.uptime_seconds);
+
         Column::new()
             .padding(10.0)
             .spacing(6.0)
@@ -285,6 +288,7 @@ impl StatusPanel {
             .width(Length::Fill)
             .text(TextElement::new("Status Indicators").color(colors::TEXT_SECONDARY))
             .row(row)
+            .text(TextElement::new(uptime).color(colors::TEXT_MUTED))
     }
 }
 

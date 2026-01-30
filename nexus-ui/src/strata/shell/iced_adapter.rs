@@ -286,12 +286,17 @@ fn subscription<A: StrataApp>(state: &ShellState<A>) -> Subscription<ShellMessag
     let tick = iced::window::frames()
         .map(|_| ShellMessage::Tick);
 
-    // Get app subscriptions
-    let _app_sub = A::subscription(&state.app);
-    // TODO: Convert app subscription to iced subscription
+    // Convert app subscriptions to iced subscriptions
+    let app_sub = A::subscription(&state.app);
+    let app_subs: Vec<Subscription<ShellMessage<A::Message>>> = app_sub
+        .subs
+        .into_iter()
+        .map(|s| s.map(ShellMessage::App))
+        .collect();
 
-    // Combine subscriptions
-    Subscription::batch([events, tick])
+    let mut all_subs = vec![events, tick];
+    all_subs.extend(app_subs);
+    Subscription::batch(all_subs)
 }
 
 /// Convert a Strata Command to an iced Task.
@@ -339,6 +344,7 @@ fn convert_event(event: &Event) -> Option<crate::strata::event_context::Event> {
                             y: *y,
                         },
                     },
+                    position: Point::ORIGIN,
                 },
             };
             Some(crate::strata::event_context::Event::Mouse(strata_event))
@@ -393,6 +399,7 @@ fn convert_mouse_event(
                 iced::mouse::ScrollDelta::Lines { x, y } => ScrollDelta::Lines { x: *x, y: *y },
                 iced::mouse::ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels { x: *x, y: *y },
             },
+            position: pos,
         }),
     }
 }

@@ -15,5 +15,5 @@
 pub mod containers;
 pub mod primitives;
 
-pub use containers::{Column, Row, ScrollColumn, Padding, Alignment, CrossAxisAlignment, Length, ImageElement, ButtonElement, TextInputElement};
+pub use containers::{Column, Row, ScrollColumn, Padding, Alignment, CrossAxisAlignment, Length, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell};
 pub use primitives::{LineStyle, PrimitiveBatch};

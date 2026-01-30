@@ -148,6 +148,9 @@ pub enum LayoutChild {
     /// A text input element (editable text field, registers as widget hit target).
     TextInput(TextInputElement),
 
+    /// A table element (headers + rows with sortable columns).
+    Table(TableElement),
+
     /// A fixed-size spacer.
     FixedSpacer { size: f32 },
 }
@@ -161,6 +164,7 @@ impl LayoutChild {
             LayoutChild::Image(img) => img.size(),
             LayoutChild::Button(b) => b.estimate_size(),
             LayoutChild::TextInput(t) => t.estimate_size(),
+            LayoutChild::Table(t) => t.estimate_size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
@@ -178,6 +182,7 @@ impl LayoutChild {
             LayoutChild::Image(img) => img.size(),
             LayoutChild::Button(b) => b.estimate_size(),
             LayoutChild::TextInput(t) => t.estimate_size(),
+            LayoutChild::Table(t) => t.estimate_size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
@@ -298,6 +303,131 @@ fn render_text_input(
 
     // Register for hit-testing
     snapshot.register_widget(input.id, input_rect);
+}
+
+/// Render a multiline text input element (code editor style).
+///
+/// Supports vertical scrolling, per-line cursor positioning, and
+/// per-line selection highlights. Only visible lines are rendered
+/// (virtualized).
+fn render_text_input_multiline(
+    snapshot: &mut LayoutSnapshot,
+    input: TextInputElement,
+    x: f32, y: f32, w: f32, h: f32,
+) {
+    use crate::strata::primitives::Point;
+
+    let input_rect = Rect::new(x, y, w, h);
+
+    // Background
+    snapshot.primitives_mut().add_rounded_rect(input_rect, input.corner_radius, input.background);
+
+    // Border
+    let border_color = if input.focused { input.focus_border_color } else { input.border_color };
+    snapshot.primitives_mut().add_border(input_rect, input.corner_radius, input.border_width, border_color);
+
+    // Clip content area
+    snapshot.primitives_mut().push_clip(input_rect);
+
+    let text_x = x + input.padding.left;
+    let text_y = y + input.padding.top;
+    let visible_h = h - input.padding.vertical();
+
+    // Split text into lines
+    let lines: Vec<&str> = if input.text.is_empty() {
+        vec![""]
+    } else {
+        input.text.split('\n').collect()
+    };
+
+    // Compute visible line range (virtualized rendering)
+    let first_visible = (input.scroll_offset / LINE_HEIGHT).floor().max(0.0) as usize;
+    let visible_count = (visible_h / LINE_HEIGHT).ceil() as usize + 1;
+    let last_visible = (first_visible + visible_count).min(lines.len());
+
+    // Compute cursor (line, col) from byte offset
+    let (cursor_line, cursor_col) = offset_to_line_col(&input.text, input.cursor);
+
+    // Selection highlight (per-line)
+    if let Some((sel_start, sel_end)) = input.selection {
+        let s = sel_start.min(sel_end);
+        let e = sel_start.max(sel_end);
+        let (s_line, s_col) = offset_to_line_col(&input.text, s);
+        let (e_line, e_col) = offset_to_line_col(&input.text, e);
+
+        for line_idx in s_line..=e_line {
+            if line_idx < first_visible || line_idx >= last_visible { continue; }
+            let line_len = lines.get(line_idx).map(|l| l.chars().count()).unwrap_or(0);
+            let col_start = if line_idx == s_line { s_col } else { 0 };
+            let col_end = if line_idx == e_line { e_col } else { line_len };
+            if col_start == col_end && s_line != e_line && line_idx != e_line {
+                // Full-line selection indicator for empty-col lines in middle
+            }
+            let sel_x = text_x + col_start as f32 * CHAR_WIDTH;
+            let sel_w = ((col_end - col_start).max(1)) as f32 * CHAR_WIDTH;
+            let sel_y = text_y + line_idx as f32 * LINE_HEIGHT - input.scroll_offset;
+            snapshot.primitives_mut().add_solid_rect(
+                Rect::new(sel_x, sel_y, sel_w, LINE_HEIGHT),
+                Color::rgba(0.3, 0.5, 0.8, 0.4),
+            );
+        }
+    }
+
+    // Render visible lines
+    if input.text.is_empty() && !input.focused {
+        snapshot.primitives_mut().add_text_cached(
+            input.placeholder.clone(),
+            Point::new(text_x, text_y),
+            input.placeholder_color,
+            hash_text(&input.placeholder),
+        );
+    } else {
+        for line_idx in first_visible..last_visible {
+            let line = lines[line_idx];
+            let ly = text_y + line_idx as f32 * LINE_HEIGHT - input.scroll_offset;
+            if !line.is_empty() {
+                snapshot.primitives_mut().add_text_cached(
+                    line.to_string(),
+                    Point::new(text_x, ly),
+                    input.text_color,
+                    hash_text(line).wrapping_add(line_idx as u64),
+                );
+            }
+        }
+    }
+
+    // Cursor
+    if input.focused {
+        let cursor_x = text_x + cursor_col as f32 * CHAR_WIDTH;
+        let cursor_y = text_y + cursor_line as f32 * LINE_HEIGHT - input.scroll_offset;
+        snapshot.primitives_mut().add_solid_rect(
+            Rect::new(cursor_x, cursor_y, 2.0, LINE_HEIGHT),
+            Color::rgba(0.85, 0.85, 0.88, 0.8),
+        );
+    }
+
+    snapshot.primitives_mut().pop_clip();
+
+    // Register for hit-testing
+    snapshot.register_widget(input.id, input_rect);
+}
+
+/// Convert a char offset to (line, col) within newline-delimited text.
+fn offset_to_line_col(text: &str, char_offset: usize) -> (usize, usize) {
+    let mut line = 0;
+    let mut col = 0;
+    for (i, ch) in text.chars().enumerate() {
+        if i == char_offset {
+            return (line, col);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
 
 /// Fast non-cryptographic hash for cache keys.
@@ -558,6 +688,9 @@ pub struct TextInputElement {
     pub corner_radius: f32,
     pub padding: Padding,
     pub width: Length,
+    pub multiline: bool,
+    pub height: Length,
+    pub scroll_offset: f32,
     cache_key: u64,
 }
 
@@ -581,6 +714,9 @@ impl TextInputElement {
             corner_radius: 6.0,
             padding: Padding::new(8.0, 12.0, 8.0, 12.0),
             width: Length::Fill,
+            multiline: false,
+            height: Length::Shrink,
+            scroll_offset: 0.0,
             cache_key,
         }
     }
@@ -596,14 +732,177 @@ impl TextInputElement {
     pub fn corner_radius(mut self, radius: f32) -> Self { self.corner_radius = radius; self }
     pub fn padding(mut self, padding: Padding) -> Self { self.padding = padding; self }
     pub fn width(mut self, width: Length) -> Self { self.width = width; self }
+    pub fn multiline(mut self, multiline: bool) -> Self { self.multiline = multiline; self }
+    pub fn height(mut self, height: Length) -> Self { self.height = height; self }
+    pub fn scroll_offset(mut self, offset: f32) -> Self { self.scroll_offset = offset; self }
 
     fn estimate_size(&self) -> Size {
         let text_w = self.text.chars().count().max(20) as f32 * CHAR_WIDTH;
-        Size::new(
-            text_w + self.padding.horizontal(),
-            LINE_HEIGHT + self.padding.vertical(),
-        )
+        if self.multiline {
+            let line_count = self.text.lines().count().max(1) as f32;
+            let content_h = line_count * LINE_HEIGHT + self.padding.vertical();
+            let h = match self.height {
+                Length::Fixed(px) => px,
+                _ => content_h,
+            };
+            Size::new(text_w + self.padding.horizontal(), h)
+        } else {
+            Size::new(
+                text_w + self.padding.horizontal(),
+                LINE_HEIGHT + self.padding.vertical(),
+            )
+        }
     }
+}
+
+// =========================================================================
+// Table Element
+// =========================================================================
+
+/// A column definition for a table.
+pub struct TableColumn {
+    pub name: String,
+    pub width: f32,
+    pub sort_id: Option<SourceId>,
+}
+
+/// A cell in a table row.
+pub struct TableCell {
+    pub text: String,
+    pub color: Color,
+}
+
+/// A table element with column headers and data rows.
+///
+/// Headers register as clickable widgets (via `sort_id`) for sort interaction.
+/// Data rows render as text primitives. All state is external.
+pub struct TableElement {
+    pub source_id: SourceId,
+    pub columns: Vec<TableColumn>,
+    pub rows: Vec<Vec<TableCell>>,
+    pub header_bg: Color,
+    pub header_text_color: Color,
+    pub row_height: f32,
+    pub header_height: f32,
+    pub stripe_color: Option<Color>,
+    pub separator_color: Color,
+    cache_key: u64,
+}
+
+impl TableElement {
+    pub fn new(source_id: SourceId) -> Self {
+        Self {
+            source_id,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            header_bg: Color::rgba(0.15, 0.15, 0.2, 1.0),
+            header_text_color: Color::rgba(0.6, 0.6, 0.65, 1.0),
+            row_height: 22.0,
+            header_height: 26.0,
+            stripe_color: Some(Color::rgba(1.0, 1.0, 1.0, 0.02)),
+            separator_color: Color::rgba(1.0, 1.0, 1.0, 0.12),
+            cache_key: 0,
+        }
+    }
+
+    pub fn column(mut self, name: impl Into<String>, width: f32) -> Self {
+        self.columns.push(TableColumn { name: name.into(), width, sort_id: None });
+        self
+    }
+
+    pub fn column_sortable(mut self, name: impl Into<String>, width: f32, sort_id: SourceId) -> Self {
+        self.columns.push(TableColumn { name: name.into(), width, sort_id: Some(sort_id) });
+        self
+    }
+
+    pub fn row(mut self, cells: Vec<TableCell>) -> Self {
+        self.rows.push(cells);
+        self
+    }
+
+    pub fn header_bg(mut self, color: Color) -> Self { self.header_bg = color; self }
+    pub fn header_text_color(mut self, color: Color) -> Self { self.header_text_color = color; self }
+    pub fn row_height(mut self, height: f32) -> Self { self.row_height = height; self }
+    pub fn header_height(mut self, height: f32) -> Self { self.header_height = height; self }
+    pub fn stripe_color(mut self, color: Option<Color>) -> Self { self.stripe_color = color; self }
+    pub fn separator_color(mut self, color: Color) -> Self { self.separator_color = color; self }
+
+    fn estimate_size(&self) -> Size {
+        let w: f32 = self.columns.iter().map(|c| c.width).sum();
+        let h = self.header_height + 1.0 + self.rows.len() as f32 * self.row_height;
+        Size::new(w, h)
+    }
+}
+
+/// Render a table element into the snapshot.
+fn render_table(
+    snapshot: &mut LayoutSnapshot,
+    table: TableElement,
+    x: f32, y: f32, w: f32, _h: f32,
+) {
+    use crate::strata::primitives::Point;
+
+    let cell_pad = 8.0;
+
+    // Header background
+    snapshot.primitives_mut().add_solid_rect(
+        Rect::new(x, y, w, table.header_height),
+        table.header_bg,
+    );
+
+    // Header text + register sortable headers as widgets
+    let mut col_x = x;
+    for col in &table.columns {
+        snapshot.primitives_mut().add_text_cached(
+            col.name.clone(),
+            Point::new(col_x + cell_pad, y + 4.0),
+            table.header_text_color,
+            hash_text(&col.name),
+        );
+        if let Some(sort_id) = col.sort_id {
+            snapshot.register_widget(sort_id, Rect::new(col_x, y, col.width, table.header_height));
+        }
+        col_x += col.width;
+    }
+
+    // Separator line
+    let sep_y = y + table.header_height;
+    snapshot.primitives_mut().add_line(
+        Point::new(x, sep_y),
+        Point::new(x + w, sep_y),
+        1.0,
+        table.separator_color,
+    );
+
+    // Data rows
+    let data_y = sep_y + 1.0;
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        let ry = data_y + row_idx as f32 * table.row_height;
+
+        // Stripe background for odd rows
+        if row_idx % 2 == 1 {
+            if let Some(stripe) = table.stripe_color {
+                snapshot.primitives_mut().add_solid_rect(
+                    Rect::new(x, ry, w, table.row_height),
+                    stripe,
+                );
+            }
+        }
+
+        let mut col_x = x;
+        for (col_idx, cell) in row.iter().enumerate() {
+            if col_idx < table.columns.len() {
+                snapshot.primitives_mut().add_text_cached(
+                    cell.text.clone(),
+                    Point::new(col_x + cell_pad, ry + 2.0),
+                    cell.color,
+                    hash_text(&cell.text) ^ (row_idx as u64),
+                );
+                col_x += table.columns[col_idx].width;
+            }
+        }
+    }
+
 }
 
 // =========================================================================
@@ -799,6 +1098,11 @@ impl Column {
         self
     }
 
+    pub fn table(mut self, element: TableElement) -> Self {
+        self.children.push(LayoutChild::Table(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes — does not recurse into children
@@ -962,6 +1266,11 @@ impl Column {
                     child_heights.push(h);
                     total_fixed_height += h;
                 }
+                LayoutChild::Table(table) => {
+                    let h = table.estimate_size().height;
+                    child_heights.push(h);
+                    total_fixed_height += h;
+                }
                 LayoutChild::Spacer { flex } => {
                     child_heights.push(0.0);
                     total_flex += flex;
@@ -1103,15 +1412,30 @@ impl Column {
                     y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::TextInput(input) => {
-                    let h = LINE_HEIGHT + input.padding.vertical();
+                    let h = if input.multiline {
+                        input.estimate_size().height
+                    } else {
+                        LINE_HEIGHT + input.padding.vertical()
+                    };
                     let w = match input.width {
                         Length::Fixed(px) => px,
                         Length::Fill | Length::FillPortion(_) => content_width,
                         Length::Shrink => input.estimate_size().width.min(content_width),
                     };
                     let ix = cross_x(w);
-                    render_text_input(snapshot, input, ix, y, w, h);
+                    if input.multiline {
+                        render_text_input_multiline(snapshot, input, ix, y, w, h);
+                    } else {
+                        render_text_input(snapshot, input, ix, y, w, h);
+                    }
                     y += h + self.spacing + alignment_gap;
+                }
+                LayoutChild::Table(table) => {
+                    let size = table.estimate_size();
+                    let w = size.width.min(content_width);
+                    let tx = cross_x(w);
+                    render_table(snapshot, table, tx, y, w, size.height);
+                    y += size.height + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
                     // Resolve flex height for Fill children
@@ -1378,6 +1702,12 @@ impl Row {
         self
     }
 
+    /// Add a table element.
+    pub fn table(mut self, element: TableElement) -> Self {
+        self.children.push(LayoutChild::Table(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes.
@@ -1548,6 +1878,11 @@ impl Row {
                         }
                     }
                 }
+                LayoutChild::Table(table) => {
+                    let w = table.estimate_size().width;
+                    child_widths.push(w);
+                    total_fixed_width += w;
+                }
                 LayoutChild::Spacer { flex } => {
                     child_widths.push(0.0);
                     total_flex += flex;
@@ -1696,10 +2031,24 @@ impl Row {
                     } else {
                         width
                     };
-                    let h = LINE_HEIGHT + input.padding.vertical();
+                    let h = if input.multiline {
+                        input.estimate_size().height
+                    } else {
+                        LINE_HEIGHT + input.padding.vertical()
+                    };
                     let iy = cross_y(h);
-                    render_text_input(snapshot, input, x, iy, w, h);
+                    if input.multiline {
+                        render_text_input_multiline(snapshot, input, x, iy, w, h);
+                    } else {
+                        render_text_input(snapshot, input, x, iy, w, h);
+                    }
                     x += w + self.spacing + alignment_gap;
+                }
+                LayoutChild::Table(table) => {
+                    let size = table.estimate_size();
+                    let ty = cross_y(size.height);
+                    render_table(snapshot, table, x, ty, size.width, size.height);
+                    x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
                     // Resolve flex width for Fill children
@@ -1939,6 +2288,12 @@ impl ScrollColumn {
         self
     }
 
+    /// Add a table element.
+    pub fn table(mut self, element: TableElement) -> Self {
+        self.children.push(LayoutChild::Table(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     pub fn measure(&self) -> Size {
         let intrinsic_width = match self.width {
@@ -2107,8 +2462,21 @@ impl ScrollColumn {
                             Length::Fill | Length::FillPortion(_) => content_width,
                             Length::Shrink => input.estimate_size().width.min(content_width),
                         };
-                        let h = LINE_HEIGHT + input.padding.vertical();
-                        render_text_input(snapshot, input, content_x, screen_y, w, h);
+                        let h = if input.multiline {
+                            input.estimate_size().height
+                        } else {
+                            LINE_HEIGHT + input.padding.vertical()
+                        };
+                        if input.multiline {
+                            render_text_input_multiline(snapshot, input, content_x, screen_y, w, h);
+                        } else {
+                            render_text_input(snapshot, input, content_x, screen_y, w, h);
+                        }
+                    }
+                    LayoutChild::Table(table) => {
+                        let size = table.estimate_size();
+                        let w = size.width.min(content_width);
+                        render_table(snapshot, table, content_x, screen_y, w, size.height);
                     }
                     LayoutChild::Column(nested) => {
                         let w = match nested.width {

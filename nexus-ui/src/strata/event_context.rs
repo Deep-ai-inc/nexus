@@ -164,6 +164,7 @@ pub enum MouseEvent {
     /// Mouse wheel scrolled.
     WheelScrolled {
         delta: ScrollDelta,
+        position: Point,
     },
 }
 
