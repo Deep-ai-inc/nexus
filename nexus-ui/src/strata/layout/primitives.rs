@@ -3,6 +3,7 @@
 //! The fastest path for rendering. Primitives added here map 1:1 to GPU instances
 //! with zero abstraction overhead. Use for backgrounds, decorations, canvas drawing.
 
+use crate::strata::gpu::ImageHandle;
 use crate::strata::primitives::{Color, Point, Rect};
 
 /// A batch of primitives ready for GPU rendering.
@@ -34,6 +35,9 @@ pub struct PrimitiveBatch {
 
     /// Drop shadows (soft SDF blur).
     pub(crate) shadows: Vec<Shadow>,
+
+    /// Images (rendered via image atlas, Mode 4).
+    pub(crate) images: Vec<ImagePrimitive>,
 
     /// Clip stack for nested container clipping.
     /// Each entry is a clip rect; the effective clip is the intersection of all.
@@ -129,6 +133,16 @@ pub struct Shadow {
     pub clip_rect: Option<Rect>,
 }
 
+/// An image primitive (rendered via Mode 4 from the image atlas).
+#[derive(Debug, Clone, Copy)]
+pub struct ImagePrimitive {
+    pub rect: Rect,
+    pub handle: ImageHandle,
+    pub corner_radius: f32,
+    pub tint: Color,
+    pub clip_rect: Option<Rect>,
+}
+
 impl PrimitiveBatch {
     /// Create an empty primitive batch.
     pub fn new() -> Self {
@@ -145,6 +159,7 @@ impl PrimitiveBatch {
         self.text_runs.clear();
         self.borders.clear();
         self.shadows.clear();
+        self.images.clear();
         self.clip_stack.clear();
     }
 
@@ -354,6 +369,26 @@ impl PrimitiveBatch {
         self
     }
 
+    /// Add an image.
+    #[inline]
+    pub fn add_image(
+        &mut self,
+        rect: Rect,
+        handle: ImageHandle,
+        corner_radius: f32,
+        tint: Color,
+    ) -> &mut Self {
+        let clip_rect = self.current_clip();
+        self.images.push(ImagePrimitive {
+            rect,
+            handle,
+            corner_radius,
+            tint,
+            clip_rect,
+        });
+        self
+    }
+
     /// Check if the batch is empty.
     pub fn is_empty(&self) -> bool {
         self.solid_rects.is_empty()
@@ -364,6 +399,7 @@ impl PrimitiveBatch {
             && self.text_runs.is_empty()
             && self.borders.is_empty()
             && self.shadows.is_empty()
+            && self.images.is_empty()
     }
 
     /// Total number of primitives.
@@ -376,5 +412,6 @@ impl PrimitiveBatch {
             + self.text_runs.len()
             + self.borders.len()
             + self.shadows.len()
+            + self.images.len()
     }
 }

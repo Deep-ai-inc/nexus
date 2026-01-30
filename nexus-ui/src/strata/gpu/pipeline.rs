@@ -22,12 +22,119 @@
 //! Uses `StagingBelt` for buffer uploads to exploit unified memory on M1/M2/M3.
 
 use std::num::NonZeroU64;
+use std::path::Path;
 
 use iced::widget::shader::wgpu;
 use wgpu::util::StagingBelt;
 
 use super::glyph_atlas::GlyphAtlas;
 use crate::strata::primitives::{Color, Rect};
+
+/// Opaque handle to a loaded image in the pipeline's image atlas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageHandle(pub u32);
+
+/// An image queued for GPU upload (decoded RGBA data, no GPU resources yet).
+pub struct PendingImage {
+    pub handle: ImageHandle,
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+/// CPU-side image store for dynamic loading.
+///
+/// Call `load_rgba()` or `load_png()` at any time to get a handle immediately.
+/// Decoded pixel data is queued internally; the shell adapter drains pending
+/// uploads each frame and pushes them to the GPU atlas during `prepare()`.
+pub struct ImageStore {
+    pending: std::sync::Mutex<Vec<PendingImage>>,
+    next_handle: u32,
+}
+
+impl ImageStore {
+    /// Create an empty image store.
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(Vec::new()),
+            next_handle: 0,
+        }
+    }
+
+    /// Load raw RGBA pixel data. Returns a handle immediately.
+    ///
+    /// The actual GPU upload happens on the next frame's prepare pass.
+    pub fn load_rgba(&mut self, width: u32, height: u32, data: Vec<u8>) -> ImageHandle {
+        assert_eq!(data.len(), (width * height * 4) as usize, "RGBA data size mismatch");
+        let handle = ImageHandle(self.next_handle);
+        self.next_handle += 1;
+        self.pending.get_mut().unwrap().push(PendingImage {
+            handle,
+            width,
+            height,
+            data,
+        });
+        handle
+    }
+
+    /// Decode a PNG file and queue it for upload. Returns a handle immediately.
+    pub fn load_png(&mut self, path: impl AsRef<std::path::Path>) -> Result<ImageHandle, String> {
+        let img = image::open(path.as_ref()).map_err(|e| format!("Failed to load image: {}", e))?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        Ok(self.load_rgba(w, h, rgba.into_raw()))
+    }
+
+    /// Generate a procedural test image (gradient pattern).
+    pub fn load_test_gradient(&mut self, width: u32, height: u32) -> ImageHandle {
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let u = x as f32 / width as f32;
+                let v = y as f32 / height as f32;
+                let r = (u * 100.0 + 50.0) as u8;
+                let g = (v * 80.0 + 40.0) as u8;
+                let b = ((1.0 - u) * 180.0 + 75.0) as u8;
+                data.extend_from_slice(&[r, g, b, 255]);
+            }
+        }
+        self.load_rgba(width, height, data)
+    }
+
+    /// Drain all pending image uploads (called by the shell adapter).
+    ///
+    /// Uses `&self` with internal locking so it can be called from contexts
+    /// that only have shared access (e.g., view → StrataPrimitive → prepare).
+    pub(crate) fn drain_pending(&self) -> Vec<PendingImage> {
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
+}
+
+/// Metadata for a loaded image within the image atlas.
+#[derive(Debug, Clone)]
+struct LoadedImage {
+    /// UV region in the image atlas (normalized 0–1).
+    uv_tl: [f32; 2],
+    uv_br: [f32; 2],
+    /// Original pixel dimensions.
+    width: u32,
+    height: u32,
+}
+
+/// Image atlas — packs loaded images into a single RGBA texture using shelf packing.
+struct ImageAtlas {
+    texture: wgpu::Texture,
+    width: u32,
+    height: u32,
+    /// Shelf packer state.
+    cursor_x: u32,
+    cursor_y: u32,
+    shelf_height: u32,
+    /// Raw RGBA pixel data (kept for atlas regrow/reupload).
+    data: Vec<u8>,
+    /// Loaded image metadata.
+    images: Vec<LoadedImage>,
+}
 
 /// Instance for GPU rendering (64 bytes — one cache line).
 ///
@@ -117,9 +224,13 @@ pub struct StrataPipeline {
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     atlas_texture: wgpu::Texture,
+    /// Combined bind group for glyph atlas (bindings 0–1) + image atlas (bindings 2–3).
     atlas_bind_group: wgpu::BindGroup,
     atlas_bind_group_layout: wgpu::BindGroupLayout,
     atlas_sampler: wgpu::Sampler,
+    /// Image atlas (separate texture from glyph atlas — full RGBA).
+    image_atlas: ImageAtlas,
+    image_sampler: wgpu::Sampler,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
     glyph_atlas: GlyphAtlas,
@@ -133,7 +244,7 @@ pub struct StrataPipeline {
 
 impl StrataPipeline {
     /// Create a new pipeline.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, font_size: f32) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, font_size: f32) -> Self {
         let mut glyph_atlas = GlyphAtlas::new(font_size);
         glyph_atlas.precache_ascii();
 
@@ -158,11 +269,16 @@ impl StrataPipeline {
             }],
         });
 
-        // Create atlas bind group layout
+        // Create combined atlas bind group layout (group 1):
+        //   binding 0: glyph atlas texture
+        //   binding 1: glyph atlas sampler
+        //   binding 2: image atlas texture
+        //   binding 3: image atlas sampler
         let atlas_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Strata Atlas Layout"),
                 entries: &[
+                    // Glyph atlas
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -179,10 +295,27 @@ impl StrataPipeline {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // Image atlas
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             });
 
-        // Create pipeline layout
+        // Create pipeline layout (2 bind groups: globals, combined atlas)
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Strata Pipeline Layout"),
             bind_group_layouts: &[&globals_layout, &atlas_bind_group_layout],
@@ -318,10 +451,57 @@ impl StrataPipeline {
             ..Default::default()
         });
 
-        // Create atlas bind group
+        // Create image sampler (shared across atlas rebuilds)
+        let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Strata Image Sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // Create 1×1 white placeholder image atlas (no images loaded yet)
+        let placeholder_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Strata Image Atlas Placeholder"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &placeholder_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8, 255, 255, 255],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+
+        let image_atlas = ImageAtlas {
+            texture: placeholder_texture,
+            width: 1,
+            height: 1,
+            cursor_x: 0,
+            cursor_y: 0,
+            shelf_height: 0,
+            data: vec![255u8; 4],
+            images: Vec::new(),
+        };
+
+        // Create combined atlas bind group (glyph atlas + image atlas)
         let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let image_atlas_view = image_atlas.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Strata Atlas Bind Group"),
+            label: Some("Strata Combined Atlas Bind Group"),
             layout: &atlas_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -331,6 +511,14 @@ impl StrataPipeline {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&atlas_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&image_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&image_sampler),
                 },
             ],
         });
@@ -355,6 +543,8 @@ impl StrataPipeline {
             atlas_bind_group,
             atlas_bind_group_layout,
             atlas_sampler,
+            image_atlas,
+            image_sampler,
             instance_buffer,
             instance_capacity: initial_capacity,
             glyph_atlas,
@@ -616,31 +806,207 @@ impl StrataPipeline {
     }
 
     // =========================================================================
-    // Mode 4: Image (texture array — stubbed, requires texture array setup)
+    // Mode 4: Image (atlas-based)
     // =========================================================================
 
-    /// Add an image from the texture array (future: requires texture array setup).
+    /// Add an image instance.
     pub fn add_image(
         &mut self,
         x: f32,
         y: f32,
         width: f32,
         height: f32,
-        layer: u32,
+        handle: ImageHandle,
         corner_radius: f32,
         tint: Color,
     ) {
+        let Some(img) = self.image_atlas.images.get(handle.0 as usize) else {
+            return; // Image not yet uploaded to GPU; will render next frame.
+        };
         self.instances.push(GpuInstance {
             pos: [x, y],
             size: [width, height],
-            uv_tl: [0.0, 0.0],
-            uv_br: [1.0, 1.0],
+            uv_tl: img.uv_tl,
+            uv_br: img.uv_br,
             color: tint.pack(),
             mode: 4,
             corner_radius,
-            texture_layer: layer,
+            texture_layer: 0,
             clip_rect: NO_CLIP,
         });
+    }
+
+    /// Load a PNG image and return a handle for rendering.
+    pub fn load_image_png(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: &Path,
+    ) -> ImageHandle {
+        let img = image::open(path)
+            .unwrap_or_else(|e| panic!("Failed to load image {}: {}", path.display(), e))
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        self.load_image_rgba(device, queue, w, h, &img.into_raw())
+    }
+
+    /// Load raw RGBA pixel data and return a handle for rendering.
+    pub fn load_image_rgba(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> ImageHandle {
+        assert_eq!(data.len(), (width * height * 4) as usize);
+
+        let atlas = &mut self.image_atlas;
+
+        // Check if we need a new shelf row
+        if atlas.cursor_x + width > atlas.width {
+            atlas.cursor_y += atlas.shelf_height;
+            atlas.cursor_x = 0;
+            atlas.shelf_height = 0;
+        }
+
+        // Grow atlas if needed
+        let needed_width = (atlas.cursor_x + width).max(atlas.width);
+        let needed_height = atlas.cursor_y + height;
+        if needed_width > atlas.width || needed_height > atlas.height {
+            let new_width = needed_width.next_power_of_two().max(256);
+            let new_height = needed_height.next_power_of_two().max(256);
+            self.grow_image_atlas(device, queue, new_width, new_height);
+        }
+
+        let atlas = &mut self.image_atlas;
+
+        // Copy image data into the atlas buffer
+        let ax = atlas.cursor_x;
+        let ay = atlas.cursor_y;
+        for row in 0..height {
+            let src_start = (row * width * 4) as usize;
+            let src_end = src_start + (width * 4) as usize;
+            let dst_start = ((ay + row) * atlas.width * 4 + ax * 4) as usize;
+            let dst_end = dst_start + (width * 4) as usize;
+            atlas.data[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
+        }
+
+        // Upload the modified region to GPU
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &atlas.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: ax, y: ay, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            // Upload just the rows we wrote (contiguous in source data)
+            data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        // Record UV region
+        let uv_tl = [ax as f32 / atlas.width as f32, ay as f32 / atlas.height as f32];
+        let uv_br = [
+            (ax + width) as f32 / atlas.width as f32,
+            (ay + height) as f32 / atlas.height as f32,
+        ];
+
+        let handle = ImageHandle(atlas.images.len() as u32);
+        atlas.images.push(LoadedImage { uv_tl, uv_br, width, height });
+
+        // Advance shelf packer
+        atlas.cursor_x += width;
+        atlas.shelf_height = atlas.shelf_height.max(height);
+
+        handle
+    }
+
+    /// Query image dimensions.
+    pub fn image_size(&self, handle: ImageHandle) -> (u32, u32) {
+        let img = &self.image_atlas.images[handle.0 as usize];
+        (img.width, img.height)
+    }
+
+    /// Grow the image atlas to a new size, preserving existing data.
+    fn grow_image_atlas(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        new_width: u32,
+        new_height: u32,
+    ) {
+        let atlas = &mut self.image_atlas;
+        let old_width = atlas.width;
+        let old_height = atlas.height;
+
+        // Allocate new data buffer
+        let mut new_data = vec![0u8; (new_width * new_height * 4) as usize];
+
+        // Copy old data row by row
+        let copy_rows = old_height.min(new_height);
+        let copy_cols = old_width.min(new_width);
+        for row in 0..copy_rows {
+            let src_start = (row * old_width * 4) as usize;
+            let src_end = src_start + (copy_cols * 4) as usize;
+            let dst_start = (row * new_width * 4) as usize;
+            let dst_end = dst_start + (copy_cols * 4) as usize;
+            new_data[dst_start..dst_end].copy_from_slice(&atlas.data[src_start..src_end]);
+        }
+
+        atlas.data = new_data;
+        atlas.width = new_width;
+        atlas.height = new_height;
+
+        // Recreate GPU texture
+        atlas.texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Strata Image Atlas"),
+            size: wgpu::Extent3d { width: new_width, height: new_height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload entire atlas data
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &atlas.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(new_width * 4),
+                rows_per_image: Some(new_height),
+            },
+            wgpu::Extent3d { width: new_width, height: new_height, depth_or_array_layers: 1 },
+        );
+
+        // Recompute UV regions for all loaded images
+        for img in &mut atlas.images {
+            // UVs were based on old atlas dimensions — need to recompute from pixel positions.
+            // We don't store pixel positions separately, so derive them from old UVs.
+            let px_x = img.uv_tl[0] * old_width as f32;
+            let px_y = img.uv_tl[1] * old_height as f32;
+            img.uv_tl = [px_x / new_width as f32, px_y / new_height as f32];
+            img.uv_br = [
+                (px_x + img.width as f32) / new_width as f32,
+                (px_y + img.height as f32) / new_height as f32,
+            ];
+        }
+
+        // Rebuild combined bind group (image atlas texture changed)
+        self.rebuild_combined_bind_group(device);
     }
 
     // =========================================================================
@@ -823,26 +1189,37 @@ impl StrataPipeline {
             view_formats: &[],
         });
 
-        let atlas_view = self
-            .atlas_texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.upload_atlas(queue);
+        self.rebuild_combined_bind_group(device);
+    }
 
+    /// Rebuild the combined bind group (glyph atlas + image atlas in group 1).
+    /// Must be called whenever either atlas texture changes.
+    fn rebuild_combined_bind_group(&mut self, device: &wgpu::Device) {
+        let glyph_view = self.atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let image_view = self.image_atlas.texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Strata Atlas Bind Group"),
+            label: Some("Strata Combined Atlas Bind Group"),
             layout: &self.atlas_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
+                    resource: wgpu::BindingResource::TextureView(&glyph_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&image_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
+                },
             ],
         });
-
-        self.upload_atlas(queue);
     }
 
     fn upload_atlas(&self, queue: &wgpu::Queue) {

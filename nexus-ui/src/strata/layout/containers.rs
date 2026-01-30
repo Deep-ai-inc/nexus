@@ -5,6 +5,7 @@
 //! not during widget construction.
 
 use crate::strata::content_address::SourceId;
+use crate::strata::gpu::ImageHandle;
 use crate::strata::layout_snapshot::LayoutSnapshot;
 use crate::strata::primitives::{Color, Rect, Size};
 
@@ -126,6 +127,9 @@ pub enum LayoutChild {
     /// A terminal/grid element.
     Terminal(TerminalElement),
 
+    /// An image element.
+    Image(ImageElement),
+
     /// A nested column.
     Column(Column),
 
@@ -148,6 +152,7 @@ impl LayoutChild {
         let size = match self {
             LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT),
             LayoutChild::Terminal(t) => t.size(),
+            LayoutChild::Image(img) => img.size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
@@ -162,6 +167,7 @@ impl LayoutChild {
         let size = match self {
             LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT),
             LayoutChild::Terminal(t) => t.size(),
+            LayoutChild::Image(img) => img.size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
@@ -341,6 +347,53 @@ impl TerminalElement {
 }
 
 // =========================================================================
+// Image Element
+// =========================================================================
+
+/// An image element descriptor.
+pub struct ImageElement {
+    /// Image handle from the pipeline.
+    pub handle: ImageHandle,
+    /// Display width in logical pixels.
+    pub width: f32,
+    /// Display height in logical pixels.
+    pub height: f32,
+    /// Corner radius for rounded clipping.
+    pub corner_radius: f32,
+    /// Tint color (Color::WHITE = no tint).
+    pub tint: Color,
+}
+
+impl ImageElement {
+    /// Create a new image element with explicit size.
+    pub fn new(handle: ImageHandle, width: f32, height: f32) -> Self {
+        Self {
+            handle,
+            width,
+            height,
+            corner_radius: 0.0,
+            tint: Color::WHITE,
+        }
+    }
+
+    /// Set corner radius for rounded clipping.
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        self.corner_radius = radius;
+        self
+    }
+
+    /// Set tint color (multiplied with image color).
+    pub fn tint(mut self, tint: Color) -> Self {
+        self.tint = tint;
+        self
+    }
+
+    fn size(&self) -> Size {
+        Size::new(self.width, self.height)
+    }
+}
+
+// =========================================================================
 // Column
 // =========================================================================
 
@@ -515,6 +568,12 @@ impl Column {
         self
     }
 
+    /// Add an image element.
+    pub fn image(mut self, element: ImageElement) -> Self {
+        self.children.push(LayoutChild::Image(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes — does not recurse into children
@@ -663,6 +722,11 @@ impl Column {
                         }
                     }
                 }
+                LayoutChild::Image(img) => {
+                    let h = img.height;
+                    child_heights.push(h);
+                    total_fixed_height += h;
+                }
                 LayoutChild::Spacer { flex } => {
                     child_heights.push(0.0);
                     total_flex += flex;
@@ -777,6 +841,16 @@ impl Column {
                     grid_layout.clip_rect = snapshot.current_clip();
                     snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
 
+                    y += height + self.spacing + alignment_gap;
+                }
+                LayoutChild::Image(img) => {
+                    let x = cross_x(img.width);
+                    snapshot.primitives_mut().add_image(
+                        Rect::new(x, y, img.width, img.height),
+                        img.handle,
+                        img.corner_radius,
+                        img.tint,
+                    );
                     y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
@@ -1026,6 +1100,12 @@ impl Row {
         self
     }
 
+    /// Add an image element.
+    pub fn image(mut self, element: ImageElement) -> Self {
+        self.children.push(LayoutChild::Image(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes.
@@ -1169,6 +1249,11 @@ impl Row {
                         }
                     }
                 }
+                LayoutChild::Image(img) => {
+                    let w = img.width;
+                    child_widths.push(w);
+                    total_fixed_width += w;
+                }
                 LayoutChild::Spacer { flex } => {
                     child_widths.push(0.0);
                     total_flex += flex;
@@ -1285,6 +1370,16 @@ impl Row {
                     grid_layout.clip_rect = snapshot.current_clip();
                     snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
 
+                    x += width + self.spacing + alignment_gap;
+                }
+                LayoutChild::Image(img) => {
+                    let y = cross_y(img.height);
+                    snapshot.primitives_mut().add_image(
+                        Rect::new(x, y, img.width, img.height),
+                        img.handle,
+                        img.corner_radius,
+                        img.tint,
+                    );
                     x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
@@ -1507,6 +1602,12 @@ impl ScrollColumn {
         self
     }
 
+    /// Add an image element.
+    pub fn image(mut self, element: ImageElement) -> Self {
+        self.children.push(LayoutChild::Image(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     pub fn measure(&self) -> Size {
         let intrinsic_width = match self.width {
@@ -1648,6 +1749,14 @@ impl ScrollColumn {
                         );
                         grid_layout.clip_rect = snapshot.current_clip();
                         snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
+                    }
+                    LayoutChild::Image(img) => {
+                        snapshot.primitives_mut().add_image(
+                            Rect::new(content_x, screen_y, img.width, img.height),
+                            img.handle,
+                            img.corner_radius,
+                            img.tint,
+                        );
                     }
                     LayoutChild::Column(nested) => {
                         let w = match nested.width {

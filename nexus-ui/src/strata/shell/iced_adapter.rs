@@ -5,7 +5,7 @@
 //!
 //! **This is the ONLY file in Strata that imports iced.**
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use iced::widget::shader::{self, wgpu};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
@@ -13,7 +13,7 @@ use iced::{Element, Event, Length, Subscription, Task, Theme};
 use crate::strata::app::{AppConfig, Command, StrataApp};
 use crate::strata::content_address::Selection;
 use crate::strata::layout_snapshot::HitResult;
-use crate::strata::gpu::StrataPipeline;
+use crate::strata::gpu::{PendingImage, StrataPipeline};
 use crate::strata::event_context::{
     CaptureState, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey, ScrollDelta,
 };
@@ -79,6 +79,9 @@ struct ShellState<A: StrataApp> {
 
     /// Frame counter (forces shader redraw when changed).
     frame: u64,
+
+    /// Shared image store for dynamic image loading.
+    image_store: crate::strata::gpu::ImageStore,
 }
 
 /// Messages handled by the shell.
@@ -107,7 +110,8 @@ impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
 
 /// Initialize the shell state.
 fn init<A: StrataApp>() -> (ShellState<A>, Task<ShellMessage<A::Message>>) {
-    let (app_state, cmd) = A::init();
+    let mut image_store = crate::strata::gpu::ImageStore::new();
+    let (app_state, cmd) = A::init(&mut image_store);
 
     let shell_state = ShellState {
         app: app_state,
@@ -115,6 +119,7 @@ fn init<A: StrataApp>() -> (ShellState<A>, Task<ShellMessage<A::Message>>) {
         window_size: (1200.0, 800.0),
         cursor_position: None,
         frame: 0,
+        image_store,
     };
 
     // Convert app command to shell tasks, and send initial tick to trigger first render
@@ -132,7 +137,7 @@ fn update<A: StrataApp>(
 ) -> Task<ShellMessage<A::Message>> {
     match message {
         ShellMessage::App(msg) => {
-            let cmd = A::update(&mut state.app, msg);
+            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
             state.frame = state.frame.wrapping_add(1); // Trigger redraw
             command_to_task(cmd)
         }
@@ -193,7 +198,7 @@ fn update<A: StrataApp>(
 
                         // Process message
                         if let Some(msg) = response.message {
-                            let cmd = A::update(&mut state.app, msg);
+                            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
                             return command_to_task(cmd);
                         }
                     }
@@ -223,12 +228,18 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
     // The shader only needs read access.
     let snapshot = Arc::new(snapshot);
 
+    // Drain any pending image uploads from the image store.
+    // These will be uploaded to the GPU atlas during prepare().
+    let pending = state.image_store.drain_pending();
+    let pending_images = Arc::new(Mutex::new(pending));
+
     // Create the shader widget that will render Strata content
     let program = StrataShaderProgram {
         snapshot, // Cheap Arc clone
         selection: A::selection(&state.app).cloned(),
         background: crate::strata::primitives::Color::rgb(0.1, 0.1, 0.1),
         frame: state.frame,
+        pending_images,
     };
 
     shader::Shader::new(program)
@@ -434,16 +445,28 @@ struct StrataShaderProgram {
     background: crate::strata::primitives::Color,
     /// Frame counter - changing this triggers iced to redraw.
     frame: u64,
+    /// Pending image uploads (drained by prepare on first access).
+    pending_images: Arc<Mutex<Vec<PendingImage>>>,
 }
 
 /// Primitive passed to the GPU.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct StrataPrimitive {
     /// Layout snapshot wrapped in Arc to avoid deep copying.
     snapshot: Arc<LayoutSnapshot>,
     selection: Option<Selection>,
     background: crate::strata::primitives::Color,
     frame: u64,
+    /// Pending image uploads (drained by prepare on first access).
+    pending_images: Arc<Mutex<Vec<PendingImage>>>,
+}
+
+impl std::fmt::Debug for StrataPrimitive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StrataPrimitive")
+            .field("frame", &self.frame)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Message> shader::Program<Message> for StrataShaderProgram {
@@ -461,6 +484,7 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             selection: self.selection.clone(),
             background: self.background,
             frame: self.frame,
+            pending_images: self.pending_images.clone(),
         }
     }
 }
@@ -482,6 +506,11 @@ impl shader::Primitive for StrataPrimitive {
         }
 
         let wrapper = storage.get_mut::<PipelineWrapper>().unwrap();
+
+        // Drain pending images — pass them into prepare() so they're uploaded
+        // after the pipeline is guaranteed to exist.
+        let pending = std::mem::take(&mut *self.pending_images.lock().unwrap());
+
         wrapper.prepare(
             device,
             queue,
@@ -490,6 +519,7 @@ impl shader::Primitive for StrataPrimitive {
             bounds,
             viewport,
             self.background,
+            pending,
         );
     }
 
@@ -541,14 +571,20 @@ impl PipelineWrapper {
         bounds: &iced::Rectangle,
         viewport: &iced::advanced::graphics::Viewport,
         background: crate::strata::primitives::Color,
+        pending_images: Vec<PendingImage>,
     ) {
         let scale = viewport.scale_factor() as f32;
 
         // Create or recreate pipeline if scale factor changed
         if self.pipeline.is_none() || (self.current_scale - scale).abs() > 0.01 {
             let font_size = BASE_FONT_SIZE * scale;
-            self.pipeline = Some(StrataPipeline::new(device, self.format, font_size));
+            self.pipeline = Some(StrataPipeline::new(device, queue, self.format, font_size));
             self.current_scale = scale;
+        }
+
+        // Upload pending images now that the pipeline is guaranteed to exist.
+        if !pending_images.is_empty() {
+            self.upload_pending_images(device, queue, pending_images);
         }
 
         let pipeline = self.pipeline.as_mut().unwrap();
@@ -695,6 +731,21 @@ impl PipelineWrapper {
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
+        // 2f. Images
+        for prim in &primitives.images {
+            let start = pipeline.instance_count();
+            pipeline.add_image(
+                prim.rect.x * scale,
+                prim.rect.y * scale,
+                prim.rect.width * scale,
+                prim.rect.height * scale,
+                prim.handle,
+                prim.corner_radius * scale,
+                prim.tint,
+            );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
+        }
+
         // 3. Selection highlight (on top of backgrounds, behind text)
         if let Some(sel) = selection {
             if !sel.is_collapsed() {
@@ -778,6 +829,24 @@ impl PipelineWrapper {
     ) {
         if let Some(pipeline) = &self.pipeline {
             pipeline.render(encoder, target, clip_bounds);
+        }
+    }
+
+    /// Upload pending images to the GPU atlas.
+    ///
+    /// Called each frame before prepare() when new images have been queued
+    /// via `ImageStore::load_rgba()` or `ImageStore::load_png()`.
+    fn upload_pending_images(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pending: Vec<PendingImage>,
+    ) {
+        let Some(pipeline) = self.pipeline.as_mut() else {
+            return;
+        };
+        for img in pending {
+            pipeline.load_image_rgba(device, queue, img.width, img.height, &img.data);
         }
     }
 }

@@ -28,6 +28,12 @@ var atlas_texture: texture_2d<f32>;
 @group(1) @binding(1)
 var atlas_sampler: sampler;
 
+@group(1) @binding(2)
+var image_texture: texture_2d<f32>;
+
+@group(1) @binding(3)
+var image_sampler: sampler;
+
 struct Instance {
     @location(0) position: vec2<f32>,      // pos
     @location(1) size: vec2<f32>,          // size
@@ -281,9 +287,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // ============================================================
-    // MODE 0 (and 4): STANDARD QUAD
+    // MODE 4: IMAGE (full RGBA from image atlas)
     // ============================================================
-    // Sample the atlas.
+    if (base_mode == 4u) {
+        let texel = textureSample(image_texture, image_sampler, in.uv);
+        var color = texel.rgb * in.color.rgb;
+        var alpha = texel.a * in.color.a;
+
+        if (in.corner_radius > 0.0) {
+            let centered_pos = (in.local_pos - 0.5) * in.size;
+            let half_size = in.size * 0.5;
+            let dist = sdf_rounded_box(centered_pos, half_size, in.corner_radius);
+            let edge_aa = fwidth(dist);
+            let sdf_alpha = 1.0 - smoothstep(-edge_aa, edge_aa, dist);
+            alpha = alpha * sdf_alpha;
+        }
+
+        return vec4<f32>(color, alpha);
+    }
+
+    // ============================================================
+    // MODE 0: STANDARD QUAD (glyphs, solid rects, rounded rects)
+    // ============================================================
+    // Sample the glyph atlas.
     let atlas_alpha = textureSample(atlas_texture, atlas_sampler, in.uv).a;
 
     // Start with atlas-modulated alpha

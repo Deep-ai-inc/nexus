@@ -7,4 +7,4 @@ mod glyph_atlas;
 mod pipeline;
 
 pub use glyph_atlas::GlyphAtlas;
-pub use pipeline::{GpuInstance, LineStyle, StrataPipeline, SELECTION_COLOR};
+pub use pipeline::{GpuInstance, ImageHandle, ImageStore, LineStyle, PendingImage, StrataPipeline, SELECTION_COLOR};

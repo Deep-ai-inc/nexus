@@ -8,6 +8,7 @@ use std::pin::Pin;
 
 use crate::strata::content_address::{Selection, SourceId};
 use crate::strata::event_context::{CaptureState, MouseEvent};
+use crate::strata::gpu::ImageStore;
 use crate::strata::layout_snapshot::{HitResult, LayoutSnapshot};
 
 /// Response from a mouse event handler.
@@ -207,12 +208,15 @@ pub trait StrataApp: Sized + 'static {
     /// Initialize the application state.
     ///
     /// Returns the initial state and an optional command to run.
-    fn init() -> (Self::State, Command<Self::Message>);
+    /// The `images` store can be used to load images (PNG, raw RGBA)
+    /// that will be uploaded to the GPU before the first frame.
+    fn init(images: &mut ImageStore) -> (Self::State, Command<Self::Message>);
 
     /// Update state in response to a message.
     ///
     /// Returns a command for any async work to perform.
-    fn update(state: &mut Self::State, message: Self::Message) -> Command<Self::Message>;
+    /// The `images` store can be used to dynamically load new images.
+    fn update(state: &mut Self::State, message: Self::Message, images: &mut ImageStore) -> Command<Self::Message>;
 
     /// Build the view and populate the layout snapshot.
     ///

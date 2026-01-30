@@ -20,6 +20,7 @@ use crate::strata::event_context::{CaptureState, MouseButton, MouseEvent};
 use crate::strata::layout::containers::Length;
 use crate::strata::layout::primitives::LineStyle;
 use crate::strata::primitives::{Color, Point, Rect};
+use crate::strata::gpu::{ImageHandle, ImageStore};
 use crate::strata::{
     AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, ScrollColumn, Selection,
     StrataApp, Subscription,
@@ -109,6 +110,8 @@ pub struct DemoState {
     fps_smooth: Cell<f32>,
     // Animation start time
     start_time: Instant,
+    // Test image handle
+    test_image: ImageHandle,
 }
 
 /// Demo application.
@@ -118,7 +121,8 @@ impl StrataApp for DemoApp {
     type State = DemoState;
     type Message = DemoMessage;
 
-    fn init() -> (Self::State, Command<Self::Message>) {
+    fn init(images: &mut ImageStore) -> (Self::State, Command<Self::Message>) {
+        let test_image = images.load_test_gradient(128, 128);
         let state = DemoState {
             query_source: SourceId::new(),
             response_source: SourceId::new(),
@@ -137,11 +141,12 @@ impl StrataApp for DemoApp {
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             start_time: Instant::now(),
+            test_image,
         };
         (state, Command::none())
     }
 
-    fn update(state: &mut Self::State, message: Self::Message) -> Command<Self::Message> {
+    fn update(state: &mut Self::State, message: Self::Message, _images: &mut ImageStore) -> Command<Self::Message> {
         match message {
             DemoMessage::SelectionStart(addr) => {
                 state.selection = Some(Selection::new(addr.clone(), addr));
@@ -231,6 +236,15 @@ impl StrataApp for DemoApp {
                     .spacing(16.0)
                     .width(Length::Fill)
                     .height(Length::Fill)
+                    // Test image (loaded via ImageStore in init)
+                    .image(
+                        crate::strata::layout::containers::ImageElement::new(
+                            state.test_image,
+                            128.0,
+                            128.0,
+                        )
+                        .corner_radius(8.0),
+                    )
                     // Shell Block
                     .column(
                         ShellBlock {
@@ -318,7 +332,8 @@ impl StrataApp for DemoApp {
                             mode_bg: colors::BTN_MODE_SH,
                         }
                         .build(),
-                    ),
+                    )
+                    ,
             )
             // =============================================================
             // RIGHT COLUMN: Component Catalog
