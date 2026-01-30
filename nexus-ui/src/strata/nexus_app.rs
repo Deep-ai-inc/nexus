@@ -171,7 +171,7 @@ pub enum NexusMessage {
     RemoveAttachment(usize),
 
     // Context menu
-    ShowContextMenu(f32, f32, Vec<ContextMenuItem>),
+    ShowContextMenu(f32, f32, Vec<ContextMenuItem>, ContextTarget),
     ContextMenuAction(ContextMenuItem),
     DismissContextMenu,
 
@@ -217,10 +217,18 @@ impl ContextMenuItem {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ContextTarget {
+    Block(BlockId),
+    AgentBlock(BlockId),
+    Input,
+}
+
 pub struct ContextMenuState {
     pub x: f32,
     pub y: f32,
     pub items: Vec<ContextMenuItem>,
+    pub target: ContextTarget,
 }
 
 // =========================================================================
@@ -768,7 +776,37 @@ impl StrataApp for NexusApp {
                 state.is_selecting = false;
             }
             NexusMessage::Copy => {
-                // TODO: extract selected text and copy to clipboard
+                let mut copied = false;
+
+                // First try: terminal/content selection
+                if let Some(ref sel) = state.selection {
+                    if !sel.is_collapsed() {
+                        let text = extract_selected_text(state, sel);
+                        if !text.is_empty() {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                let _ = clipboard.set_text(&text);
+                                copied = true;
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: input text selection
+                if !copied {
+                    if let Some((sel_start, sel_end)) = state.input.selection {
+                        let start = sel_start.min(sel_end);
+                        let end = sel_start.max(sel_end);
+                        if start != end {
+                            let selected: String = state.input.text.chars()
+                                .skip(start).take(end - start).collect();
+                            if !selected.is_empty() {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    let _ = clipboard.set_text(&selected);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // =============================================================
@@ -943,21 +981,17 @@ impl StrataApp for NexusApp {
             // =============================================================
             // Context menu
             // =============================================================
-            NexusMessage::ShowContextMenu(x, y, items) => {
-                state.context_menu = Some(ContextMenuState { x, y, items });
+            NexusMessage::ShowContextMenu(x, y, items, target) => {
+                state.context_menu = Some(ContextMenuState { x, y, items, target });
             }
             NexusMessage::ContextMenuAction(item) => {
+                let target = state.context_menu.as_ref().map(|m| m.target.clone());
                 state.context_menu = None;
                 match item {
                     ContextMenuItem::Copy => {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            if let Some((sel_start, sel_end)) = state.input.selection {
-                                let start = sel_start.min(sel_end);
-                                let end = sel_start.max(sel_end);
-                                let selected: String = state.input.text.chars().skip(start).take(end - start).collect();
-                                if !selected.is_empty() {
-                                    let _ = clipboard.set_text(&selected);
-                                }
+                        if let Some(text) = target.and_then(|t| extract_block_text(state, &t)) {
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                let _ = clipboard.set_text(&text);
                             }
                         }
                     }
@@ -1261,22 +1295,51 @@ impl StrataApp for NexusApp {
 
         // Right-click → context menu
         if let MouseEvent::ButtonPressed { button: MouseButton::Right, position, .. } = &event {
-            if let Some(ref _hit) = hit {
-                // Check if hit is on input
-                let input_bounds = state.input.bounds();
-                if position.x >= input_bounds.x && position.x <= input_bounds.x + input_bounds.width
-                    && position.y >= input_bounds.y && position.y <= input_bounds.y + input_bounds.height
-                {
-                    return MouseResponse::message(NexusMessage::ShowContextMenu(
-                        position.x, position.y,
-                        vec![ContextMenuItem::Paste, ContextMenuItem::SelectAll, ContextMenuItem::Clear],
-                    ));
-                }
-                // Otherwise show terminal context menu
+            // Check if hit is on input
+            let input_bounds = state.input.bounds();
+            if position.x >= input_bounds.x && position.x <= input_bounds.x + input_bounds.width
+                && position.y >= input_bounds.y && position.y <= input_bounds.y + input_bounds.height
+            {
                 return MouseResponse::message(NexusMessage::ShowContextMenu(
                     position.x, position.y,
-                    vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                    vec![ContextMenuItem::Paste, ContextMenuItem::SelectAll, ContextMenuItem::Clear],
+                    ContextTarget::Input,
                 ));
+            }
+
+            // Check if hit is on a terminal block (by matching source IDs)
+            if let Some(HitResult::Content(ref addr)) = hit {
+                for block in &state.blocks {
+                    let term_id = SourceId::named(&format!("shell_term_{}", block.id.0));
+                    if addr.source_id == term_id {
+                        return MouseResponse::message(NexusMessage::ShowContextMenu(
+                            position.x, position.y,
+                            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                            ContextTarget::Block(block.id),
+                        ));
+                    }
+                }
+            }
+
+            // Check if hit is on any block area (widget hits like buttons, etc.)
+            // Use the last block as fallback — right-click anywhere in content area
+            if hit.is_some() {
+                // Find the most recent block as a reasonable target
+                if let Some(block) = state.blocks.last() {
+                    return MouseResponse::message(NexusMessage::ShowContextMenu(
+                        position.x, position.y,
+                        vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                        ContextTarget::Block(block.id),
+                    ));
+                }
+                // Agent blocks
+                if let Some(block) = state.agent_blocks.last() {
+                    return MouseResponse::message(NexusMessage::ShowContextMenu(
+                        position.x, position.y,
+                        vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                        ContextTarget::AgentBlock(block.id),
+                    ));
+                }
             }
         }
 
@@ -1998,55 +2061,207 @@ fn spawn_agent(state: &mut NexusState, query: String, attachments: Vec<Value>) -
 }
 
 // =========================================================================
+// Selection text extraction
+// =========================================================================
+
+/// Extract the full visible text from a block targeted by the context menu.
+fn extract_block_text(state: &NexusState, target: &ContextTarget) -> Option<String> {
+    match target {
+        ContextTarget::Block(block_id) => {
+            let idx = state.block_index.get(block_id)?;
+            let block = state.blocks.get(*idx)?;
+
+            // If the block has native output, convert it to text
+            if let Some(ref value) = block.native_output {
+                return Some(value.to_text());
+            }
+
+            // Otherwise extract from terminal grid
+            let grid = if block.parser.is_alternate_screen() || block.is_running() {
+                block.parser.grid()
+            } else {
+                block.parser.grid_with_scrollback()
+            };
+
+            let mut lines = Vec::new();
+            for row in grid.rows_iter() {
+                let text: String = row.iter().map(|cell| cell.c).collect();
+                let trimmed = text.trim_end();
+                if !trimmed.is_empty() || !lines.is_empty() {
+                    lines.push(trimmed.to_string());
+                }
+            }
+            // Trim trailing empty lines
+            while lines.last().map_or(false, |l| l.is_empty()) {
+                lines.pop();
+            }
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        }
+        ContextTarget::AgentBlock(block_id) => {
+            let idx = state.agent_block_index.get(block_id)?;
+            let block = state.agent_blocks.get(*idx)?;
+
+            let mut text = String::new();
+            if !block.response.is_empty() {
+                text.push_str(&block.response);
+            }
+            if text.is_empty() && !block.thinking.is_empty() {
+                text.push_str(&block.thinking);
+            }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        ContextTarget::Input => {
+            let text = &state.input.text;
+            if text.is_empty() { None } else { Some(text.clone()) }
+        }
+    }
+}
+
+/// Extract the text content within a selection from terminal blocks.
+///
+/// Walks all blocks checking their terminal source ID, then extracts the
+/// selected character range from the parser grid.
+fn extract_selected_text(state: &NexusState, sel: &Selection) -> String {
+    // Only handle same-source selections
+    if sel.anchor.source_id != sel.focus.source_id {
+        return String::new();
+    }
+
+    let source_id = sel.anchor.source_id;
+
+    // Normalize anchor/focus to start/end by content_offset
+    let (start_offset, end_offset) = if sel.anchor.content_offset <= sel.focus.content_offset {
+        (sel.anchor.content_offset, sel.focus.content_offset)
+    } else {
+        (sel.focus.content_offset, sel.anchor.content_offset)
+    };
+
+    if start_offset == end_offset {
+        return String::new();
+    }
+
+    // Try terminal blocks
+    for block in &state.blocks {
+        let expected_id = SourceId::named(&format!("shell_term_{}", block.id.0));
+        if expected_id != source_id {
+            continue;
+        }
+
+        // Skip blocks with native output — they don't use terminal rendering
+        if block.native_output.is_some() {
+            continue;
+        }
+
+        let grid = if block.parser.is_alternate_screen() || block.is_running() {
+            block.parser.grid()
+        } else {
+            block.parser.grid_with_scrollback()
+        };
+        let cols = grid.cols() as usize;
+        if cols == 0 {
+            return String::new();
+        }
+
+        let start_row = start_offset / cols;
+        let start_col = start_offset % cols;
+        let end_row = end_offset / cols;
+        let end_col = end_offset % cols;
+
+        let mut result = String::new();
+        let rows: Vec<Vec<nexus_term::Cell>> = grid.rows_iter()
+            .map(|row| row.to_vec())
+            .collect();
+
+        for row_idx in start_row..=end_row {
+            if row_idx >= rows.len() {
+                break;
+            }
+            let row = &rows[row_idx];
+            let col_start = if row_idx == start_row { start_col } else { 0 };
+            let col_end = if row_idx == end_row { end_col } else { row.len() };
+
+            let line: String = row.iter()
+                .skip(col_start)
+                .take(col_end.saturating_sub(col_start))
+                .map(|cell| cell.c)
+                .collect();
+
+            result.push_str(line.trim_end());
+            if row_idx < end_row {
+                result.push('\n');
+            }
+        }
+
+        return result;
+    }
+
+    // If no terminal block matched, the selection might be on native text output.
+    // Native output uses TextElement without source IDs, so selection isn't
+    // supported there yet. For now, return empty.
+    String::new()
+}
+
+// =========================================================================
 // Context menu rendering
 // =========================================================================
 
 fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuState) {
     use crate::strata::primitives::{Color, Point, Rect};
 
-    let w = 180.0_f32;
-    let row_h = 28.0_f32;
-    let h = menu.items.len() as f32 * row_h + 8.0;
+    let w = 200.0_f32;
+    let row_h = 30.0_f32;
+    let padding = 6.0_f32;
+    let h = menu.items.len() as f32 * row_h + padding * 2.0;
 
-    let x = menu.x;
-    let y = menu.y;
+    // Clamp position to stay within viewport
+    let vp = snapshot.viewport();
+    let x = menu.x.min(vp.width - w - 4.0).max(0.0);
+    let y = menu.y.min(vp.height - h - 4.0).max(0.0);
 
-    let p = snapshot.primitives_mut();
+    let p = snapshot.overlay_primitives_mut();
 
     // Shadow
     p.add_shadow(
-        Rect::new(x + 4.0, y + 4.0, w, h),
-        8.0, 12.0,
-        Color::rgba(0.0, 0.0, 0.0, 0.5),
+        Rect::new(x + 3.0, y + 3.0, w, h),
+        8.0, 16.0,
+        Color::rgba(0.0, 0.0, 0.0, 0.7),
     );
-    // Background
-    p.add_rounded_rect(Rect::new(x, y, w, h), 8.0, Color::rgb(0.14, 0.14, 0.16));
+    // Background — dark opaque
+    p.add_rounded_rect(Rect::new(x, y, w, h), 8.0, Color::rgb(0.08, 0.08, 0.10));
     // Border
-    p.add_border(Rect::new(x, y, w, h), 8.0, 1.0, Color::rgba(1.0, 1.0, 1.0, 0.1));
+    p.add_border(Rect::new(x, y, w, h), 8.0, 1.0, Color::rgba(1.0, 1.0, 1.0, 0.15));
 
-    let ix = x + 4.0;
-    let iw = w - 8.0;
+    let ix = x + padding;
+    let iw = w - padding * 2.0;
 
     for (i, item) in menu.items.iter().enumerate() {
-        let iy = y + 4.0 + i as f32 * row_h;
+        let iy = y + padding + i as f32 * row_h;
         let item_rect = Rect::new(ix, iy, iw, row_h - 2.0);
 
         // Register as clickable widget
         let item_id = SourceId::named(&format!("ctx_menu_{}", i));
         snapshot.register_widget(item_id, item_rect);
 
-        let p = snapshot.primitives_mut();
+        let p = snapshot.overlay_primitives_mut();
 
-        // Hover background
-        p.add_rounded_rect(item_rect, 4.0, Color::rgba(1.0, 1.0, 1.0, 0.05));
+        // Item background — visible against dark menu
+        p.add_rounded_rect(item_rect, 4.0, Color::rgb(0.15, 0.15, 0.18));
 
         // Label
-        p.add_text(item.label(), Point::new(ix + 8.0, iy + 5.0), Color::rgb(0.9, 0.9, 0.9));
+        p.add_text(item.label(), Point::new(ix + 10.0, iy + 6.0), Color::rgb(0.92, 0.92, 0.92));
 
-        // Shortcut
+        // Shortcut hint (right-aligned)
         let shortcut = item.shortcut();
         if !shortcut.is_empty() {
-            p.add_text(shortcut, Point::new(ix + iw - 32.0, iy + 5.0), Color::rgb(0.5, 0.5, 0.5));
+            p.add_text(shortcut, Point::new(ix + iw - 36.0, iy + 6.0), Color::rgb(0.45, 0.45, 0.5));
         }
     }
 }

@@ -885,9 +885,56 @@ impl PipelineWrapper {
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
-        // Render foreground decorations LAST (on top of everything).
+        // Render foreground decorations (on top of text).
         for decoration in snapshot.foreground_decorations() {
             render_decoration(pipeline, decoration, scale);
+        }
+
+        // 7. Overlay primitives — rendered LAST, on top of everything.
+        // Used for context menus, tooltips, popups.
+        let overlays = snapshot.overlay_primitives();
+
+        for prim in &overlays.shadows {
+            let start = pipeline.instance_count();
+            pipeline.add_shadow(
+                prim.rect.x * scale, prim.rect.y * scale,
+                prim.rect.width * scale, prim.rect.height * scale,
+                prim.corner_radius * scale, prim.blur_radius * scale, prim.color,
+            );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
+        }
+        for prim in &overlays.rounded_rects {
+            let start = pipeline.instance_count();
+            pipeline.add_rounded_rect(
+                prim.rect.x * scale, prim.rect.y * scale,
+                prim.rect.width * scale, prim.rect.height * scale,
+                prim.corner_radius * scale, prim.color,
+            );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
+        }
+        for prim in &overlays.solid_rects {
+            let start = pipeline.instance_count();
+            pipeline.add_solid_rect(
+                prim.rect.x * scale, prim.rect.y * scale,
+                prim.rect.width * scale, prim.rect.height * scale, prim.color,
+            );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
+        }
+        for prim in &overlays.borders {
+            let start = pipeline.instance_count();
+            pipeline.add_border(
+                prim.rect.x * scale, prim.rect.y * scale,
+                prim.rect.width * scale, prim.rect.height * scale,
+                prim.corner_radius * scale, prim.border_width * scale, prim.color,
+            );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
+        }
+        for prim in &overlays.text_runs {
+            let start = pipeline.instance_count();
+            pipeline.add_text(
+                &prim.text, prim.position.x * scale, prim.position.y * scale, prim.color,
+            );
+            maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
 
         // Create command encoder for staging belt uploads.

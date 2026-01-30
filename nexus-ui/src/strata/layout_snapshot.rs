@@ -429,6 +429,10 @@ pub struct LayoutSnapshot {
     /// This is the "escape hatch" for canvas-like drawing.
     primitives: PrimitiveBatch,
 
+    /// Overlay primitive batch — rendered LAST, on top of everything.
+    /// Use for popups, context menus, tooltips that must appear above all content.
+    overlay_primitives: PrimitiveBatch,
+
     /// Bounds of widgets registered with an ID.
     /// Used for hit-testing non-content areas (buttons, panels) and overlay anchoring.
     widget_bounds: HashMap<SourceId, Rect>,
@@ -459,6 +463,7 @@ impl LayoutSnapshot {
             background_decorations: Vec::new(),
             foreground_decorations: Vec::new(),
             primitives: PrimitiveBatch::new(),
+            overlay_primitives: PrimitiveBatch::new(),
             widget_bounds: HashMap::new(),
             scroll_limits: HashMap::new(),
             scroll_tracks: HashMap::new(),
@@ -472,6 +477,7 @@ impl LayoutSnapshot {
         self.background_decorations.clear();
         self.foreground_decorations.clear();
         self.primitives.clear();
+        self.overlay_primitives.clear();
         self.widget_bounds.clear();
         self.scroll_limits.clear();
         self.scroll_tracks.clear();
@@ -482,6 +488,19 @@ impl LayoutSnapshot {
     /// Use this for inspecting primitives added by the layout system.
     pub fn primitives(&self) -> &PrimitiveBatch {
         &self.primitives
+    }
+
+    /// Get read-only access to the overlay primitive batch.
+    pub fn overlay_primitives(&self) -> &PrimitiveBatch {
+        &self.overlay_primitives
+    }
+
+    /// Get mutable access to the overlay primitive batch.
+    ///
+    /// Overlay primitives render on top of ALL content (text, grids, etc.).
+    /// Use for context menus, tooltips, popups.
+    pub fn overlay_primitives_mut(&mut self) -> &mut PrimitiveBatch {
+        &mut self.overlay_primitives
     }
 
     /// Get mutable access to the primitive batch.
