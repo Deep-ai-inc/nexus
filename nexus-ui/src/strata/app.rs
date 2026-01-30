@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::strata::content_address::{Selection, SourceId};
-use crate::strata::event_context::{CaptureState, MouseEvent};
+use crate::strata::event_context::{CaptureState, KeyEvent, MouseEvent};
 use crate::strata::gpu::ImageStore;
 use crate::strata::layout_snapshot::{HitResult, LayoutSnapshot};
 
@@ -249,6 +249,17 @@ pub trait StrataApp: Sized + 'static {
         _capture: &CaptureState,
     ) -> MouseResponse<Self::Message> {
         MouseResponse::none()
+    }
+
+    /// Handle a keyboard event.
+    ///
+    /// Called by the shell on key press/release. Dispatched globally
+    /// (no hit-testing). The app decides routing based on focus state.
+    fn on_key(
+        _state: &Self::State,
+        _event: KeyEvent,
+    ) -> Option<Self::Message> {
+        None
     }
 
     /// Create subscriptions based on current state.

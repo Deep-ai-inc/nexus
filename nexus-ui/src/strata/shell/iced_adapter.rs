@@ -205,6 +205,33 @@ fn update<A: StrataApp>(
                 }
             }
 
+            // Handle keyboard events
+            if let Event::Keyboard(keyboard_event) = &event {
+                match keyboard_event {
+                    iced::keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                        let strata_event = KeyEvent::Pressed {
+                            key: convert_key(key),
+                            modifiers: convert_modifiers(*modifiers),
+                        };
+                        if let Some(msg) = A::on_key(&state.app, strata_event) {
+                            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
+                            return command_to_task(cmd);
+                        }
+                    }
+                    iced::keyboard::Event::KeyReleased { key, modifiers, .. } => {
+                        let strata_event = KeyEvent::Released {
+                            key: convert_key(key),
+                            modifiers: convert_modifiers(*modifiers),
+                        };
+                        if let Some(msg) = A::on_key(&state.app, strata_event) {
+                            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
+                            return command_to_task(cmd);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             Task::none()
         }
 

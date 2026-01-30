@@ -142,6 +142,12 @@ pub enum LayoutChild {
     /// A spacer that expands to fill available space.
     Spacer { flex: f32 },
 
+    /// A button element (text label with background, registers as widget hit target).
+    Button(ButtonElement),
+
+    /// A text input element (editable text field, registers as widget hit target).
+    TextInput(TextInputElement),
+
     /// A fixed-size spacer.
     FixedSpacer { size: f32 },
 }
@@ -153,6 +159,8 @@ impl LayoutChild {
             LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT),
             LayoutChild::Terminal(t) => t.size(),
             LayoutChild::Image(img) => img.size(),
+            LayoutChild::Button(b) => b.estimate_size(),
+            LayoutChild::TextInput(t) => t.estimate_size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
@@ -168,6 +176,8 @@ impl LayoutChild {
             LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT),
             LayoutChild::Terminal(t) => t.size(),
             LayoutChild::Image(img) => img.size(),
+            LayoutChild::Button(b) => b.estimate_size(),
+            LayoutChild::TextInput(t) => t.estimate_size(),
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
@@ -192,6 +202,9 @@ impl LayoutChild {
             }
             LayoutChild::ScrollColumn(s) => {
                 if is_column { s.height.flex() } else { s.width.flex() }
+            }
+            LayoutChild::TextInput(t) => {
+                if is_column { 0.0 } else { t.width.flex() }
             }
             _ => 0.0,
         }
@@ -218,6 +231,73 @@ pub struct TextElement {
     pub cache_key: u64,
     /// Measured size (filled during layout).
     measured_size: Option<Size>,
+}
+
+/// Render a TextInputElement at the given position and size.
+fn render_text_input(
+    snapshot: &mut LayoutSnapshot,
+    input: TextInputElement,
+    x: f32, y: f32, w: f32, h: f32,
+) {
+    use crate::strata::primitives::Point;
+
+    let input_rect = Rect::new(x, y, w, h);
+
+    // Background
+    snapshot.primitives_mut().add_rounded_rect(input_rect, input.corner_radius, input.background);
+
+    // Border
+    let border_color = if input.focused { input.focus_border_color } else { input.border_color };
+    snapshot.primitives_mut().add_border(input_rect, input.corner_radius, input.border_width, border_color);
+
+    // Clip content
+    snapshot.primitives_mut().push_clip(input_rect);
+
+    let text_x = x + input.padding.left;
+    let text_y = y + input.padding.top;
+
+    // Selection highlight
+    if let Some((sel_start, sel_end)) = input.selection {
+        let s = sel_start.min(sel_end);
+        let e = sel_start.max(sel_end);
+        let sel_x = text_x + s as f32 * CHAR_WIDTH;
+        let sel_w = (e - s) as f32 * CHAR_WIDTH;
+        snapshot.primitives_mut().add_solid_rect(
+            Rect::new(sel_x, text_y, sel_w, LINE_HEIGHT),
+            Color::rgba(0.3, 0.5, 0.8, 0.4),
+        );
+    }
+
+    // Text or placeholder
+    if input.text.is_empty() && !input.focused {
+        snapshot.primitives_mut().add_text_cached(
+            input.placeholder.clone(),
+            Point::new(text_x, text_y),
+            input.placeholder_color,
+            hash_text(&input.placeholder),
+        );
+    } else {
+        snapshot.primitives_mut().add_text_cached(
+            input.text,
+            Point::new(text_x, text_y),
+            input.text_color,
+            input.cache_key,
+        );
+    }
+
+    // Cursor
+    if input.focused {
+        let cursor_x = text_x + input.cursor as f32 * CHAR_WIDTH;
+        snapshot.primitives_mut().add_solid_rect(
+            Rect::new(cursor_x, text_y, 2.0, LINE_HEIGHT),
+            Color::rgba(0.85, 0.85, 0.88, 0.8),
+        );
+    }
+
+    snapshot.primitives_mut().pop_clip();
+
+    // Register for hit-testing
+    snapshot.register_widget(input.id, input_rect);
 }
 
 /// Fast non-cryptographic hash for cache keys.
@@ -390,6 +470,139 @@ impl ImageElement {
 
     fn size(&self) -> Size {
         Size::new(self.width, self.height)
+    }
+}
+
+/// A button element descriptor.
+///
+/// Renders a padded text label with background and corner radius.
+/// Auto-registers as a widget hit target for click detection via `on_mouse`.
+pub struct ButtonElement {
+    /// Widget ID for hit-testing (required).
+    pub id: SourceId,
+    /// Button label text.
+    pub label: String,
+    /// Text color.
+    pub text_color: Color,
+    /// Background color.
+    pub background: Color,
+    /// Corner radius.
+    pub corner_radius: f32,
+    /// Padding around the label.
+    pub padding: Padding,
+    /// Cache key for text rendering.
+    cache_key: u64,
+}
+
+impl ButtonElement {
+    pub fn new(id: SourceId, label: impl Into<String>) -> Self {
+        let label = label.into();
+        let cache_key = hash_text(&label);
+        Self {
+            id,
+            label,
+            text_color: Color::WHITE,
+            background: Color::rgba(0.3, 0.3, 0.4, 1.0),
+            corner_radius: 4.0,
+            padding: Padding::new(3.0, 14.0, 3.0, 14.0),
+            cache_key,
+        }
+    }
+
+    pub fn text_color(mut self, color: Color) -> Self {
+        self.text_color = color;
+        self
+    }
+
+    pub fn background(mut self, color: Color) -> Self {
+        self.background = color;
+        self
+    }
+
+    pub fn corner_radius(mut self, radius: f32) -> Self {
+        self.corner_radius = radius;
+        self
+    }
+
+    pub fn padding(mut self, padding: Padding) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    fn estimate_size(&self) -> Size {
+        let char_count = self.label.chars().count() as f32;
+        Size::new(
+            char_count * CHAR_WIDTH + self.padding.horizontal(),
+            LINE_HEIGHT + self.padding.vertical(),
+        )
+    }
+}
+
+/// A text input element descriptor.
+///
+/// Renders an editable text field with cursor and optional selection highlight.
+/// All state is external — the app passes text, cursor, selection, and focus.
+pub struct TextInputElement {
+    pub id: SourceId,
+    pub text: String,
+    pub cursor: usize,
+    pub selection: Option<(usize, usize)>,
+    pub focused: bool,
+    pub placeholder: String,
+    pub text_color: Color,
+    pub placeholder_color: Color,
+    pub background: Color,
+    pub border_color: Color,
+    pub focus_border_color: Color,
+    pub border_width: f32,
+    pub corner_radius: f32,
+    pub padding: Padding,
+    pub width: Length,
+    cache_key: u64,
+}
+
+impl TextInputElement {
+    pub fn new(id: SourceId, text: impl Into<String>) -> Self {
+        let text = text.into();
+        let cache_key = hash_text(&text);
+        Self {
+            id,
+            text,
+            cursor: 0,
+            selection: None,
+            focused: false,
+            placeholder: String::new(),
+            text_color: Color::WHITE,
+            placeholder_color: Color::rgba(0.4, 0.4, 0.45, 1.0),
+            background: Color::rgba(0.10, 0.10, 0.13, 1.0),
+            border_color: Color::rgba(1.0, 1.0, 1.0, 0.12),
+            focus_border_color: Color::rgba(0.3, 0.5, 0.8, 0.6),
+            border_width: 1.0,
+            corner_radius: 6.0,
+            padding: Padding::new(8.0, 12.0, 8.0, 12.0),
+            width: Length::Fill,
+            cache_key,
+        }
+    }
+
+    pub fn cursor(mut self, pos: usize) -> Self { self.cursor = pos; self }
+    pub fn selection(mut self, range: Option<(usize, usize)>) -> Self { self.selection = range; self }
+    pub fn focused(mut self, focused: bool) -> Self { self.focused = focused; self }
+    pub fn placeholder(mut self, text: impl Into<String>) -> Self { self.placeholder = text.into(); self }
+    pub fn text_color(mut self, color: Color) -> Self { self.text_color = color; self }
+    pub fn background(mut self, color: Color) -> Self { self.background = color; self }
+    pub fn border_color(mut self, color: Color) -> Self { self.border_color = color; self }
+    pub fn focus_border_color(mut self, color: Color) -> Self { self.focus_border_color = color; self }
+    pub fn corner_radius(mut self, radius: f32) -> Self { self.corner_radius = radius; self }
+    pub fn padding(mut self, padding: Padding) -> Self { self.padding = padding; self }
+    pub fn width(mut self, width: Length) -> Self { self.width = width; self }
+
+    fn estimate_size(&self) -> Size {
+        let text_w = self.text.chars().count().max(20) as f32 * CHAR_WIDTH;
+        Size::new(
+            text_w + self.padding.horizontal(),
+            LINE_HEIGHT + self.padding.vertical(),
+        )
     }
 }
 
@@ -574,6 +787,18 @@ impl Column {
         self
     }
 
+    /// Add a button element.
+    pub fn button(mut self, element: ButtonElement) -> Self {
+        self.children.push(LayoutChild::Button(element));
+        self
+    }
+
+    /// Add a text input element.
+    pub fn text_input(mut self, element: TextInputElement) -> Self {
+        self.children.push(LayoutChild::TextInput(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes — does not recurse into children
@@ -727,6 +952,16 @@ impl Column {
                     child_heights.push(h);
                     total_fixed_height += h;
                 }
+                LayoutChild::Button(btn) => {
+                    let h = btn.estimate_size().height;
+                    child_heights.push(h);
+                    total_fixed_height += h;
+                }
+                LayoutChild::TextInput(input) => {
+                    let h = LINE_HEIGHT + input.padding.vertical();
+                    child_heights.push(h);
+                    total_fixed_height += h;
+                }
                 LayoutChild::Spacer { flex } => {
                     child_heights.push(0.0);
                     total_flex += flex;
@@ -852,6 +1087,31 @@ impl Column {
                         img.tint,
                     );
                     y += height + self.spacing + alignment_gap;
+                }
+                LayoutChild::Button(btn) => {
+                    let size = btn.estimate_size();
+                    let bx = cross_x(size.width);
+                    let btn_rect = Rect::new(bx, y, size.width, size.height);
+                    snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
+                    snapshot.primitives_mut().add_text_cached(
+                        btn.label,
+                        crate::strata::primitives::Point::new(bx + btn.padding.left, y + btn.padding.top),
+                        btn.text_color,
+                        btn.cache_key,
+                    );
+                    snapshot.register_widget(btn.id, btn_rect);
+                    y += height + self.spacing + alignment_gap;
+                }
+                LayoutChild::TextInput(input) => {
+                    let h = LINE_HEIGHT + input.padding.vertical();
+                    let w = match input.width {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) => content_width,
+                        Length::Shrink => input.estimate_size().width.min(content_width),
+                    };
+                    let ix = cross_x(w);
+                    render_text_input(snapshot, input, ix, y, w, h);
+                    y += h + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
                     // Resolve flex height for Fill children
@@ -1106,6 +1366,18 @@ impl Row {
         self
     }
 
+    /// Add a button element.
+    pub fn button(mut self, element: ButtonElement) -> Self {
+        self.children.push(LayoutChild::Button(element));
+        self
+    }
+
+    /// Add a text input element.
+    pub fn text_input(mut self, element: TextInputElement) -> Self {
+        self.children.push(LayoutChild::TextInput(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     ///
     /// Short-circuits on Fixed axes.
@@ -1254,6 +1526,28 @@ impl Row {
                     child_widths.push(w);
                     total_fixed_width += w;
                 }
+                LayoutChild::Button(btn) => {
+                    let w = btn.estimate_size().width;
+                    child_widths.push(w);
+                    total_fixed_width += w;
+                }
+                LayoutChild::TextInput(input) => {
+                    match input.width {
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_widths.push(0.0);
+                            total_flex += input.width.flex();
+                        }
+                        Length::Fixed(px) => {
+                            child_widths.push(px);
+                            total_fixed_width += px;
+                        }
+                        Length::Shrink => {
+                            let w = input.estimate_size().width;
+                            child_widths.push(w);
+                            total_fixed_width += w;
+                        }
+                    }
+                }
                 LayoutChild::Spacer { flex } => {
                     child_widths.push(0.0);
                     total_flex += flex;
@@ -1381,6 +1675,31 @@ impl Row {
                         img.tint,
                     );
                     x += width + self.spacing + alignment_gap;
+                }
+                LayoutChild::Button(btn) => {
+                    let size = btn.estimate_size();
+                    let by = cross_y(size.height);
+                    let btn_rect = Rect::new(x, by, size.width, size.height);
+                    snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
+                    snapshot.primitives_mut().add_text_cached(
+                        btn.label,
+                        crate::strata::primitives::Point::new(x + btn.padding.left, by + btn.padding.top),
+                        btn.text_color,
+                        btn.cache_key,
+                    );
+                    snapshot.register_widget(btn.id, btn_rect);
+                    x += width + self.spacing + alignment_gap;
+                }
+                LayoutChild::TextInput(input) => {
+                    let w = if input.width.is_flex() && total_flex > 0.0 {
+                        (input.width.flex() / total_flex) * available_flex
+                    } else {
+                        width
+                    };
+                    let h = LINE_HEIGHT + input.padding.vertical();
+                    let iy = cross_y(h);
+                    render_text_input(snapshot, input, x, iy, w, h);
+                    x += w + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
                     // Resolve flex width for Fill children
@@ -1608,6 +1927,18 @@ impl ScrollColumn {
         self
     }
 
+    /// Add a button element.
+    pub fn button(mut self, element: ButtonElement) -> Self {
+        self.children.push(LayoutChild::Button(element));
+        self
+    }
+
+    /// Add a text input element.
+    pub fn text_input(mut self, element: TextInputElement) -> Self {
+        self.children.push(LayoutChild::TextInput(element));
+        self
+    }
+
     /// Compute intrinsic size (content size + padding).
     pub fn measure(&self) -> Size {
         let intrinsic_width = match self.width {
@@ -1757,6 +2088,27 @@ impl ScrollColumn {
                             img.corner_radius,
                             img.tint,
                         );
+                    }
+                    LayoutChild::Button(btn) => {
+                        let size = btn.estimate_size();
+                        let btn_rect = Rect::new(content_x, screen_y, size.width, size.height);
+                        snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
+                        snapshot.primitives_mut().add_text_cached(
+                            btn.label,
+                            crate::strata::primitives::Point::new(content_x + btn.padding.left, screen_y + btn.padding.top),
+                            btn.text_color,
+                            btn.cache_key,
+                        );
+                        snapshot.register_widget(btn.id, btn_rect);
+                    }
+                    LayoutChild::TextInput(input) => {
+                        let w = match input.width {
+                            Length::Fixed(px) => px,
+                            Length::Fill | Length::FillPortion(_) => content_width,
+                            Length::Shrink => input.estimate_size().width.min(content_width),
+                        };
+                        let h = LINE_HEIGHT + input.padding.vertical();
+                        render_text_input(snapshot, input, content_x, screen_y, w, h);
                     }
                     LayoutChild::Column(nested) => {
                         let w = match nested.width {

@@ -13,17 +13,17 @@ use std::time::Instant;
 use crate::strata::content_address::{ContentAddress, SourceId};
 use crate::strata::layout_snapshot::HitResult;
 use crate::strata::demo_widgets::{
-    AgentBlock, InputBar, JobPanel, JobPill, PermissionDialog, ShellBlock, StatusIndicator,
+    AgentBlock, JobPanel, JobPill, PermissionDialog, ShellBlock, StatusIndicator,
     StatusPanel, ToolInvocation,
 };
-use crate::strata::event_context::{CaptureState, MouseButton, MouseEvent};
+use crate::strata::event_context::{CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey};
 use crate::strata::layout::containers::Length;
 use crate::strata::layout::primitives::LineStyle;
 use crate::strata::primitives::{Color, Point, Rect};
 use crate::strata::gpu::{ImageHandle, ImageStore};
 use crate::strata::{
     AppConfig, Column, Command, LayoutSnapshot, MouseResponse, Row, ScrollColumn, Selection,
-    StrataApp, Subscription,
+    StrataApp, Subscription, TextElement, TextInputElement,
 };
 
 // =========================================================================
@@ -82,6 +82,22 @@ pub enum DemoMessage {
     ScrollDragStart(f32),
     ScrollDragMove(f32),
     ScrollDragEnd,
+    ClearSelection,
+    ScrollByKey(f32),
+    ButtonClicked(SourceId),
+    InputFocus(SourceId),
+    InputBlur,
+    InputChar(String),
+    InputBackspace,
+    InputDelete,
+    InputLeft,
+    InputRight,
+    InputHome,
+    InputEnd,
+    InputSelectLeft,
+    InputSelectRight,
+    InputSelectAll,
+    InputSubmit,
 }
 
 /// Demo application state.
@@ -110,6 +126,16 @@ pub struct DemoState {
     fps_smooth: Cell<f32>,
     // Animation start time
     start_time: Instant,
+    // Button IDs
+    deny_btn_id: SourceId,
+    allow_btn_id: SourceId,
+    always_btn_id: SourceId,
+    // Text input state
+    input_id: SourceId,
+    input_text: String,
+    input_cursor: usize,
+    input_selection: Option<(usize, usize)>,
+    focused_input: Option<SourceId>,
     // Test image handle
     test_image: ImageHandle,
 }
@@ -137,6 +163,14 @@ impl StrataApp for DemoApp {
             scroll_thumb_id: SourceId::new(),
             status_panel_id: SourceId::new(),
             job_panel_id: SourceId::new(),
+            deny_btn_id: SourceId::new(),
+            allow_btn_id: SourceId::new(),
+            always_btn_id: SourceId::new(),
+            input_id: SourceId::new(),
+            input_text: String::new(),
+            input_cursor: 0,
+            input_selection: None,
+            focused_input: None,
             scroll_offset: 0.0,
             scroll_max: Cell::new(f32::MAX),
             scroll_track: Cell::new(None),
@@ -197,6 +231,123 @@ impl StrataApp for DemoApp {
             }
             DemoMessage::ScrollDragEnd => {
                 state.scroll_grab_offset = 0.0;
+            }
+            DemoMessage::ClearSelection => {
+                state.selection = None;
+                state.is_selecting = false;
+            }
+            DemoMessage::ScrollByKey(delta) => {
+                let max = state.scroll_max.get();
+                state.scroll_offset = (state.scroll_offset - delta).clamp(0.0, max);
+            }
+            DemoMessage::ButtonClicked(id) => {
+                if id == state.deny_btn_id {
+                    eprintln!("[demo] Button clicked: Deny");
+                } else if id == state.allow_btn_id {
+                    eprintln!("[demo] Button clicked: Allow Once");
+                } else if id == state.always_btn_id {
+                    eprintln!("[demo] Button clicked: Allow Always");
+                }
+            }
+            DemoMessage::InputFocus(id) => {
+                state.focused_input = Some(id);
+                state.input_selection = None;
+            }
+            DemoMessage::InputBlur => {
+                state.focused_input = None;
+                state.input_selection = None;
+            }
+            DemoMessage::InputChar(c) => {
+                // Delete selection first
+                if let Some((s, e)) = state.input_selection.take() {
+                    let (lo, hi) = (s.min(e), s.max(e));
+                    let lo_byte = state.input_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                    let hi_byte = state.input_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                    state.input_text.replace_range(lo_byte..hi_byte, "");
+                    state.input_cursor = lo;
+                }
+                let byte_pos = state.input_text.char_indices().nth(state.input_cursor).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                state.input_text.insert_str(byte_pos, &c);
+                state.input_cursor += c.chars().count();
+            }
+            DemoMessage::InputBackspace => {
+                if let Some((s, e)) = state.input_selection.take() {
+                    let (lo, hi) = (s.min(e), s.max(e));
+                    let lo_byte = state.input_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                    let hi_byte = state.input_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                    state.input_text.replace_range(lo_byte..hi_byte, "");
+                    state.input_cursor = lo;
+                } else if state.input_cursor > 0 {
+                    state.input_cursor -= 1;
+                    let byte_pos = state.input_text.char_indices().nth(state.input_cursor).map(|(i, _)| i).unwrap_or(0);
+                    let next = state.input_text.char_indices().nth(state.input_cursor + 1).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                    state.input_text.replace_range(byte_pos..next, "");
+                }
+            }
+            DemoMessage::InputDelete => {
+                if let Some((s, e)) = state.input_selection.take() {
+                    let (lo, hi) = (s.min(e), s.max(e));
+                    let lo_byte = state.input_text.char_indices().nth(lo).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                    let hi_byte = state.input_text.char_indices().nth(hi).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                    state.input_text.replace_range(lo_byte..hi_byte, "");
+                    state.input_cursor = lo;
+                } else {
+                    let char_count = state.input_text.chars().count();
+                    if state.input_cursor < char_count {
+                        let byte_pos = state.input_text.char_indices().nth(state.input_cursor).map(|(i, _)| i).unwrap_or(0);
+                        let next = state.input_text.char_indices().nth(state.input_cursor + 1).map(|(i, _)| i).unwrap_or(state.input_text.len());
+                        state.input_text.replace_range(byte_pos..next, "");
+                    }
+                }
+            }
+            DemoMessage::InputLeft => {
+                state.input_selection = None;
+                if state.input_cursor > 0 { state.input_cursor -= 1; }
+            }
+            DemoMessage::InputRight => {
+                state.input_selection = None;
+                let len = state.input_text.chars().count();
+                if state.input_cursor < len { state.input_cursor += 1; }
+            }
+            DemoMessage::InputHome => {
+                state.input_selection = None;
+                state.input_cursor = 0;
+            }
+            DemoMessage::InputEnd => {
+                state.input_selection = None;
+                state.input_cursor = state.input_text.chars().count();
+            }
+            DemoMessage::InputSelectLeft => {
+                let anchor = match state.input_selection {
+                    Some((a, _)) => a,
+                    None => state.input_cursor,
+                };
+                if state.input_cursor > 0 {
+                    state.input_cursor -= 1;
+                    state.input_selection = Some((anchor, state.input_cursor));
+                }
+            }
+            DemoMessage::InputSelectRight => {
+                let anchor = match state.input_selection {
+                    Some((a, _)) => a,
+                    None => state.input_cursor,
+                };
+                let len = state.input_text.chars().count();
+                if state.input_cursor < len {
+                    state.input_cursor += 1;
+                    state.input_selection = Some((anchor, state.input_cursor));
+                }
+            }
+            DemoMessage::InputSelectAll => {
+                let len = state.input_text.chars().count();
+                state.input_selection = Some((0, len));
+                state.input_cursor = len;
+            }
+            DemoMessage::InputSubmit => {
+                eprintln!("[demo] Input submitted: {:?}", state.input_text);
+                state.input_text.clear();
+                state.input_cursor = 0;
+                state.input_selection = None;
             }
         }
         Command::none()
@@ -327,16 +478,47 @@ impl StrataApp for DemoApp {
                         .build(),
                     )
                     // Permission Dialog
-                    .column(PermissionDialog { command: "rm -rf /tmp/cache" }.build())
-                    // Input Bar
+                    .column(PermissionDialog {
+                        command: "rm -rf /tmp/cache",
+                        deny_id: state.deny_btn_id,
+                        allow_id: state.allow_btn_id,
+                        always_id: state.always_btn_id,
+                    }.build())
+                    // Input Bar (with real TextInput)
                     .row(
-                        InputBar {
-                            cwd: "~/Desktop/nexus",
-                            mode: "SH",
-                            mode_color: colors::SUCCESS,
-                            mode_bg: colors::BTN_MODE_SH,
-                        }
-                        .build(),
+                        Row::new()
+                            .padding_custom(crate::strata::layout::containers::Padding::new(8.0, 12.0, 8.0, 12.0))
+                            .spacing(10.0)
+                            .background(colors::BG_INPUT)
+                            .corner_radius(6.0)
+                            .border(colors::BORDER_INPUT, 1.0)
+                            .width(Length::Fill)
+                            .cross_align(crate::strata::layout::containers::CrossAxisAlignment::Center)
+                            .text(TextElement::new("~/Desktop/nexus").color(colors::TEXT_PATH))
+                            .column(
+                                Column::new()
+                                    .padding_custom(crate::strata::layout::containers::Padding::new(1.0, 8.0, 1.0, 8.0))
+                                    .background(colors::BTN_MODE_SH)
+                                    .corner_radius(3.0)
+                                    .text(TextElement::new("SH").color(colors::SUCCESS).size(12.0)),
+                            )
+                            .text(TextElement::new("$").color(colors::SUCCESS))
+                            .text_input(
+                                TextInputElement::new(
+                                    state.input_id,
+                                    &state.input_text,
+                                )
+                                .cursor(state.input_cursor)
+                                .selection(state.input_selection)
+                                .focused(state.focused_input == Some(state.input_id))
+                                .placeholder("Type a command...")
+                                .background(Color::rgba(0.0, 0.0, 0.0, 0.0))
+                                .border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
+                                .focus_border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
+                                .corner_radius(0.0)
+                                .padding(crate::strata::layout::containers::Padding::new(0.0, 4.0, 0.0, 4.0))
+                                .width(Length::Fill),
+                            ),
                     )
                     ,
             )
@@ -463,8 +645,16 @@ impl StrataApp for DemoApp {
                 button: MouseButton::Left,
                 position,
             } => {
-                // Scrollbar thumb drag
                 if let Some(HitResult::Widget(id)) = &hit {
+                    // Text input focus
+                    if *id == state.input_id {
+                        return MouseResponse::message(DemoMessage::InputFocus(*id));
+                    }
+                    // Button clicks
+                    if *id == state.deny_btn_id || *id == state.allow_btn_id || *id == state.always_btn_id {
+                        return MouseResponse::message(DemoMessage::ButtonClicked(*id));
+                    }
+                    // Scrollbar thumb drag
                     if *id == state.scroll_thumb_id {
                         return MouseResponse::message_and_capture(
                             DemoMessage::ScrollDragStart(position.y),
@@ -474,10 +664,17 @@ impl StrataApp for DemoApp {
                 }
                 // Text selection
                 if let Some(HitResult::Content(addr)) = hit {
+                    if state.focused_input.is_some() {
+                        return MouseResponse::message(DemoMessage::InputBlur);
+                    }
                     return MouseResponse::message_and_capture(
                         DemoMessage::SelectionStart(addr),
                         state.query_source,
                     );
+                }
+                // Clicked on empty space: blur input
+                if state.focused_input.is_some() {
+                    return MouseResponse::message(DemoMessage::InputBlur);
                 }
             }
             MouseEvent::CursorMoved { position } => {
@@ -526,6 +723,43 @@ impl StrataApp for DemoApp {
             _ => {}
         }
         MouseResponse::none()
+    }
+
+    fn on_key(
+        state: &Self::State,
+        event: KeyEvent,
+    ) -> Option<Self::Message> {
+        if let KeyEvent::Pressed { key, modifiers } = event {
+            // Route to focused input first
+            if state.focused_input.is_some() {
+                match (&key, modifiers.shift, modifiers.meta || modifiers.ctrl) {
+                    (Key::Named(NamedKey::Escape), _, _) => return Some(DemoMessage::InputBlur),
+                    (Key::Named(NamedKey::Enter), _, _) => return Some(DemoMessage::InputSubmit),
+                    (Key::Named(NamedKey::Backspace), _, _) => return Some(DemoMessage::InputBackspace),
+                    (Key::Named(NamedKey::Delete), _, _) => return Some(DemoMessage::InputDelete),
+                    (Key::Named(NamedKey::ArrowLeft), true, _) => return Some(DemoMessage::InputSelectLeft),
+                    (Key::Named(NamedKey::ArrowRight), true, _) => return Some(DemoMessage::InputSelectRight),
+                    (Key::Named(NamedKey::ArrowLeft), _, _) => return Some(DemoMessage::InputLeft),
+                    (Key::Named(NamedKey::ArrowRight), _, _) => return Some(DemoMessage::InputRight),
+                    (Key::Named(NamedKey::Home), _, _) => return Some(DemoMessage::InputHome),
+                    (Key::Named(NamedKey::End), _, _) => return Some(DemoMessage::InputEnd),
+                    (Key::Character(c), _, true) if c == "a" => return Some(DemoMessage::InputSelectAll),
+                    (Key::Character(c), _, false) => return Some(DemoMessage::InputChar(c.clone())),
+                    (Key::Named(NamedKey::Space), _, false) => return Some(DemoMessage::InputChar(" ".into())),
+                    _ => return None, // Swallow unhandled keys when focused
+                }
+            }
+            // Global shortcuts
+            match key {
+                Key::Named(NamedKey::Escape) => return Some(DemoMessage::ClearSelection),
+                Key::Named(NamedKey::ArrowUp) => return Some(DemoMessage::ScrollByKey(60.0)),
+                Key::Named(NamedKey::ArrowDown) => return Some(DemoMessage::ScrollByKey(-60.0)),
+                Key::Named(NamedKey::PageUp) => return Some(DemoMessage::ScrollByKey(300.0)),
+                Key::Named(NamedKey::PageDown) => return Some(DemoMessage::ScrollByKey(-300.0)),
+                _ => {}
+            }
+        }
+        None
     }
 
     fn subscription(_state: &Self::State) -> Subscription<Self::Message> {

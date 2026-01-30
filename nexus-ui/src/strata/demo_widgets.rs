@@ -4,7 +4,7 @@
 //! Each struct encapsulates the visual structure of a Nexus UI element.
 
 use crate::strata::content_address::SourceId;
-use crate::strata::layout::containers::{Column, Length, Padding, Row, TextElement, TerminalElement};
+use crate::strata::layout::containers::{ButtonElement, Column, Length, Padding, Row, TextElement, TerminalElement};
 use crate::strata::primitives::Color;
 
 use super::demo::colors;
@@ -167,40 +167,35 @@ impl AgentBlock {
 
 pub struct PermissionDialog {
     pub command: &'static str,
+    pub deny_id: SourceId,
+    pub allow_id: SourceId,
+    pub always_id: SourceId,
 }
 
 impl PermissionDialog {
     pub fn build(self) -> Column {
-        // Code block
         let code_block = Column::new()
             .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
             .background(Color::rgba(0.0, 0.0, 0.0, 0.3))
             .corner_radius(4.0)
             .text(TextElement::new(self.command).color(colors::ERROR));
 
-        // Buttons
         let buttons = Row::new()
             .spacing(8.0)
-            .column(
-                Column::new()
-                    .padding_custom(Padding::new(3.0, 14.0, 3.0, 14.0))
+            .button(
+                ButtonElement::new(self.deny_id, "Deny")
                     .background(colors::BTN_DENY)
-                    .corner_radius(4.0)
-                    .text(TextElement::new("Deny").color(Color::WHITE)),
+                    .corner_radius(4.0),
             )
-            .column(
-                Column::new()
-                    .padding_custom(Padding::new(3.0, 14.0, 3.0, 14.0))
+            .button(
+                ButtonElement::new(self.allow_id, "Allow Once")
                     .background(colors::BTN_ALLOW)
-                    .corner_radius(4.0)
-                    .text(TextElement::new("Allow Once").color(Color::WHITE)),
+                    .corner_radius(4.0),
             )
-            .column(
-                Column::new()
-                    .padding_custom(Padding::new(3.0, 14.0, 3.0, 14.0))
+            .button(
+                ButtonElement::new(self.always_id, "Allow Always")
                     .background(colors::BTN_ALWAYS)
-                    .corner_radius(4.0)
-                    .text(TextElement::new("Allow Always").color(Color::WHITE)),
+                    .corner_radius(4.0),
             );
 
         Column::new()
