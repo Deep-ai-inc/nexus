@@ -234,7 +234,7 @@ impl<M> Default for Subscription<M> {
 /// The architecture follows the Elm pattern: init → update → view.
 pub trait StrataApp: Sized + 'static {
     /// Application state type.
-    type State: Send + 'static;
+    type State: 'static;
 
     /// Message type that drives state updates.
     type Message: Clone + Send + std::fmt::Debug + 'static;

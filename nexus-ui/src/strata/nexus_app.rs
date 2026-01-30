@@ -6,25 +6,44 @@
 //! Run with: `cargo run -p nexus-ui -- --strata`
 
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::sync::{broadcast, mpsc, Mutex};
+
+use nexus_api::{BlockId, BlockState, ShellEvent};
+use nexus_kernel::{CommandClassification, CommandRegistry, Kernel};
+use nexus_term::TerminalParser;
+
+use crate::agent_adapter::{AgentEvent, PermissionResponse};
+use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
+use crate::blocks::{Block, Focus, InputMode, PtyEvent, UnifiedBlockRef};
+use crate::context::NexusContext;
+use crate::pty::PtyHandle;
 use crate::route_mouse;
+use crate::shell_context::build_shell_context;
 use crate::strata::content_address::{ContentAddress, SourceId};
-use crate::strata::nexus_widgets::{Card, ShellBlock, StatusIndicator, StatusPanel};
 use crate::strata::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
 use crate::strata::layout_snapshot::HitResult;
-use crate::strata::primitives::{Color, Point, Rect};
-use crate::strata::{
-    AppConfig, ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
-    ImageStore, LayoutSnapshot, Length, LineStyle, MouseResponse, Padding, Row, ScrollAction,
-    ScrollColumn, ScrollState, Selection, StrataApp, Subscription, TableCell, TableElement,
-    TextElement, TextInputAction, TextInputElement, TextInputMouseAction, TextInputState,
+use crate::strata::nexus_widgets::{
+    AgentBlockWidget, JobBar, NexusInputBar, ShellBlockWidget, WelcomeScreen,
 };
+use crate::strata::primitives::Rect;
+use crate::strata::{
+    AppConfig, Column, Command, ImageStore, LayoutSnapshot, Length,
+    MouseResponse, Padding, ScrollAction, ScrollColumn, ScrollState, Selection, StrataApp,
+    Subscription, TextInputAction, TextInputMouseAction, TextInputState,
+};
+use crate::systems::{agent_subscription, kernel_subscription, pty_subscription, spawn_agent_task};
+use crate::widgets::job_indicator::{VisualJob, VisualJobState};
 
 // =========================================================================
-// Nexus color palette (matches real app)
+// Color palette (matches real Nexus app)
 // =========================================================================
 pub(crate) mod colors {
     use crate::strata::primitives::Color;
@@ -34,15 +53,13 @@ pub(crate) mod colors {
     pub const BG_BLOCK: Color = Color { r: 0.08, g: 0.08, b: 0.11, a: 1.0 };
     pub const BG_INPUT: Color = Color { r: 0.10, g: 0.10, b: 0.13, a: 1.0 };
     pub const BG_CARD: Color = Color { r: 0.12, g: 0.12, b: 0.16, a: 1.0 };
-    pub const BG_HOVER: Color = Color { r: 0.18, g: 0.30, b: 0.50, a: 0.5 };
-    pub const BG_OVERLAY: Color = Color { r: 0.12, g: 0.12, b: 0.18, a: 0.95 };
 
     // Status
     pub const SUCCESS: Color = Color { r: 0.3, g: 0.8, b: 0.5, a: 1.0 };
     pub const ERROR: Color = Color { r: 0.8, g: 0.3, b: 0.3, a: 1.0 };
     pub const WARNING: Color = Color { r: 0.8, g: 0.5, b: 0.2, a: 1.0 };
     pub const RUNNING: Color = Color { r: 0.3, g: 0.7, b: 1.0, a: 1.0 };
-    pub const KILLED: Color = Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+    pub const THINKING: Color = Color { r: 0.6, g: 0.5, b: 0.8, a: 1.0 };
 
     // Text
     pub const TEXT_PRIMARY: Color = Color { r: 0.85, g: 0.85, b: 0.88, a: 1.0 };
@@ -52,776 +69,602 @@ pub(crate) mod colors {
     pub const TEXT_PURPLE: Color = Color { r: 0.6, g: 0.4, b: 0.9, a: 1.0 };
     pub const TEXT_QUERY: Color = Color { r: 0.5, g: 0.7, b: 1.0, a: 1.0 };
 
+    // Tool colors
+    pub const TOOL_PENDING: Color = Color { r: 0.6, g: 0.6, b: 0.3, a: 1.0 };
+    pub const TOOL_OUTPUT: Color = Color { r: 0.7, g: 0.7, b: 0.7, a: 1.0 };
+
+    // Code blocks
+    pub const CODE_BG: Color = Color { r: 0.06, g: 0.06, b: 0.08, a: 1.0 };
+    pub const CODE_TEXT: Color = Color { r: 0.8, g: 0.85, b: 0.8, a: 1.0 };
+
     // Buttons
     pub const BTN_DENY: Color = Color { r: 0.6, g: 0.15, b: 0.15, a: 1.0 };
     pub const BTN_ALLOW: Color = Color { r: 0.15, g: 0.5, b: 0.25, a: 1.0 };
     pub const BTN_ALWAYS: Color = Color { r: 0.1, g: 0.35, b: 0.18, a: 1.0 };
     pub const BTN_KILL: Color = Color { r: 0.6, g: 0.2, b: 0.2, a: 1.0 };
+
     // Borders
     pub const BORDER_SUBTLE: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 };
     pub const BORDER_INPUT: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.12 };
+
+    // Welcome screen
+    pub const WELCOME_TITLE: Color = Color { r: 0.6, g: 0.8, b: 0.6, a: 1.0 };
+    pub const WELCOME_HEADING: Color = Color { r: 0.8, g: 0.7, b: 0.5, a: 1.0 };
+    pub const CARD_BG: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.03 };
+    pub const CARD_BORDER: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.06 };
 
     // Cursor
     pub const CURSOR: Color = Color { r: 0.85, g: 0.85, b: 0.88, a: 0.8 };
 }
 
 // =========================================================================
-// Dynamic chat item (proves Vec<T> in view)
-// =========================================================================
-
-struct ChatItem {
-    /// Stable ID for this item — survives across frames.
-    source: SourceId,
-    role: &'static str,
-    text: String,
-}
-
-// =========================================================================
 // Message type
 // =========================================================================
 
-/// Demo message type.
 #[derive(Debug, Clone)]
-pub enum DemoMessage {
-    // Content selection (cross-widget text selection)
+pub enum NexusMessage {
+    // Input
+    InputKey(KeyEvent),
+    InputMouse(TextInputMouseAction),
+    Submit,
+    ToggleMode,
+
+    // Terminal / PTY
+    PtyOutput(BlockId, Vec<u8>),
+    PtyExited(BlockId, i32),
+    KernelEvent(ShellEvent),
+    KillBlock(BlockId),
+
+    // Agent
+    AgentEvent(AgentEvent),
+    ToggleThinking(BlockId),
+    ToggleTool(BlockId, usize),
+    PermissionGrant(BlockId, String),
+    PermissionGrantSession(BlockId, String),
+    PermissionDeny(BlockId, String),
+    AgentInterrupt,
+
+    // Scroll
+    HistoryScroll(ScrollAction),
+
+    // Selection
     SelectionStart(ContentAddress),
     SelectionExtend(ContentAddress),
     SelectionEnd,
     ClearSelection,
     Copy,
 
-    // Scroll panels
-    LeftScroll(ScrollAction),
-    RightScroll(ScrollAction),
-
-    // Text input events (routed from on_key/on_mouse)
-    InputKey(KeyEvent),
-    InputMouse(TextInputMouseAction),
-    EditorKey(KeyEvent),
-    EditorMouse(TextInputMouseAction),
-
-    // Dynamic list: submit command from input bar
-    SubmitCommand,
-
-    // Buttons
-    ButtonClicked(SourceId),
-
-    // Table
-    TableSort(SourceId),
-
-    // Timer subscription
-    TimerTick,
-
-    // Focus management
+    // Window
     BlurAll,
+    Tick,
 }
 
 // =========================================================================
-// Application state
+// Application State
 // =========================================================================
 
-/// Demo application state.
-pub struct DemoState {
-    // Scroll panels
-    left_scroll: ScrollState,
-    right_scroll: ScrollState,
-    // Text inputs
-    input: TextInputState,
-    editor: TextInputState,
+pub struct NexusState {
+    // --- Input ---
+    pub input: TextInputState,
+    pub mode: InputMode,
+    pub shell_history: Vec<String>,
+    pub shell_history_index: Option<usize>,
+    pub agent_history: Vec<String>,
+    pub agent_history_index: Option<usize>,
+    pub saved_input: String,
 
-    // --- Focus Management (centralized) ---
-    /// The currently focused widget, or None if nothing focused.
-    focused_id: Option<SourceId>,
+    // --- Terminal ---
+    pub blocks: Vec<Block>,
+    pub block_index: HashMap<BlockId, usize>,
+    pub next_block_id: u64,
+    pub cwd: String,
+    pub pty_handles: Vec<PtyHandle>,
+    pub pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
+    pub pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
+    pub focus: Focus,
+    pub terminal_size: Cell<(u16, u16)>,
+    pub last_exit_code: Option<i32>,
+    pub commands: CommandRegistry,
+    pub kernel: Arc<Mutex<Kernel>>,
+    pub kernel_tx: broadcast::Sender<ShellEvent>,
+    pub kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
+    pub jobs: Vec<VisualJob>,
+    pub terminal_dirty: bool,
 
-    // --- Dynamic List ---
-    /// Chat history — grows at runtime when commands are submitted.
-    chat_history: Vec<ChatItem>,
+    // --- Agent ---
+    pub agent_blocks: Vec<AgentBlock>,
+    pub agent_block_index: HashMap<BlockId, usize>,
+    pub active_agent: Option<BlockId>,
+    pub agent_event_tx: mpsc::UnboundedSender<AgentEvent>,
+    pub agent_event_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
+    pub agent_permission_tx: Option<mpsc::UnboundedSender<(String, PermissionResponse)>>,
+    pub agent_cancel_flag: Arc<AtomicBool>,
+    pub agent_dirty: bool,
+    pub agent_session_id: Option<String>,
 
-    // --- Hover Tracking (Cell for interior mutability in on_mouse/view) ---
-    /// SourceId of the widget currently under the cursor.
-    hovered_widget: Cell<Option<SourceId>>,
+    // --- Layout ---
+    pub history_scroll: ScrollState,
+    pub window_size: (f32, f32),
 
-    // Content selection (cross-widget)
-    selection: Option<Selection>,
-    is_selecting: bool,
-    // Cursor blink
-    last_edit_time: Instant,
-    // FPS tracking (Cell for interior mutability in view())
-    last_frame: Cell<Instant>,
-    fps_smooth: Cell<f32>,
-    // Animation start time
-    start_time: Instant,
-    // Test image handle
-    test_image: ImageHandle,
-    // Subscription demo
-    elapsed_seconds: u32,
-    // Virtualization: content-space Y of the chat list within the scroll column.
-    // Updated after layout each frame; used next frame to adjust scroll offset.
-    chat_content_top: Cell<f32>,
-    // Table state
-    table_sort_col: usize,
-    table_sort_asc: bool,
-    table_rows: Vec<(&'static str, &'static str, u32, &'static str, Color)>,
+    // --- Selection ---
+    pub selection: Option<Selection>,
+    pub is_selecting: bool,
+
+    // --- Cursor blink ---
+    pub last_edit_time: Instant,
+
+    // --- Context ---
+    pub context: NexusContext,
 }
 
-impl DemoState {
-    // ------------------------------------------------------------------
-    // Centralized focus helpers
-    // ------------------------------------------------------------------
-
-    /// Focus a specific widget. Automatically blurs all others.
-    fn focus(&mut self, id: SourceId) {
-        self.focused_id = Some(id);
-        // Propagate to widget states
-        self.input.focused = self.input.id() == id;
-        self.editor.focused = self.editor.id() == id;
+impl NexusState {
+    fn next_id(&mut self) -> BlockId {
+        let id = BlockId(self.next_block_id);
+        self.next_block_id += 1;
+        id
     }
 
-    /// Blur all widgets.
-    fn blur_all(&mut self) {
-        self.focused_id = None;
-        self.input.focused = false;
-        self.editor.focused = false;
-    }
-}
-
-// =========================================================================
-// Button helper — hover-aware, zero allocation
-// =========================================================================
-
-/// Create a ButtonElement with hover highlight.
-///
-/// Reads the hovered_widget Cell to determine if this button is hovered,
-/// and adjusts the background color accordingly. No heap allocation —
-/// just a conditional color tweak on the existing ButtonElement.
-fn hover_button(id: SourceId, label: &str, bg: Color, hovered: Option<SourceId>) -> ButtonElement {
-    let is_hovered = hovered == Some(id);
-    let actual_bg = if is_hovered {
-        // Lighten by blending towards white
-        Color {
-            r: (bg.r + 0.15).min(1.0),
-            g: (bg.g + 0.15).min(1.0),
-            b: (bg.b + 0.15).min(1.0),
-            a: bg.a,
+    fn current_history(&self) -> &[String] {
+        match self.mode {
+            InputMode::Shell => &self.shell_history,
+            InputMode::Agent => &self.agent_history,
         }
-    } else {
-        bg
-    };
-    ButtonElement::new(id, label).background(actual_bg)
-}
+    }
 
-// =========================================================================
-// Component: Chat Bubble (zero-cost view fragment)
-// =========================================================================
+    fn current_history_index(&self) -> Option<usize> {
+        match self.mode {
+            InputMode::Shell => self.shell_history_index,
+            InputMode::Agent => self.agent_history_index,
+        }
+    }
 
-/// Build a single chat item card as a Column.
-///
-/// Returns a concrete `Column` — no trait objects, no heap allocation.
-/// The caller pushes this into the parent container.
-fn chat_bubble(item: &ChatItem) -> Column {
-    let (role_color, text_color) = if item.role == "user" {
-        (colors::SUCCESS, colors::TEXT_PRIMARY)
-    } else {
-        (colors::RUNNING, colors::TEXT_SECONDARY)
-    };
+    fn set_history_index(&mut self, idx: Option<usize>) {
+        match self.mode {
+            InputMode::Shell => self.shell_history_index = idx,
+            InputMode::Agent => self.agent_history_index = idx,
+        }
+    }
 
-    let mut card = Column::new()
-        .padding(10.0)
-        .spacing(4.0)
-        .background(colors::BG_BLOCK)
-        .corner_radius(6.0)
-        .width(Length::Fill)
-        .push(TextElement::new(item.role).color(role_color).size(12.0));
+    fn push_history(&mut self, text: &str) {
+        let history = match self.mode {
+            InputMode::Shell => &mut self.shell_history,
+            InputMode::Agent => &mut self.agent_history,
+        };
+        if history.last().map(|s| s.as_str()) != Some(text) {
+            history.push(text.to_string());
+            if history.len() > 1000 {
+                history.remove(0);
+            }
+        }
+    }
 
-    for line in item.text.lines() {
-        card = card.push(
-            TextElement::new(line)
-                .source(item.source)
-                .color(text_color),
+    /// Build a sorted list of unified block references for view rendering.
+    fn unified_blocks(&self) -> Vec<UnifiedBlockRef<'_>> {
+        let mut blocks: Vec<UnifiedBlockRef> = Vec::with_capacity(
+            self.blocks.len() + self.agent_blocks.len()
         );
-    }
-    card
-}
-
-// =========================================================================
-// Virtualized list helpers
-// =========================================================================
-
-/// Line height used by TextElement (must match containers.rs).
-const LINE_HEIGHT: f32 = 18.0;
-
-/// Estimate the laid-out height of a chat item card.
-///
-/// Must match the padding/spacing/font sizes used in the view() builder.
-/// This is cheap: just counts newlines in the text, no allocation.
-fn chat_item_height(item: &ChatItem) -> f32 {
-    let padding = 20.0;            // 10 top + 10 bottom
-    let role_height = 14.0;        // 12pt font, ~14px
-    let inner_spacing = 4.0;       // Column spacing between role and body lines
-    let line_count = item.text.lines().count().max(1) as f32;
-    let body_height = line_count * LINE_HEIGHT;
-    let body_spacing = (line_count - 1.0).max(0.0) * inner_spacing;
-    padding + role_height + inner_spacing + body_height + body_spacing
-}
-
-/// Compute the visible range and spacer heights for a virtualized list.
-///
-/// Returns `(first_index, last_index, top_spacer_px, bottom_spacer_px)`.
-/// The caller should lay out `items[first..last]` and insert fixed spacers
-/// for the skipped regions to preserve total content height.
-///
-/// `content_above` is the estimated height of scroll column children that
-/// appear before the chat list (image, shell block, etc.).
-fn virtualize_chat(
-    items: &[ChatItem],
-    scroll_offset: f32,
-    viewport_height: f32,
-    spacing: f32,
-) -> (usize, usize, f32, f32) {
-    if items.is_empty() || viewport_height <= 0.0 {
-        return (0, 0, 0.0, 0.0);
-    }
-
-    // Extra items rendered above/below viewport to prevent pop-in
-    const OVERSCAN: usize = 3;
-
-    // Compute all item heights upfront (cheap: just counts newlines)
-    let heights: Vec<f32> = items.iter().map(|item| chat_item_height(item)).collect();
-
-    let mut y = 0.0_f32;
-    let mut first = items.len();
-    let mut last = items.len();
-
-    for (i, h) in heights.iter().enumerate() {
-        let item_bottom = y + h;
-
-        // First item whose bottom edge is past the scroll top
-        if first == items.len() && item_bottom > scroll_offset {
-            first = i.saturating_sub(OVERSCAN);
+        for b in &self.blocks {
+            blocks.push(UnifiedBlockRef::Shell(b));
         }
-
-        // First item whose top edge is past the scroll bottom
-        if first != items.len() && y > scroll_offset + viewport_height {
-            last = (i + OVERSCAN).min(items.len());
-            break;
+        for b in &self.agent_blocks {
+            blocks.push(UnifiedBlockRef::Agent(b));
         }
-
-        y += h + spacing;
-    }
-
-    let first = first.min(items.len());
-
-    // Spacer heights from precomputed per-item heights
-    let top_spacer: f32 = heights[..first].iter().sum::<f32>()
-        + if first > 0 { first as f32 * spacing } else { 0.0 };
-    let bottom_spacer: f32 = heights[last..].iter().sum::<f32>()
-        + if last < items.len() { (items.len() - last) as f32 * spacing } else { 0.0 };
-
-    (first, last, top_spacer, bottom_spacer)
-}
-
-/// Generate N demo chat items with realistic variety.
-fn generate_demo_chat(count: usize) -> Vec<ChatItem> {
-    let commands = [
-        ("ls -la", "total 32\ndrwxr-xr-x  8 kevin staff  256 Jan 29 src/\n-rw-r--r--  1 kevin staff  420 Jan 29 main.rs"),
-        ("cargo build", "   Compiling nexus-ui v0.1.0\n    Finished dev [unoptimized + debuginfo] target(s)"),
-        ("git status", "On branch main\nnothing to commit, working tree clean"),
-        ("cat README.md", "# Nexus\n\nA GPU-accelerated terminal emulator."),
-        ("echo hello", "hello"),
-        ("pwd", "/Users/kevin/Desktop/nexus"),
-        ("wc -l src/*.rs", "  142 src/main.rs\n  867 src/lib.rs\n 1009 total"),
-        ("date", "Thu Jan 30 09:45:00 PST 2026"),
-        ("cargo test", "running 47 tests\ntest result: ok. 47 passed; 0 failed"),
-        ("ps aux | head -5", "USER  PID %CPU %MEM   VSZ    RSS  TT  STAT STARTED  TIME COMMAND\nroot    1  0.0  0.1 34292   9280  ??  Ss   Jan29   0:42 /sbin/launchd"),
-    ];
-
-    let mut items = Vec::with_capacity(count);
-    for i in 0..count {
-        let (cmd, output) = commands[i % commands.len()];
-        items.push(ChatItem {
-            source: SourceId::new(),
-            role: "user",
-            text: format!("{cmd} # run {}", i / 2 + 1),
+        blocks.sort_by_key(|b| match b {
+            UnifiedBlockRef::Shell(b) => b.id.0,
+            UnifiedBlockRef::Agent(b) => b.id.0,
         });
-        items.push(ChatItem {
-            source: SourceId::new(),
-            role: "system",
-            text: output.into(),
-        });
-        if items.len() >= count {
-            break;
-        }
+        blocks
     }
-    items.truncate(count);
-    items
+
+    fn is_dirty(&self) -> bool {
+        self.terminal_dirty || self.agent_dirty
+    }
 }
 
 // =========================================================================
-// StrataApp implementation
+// StrataApp Implementation
 // =========================================================================
 
-/// Demo application.
-pub struct DemoApp;
+pub struct NexusApp;
 
-impl StrataApp for DemoApp {
-    type State = DemoState;
-    type Message = DemoMessage;
+impl StrataApp for NexusApp {
+    type State = NexusState;
+    type Message = NexusMessage;
 
-    fn init(images: &mut ImageStore) -> (Self::State, Command<Self::Message>) {
-        let test_image = images
-            .load_png("nexus-ui/assets/demo.png")
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to load demo.png: {e}");
-                images.load_test_gradient(128, 128)
-            });
+    fn init(_images: &mut ImageStore) -> (Self::State, Command<Self::Message>) {
+        // Create kernel
+        let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
+        let kernel_tx = kernel.event_sender().clone();
 
-        let input = TextInputState::single_line("input");
-        let input_id = input.id();
+        // Load command history
+        let command_history: Vec<String> = kernel
+            .store()
+            .and_then(|store| store.get_recent_history(1000).ok())
+            .map(|entries| entries.into_iter().rev().map(|e| e.command).collect())
+            .unwrap_or_default();
 
-        let state = DemoState {
-            left_scroll: ScrollState::new(),
-            right_scroll: ScrollState::new(),
+        // PTY channels
+        let (pty_tx, pty_rx) = mpsc::unbounded_channel();
+
+        // Agent channels
+        let (agent_event_tx, agent_event_rx) = mpsc::unbounded_channel();
+
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "~".to_string());
+
+        let context = NexusContext::new(std::env::current_dir().unwrap_or_default());
+
+        let mut input = TextInputState::single_line("nexus_input");
+        input.focused = true;
+
+        let state = NexusState {
             input,
-            editor: TextInputState::multi_line_with_text(
-                "editor",
-                "Hello, world!\nThis is a multi-line editor.\n\nTry typing here.",
-            ),
-            // Start with input focused
-            focused_id: Some(input_id),
-            // Seed with 200 chat items to demonstrate virtualized scrolling.
-            // Only ~10-15 items are laid out per frame regardless of list size.
-            chat_history: generate_demo_chat(200),
-            chat_content_top: Cell::new(0.0),
-            hovered_widget: Cell::new(None),
+            mode: InputMode::Shell,
+            shell_history: command_history,
+            shell_history_index: None,
+            agent_history: Vec::new(),
+            agent_history_index: None,
+            saved_input: String::new(),
+
+            blocks: Vec::new(),
+            block_index: HashMap::new(),
+            next_block_id: 1,
+            cwd,
+            pty_handles: Vec::new(),
+            pty_tx,
+            pty_rx: Arc::new(Mutex::new(pty_rx)),
+            focus: Focus::Input,
+            terminal_size: Cell::new((120, 24)),
+            last_exit_code: None,
+            commands: CommandRegistry::new(),
+            kernel: Arc::new(Mutex::new(kernel)),
+            kernel_tx,
+            kernel_rx: Arc::new(Mutex::new(kernel_rx)),
+            jobs: Vec::new(),
+            terminal_dirty: false,
+
+            agent_blocks: Vec::new(),
+            agent_block_index: HashMap::new(),
+            active_agent: None,
+            agent_event_tx,
+            agent_event_rx: Arc::new(Mutex::new(agent_event_rx)),
+            agent_permission_tx: None,
+            agent_cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_dirty: false,
+            agent_session_id: None,
+
+            history_scroll: ScrollState::new(),
+            window_size: (1200.0, 800.0),
+
             selection: None,
             is_selecting: false,
-            last_edit_time: Instant::now(),
-            last_frame: Cell::new(Instant::now()),
-            fps_smooth: Cell::new(0.0),
-            start_time: Instant::now(),
-            test_image,
-            elapsed_seconds: 0,
-            table_sort_col: 0,
-            table_sort_asc: true,
-            table_rows: vec![
-                ("src/",       "256B", 256,  "dir",  colors::TEXT_PATH),
-                ("main.rs",    "420B", 420,  "rust", colors::TEXT_PRIMARY),
-                ("lib.rs",     "1.2K", 1200, "rust", colors::TEXT_PRIMARY),
-                ("Cargo.toml", "890B", 890,  "toml", colors::TEXT_PRIMARY),
-                ("README.md",  "2.4K", 2400, "md",   colors::TEXT_PRIMARY),
-            ],
-        };
 
-        // Focus the input widget
-        // (can't call focus() before state is created, so set focused directly)
-        let mut state = state;
-        state.input.focused = true;
+            last_edit_time: Instant::now(),
+
+            context,
+        };
 
         (state, Command::none())
     }
 
-    fn update(state: &mut Self::State, message: Self::Message, _images: &mut ImageStore) -> Command<Self::Message> {
-        // Reset cursor blink on any edit/cursor action
-        match &message {
-            DemoMessage::InputKey(_) | DemoMessage::InputMouse(_)
-            | DemoMessage::EditorKey(_) | DemoMessage::EditorMouse(_) => {
-                state.last_edit_time = Instant::now();
-            }
-            _ => {}
+    fn update(
+        state: &mut Self::State,
+        message: Self::Message,
+        _images: &mut ImageStore,
+    ) -> Command<Self::Message> {
+        // Reset cursor blink on input activity
+        if matches!(&message, NexusMessage::InputKey(_) | NexusMessage::InputMouse(_)) {
+            state.last_edit_time = Instant::now();
         }
 
         match message {
             // =============================================================
-            // Dynamic list: command submission via async Command round-trip
+            // Input
             // =============================================================
-            DemoMessage::SubmitCommand => {
-                let text = state.input.text.trim().to_string();
-                if !text.is_empty() {
-                    // Append user message
-                    state.chat_history.push(ChatItem {
-                        source: SourceId::new(),
-                        role: "user",
-                        text: text.clone(),
-                    });
-                    // Append mock system response
-                    state.chat_history.push(ChatItem {
-                        source: SourceId::new(),
-                        role: "system",
-                        text: format!("$ {text}\ncommand not found: {text}"),
-                    });
-                    // Clear input
-                    state.input.text.clear();
-                    state.input.cursor = 0;
-                    state.input.selection = None;
-                    // Auto-scroll to bottom
-                    state.left_scroll.offset = state.left_scroll.max.get();
-                }
-            }
-
-            // =============================================================
-            // Text inputs — key events routed from on_key
-            // =============================================================
-            DemoMessage::InputKey(event) => {
+            NexusMessage::InputKey(event) => {
                 match state.input.handle_key(&event, false) {
                     TextInputAction::Submit(_) => {
-                        // Prove the Command pipeline: round-trip through Command::message
-                        return Command::message(DemoMessage::SubmitCommand);
+                        return Command::message(NexusMessage::Submit);
                     }
                     _ => {}
                 }
             }
-            DemoMessage::EditorKey(event) => {
-                state.editor.handle_key(&event, true);
-            }
-
-            // =============================================================
-            // Text inputs — mouse events (focus managed centrally)
-            // =============================================================
-            DemoMessage::InputMouse(action) => {
-                state.focus(state.input.id());
+            NexusMessage::InputMouse(action) => {
+                state.input.focused = true;
                 state.input.apply_mouse(action);
             }
-            DemoMessage::EditorMouse(action) => {
-                state.focus(state.editor.id());
-                state.editor.apply_mouse(action);
+            NexusMessage::Submit => {
+                let text = state.input.text.trim().to_string();
+                if text.is_empty() {
+                    return Command::none();
+                }
+
+                // Check for "? " prefix → agent mode one-shot
+                let is_agent_query = state.mode == InputMode::Agent
+                    || text.starts_with("? ");
+
+                let query = if text.starts_with("? ") {
+                    text[2..].to_string()
+                } else {
+                    text.clone()
+                };
+
+                // Record history
+                state.push_history(&text);
+
+                // Clear input
+                state.input.text.clear();
+                state.input.cursor = 0;
+                state.input.selection = None;
+
+                if is_agent_query {
+                    return spawn_agent(state, query);
+                } else {
+                    return execute_command(state, text);
+                }
             }
-            DemoMessage::BlurAll => {
-                state.blur_all();
+            NexusMessage::ToggleMode => {
+                state.mode = match state.mode {
+                    InputMode::Shell => InputMode::Agent,
+                    InputMode::Agent => InputMode::Shell,
+                };
             }
 
             // =============================================================
-            // Content selection
+            // Terminal / PTY
             // =============================================================
-            DemoMessage::SelectionStart(addr) => {
+            NexusMessage::PtyOutput(id, data) => {
+                if let Some(&idx) = state.block_index.get(&id) {
+                    if let Some(block) = state.blocks.get_mut(idx) {
+                        block.parser.feed(&data);
+                        block.version += 1;
+                    }
+                }
+                if data.len() < 128 {
+                    state.terminal_dirty = false;
+                    // Auto-scroll
+                    state.history_scroll.offset = state.history_scroll.max.get();
+                } else {
+                    state.terminal_dirty = true;
+                }
+            }
+            NexusMessage::PtyExited(id, exit_code) => {
+                if let Some(&idx) = state.block_index.get(&id) {
+                    if let Some(block) = state.blocks.get_mut(idx) {
+                        block.state = if exit_code == 0 {
+                            BlockState::Success
+                        } else {
+                            BlockState::Failed(exit_code)
+                        };
+                        block.duration_ms = Some(block.started_at.elapsed().as_millis() as u64);
+                        block.version += 1;
+                    }
+                }
+                state.pty_handles.retain(|h| h.block_id != id);
+                state.last_exit_code = Some(exit_code);
+                if state.focus == Focus::Block(id) {
+                    state.focus = Focus::Input;
+                    state.input.focused = true;
+                }
+            }
+            NexusMessage::KernelEvent(evt) => {
+                return handle_kernel_event(state, evt);
+            }
+            NexusMessage::KillBlock(id) => {
+                if let Some(handle) = state.pty_handles.iter().find(|h| h.block_id == id) {
+                    let _ = handle.send_interrupt();
+                    handle.kill();
+                }
+            }
+
+            // =============================================================
+            // Agent
+            // =============================================================
+            NexusMessage::AgentEvent(evt) => {
+                state.agent_dirty = true;
+                return handle_agent_event(state, evt);
+            }
+            NexusMessage::ToggleThinking(id) => {
+                if let Some(&idx) = state.agent_block_index.get(&id) {
+                    if let Some(block) = state.agent_blocks.get_mut(idx) {
+                        block.toggle_thinking();
+                    }
+                }
+            }
+            NexusMessage::ToggleTool(id, tool_index) => {
+                if let Some(&idx) = state.agent_block_index.get(&id) {
+                    if let Some(block) = state.agent_blocks.get_mut(idx) {
+                        if let Some(tool) = block.tools.get_mut(tool_index) {
+                            tool.collapsed = !tool.collapsed;
+                            block.version += 1;
+                        }
+                    }
+                }
+            }
+            NexusMessage::PermissionGrant(block_id, perm_id) => {
+                if let Some(&idx) = state.agent_block_index.get(&block_id) {
+                    if let Some(block) = state.agent_blocks.get_mut(idx) {
+                        block.clear_permission();
+                    }
+                }
+                if let Some(ref tx) = state.agent_permission_tx {
+                    let _ = tx.send((perm_id, PermissionResponse::GrantedOnce));
+                }
+            }
+            NexusMessage::PermissionGrantSession(block_id, perm_id) => {
+                if let Some(&idx) = state.agent_block_index.get(&block_id) {
+                    if let Some(block) = state.agent_blocks.get_mut(idx) {
+                        block.clear_permission();
+                    }
+                }
+                if let Some(ref tx) = state.agent_permission_tx {
+                    let _ = tx.send((perm_id, PermissionResponse::GrantedSession));
+                }
+            }
+            NexusMessage::PermissionDeny(block_id, perm_id) => {
+                if let Some(&idx) = state.agent_block_index.get(&block_id) {
+                    if let Some(block) = state.agent_blocks.get_mut(idx) {
+                        block.clear_permission();
+                        block.fail("Permission denied".to_string());
+                    }
+                }
+                if let Some(ref tx) = state.agent_permission_tx {
+                    let _ = tx.send((perm_id, PermissionResponse::Denied));
+                }
+                state.active_agent = None;
+            }
+            NexusMessage::AgentInterrupt => {
+                if state.active_agent.is_some() {
+                    state.agent_cancel_flag.store(true, Ordering::SeqCst);
+                }
+            }
+
+            // =============================================================
+            // Scroll
+            // =============================================================
+            NexusMessage::HistoryScroll(action) => {
+                state.history_scroll.apply(action);
+            }
+
+            // =============================================================
+            // Selection
+            // =============================================================
+            NexusMessage::SelectionStart(addr) => {
                 state.selection = Some(Selection::new(addr.clone(), addr));
                 state.is_selecting = true;
             }
-            DemoMessage::SelectionExtend(addr) => {
+            NexusMessage::SelectionExtend(addr) => {
                 if let Some(sel) = &mut state.selection {
                     sel.focus = addr;
                 }
             }
-            DemoMessage::SelectionEnd => {
+            NexusMessage::SelectionEnd => {
                 state.is_selecting = false;
             }
-            DemoMessage::ClearSelection => {
+            NexusMessage::ClearSelection => {
                 state.selection = None;
                 state.is_selecting = false;
             }
-            DemoMessage::Copy => {
-                if let Some(sel) = &state.selection {
-                    eprintln!(
-                        "[demo] Copy: source={:?} offsets={}..{}",
-                        sel.anchor.source_id,
-                        sel.anchor.content_offset,
-                        sel.focus.content_offset,
-                    );
-                    // In production: return Command::perform(clipboard_write_future)
-                }
+            NexusMessage::Copy => {
+                // TODO: extract selected text and copy to clipboard
             }
 
             // =============================================================
-            // Scroll panels
+            // Window
             // =============================================================
-            DemoMessage::LeftScroll(action) => state.left_scroll.apply(action),
-            DemoMessage::RightScroll(action) => state.right_scroll.apply(action),
-
-            // =============================================================
-            // Buttons
-            // =============================================================
-            DemoMessage::ButtonClicked(id) => {
-                if id == SourceId::named("clear_btn") {
-                    state.chat_history.clear();
-                    eprintln!("[demo] Chat cleared");
-                } else {
-                    eprintln!("[demo] Button clicked: {:?}", id);
-                }
+            NexusMessage::BlurAll => {
+                state.input.focused = false;
             }
-
-            // =============================================================
-            // Table sorting
-            // =============================================================
-            DemoMessage::TableSort(id) => {
-                let col = if id == SourceId::named("sort_name") { 0 } else { 1 };
-                if state.table_sort_col == col {
-                    state.table_sort_asc = !state.table_sort_asc;
-                } else {
-                    state.table_sort_col = col;
-                    state.table_sort_asc = true;
+            NexusMessage::Tick => {
+                if state.is_dirty() {
+                    state.terminal_dirty = false;
+                    state.agent_dirty = false;
+                    // Auto-scroll to bottom on new content
+                    state.history_scroll.offset = state.history_scroll.max.get();
                 }
-                match col {
-                    0 => state.table_rows.sort_by(|a, b| {
-                        if state.table_sort_asc { a.0.cmp(b.0) } else { b.0.cmp(a.0) }
-                    }),
-                    _ => state.table_rows.sort_by(|a, b| {
-                        if state.table_sort_asc { a.2.cmp(&b.2) } else { b.2.cmp(&a.2) }
-                    }),
-                }
-            }
-
-            // =============================================================
-            // Timer
-            // =============================================================
-            DemoMessage::TimerTick => {
-                state.elapsed_seconds += 1;
             }
         }
+
         Command::none()
     }
 
     fn view(state: &Self::State, snapshot: &mut LayoutSnapshot) {
-        // FPS calculation (exponential moving average)
-        let now = Instant::now();
-        let dt = now.duration_since(state.last_frame.get()).as_secs_f32();
-        state.last_frame.set(now);
-        let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
-        let prev = state.fps_smooth.get();
-        let fps = if prev == 0.0 { instant_fps } else { prev * 0.95 + instant_fps * 0.05 };
-        state.fps_smooth.set(fps);
-
-        // Cursor blink: 500ms on / 500ms off, reset on edit
-        let blink_elapsed = now.duration_since(state.last_edit_time).as_millis();
-        let cursor_visible = (blink_elapsed / 500) % 2 == 0;
-
-        // Dynamic viewport — reflows on window resize
         let vp = snapshot.viewport();
         let vw = vp.width;
         let vh = vp.height;
 
-        // Right column: 30% of viewport, clamped
-        let right_col_width = (vw * 0.3).clamp(300.0, 420.0);
+        // Recalculate terminal size from viewport
+        let char_width = crate::constants::DEFAULT_FONT_SIZE * crate::constants::CHAR_WIDTH_RATIO;
+        let line_height = crate::constants::DEFAULT_FONT_SIZE * crate::constants::LINE_HEIGHT_FACTOR;
+        let h_padding = 16.0 + 12.0 * 2.0; // outer padding + block padding
+        let v_padding = 60.0;
+        let cols = ((vw - h_padding) / char_width) as u16;
+        let rows = ((vh - v_padding) / line_height) as u16;
+        state.terminal_size.set((cols.max(40).min(500), rows.max(5).min(200)));
 
-        // Read hover state for button rendering
-        let hovered = state.hovered_widget.get();
+        // Cursor blink
+        let now = Instant::now();
+        let blink_elapsed = now.duration_since(state.last_edit_time).as_millis();
+        let cursor_visible = (blink_elapsed / 500) % 2 == 0;
 
-        // =================================================================
-        // BUILD VIRTUALIZED CHAT LIST
-        // =================================================================
-        // Only lay out items visible in the scroll viewport. Items above
-        // and below are replaced by fixed spacers to preserve total height
-        // and correct scrollbar proportions. O(n) height scan, O(visible)
-        // layout — scales to thousands of items.
+        // Build unified block list
+        let unified = state.unified_blocks();
+        let has_blocks = !unified.is_empty();
 
-        let chat_spacing = 8.0;
-
-        // Use previous frame's measured position of the chat list within
-        // the scroll column's content space. Avoids hardcoded magic numbers
-        // that break when content above the chat list changes.
-        let chat_scroll = (state.left_scroll.offset - state.chat_content_top.get()).max(0.0);
-
-        // Compute visible range using scroll state from previous frame.
-        let (first, last, top_spacer, bottom_spacer) = virtualize_chat(
-            &state.chat_history,
-            chat_scroll,
-            state.left_scroll.bounds.get().height,
-            chat_spacing,
-        );
-
-        let mut chat_col = Column::new()
-            .spacing(chat_spacing)
+        // Build history content
+        let mut scroll = ScrollColumn::from_state(&state.history_scroll)
+            .spacing(8.0)
             .width(Length::Fill)
-            .id(SourceId::named("chat_list"));
+            .height(Length::Fill);
 
-        // Top spacer replaces items above the viewport
-        if top_spacer > 0.0 {
-            chat_col = chat_col.fixed_spacer(top_spacer);
+        if !has_blocks {
+            // Welcome screen
+            scroll = scroll.push(WelcomeScreen { cwd: &state.cwd });
+        } else {
+            // Render unified blocks
+            for block_ref in &unified {
+                match block_ref {
+                    UnifiedBlockRef::Shell(block) => {
+                        let kill_id = SourceId::named(&format!("kill_{}", block.id.0));
+                        scroll = scroll.push(ShellBlockWidget {
+                            block,
+                            kill_id,
+                        });
+                    }
+                    UnifiedBlockRef::Agent(block) => {
+                        let thinking_id = SourceId::named(&format!("thinking_{}", block.id.0));
+                        let stop_id = SourceId::named(&format!("stop_{}", block.id.0));
+                        scroll = scroll.push(AgentBlockWidget {
+                            block,
+                            thinking_toggle_id: thinking_id,
+                            stop_id,
+                        });
+                    }
+                }
+            }
         }
 
-        // Only lay out visible items (uses chat_bubble component function)
-        for item in &state.chat_history[first..last] {
-            chat_col = chat_col.push(chat_bubble(item));
-        }
-
-        // Bottom spacer replaces items below the viewport
-        if bottom_spacer > 0.0 {
-            chat_col = chat_col.fixed_spacer(bottom_spacer);
-        }
-
-        // =================================================================
-        // MAIN LAYOUT: Row with two columns
-        // =================================================================
-        Row::new()
-            .padding(16.0)
-            .spacing(20.0)
+        // Main layout: Column with ScrollColumn + optional JobBar + InputBar
+        let mut main_col = Column::new()
             .width(Length::Fixed(vw))
             .height(Length::Fixed(vh))
-            // =============================================================
-            // LEFT COLUMN: Chat History + Shell Block + Input Bar
-            // =============================================================
-            .push(
-                ScrollColumn::from_state(&state.left_scroll)
-                    .spacing(16.0)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    // Test image
-                    .push(
-                        ImageElement::new(state.test_image, 336.0, 296.0)
-                            .corner_radius(8.0),
-                    )
-                    // Static shell block
-                    .push(ShellBlock {
-                        cmd: "ls -la",
-                        status_icon: "\u{2713}",
-                        status_color: colors::SUCCESS,
-                        terminal_source: SourceId::named("terminal"),
-                        rows: vec![
-                            ("total 32", Color::rgb(0.7, 0.7, 0.7)),
-                            ("drwxr-xr-x  8 kevin staff  256 Jan 29 src/", Color::rgb(0.4, 0.6, 1.0)),
-                            ("-rw-r--r--  1 kevin staff  420 Jan 29 main.rs", Color::rgb(0.7, 0.7, 0.7)),
-                        ],
-                        cols: 75,
-                        row_count: 3,
-                    })
-                    // Dynamic chat history
-                    .push(chat_col)
-                    // Input bar
-                    .push(
-                        Row::new()
-                            .padding_custom(Padding::new(8.0, 12.0, 8.0, 12.0))
-                            .spacing(10.0)
-                            .background(colors::BG_INPUT)
-                            .corner_radius(6.0)
-                            .border(colors::BORDER_INPUT, 1.0)
-                            .width(Length::Fill)
-                            .cross_align(CrossAxisAlignment::Center)
-                            .push(TextElement::new("$").color(colors::SUCCESS))
-                            .push(
-                                TextInputElement::from_state(&state.input)
-                                    .placeholder("Type a command...")
-                                    .background(Color::rgba(0.0, 0.0, 0.0, 0.0))
-                                    .border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
-                                    .focus_border_color(Color::rgba(0.0, 0.0, 0.0, 0.0))
-                                    .corner_radius(0.0)
-                                    .padding(Padding::new(0.0, 4.0, 0.0, 4.0))
-                                    .width(Length::Fill)
-                                    .cursor_visible(cursor_visible),
-                            )
-                            .push(hover_button(
-                                SourceId::named("submit_btn"),
-                                "Send",
-                                colors::BTN_ALLOW,
-                                hovered,
-                            )),
-                    ),
-            )
-            // =============================================================
-            // RIGHT COLUMN: Component Catalog
-            // =============================================================
-            .push({
-                let arrow = if state.table_sort_asc { " \u{25B2}" } else { " \u{25BC}" };
-                let name_header: String = if state.table_sort_col == 0 { format!("NAME{}", arrow) } else { "NAME".into() };
-                let size_header: String = if state.table_sort_col == 1 { format!("SIZE{}", arrow) } else { "SIZE".into() };
+            .padding(0.0);
 
-                let mut table = TableElement::new(SourceId::named("table"))
-                    .column_sortable(&name_header, 140.0, SourceId::named("sort_name"))
-                    .column_sortable(&size_header, 70.0, SourceId::named("sort_size"))
-                    .column("TYPE", 70.0);
-
-                for &(name, size_str, _size_bytes, kind, name_color) in &state.table_rows {
-                    table = table.row(vec![
-                        TableCell { text: name.into(), color: name_color },
-                        TableCell { text: size_str.into(), color: colors::TEXT_SECONDARY },
-                        TableCell { text: kind.into(), color: colors::TEXT_MUTED },
-                    ]);
-                }
-
-                ScrollColumn::from_state(&state.right_scroll)
-                    .spacing(16.0)
-                    .width(Length::Fixed(right_col_width))
-                    .height(Length::Fill)
-                    // Status indicators
-                    .push(
-                        StatusPanel::new(
-                            vec![
-                                StatusIndicator { icon: "\u{25CF}", label: "Running", color: colors::RUNNING },
-                                StatusIndicator { icon: "\u{2713}", label: "Success", color: colors::SUCCESS },
-                                StatusIndicator { icon: "\u{2717}", label: "Error", color: colors::ERROR },
-                                StatusIndicator { icon: "\u{2620}", label: "Killed", color: colors::KILLED },
-                            ],
-                            state.elapsed_seconds,
-                        )
-                        .id(SourceId::named("status_panel")),
-                    )
-                    // Multi-line editor
-                    .push(
-                        Card::new("Multi-line Editor")
-                            .push(
-                                TextInputElement::from_state(&state.editor)
-                                    .height(Length::Fixed(120.0))
-                                    .placeholder("Multi-line editor...")
-                                    .cursor_visible(cursor_visible),
-                            )
-                            .id(SourceId::named("editor_panel")),
-                    )
-                    // Action buttons (hover-aware)
-                    .push(
-                        Row::new()
-                            .spacing(8.0)
-                            .width(Length::Fill)
-                            .push(hover_button(
-                                SourceId::named("copy_btn"),
-                                "Copy",
-                                colors::BG_CARD,
-                                hovered,
-                            ))
-                            .push(hover_button(
-                                SourceId::named("clear_btn"),
-                                "Clear Chat",
-                                colors::BTN_DENY,
-                                hovered,
-                            )),
-                    )
-                    // Context menu placeholder
-                    .push(
-                        Column::new()
-                            .width(Length::Fill)
-                            .height(Length::Fixed(194.0))
-                            .id(SourceId::named("ctx_menu")),
-                    )
-                    // Drawing styles placeholder
-                    .push(
-                        Column::new()
-                            .width(Length::Fill)
-                            .height(Length::Fixed(180.0))
-                            .id(SourceId::named("draw_styles")),
-                    )
-                    // Table
-                    .push(Card::new("Table").push(table))
-            })
-            .layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
-
-        // Sync state helpers from layout snapshot
-        state.left_scroll.sync_from_snapshot(snapshot);
-        state.right_scroll.sync_from_snapshot(snapshot);
-        state.input.sync_from_snapshot(snapshot);
-        state.editor.sync_from_snapshot(snapshot);
-
-        // Update chat list content-space position for next frame's virtualization
-        if let Some(chat_bounds) = snapshot.widget_bounds(&SourceId::named("chat_list")) {
-            let scroll_bounds = state.left_scroll.bounds.get();
-            let content_top = chat_bounds.y - scroll_bounds.y + state.left_scroll.offset;
-            state.chat_content_top.set(content_top);
-        }
-
-        // =================================================================
-        // POST-LAYOUT: Render primitives into placeholder positions
-        // =================================================================
-        let anim_t = now.duration_since(state.start_time).as_secs_f32();
-
-        if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("ctx_menu")) {
-            view_context_menu(snapshot, bounds.x, bounds.y);
-        }
-
-        if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("draw_styles")) {
-            view_drawing_styles(snapshot, bounds.x, bounds.y, bounds.width, anim_t);
-        }
-
-        // FPS counter (top-right corner)
-        snapshot.primitives_mut().add_text(
-            format!("{:.0} FPS", fps),
-            Point::new(vw - 70.0, 4.0),
-            colors::TEXT_MUTED,
+        // History area (takes remaining space)
+        main_col = main_col.push(
+            Column::new()
+                .padding_custom(Padding::new(8.0, 16.0, 0.0, 16.0))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .push(scroll),
         );
+
+        // Job bar (only if jobs exist)
+        if !state.jobs.is_empty() {
+            main_col = main_col.push(JobBar { jobs: &state.jobs });
+        }
+
+        // Input bar
+        main_col = main_col.push(
+            Column::new()
+                .padding_custom(Padding::new(8.0, 16.0, 12.0, 16.0))
+                .width(Length::Fill)
+                .push(NexusInputBar {
+                    input: &state.input,
+                    mode: state.mode,
+                    cwd: &state.cwd,
+                    last_exit_code: state.last_exit_code,
+                    cursor_visible,
+                    mode_toggle_id: SourceId::named("mode_toggle"),
+                }),
+        );
+
+        main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
+
+        // Sync layout state
+        state.history_scroll.sync_from_snapshot(snapshot);
+        state.input.sync_from_snapshot(snapshot);
     }
 
     fn selection(state: &Self::State) -> Option<&Selection> {
@@ -834,70 +677,103 @@ impl StrataApp for DemoApp {
         hit: Option<HitResult>,
         capture: &CaptureState,
     ) -> MouseResponse<Self::Message> {
-        // Track hovered widget for button hover effects (Cell = zero-cost interior mutability)
-        if let MouseEvent::CursorMoved { .. } = &event {
-            state.hovered_widget.set(match &hit {
-                Some(HitResult::Widget(id)) => Some(*id),
-                _ => None,
-            });
-        }
-
-        // Composable handlers: scroll panels + text inputs
+        // Composable scroll + input handlers
         route_mouse!(&event, &hit, capture, [
-            state.left_scroll  => DemoMessage::LeftScroll,
-            state.right_scroll => DemoMessage::RightScroll,
-            state.input        => DemoMessage::InputMouse,
-            state.editor       => DemoMessage::EditorMouse,
+            state.history_scroll => NexusMessage::HistoryScroll,
+            state.input          => NexusMessage::InputMouse,
         ]);
 
-        // Button clicks and table sort headers
+        // Button clicks
         if let MouseEvent::ButtonPressed { button: MouseButton::Left, .. } = &event {
             if let Some(HitResult::Widget(id)) = &hit {
-                // Buttons
-                if *id == SourceId::named("submit_btn") {
-                    return MouseResponse::message(DemoMessage::SubmitCommand);
+                // Mode toggle
+                if *id == SourceId::named("mode_toggle") {
+                    return MouseResponse::message(NexusMessage::ToggleMode);
                 }
-                if *id == SourceId::named("copy_btn") {
-                    return MouseResponse::message(DemoMessage::Copy);
+
+                // Kill buttons
+                for block in &state.blocks {
+                    if block.is_running() {
+                        let kill_id = SourceId::named(&format!("kill_{}", block.id.0));
+                        if *id == kill_id {
+                            return MouseResponse::message(NexusMessage::KillBlock(block.id));
+                        }
+                    }
                 }
-                if *id == SourceId::named("clear_btn") {
-                    return MouseResponse::message(DemoMessage::ButtonClicked(*id));
+
+                // Agent thinking toggles
+                for block in &state.agent_blocks {
+                    let thinking_id = SourceId::named(&format!("thinking_{}", block.id.0));
+                    if *id == thinking_id {
+                        return MouseResponse::message(NexusMessage::ToggleThinking(block.id));
+                    }
+
+                    // Stop button
+                    let stop_id = SourceId::named(&format!("stop_{}", block.id.0));
+                    if *id == stop_id {
+                        return MouseResponse::message(NexusMessage::AgentInterrupt);
+                    }
+
+                    // Tool toggles
+                    for (i, _tool) in block.tools.iter().enumerate() {
+                        let toggle_id = SourceId::named(&format!("tool_toggle_{}_{}", block.id.0, i));
+                        if *id == toggle_id {
+                            return MouseResponse::message(NexusMessage::ToggleTool(block.id, i));
+                        }
+                    }
+
+                    // Permission buttons
+                    if let Some(ref perm) = block.pending_permission {
+                        let deny_id = SourceId::named(&format!("perm_deny_{}", block.id.0));
+                        let allow_id = SourceId::named(&format!("perm_allow_{}", block.id.0));
+                        let always_id = SourceId::named(&format!("perm_always_{}", block.id.0));
+
+                        if *id == deny_id {
+                            return MouseResponse::message(NexusMessage::PermissionDeny(block.id, perm.id.clone()));
+                        }
+                        if *id == allow_id {
+                            return MouseResponse::message(NexusMessage::PermissionGrant(block.id, perm.id.clone()));
+                        }
+                        if *id == always_id {
+                            return MouseResponse::message(NexusMessage::PermissionGrantSession(block.id, perm.id.clone()));
+                        }
+                    }
                 }
-                // Table sort
-                if *id == SourceId::named("sort_name") || *id == SourceId::named("sort_size") {
-                    return MouseResponse::message(DemoMessage::TableSort(*id));
-                }
+
+                // Content selection start (clicked text)
             }
-            // Text / grid cell selection
+
+            // Text content selection
             if let Some(HitResult::Content(addr)) = hit {
-                if state.input.focused || state.editor.focused {
-                    return MouseResponse::message(DemoMessage::BlurAll);
+                if state.input.focused {
+                    return MouseResponse::message(NexusMessage::BlurAll);
                 }
                 let capture_source = addr.source_id;
                 return MouseResponse::message_and_capture(
-                    DemoMessage::SelectionStart(addr),
+                    NexusMessage::SelectionStart(addr),
                     capture_source,
                 );
             }
-            // Clicked on empty space: blur inputs
-            if state.input.focused || state.editor.focused {
-                return MouseResponse::message(DemoMessage::BlurAll);
+
+            // Clicked empty space: blur inputs
+            if state.input.focused {
+                return MouseResponse::message(NexusMessage::BlurAll);
             }
         }
 
-        // Content selection drag
+        // Selection drag
         if let MouseEvent::CursorMoved { .. } = &event {
             if let CaptureState::Captured(_) = capture {
                 if let Some(HitResult::Content(addr)) = hit {
-                    return MouseResponse::message(DemoMessage::SelectionExtend(addr));
+                    return MouseResponse::message(NexusMessage::SelectionExtend(addr));
                 }
             }
         }
 
-        // Content selection release
+        // Selection release
         if let MouseEvent::ButtonReleased { button: MouseButton::Left, .. } = &event {
             if let CaptureState::Captured(_) = capture {
-                return MouseResponse::message_and_release(DemoMessage::SelectionEnd);
+                return MouseResponse::message_and_release(NexusMessage::SelectionEnd);
             }
         }
 
@@ -908,45 +784,113 @@ impl StrataApp for DemoApp {
         state: &Self::State,
         event: KeyEvent,
     ) -> Option<Self::Message> {
-        // Only handle key presses
+        // Only handle presses
         if matches!(&event, KeyEvent::Released { .. }) {
             return None;
         }
-        // Route to focused input (centralized focus check)
-        if state.editor.focused {
-            return Some(DemoMessage::EditorKey(event));
-        }
-        if state.input.focused {
-            return Some(DemoMessage::InputKey(event));
-        }
-        // Global shortcuts
+
         if let KeyEvent::Pressed { ref key, ref modifiers } = event {
-            match (key, modifiers.meta) {
-                (Key::Character(c), true) if c == "c" => return Some(DemoMessage::Copy),
-                (Key::Named(NamedKey::Escape), _) => return Some(DemoMessage::ClearSelection),
-                (Key::Named(NamedKey::ArrowUp), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(60.0)));
+            // Cmd+K: clear screen
+            if modifiers.meta {
+                if let Key::Character(c) = key {
+                    match c.as_str() {
+                        "k" => {
+                            // TODO: implement clear all
+                            return None;
+                        }
+                        "c" => return Some(NexusMessage::Copy),
+                        _ => {}
+                    }
                 }
-                (Key::Named(NamedKey::ArrowDown), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(-60.0)));
+            }
+
+            // Escape: interrupt agent or clear selection
+            if matches!(key, Key::Named(NamedKey::Escape)) {
+                if state.active_agent.is_some() {
+                    return Some(NexusMessage::AgentInterrupt);
                 }
-                (Key::Named(NamedKey::PageUp), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(300.0)));
+                if state.selection.is_some() {
+                    return Some(NexusMessage::ClearSelection);
                 }
-                (Key::Named(NamedKey::PageDown), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(-300.0)));
+            }
+
+            // When input is focused, route keys
+            if state.input.focused {
+                // History navigation
+                if matches!(key, Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown)) {
+                    // Handle history in on_key since TextInputState doesn't know about history
+                    let history = state.current_history();
+                    if history.is_empty() {
+                        return None;
+                    }
+
+                    let is_up = matches!(key, Key::Named(NamedKey::ArrowUp));
+
+                    // For single-line input, up/down navigate history
+                    if is_up {
+                        // In on_key we can't mutate state, so we need to do
+                        // history navigation via a key event that gets handled in update.
+                        // For now, pass the key event to the input handler
+                    }
+                }
+
+                return Some(NexusMessage::InputKey(event));
+            }
+
+            // Global shortcuts when input not focused
+            match key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(60.0)));
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(-60.0)));
+                }
+                Key::Named(NamedKey::PageUp) => {
+                    return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(300.0)));
+                }
+                Key::Named(NamedKey::PageDown) => {
+                    return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(-300.0)));
                 }
                 _ => {}
             }
         }
+
         None
     }
 
-    fn subscription(_state: &Self::State) -> Subscription<Self::Message> {
-        Subscription::from_iced(
-            iced::time::every(std::time::Duration::from_secs(1))
-                .map(|_| DemoMessage::TimerTick),
-        )
+    fn subscription(state: &Self::State) -> Subscription<Self::Message> {
+        let mut subs = Vec::new();
+
+        // PTY subscription
+        let pty_rx = state.pty_rx.clone();
+        subs.push(Subscription::from_iced(
+            pty_subscription(pty_rx).map(|(id, evt)| match evt {
+                PtyEvent::Output(data) => NexusMessage::PtyOutput(id, data),
+                PtyEvent::Exited(code) => NexusMessage::PtyExited(id, code),
+            }),
+        ));
+
+        // Kernel subscription
+        let kernel_rx = state.kernel_rx.clone();
+        subs.push(Subscription::from_iced(
+            kernel_subscription(kernel_rx).map(NexusMessage::KernelEvent),
+        ));
+
+        // Agent subscription
+        let agent_rx = state.agent_event_rx.clone();
+        subs.push(Subscription::from_iced(
+            agent_subscription(agent_rx).map(NexusMessage::AgentEvent),
+        ));
+
+        // Tick subscription when dirty (drives auto-scroll)
+        if state.is_dirty() {
+            subs.push(Subscription::from_iced(
+                iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| NexusMessage::Tick),
+            ));
+        }
+
+        Subscription::batch(subs)
     }
 
     fn title(_state: &Self::State) -> String {
@@ -955,157 +899,365 @@ impl StrataApp for DemoApp {
 }
 
 // =========================================================================
-// Overlay: Context Menu (absolute positioned)
+// Command execution
 // =========================================================================
 
-fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
-    let w = 180.0;
-    let h = 150.0;
+fn execute_command(state: &mut NexusState, command: String) -> Command<NexusMessage> {
+    let trimmed = command.trim().to_string();
 
-    let p = snapshot.primitives_mut();
+    state.shell_history_index = None;
+    state.agent_history_index = None;
+    state.saved_input.clear();
 
-    p.add_text("Context Menu", Point::new(x, y), colors::TEXT_SECONDARY);
+    let block_id = state.next_id();
 
-    let my = y + 22.0;
+    // Handle built-in: clear
+    if trimmed == "clear" {
+        state.agent_cancel_flag.store(true, Ordering::SeqCst);
+        state.blocks.clear();
+        state.block_index.clear();
+        state.agent_blocks.clear();
+        state.agent_block_index.clear();
+        state.active_agent = None;
+        return Command::none();
+    }
 
-    p.add_shadow(
-        Rect::new(x + 4.0, my + 4.0, w, h),
-        8.0, 12.0,
-        Color::rgba(0.0, 0.0, 0.0, 0.5),
-    );
-    p.add_rounded_rect(Rect::new(x, my, w, h), 8.0, colors::BG_OVERLAY);
-    p.add_border(Rect::new(x, my, w, h), 8.0, 1.0, colors::BORDER_SUBTLE);
+    // Classify and execute
+    let classification = state.kernel.blocking_lock().classify_command(&trimmed);
 
-    let ix = x + 8.0;
-    let iw = w - 16.0;
-    let row_h = 26.0;
-    let sep_gap = 8.0;
+    if classification == CommandClassification::Kernel {
+        // Kernel (pipeline/native) command
+        let mut block = Block::new(block_id, trimmed.clone());
+        let (ts_cols, ts_rows) = state.terminal_size.get();
+        block.parser = TerminalParser::new(ts_cols, ts_rows);
+        let block_idx = state.blocks.len();
+        state.blocks.push(block);
+        state.block_index.insert(block_id, block_idx);
 
-    // Copy (hover)
-    let iy = my + 4.0;
-    p.add_rounded_rect(Rect::new(ix, iy, iw, row_h - 2.0), 4.0, colors::BG_HOVER);
-    p.add_text("Copy", Point::new(ix + 8.0, iy + 4.0), Color::WHITE);
-    p.add_text("\u{2318}C", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+        let kernel = state.kernel.clone();
+        let kernel_tx = state.kernel_tx.clone();
+        let cwd = state.cwd.clone();
+        let cmd = trimmed;
 
-    // Paste
-    let iy = iy + row_h;
-    p.add_text("Paste", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY);
-    p.add_text("\u{2318}V", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    let mut kernel = kernel.lock().await;
+                    let _ = kernel
+                        .state_mut()
+                        .set_cwd(std::path::PathBuf::from(&cwd));
+                    let _ = kernel.execute_with_block_id(&cmd, Some(block_id));
+                });
+            }));
 
-    // Separator
-    let iy = iy + row_h;
-    p.add_line(
-        Point::new(ix, iy + sep_gap * 0.5),
-        Point::new(ix + iw, iy + sep_gap * 0.5),
-        1.0, Color::rgba(1.0, 1.0, 1.0, 0.08),
-    );
+            if let Err(panic_info) = result {
+                let error_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    format!("Command panicked: {}", s)
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    format!("Command panicked: {}", s)
+                } else {
+                    "Command panicked (unknown error)".to_string()
+                };
+                let _ = kernel_tx.send(ShellEvent::StderrChunk {
+                    block_id,
+                    data: format!("{}\n", error_msg).into_bytes(),
+                });
+                let _ = kernel_tx.send(ShellEvent::CommandFinished {
+                    block_id,
+                    exit_code: 1,
+                    duration_ms: 0,
+                });
+            }
+        });
 
-    // Select All
-    let iy = iy + sep_gap;
-    p.add_text("Select All", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY);
-    p.add_text("\u{2318}A", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+        // Auto-scroll
+        state.history_scroll.offset = state.history_scroll.max.get();
+        return Command::none();
+    }
 
-    // Clear Selection (disabled)
-    let iy = iy + row_h;
-    p.add_text("Clear Selection", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_MUTED);
+    // External command - use PTY
+    let mut block = Block::new(block_id, trimmed.clone());
+    let (ts_cols, ts_rows) = state.terminal_size.get();
+    block.parser = TerminalParser::new(ts_cols, ts_rows);
+    let block_idx = state.blocks.len();
+    state.blocks.push(block);
+    state.block_index.insert(block_id, block_idx);
 
-    // Separator
-    let iy = iy + row_h;
-    p.add_line(
-        Point::new(ix, iy + sep_gap * 0.5),
-        Point::new(ix + iw, iy + sep_gap * 0.5),
-        1.0, Color::rgba(1.0, 1.0, 1.0, 0.08),
-    );
+    state.focus = Focus::Block(block_id);
+    state.input.focused = false;
 
-    // Search
-    let iy = iy + sep_gap;
-    p.add_text("Search", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY);
-    p.add_text("\u{2318}F", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+    let tx = state.pty_tx.clone();
+    let cwd = state.cwd.clone();
+    let (cols, rows) = state.terminal_size.get();
+
+    match PtyHandle::spawn_with_size(&trimmed, &cwd, block_id, tx, cols, rows) {
+        Ok(handle) => {
+            state.pty_handles.push(handle);
+            state.history_scroll.offset = state.history_scroll.max.get();
+        }
+        Err(e) => {
+            tracing::error!("Failed to spawn PTY: {}", e);
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.state = BlockState::Failed(1);
+                    block.parser.feed(format!("Error: {}\n", e).as_bytes());
+                    block.version += 1;
+                }
+            }
+            state.focus = Focus::Input;
+            state.input.focused = true;
+        }
+    }
+
+    Command::none()
 }
 
 // =========================================================================
-// Overlay: Drawing Styles (lines, curves, polylines)
+// Kernel event handler
 // =========================================================================
 
-fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32, time: f32) {
-    let p = snapshot.primitives_mut();
+fn handle_kernel_event(state: &mut NexusState, evt: ShellEvent) -> Command<NexusMessage> {
+    match evt {
+        ShellEvent::CommandStarted { block_id, command, .. } => {
+            if !state.block_index.contains_key(&block_id) {
+                let mut block = Block::new(block_id, command);
+                let (ts_cols, ts_rows) = state.terminal_size.get();
+                block.parser = TerminalParser::new(ts_cols, ts_rows);
+                let block_idx = state.blocks.len();
+                state.blocks.push(block);
+                state.block_index.insert(block_id, block_idx);
+            }
+        }
+        ShellEvent::StdoutChunk { block_id, data } | ShellEvent::StderrChunk { block_id, data } => {
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.parser.feed(&data);
+                    block.version += 1;
+                }
+            }
+            state.terminal_dirty = true;
+        }
+        ShellEvent::CommandOutput { block_id, value } => {
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.native_output = Some(value);
+                }
+            }
+        }
+        ShellEvent::CommandFinished { block_id, exit_code, duration_ms } => {
+            if let Some(&idx) = state.block_index.get(&block_id) {
+                if let Some(block) = state.blocks.get_mut(idx) {
+                    block.state = if exit_code == 0 {
+                        BlockState::Success
+                    } else {
+                        BlockState::Failed(exit_code)
+                    };
+                    block.duration_ms = Some(duration_ms);
+                    block.version += 1;
 
-    p.add_rounded_rect(Rect::new(x, y, width, 180.0), 6.0, colors::BG_BLOCK);
-    p.add_text("Drawing Styles", Point::new(x + 10.0, y + 6.0), colors::TEXT_SECONDARY);
+                    // Context update
+                    let cmd = block.command.clone();
+                    let output = block.parser.grid_with_scrollback().to_string();
+                    let output_trimmed = if output.len() > 10_000 {
+                        output[output.len() - 10_000..].to_string()
+                    } else {
+                        output
+                    };
+                    state.context.on_command_finished(cmd, output_trimmed, exit_code);
+                }
+            }
+            state.last_exit_code = Some(exit_code);
+            state.focus = Focus::Input;
+            state.input.focused = true;
+            state.history_scroll.offset = state.history_scroll.max.get();
+        }
+        ShellEvent::JobStateChanged { job_id, state: job_state } => {
+            match job_state {
+                nexus_api::JobState::Running => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == job_id) {
+                        job.state = VisualJobState::Running;
+                    } else {
+                        state.jobs.push(VisualJob::new(
+                            job_id,
+                            format!("Job {}", job_id),
+                            VisualJobState::Running,
+                        ));
+                    }
+                }
+                nexus_api::JobState::Stopped => {
+                    if let Some(job) = state.jobs.iter_mut().find(|j| j.id == job_id) {
+                        job.state = VisualJobState::Stopped;
+                    } else {
+                        state.jobs.push(VisualJob::new(
+                            job_id,
+                            format!("Job {}", job_id),
+                            VisualJobState::Stopped,
+                        ));
+                    }
+                }
+                nexus_api::JobState::Done(_) => {
+                    state.jobs.retain(|j| j.id != job_id);
+                }
+            }
+        }
+        ShellEvent::CwdChanged { new, .. } => {
+            state.cwd = new.display().to_string();
+            let _ = std::env::set_current_dir(&new);
+        }
+        _ => {}
+    }
 
-    let lx = x + 14.0;
-    let lw = width - 28.0;
-
-    // --- Solid lines (various thickness) ---
-    let ly = y + 32.0;
-    p.add_text("Solid", Point::new(lx, ly), colors::TEXT_MUTED);
-    p.add_line(Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw * 0.5, ly + 9.0), 1.0, colors::RUNNING);
-    p.add_line(Point::new(lx + lw * 0.5 + 8.0, ly + 9.0), Point::new(lx + lw, ly + 9.0), 2.0, colors::SUCCESS);
-
-    // --- Dashed lines ---
-    let ly = ly + 24.0;
-    p.add_text("Dashed", Point::new(lx, ly), colors::TEXT_MUTED);
-    p.add_line_styled(
-        Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw, ly + 9.0),
-        1.5, colors::WARNING, LineStyle::Dashed,
-    );
-
-    // --- Dotted lines ---
-    let ly = ly + 24.0;
-    p.add_text("Dotted", Point::new(lx, ly), colors::TEXT_MUTED);
-    p.add_line_styled(
-        Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw, ly + 9.0),
-        1.5, colors::ERROR, LineStyle::Dotted,
-    );
-
-    // --- Polyline (zigzag) ---
-    let ly = ly + 24.0;
-    p.add_text("Poly", Point::new(lx, ly), colors::TEXT_MUTED);
-    let seg_w = (lw - 50.0) / 8.0;
-    let zigzag: Vec<Point> = (0..9)
-        .map(|i| {
-            let px = lx + 50.0 + i as f32 * seg_w;
-            let py = ly + if i % 2 == 0 { 14.0 } else { 2.0 };
-            Point::new(px, py)
-        })
-        .collect();
-    p.add_polyline(zigzag, 1.5, colors::TEXT_PURPLE);
-
-    // --- Polyline (animated sine wave) ---
-    let ly = ly + 28.0;
-    p.add_text("Curve", Point::new(lx, ly), colors::TEXT_MUTED);
-    let curve_w = lw - 50.0;
-    let phase = time * 2.0;
-    let curve: Vec<Point> = (0..40)
-        .map(|i| {
-            let t = i as f32 / 39.0;
-            let px = lx + 50.0 + t * curve_w;
-            let py = ly + 8.0 - (t * std::f32::consts::PI * 2.0 + phase).sin() * 8.0;
-            Point::new(px, py)
-        })
-        .collect();
-    p.add_polyline(curve, 1.5, colors::RUNNING);
-
-    // --- Dashed polyline (animated wave) ---
-    let ly = ly + 28.0;
-    p.add_text("Wave", Point::new(lx, ly), colors::TEXT_MUTED);
-    let wave_phase = time * 3.0;
-    let wave: Vec<Point> = (0..40)
-        .map(|i| {
-            let t = i as f32 / 39.0;
-            let px = lx + 50.0 + t * curve_w;
-            let py = ly + 8.0 - (t * std::f32::consts::PI * 3.0 + wave_phase).sin() * 6.0;
-            Point::new(px, py)
-        })
-        .collect();
-    p.add_polyline_styled(wave, 1.0, colors::SUCCESS, LineStyle::Dashed);
+    Command::none()
 }
 
-/// Run the demo application.
+// =========================================================================
+// Agent event handler
+// =========================================================================
+
+fn handle_agent_event(state: &mut NexusState, event: AgentEvent) -> Command<NexusMessage> {
+    // Handle session ID
+    if let AgentEvent::SessionStarted { ref session_id } = event {
+        state.agent_session_id = Some(session_id.clone());
+    }
+
+    if let Some(block_id) = state.active_agent {
+        if let Some(&idx) = state.agent_block_index.get(&block_id) {
+            if let Some(block) = state.agent_blocks.get_mut(idx) {
+                match event {
+                    AgentEvent::SessionStarted { .. } => {}
+                    AgentEvent::Started { .. } => {
+                        block.state = AgentBlockState::Streaming;
+                    }
+                    AgentEvent::ResponseText(text) => {
+                        block.append_response(&text);
+                    }
+                    AgentEvent::ThinkingText(text) => {
+                        block.append_thinking(&text);
+                    }
+                    AgentEvent::ToolStarted { id, name } => {
+                        block.start_tool(id, name);
+                    }
+                    AgentEvent::ToolParameter { tool_id, name, value } => {
+                        block.add_tool_parameter(&tool_id, name, value);
+                    }
+                    AgentEvent::ToolOutput { tool_id, chunk } => {
+                        block.append_tool_output(&tool_id, &chunk);
+                    }
+                    AgentEvent::ToolEnded { .. } => {}
+                    AgentEvent::ToolStatus { id, status, message, output } => {
+                        block.update_tool_status(&id, status, message, output);
+                    }
+                    AgentEvent::ImageAdded { media_type, data } => {
+                        block.add_image(media_type, data);
+                    }
+                    AgentEvent::PermissionRequested { id, tool_name, tool_id, description, action, working_dir } => {
+                        block.request_permission(PermissionRequest {
+                            id,
+                            tool_name,
+                            tool_id,
+                            description,
+                            action,
+                            working_dir,
+                        });
+                    }
+                    AgentEvent::Finished { .. } => {
+                        block.complete();
+                        state.active_agent = None;
+                    }
+                    AgentEvent::Interrupted { .. } => {
+                        block.state = AgentBlockState::Interrupted;
+                        state.active_agent = None;
+                    }
+                    AgentEvent::Error(err) => {
+                        block.fail(err);
+                        state.active_agent = None;
+                    }
+                }
+            }
+        }
+    }
+
+    // Auto-scroll on agent activity
+    state.history_scroll.offset = state.history_scroll.max.get();
+    Command::none()
+}
+
+// =========================================================================
+// Agent spawning
+// =========================================================================
+
+fn spawn_agent(state: &mut NexusState, query: String) -> Command<NexusMessage> {
+    let is_continuation = state.agent_session_id.is_some();
+    let current_cwd = &state.cwd;
+
+    let contextualized_query = if is_continuation {
+        format!("[CWD: {}]\n{}", current_cwd, query)
+    } else {
+        let shell_context = build_shell_context(
+            current_cwd,
+            &state.blocks,
+            &state.shell_history,
+        );
+        format!("{}{}", shell_context, query)
+    };
+
+    let block_id = state.next_id();
+    let agent_block = AgentBlock::new(block_id, query.clone());
+    let idx = state.agent_blocks.len();
+    state.agent_block_index.insert(block_id, idx);
+    state.agent_blocks.push(agent_block);
+    state.active_agent = Some(block_id);
+
+    // Reset cancel flag
+    state.agent_cancel_flag.store(false, Ordering::SeqCst);
+
+    let agent_tx = state.agent_event_tx.clone();
+    let cancel_flag = state.agent_cancel_flag.clone();
+    let cwd = PathBuf::from(&state.cwd);
+    let session_id = state.agent_session_id.clone();
+
+    tokio::spawn(async move {
+        match spawn_agent_task(
+            agent_tx,
+            cancel_flag,
+            contextualized_query,
+            cwd,
+            Vec::new(), // No attachments in V1
+            session_id,
+        )
+        .await
+        {
+            Ok(new_session_id) => {
+                if let Some(sid) = new_session_id {
+                    tracing::info!("Agent session: {}", sid);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Agent task failed: {}", e);
+            }
+        }
+    });
+
+    // Mark block as streaming
+    if let Some(&idx) = state.agent_block_index.get(&block_id) {
+        if let Some(block) = state.agent_blocks.get_mut(idx) {
+            block.state = AgentBlockState::Streaming;
+        }
+    }
+
+    state.history_scroll.offset = state.history_scroll.max.get();
+    Command::none()
+}
+
+// =========================================================================
+// Entry point
+// =========================================================================
+
 pub fn run() -> Result<(), crate::strata::shell::Error> {
-    crate::strata::shell::run_with_config::<DemoApp>(AppConfig {
+    crate::strata::shell::run_with_config::<NexusApp>(AppConfig {
         title: String::from("Nexus (Strata)"),
-        window_size: (1050.0, 672.0),
+        window_size: (1200.0, 800.0),
         antialiasing: true,
         background_color: colors::BG_APP,
     })
