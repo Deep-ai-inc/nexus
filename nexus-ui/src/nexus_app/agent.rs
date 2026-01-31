@@ -9,12 +9,15 @@ use tokio::sync::{mpsc, Mutex};
 
 use nexus_api::{BlockId, Value};
 use strata::Subscription;
+use strata::content_address::SourceId;
 
 use crate::agent_adapter::{AgentEvent, PermissionResponse};
 use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
+use crate::nexus_widgets::AgentBlockWidget;
 use crate::systems::{agent_subscription, spawn_agent_task};
 
 use super::message::{AgentMsg, NexusMessage};
+use super::source_ids;
 
 /// Typed output from AgentWidget → orchestrator.
 pub(crate) enum AgentOutput {
@@ -64,6 +67,65 @@ impl AgentWidget {
     /// Whether the agent has pending output that needs a redraw tick.
     pub fn needs_redraw(&self) -> bool {
         self.dirty
+    }
+
+    // ---- View contributions ----
+
+    /// Push a single agent block into the given scroll column.
+    pub fn push_block(
+        &self,
+        scroll: strata::ScrollColumn,
+        block: &AgentBlock,
+    ) -> strata::ScrollColumn {
+        scroll.push(AgentBlockWidget {
+            block,
+            thinking_toggle_id: source_ids::agent_thinking_toggle(block.id),
+            stop_id: source_ids::agent_stop(block.id),
+        })
+    }
+
+    // ---- Event handling ----
+
+    /// Handle a widget click within agent-owned UI. Returns None if not our widget.
+    pub fn on_click(&self, id: SourceId) -> Option<AgentMsg> {
+        for block in &self.blocks {
+            if id == source_ids::agent_thinking_toggle(block.id) {
+                return Some(AgentMsg::ToggleThinking(block.id));
+            }
+            if id == source_ids::agent_stop(block.id) {
+                return Some(AgentMsg::Interrupt);
+            }
+            for (i, _tool) in block.tools.iter().enumerate() {
+                if id == source_ids::agent_tool_toggle(block.id, i) {
+                    return Some(AgentMsg::ToggleTool(block.id, i));
+                }
+            }
+            if let Some(ref perm) = block.pending_permission {
+                if id == source_ids::agent_perm_deny(block.id) {
+                    return Some(AgentMsg::PermissionDeny(block.id, perm.id.clone()));
+                }
+                if id == source_ids::agent_perm_allow(block.id) {
+                    return Some(AgentMsg::PermissionGrant(block.id, perm.id.clone()));
+                }
+                if id == source_ids::agent_perm_always(block.id) {
+                    return Some(AgentMsg::PermissionGrantSession(block.id, perm.id.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if a hit address belongs to an agent block. Returns the block_id if so.
+    pub fn block_for_source(&self, source_id: SourceId) -> Option<BlockId> {
+        for block in &self.blocks {
+            if source_id == source_ids::agent_query(block.id)
+                || source_id == source_ids::agent_thinking(block.id)
+                || source_id == source_ids::agent_response(block.id)
+            {
+                return Some(block.id);
+            }
+        }
+        None
     }
 
     /// Create the subscription for agent events.

@@ -1,6 +1,5 @@
 //! Event routing — dispatches keyboard and mouse events to the appropriate widgets.
 
-use nexus_api::Value;
 use strata::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
@@ -8,7 +7,7 @@ use strata::layout_snapshot::HitResult;
 use strata::{MouseResponse, ScrollAction, route_mouse};
 
 use crate::blocks::Focus;
-use crate::nexus_widgets::{CompletionPopup, HistorySearchBar, JobBar};
+use crate::nexus_widgets::JobBar;
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::message::{
@@ -17,181 +16,129 @@ use super::message::{
 use super::source_ids;
 use super::NexusState;
 
+// =========================================================================
+// Keyboard routing
+// =========================================================================
+
 /// Route keyboard events to the appropriate widget or message.
 pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage> {
-    // Only handle presses
     if matches!(&event, KeyEvent::Released { .. }) {
         return None;
     }
 
-    if let KeyEvent::Pressed {
+    let KeyEvent::Pressed {
         ref key,
         ref modifiers,
         ..
     } = event
-    {
-        // History search mode intercepts most keys
-        if state.input.history_search.is_active() {
-            if modifiers.ctrl {
-                if let Key::Character(c) = key {
-                    if c == "r" {
-                        return Some(NexusMessage::Input(InputMsg::HistorySearchToggle));
-                    }
-                }
+    else {
+        return None;
+    };
+
+    // Phase 1: Input overlay intercepts (history search, completion)
+    if state.input.captures_keys() {
+        return state.input.on_key(&event).map(NexusMessage::Input);
+    }
+
+    // Phase 2: Global shortcuts
+    if let Some(msg) = route_global_shortcut(state, key, modifiers) {
+        return Some(msg);
+    }
+
+    // Phase 3: Escape cascade
+    if matches!(key, Key::Named(NamedKey::Escape)) {
+        return route_escape(state);
+    }
+
+    // Phase 4: Focused PTY block → forward keys to shell
+    if let Focus::Block(id) = state.focus {
+        return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
+    }
+
+    // Phase 5: Input-focused keys (delegated to InputWidget)
+    if let Some(msg) = state.input.on_key(&event) {
+        return Some(NexusMessage::Input(msg));
+    }
+
+    // Phase 6: Global fallback
+    route_global_fallback(key)
+}
+
+fn route_global_shortcut(
+    state: &NexusState,
+    key: &Key,
+    modifiers: &strata::event_context::Modifiers,
+) -> Option<NexusMessage> {
+    if modifiers.meta {
+        if let Key::Character(c) = key {
+            match c.as_str() {
+                "q" | "w" => return Some(NexusMessage::CloseWindow),
+                "k" => return Some(NexusMessage::ClearScreen),
+                "c" => return Some(NexusMessage::Copy),
+                "v" => return Some(NexusMessage::Paste),
+                "." => return Some(NexusMessage::Input(InputMsg::ToggleMode)),
+                _ => {}
             }
-            return match key {
-                Key::Named(NamedKey::Enter) => {
-                    Some(NexusMessage::Input(InputMsg::HistorySearchAccept))
-                }
-                Key::Named(NamedKey::Escape) => {
-                    Some(NexusMessage::Input(InputMsg::HistorySearchDismiss))
-                }
-                Key::Named(NamedKey::ArrowDown) => {
-                    if !state.input.history_search.results.is_empty()
-                        && state.input.history_search.index
-                            < state.input.history_search.results.len() - 1
+        }
+    }
+
+    if modifiers.ctrl {
+        if let Key::Character(c) = key {
+            match c.as_str() {
+                "r" => return Some(NexusMessage::Input(InputMsg::HistorySearchToggle)),
+                "c" => {
+                    if state.agent.is_active() {
+                        return Some(NexusMessage::Agent(AgentMsg::Interrupt));
+                    }
+                    if let Focus::Block(id) = state.focus {
+                        return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(id)));
+                    }
+                    if let Some(block) =
+                        state.shell.blocks.iter().rev().find(|b| b.is_running())
                     {
-                        Some(NexusMessage::Input(InputMsg::HistorySearchSelect(
-                            state.input.history_search.index + 1,
-                        )))
-                    } else {
-                        None
+                        return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(block.id)));
                     }
+                    return None;
                 }
-                Key::Named(NamedKey::ArrowUp) => {
-                    if state.input.history_search.index > 0 {
-                        Some(NexusMessage::Input(InputMsg::HistorySearchSelect(
-                            state.input.history_search.index - 1,
-                        )))
-                    } else {
-                        None
-                    }
-                }
-                _ => Some(NexusMessage::Input(InputMsg::HistorySearchKey(event))),
-            };
-        }
-
-        // Completion popup intercepts navigation keys when visible.
-        if state.input.completion.is_active() {
-            match key {
-                Key::Named(NamedKey::Tab) if modifiers.shift => {
-                    return Some(NexusMessage::Input(InputMsg::CompletionNav(-1)));
-                }
-                Key::Named(NamedKey::Tab) => {
-                    return Some(NexusMessage::Input(InputMsg::CompletionNav(1)));
-                }
-                Key::Named(NamedKey::ArrowDown) => {
-                    return Some(NexusMessage::Input(InputMsg::CompletionNav(1)));
-                }
-                Key::Named(NamedKey::ArrowUp) => {
-                    return Some(NexusMessage::Input(InputMsg::CompletionNav(-1)));
-                }
-                Key::Named(NamedKey::Enter) => {
-                    return Some(NexusMessage::Input(InputMsg::CompletionAccept));
-                }
-                Key::Named(NamedKey::Escape) => {
-                    return Some(NexusMessage::Input(InputMsg::CompletionDismiss));
-                }
-                _ => {
-                    return Some(NexusMessage::Input(InputMsg::CompletionDismissAndForward(
-                        event,
-                    )));
-                }
+                _ => {}
             }
-        }
-
-        // Cmd shortcuts (global)
-        if modifiers.meta {
-            if let Key::Character(c) = key {
-                match c.as_str() {
-                    "q" => return Some(NexusMessage::CloseWindow),
-                    "k" => return Some(NexusMessage::ClearScreen),
-                    "w" => return Some(NexusMessage::CloseWindow),
-                    "c" => return Some(NexusMessage::Copy),
-                    "v" => return Some(NexusMessage::Paste),
-                    "." => return Some(NexusMessage::Input(InputMsg::ToggleMode)),
-                    _ => {}
-                }
-            }
-        }
-
-        // Ctrl shortcuts (global)
-        if modifiers.ctrl {
-            if let Key::Character(c) = key {
-                match c.as_str() {
-                    "r" => return Some(NexusMessage::Input(InputMsg::HistorySearchToggle)),
-                    "c" => {
-                        if state.agent.is_active() {
-                            return Some(NexusMessage::Agent(AgentMsg::Interrupt));
-                        }
-                        // Root handles SendInterrupt by resolving the target block
-                        if let Focus::Block(id) = state.focus {
-                            return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(id)));
-                        }
-                        // When focused on input, send to last running block
-                        if let Some(block) = state.shell.blocks.iter().rev().find(|b| b.is_running())
-                        {
-                            return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(block.id)));
-                        }
-                        return None;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Escape: dismiss overlays, interrupt agent, leave PTY focus, clear selection
-        if matches!(key, Key::Named(NamedKey::Escape)) {
-            if state.transient.context_menu().is_some() {
-                return Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss));
-            }
-            if state.agent.is_active() {
-                return Some(NexusMessage::Agent(AgentMsg::Interrupt));
-            }
-            if matches!(state.focus, Focus::Block(_)) {
-                return Some(NexusMessage::BlurAll);
-            }
-            if state.selection.selection.is_some() {
-                return Some(NexusMessage::Selection(SelectionMsg::Clear));
-            }
-        }
-
-        // When a PTY block is focused, forward keys to it
-        if let Focus::Block(id) = state.focus {
-            return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
-        }
-
-        // When input is focused, route keys
-        if state.input.text_input.focused {
-            if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.shift {
-                return Some(NexusMessage::Input(InputMsg::InsertNewline));
-            }
-            if matches!(key, Key::Named(NamedKey::Tab)) {
-                return Some(NexusMessage::Input(InputMsg::TabComplete));
-            }
-            if matches!(key, Key::Named(NamedKey::ArrowUp)) {
-                return Some(NexusMessage::Input(InputMsg::HistoryUp));
-            }
-            if matches!(key, Key::Named(NamedKey::ArrowDown)) {
-                return Some(NexusMessage::Input(InputMsg::HistoryDown));
-            }
-            return Some(NexusMessage::Input(InputMsg::Key(event)));
-        }
-
-        // Global shortcuts when input not focused
-        match key {
-            Key::Named(NamedKey::PageUp) => {
-                return Some(NexusMessage::Scroll(ScrollAction::ScrollBy(300.0)));
-            }
-            Key::Named(NamedKey::PageDown) => {
-                return Some(NexusMessage::Scroll(ScrollAction::ScrollBy(-300.0)));
-            }
-            _ => {}
         }
     }
 
     None
 }
+
+fn route_escape(state: &NexusState) -> Option<NexusMessage> {
+    if state.transient.context_menu().is_some() {
+        return Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss));
+    }
+    if state.agent.is_active() {
+        return Some(NexusMessage::Agent(AgentMsg::Interrupt));
+    }
+    if matches!(state.focus, Focus::Block(_)) {
+        return Some(NexusMessage::BlurAll);
+    }
+    if state.selection.selection.is_some() {
+        return Some(NexusMessage::Selection(SelectionMsg::Clear));
+    }
+    None
+}
+
+fn route_global_fallback(key: &Key) -> Option<NexusMessage> {
+    match key {
+        Key::Named(NamedKey::PageUp) => {
+            Some(NexusMessage::Scroll(ScrollAction::ScrollBy(300.0)))
+        }
+        Key::Named(NamedKey::PageDown) => {
+            Some(NexusMessage::Scroll(ScrollAction::ScrollBy(-300.0)))
+        }
+        _ => None,
+    }
+}
+
+// =========================================================================
+// Mouse routing
+// =========================================================================
 
 /// Route mouse events to the appropriate widget or message.
 pub(super) fn on_mouse(
@@ -215,264 +162,52 @@ pub(super) fn on_mouse(
         ..
     } = &event
     {
-        let input_bounds = state.input.text_input.bounds();
-        if position.x >= input_bounds.x
-            && position.x <= input_bounds.x + input_bounds.width
-            && position.y >= input_bounds.y
-            && position.y <= input_bounds.y + input_bounds.height
-        {
-            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-                position.x,
-                position.y,
-                vec![
-                    ContextMenuItem::Paste,
-                    ContextMenuItem::SelectAll,
-                    ContextMenuItem::Clear,
-                ],
-                ContextTarget::Input,
-            )));
-        }
-
-        if let Some(HitResult::Content(ref addr)) = hit {
-            // Match shell block content
-            for block in &state.shell.blocks {
-                let term_id = source_ids::shell_term(block.id);
-                let header_id = source_ids::shell_header(block.id);
-                let native_id = source_ids::native(block.id);
-                let table_id = source_ids::table(block.id);
-                if addr.source_id == term_id
-                    || addr.source_id == header_id
-                    || addr.source_id == native_id
-                    || addr.source_id == table_id
-                {
-                    return MouseResponse::message(NexusMessage::ContextMenu(
-                        ContextMenuMsg::Show(
-                            position.x,
-                            position.y,
-                            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                            ContextTarget::Block(block.id),
-                        ),
-                    ));
-                }
-            }
-            // Match agent block content
-            for block in &state.agent.blocks {
-                let query_id = source_ids::agent_query(block.id);
-                let thinking_id = source_ids::agent_thinking(block.id);
-                let response_id = source_ids::agent_response(block.id);
-                if addr.source_id == query_id
-                    || addr.source_id == thinking_id
-                    || addr.source_id == response_id
-                {
-                    return MouseResponse::message(NexusMessage::ContextMenu(
-                        ContextMenuMsg::Show(
-                            position.x,
-                            position.y,
-                            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                            ContextTarget::AgentBlock(block.id),
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Fallback: right-click on non-content area
-        if hit.is_some() {
-            if let Some(block) = state.shell.blocks.last() {
-                return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-                    position.x,
-                    position.y,
-                    vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                    ContextTarget::Block(block.id),
-                )));
-            }
-            if let Some(block) = state.agent.blocks.last() {
-                return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-                    position.x,
-                    position.y,
-                    vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                    ContextTarget::AgentBlock(block.id),
-                )));
-            }
-        }
+        return route_right_click(state, position, &hit);
     }
 
-    // Hover tracking for popups
+    // Hover tracking (delegated to children + context menu)
     if let MouseEvent::CursorMoved { .. } = &event {
-        if let Some(menu) = state.transient.context_menu() {
-            let idx = if let Some(HitResult::Widget(id)) = &hit {
-                (0..menu.items.len())
-                    .find(|i| *id == source_ids::ctx_menu_item(*i))
-            } else {
-                None
-            };
-            menu.hovered_item.set(idx);
-        }
-
-        if state.input.completion.is_active() {
-            let idx = if let Some(HitResult::Widget(id)) = &hit {
-                (0..state.input.completion.completions.len().min(10))
-                    .find(|i| *id == CompletionPopup::item_id(*i))
-            } else {
-                None
-            };
-            state.input.completion.hovered.set(idx);
-        }
-
-        if state.input.history_search.is_active() {
-            let idx = if let Some(HitResult::Widget(id)) = &hit {
-                (0..state.input.history_search.results.len().min(10))
-                    .find(|i| *id == HistorySearchBar::result_id(*i))
-            } else {
-                None
-            };
-            state.input.history_search.hovered.set(idx);
-        }
+        route_hover(state, &hit);
     }
 
-    // Context menu item clicks
+    // Context menu item clicks (root handles — transient UI)
     if let MouseEvent::ButtonPressed {
         button: MouseButton::Left,
         ..
     } = &event
     {
-        if let Some(menu) = state.transient.context_menu() {
-            if let Some(HitResult::Widget(id)) = &hit {
-                for (i, item) in menu.items.iter().enumerate() {
-                    if *id == source_ids::ctx_menu_item(i) {
-                        return MouseResponse::message(NexusMessage::ContextMenu(
-                            ContextMenuMsg::Action(*item),
-                        ));
-                    }
-                }
-            }
-            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss));
+        if let Some(msg) = route_context_menu_click(state, &hit) {
+            return MouseResponse::message(msg);
         }
     }
 
-    // Button clicks
+    // Widget clicks → delegate to children
     if let MouseEvent::ButtonPressed {
         button: MouseButton::Left,
         ..
     } = &event
     {
         if let Some(HitResult::Widget(id)) = &hit {
-            // Mode toggle
-            if *id == source_ids::mode_toggle() {
-                return MouseResponse::message(NexusMessage::Input(InputMsg::ToggleMode));
+            // Try each child in order
+            if let Some(msg) = state.input.on_click(*id) {
+                return MouseResponse::message(NexusMessage::Input(msg));
+            }
+            if let Some(msg) = state.shell.on_click(*id) {
+                return MouseResponse::message(NexusMessage::Shell(msg));
+            }
+            if let Some(msg) = state.agent.on_click(*id) {
+                return MouseResponse::message(NexusMessage::Agent(msg));
             }
 
-            // Completion item clicks
-            for i in 0..state.input.completion.completions.len().min(10) {
-                if *id == CompletionPopup::item_id(i) {
-                    return MouseResponse::message(NexusMessage::Input(
-                        InputMsg::CompletionSelect(i),
-                    ));
-                }
-            }
-
-            // History search result clicks
-            if state.input.history_search.is_active() {
-                for i in 0..state.input.history_search.results.len().min(10) {
-                    if *id == HistorySearchBar::result_id(i) {
-                        return MouseResponse::message(NexusMessage::Input(
-                            InputMsg::HistorySearchAcceptIndex(i),
-                        ));
-                    }
-                }
-            }
-
-            // Attachment remove buttons
-            for i in 0..state.input.attachments.len() {
-                let remove_id = source_ids::remove_attachment(i);
-                if *id == remove_id {
-                    return MouseResponse::message(NexusMessage::Input(
-                        InputMsg::RemoveAttachment(i),
-                    ));
-                }
-            }
-
-            // Job pill clicks
+            // Job pills (cross-cutting: shell data → root scroll action)
             for job in &state.shell.jobs {
                 if *id == JobBar::job_pill_id(job.id) {
                     return MouseResponse::message(NexusMessage::ScrollToJob(job.id));
                 }
             }
-
-            // Kill buttons
-            for block in &state.shell.blocks {
-                if block.is_running() {
-                    let kill_id = source_ids::kill(block.id);
-                    if *id == kill_id {
-                        return MouseResponse::message(NexusMessage::Shell(ShellMsg::KillBlock(
-                            block.id,
-                        )));
-                    }
-                }
-            }
-
-            // Agent thinking toggles, stop, tools, permissions
-            for block in &state.agent.blocks {
-                let thinking_id = source_ids::agent_thinking_toggle(block.id);
-                if *id == thinking_id {
-                    return MouseResponse::message(NexusMessage::Agent(AgentMsg::ToggleThinking(
-                        block.id,
-                    )));
-                }
-
-                let stop_id = source_ids::agent_stop(block.id);
-                if *id == stop_id {
-                    return MouseResponse::message(NexusMessage::Agent(AgentMsg::Interrupt));
-                }
-
-                for (i, _tool) in block.tools.iter().enumerate() {
-                    let toggle_id = source_ids::agent_tool_toggle(block.id, i);
-                    if *id == toggle_id {
-                        return MouseResponse::message(NexusMessage::Agent(AgentMsg::ToggleTool(
-                            block.id, i,
-                        )));
-                    }
-                }
-
-                if let Some(ref perm) = block.pending_permission {
-                    let deny_id = source_ids::agent_perm_deny(block.id);
-                    let allow_id = source_ids::agent_perm_allow(block.id);
-                    let always_id = source_ids::agent_perm_always(block.id);
-
-                    if *id == deny_id {
-                        return MouseResponse::message(NexusMessage::Agent(
-                            AgentMsg::PermissionDeny(block.id, perm.id.clone()),
-                        ));
-                    }
-                    if *id == allow_id {
-                        return MouseResponse::message(NexusMessage::Agent(
-                            AgentMsg::PermissionGrant(block.id, perm.id.clone()),
-                        ));
-                    }
-                    if *id == always_id {
-                        return MouseResponse::message(NexusMessage::Agent(
-                            AgentMsg::PermissionGrantSession(block.id, perm.id.clone()),
-                        ));
-                    }
-                }
-            }
-
-            // Table sort header clicks
-            for block in &state.shell.blocks {
-                if let Some(Value::Table { columns, .. }) = &block.native_output {
-                    for col_idx in 0..columns.len() {
-                        let sort_id = source_ids::table_sort(block.id, col_idx);
-                        if *id == sort_id {
-                            return MouseResponse::message(NexusMessage::Shell(
-                                ShellMsg::SortTable(block.id, col_idx),
-                            ));
-                        }
-                    }
-                }
-            }
         }
 
-        // Text content selection
+        // Text content selection (cross-child)
         if let Some(HitResult::Content(addr)) = hit {
             let capture_source = addr.source_id;
             return MouseResponse::message_and_capture(
@@ -512,4 +247,97 @@ pub(super) fn on_mouse(
     }
 
     MouseResponse::none()
+}
+
+// =========================================================================
+// Mouse routing helpers
+// =========================================================================
+
+fn route_right_click(
+    state: &NexusState,
+    position: &strata::primitives::Point,
+    hit: &Option<HitResult>,
+) -> MouseResponse<NexusMessage> {
+    // Input area right-click
+    if state.input.hit_test(position.x, position.y) {
+        return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
+            position.x,
+            position.y,
+            vec![
+                ContextMenuItem::Paste,
+                ContextMenuItem::SelectAll,
+                ContextMenuItem::Clear,
+            ],
+            ContextTarget::Input,
+        )));
+    }
+
+    // Content area right-click — delegate to children for target identification
+    if let Some(HitResult::Content(addr)) = hit {
+        if let Some(block_id) = state.shell.block_for_source(addr.source_id) {
+            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
+                position.x,
+                position.y,
+                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                ContextTarget::Block(block_id),
+            )));
+        }
+        if let Some(block_id) = state.agent.block_for_source(addr.source_id) {
+            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
+                position.x,
+                position.y,
+                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                ContextTarget::AgentBlock(block_id),
+            )));
+        }
+    }
+
+    // Fallback: right-click on non-content area
+    if hit.is_some() {
+        if let Some(block) = state.shell.blocks.last() {
+            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
+                position.x,
+                position.y,
+                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                ContextTarget::Block(block.id),
+            )));
+        }
+        if let Some(block) = state.agent.blocks.last() {
+            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
+                position.x,
+                position.y,
+                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                ContextTarget::AgentBlock(block.id),
+            )));
+        }
+    }
+
+    MouseResponse::none()
+}
+
+fn route_hover(state: &NexusState, hit: &Option<HitResult>) {
+    // Context menu hover (transient UI — stays at root)
+    if let Some(menu) = state.transient.context_menu() {
+        let idx = if let Some(HitResult::Widget(id)) = hit {
+            (0..menu.items.len()).find(|i| *id == source_ids::ctx_menu_item(*i))
+        } else {
+            None
+        };
+        menu.hovered_item.set(idx);
+    }
+
+    // Input-owned hover tracking (completion, history search)
+    state.input.on_hover(hit);
+}
+
+fn route_context_menu_click(state: &NexusState, hit: &Option<HitResult>) -> Option<NexusMessage> {
+    let menu = state.transient.context_menu()?;
+    if let Some(HitResult::Widget(id)) = hit {
+        for (i, item) in menu.items.iter().enumerate() {
+            if *id == source_ids::ctx_menu_item(i) {
+                return Some(NexusMessage::ContextMenu(ContextMenuMsg::Action(*item)));
+            }
+        }
+    }
+    Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss))
 }

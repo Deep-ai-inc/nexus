@@ -138,9 +138,7 @@ impl Component for NexusState {
                 .push(scroll),
         );
 
-        main_col = self.layout_overlays(main_col);
-        main_col = self.layout_attachments(main_col);
-        main_col = self.layout_input_bar(main_col, cursor_visible);
+        main_col = self.layout_overlays_and_input(main_col, cursor_visible);
 
         main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
 

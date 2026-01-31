@@ -6,8 +6,15 @@ use nexus_api::Value;
 use nexus_kernel::Kernel;
 use tokio::sync::Mutex;
 
-use strata::event_context::KeyEvent;
-use strata::{Command, TextInputAction, TextInputMouseAction, TextInputState};
+use strata::content_address::SourceId;
+use strata::event_context::{Key, KeyEvent, NamedKey};
+use strata::layout_snapshot::HitResult;
+use strata::{
+    ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, LayoutSnapshot, Length,
+    Padding, Row, TextInputAction, TextInputMouseAction, TextInputState,
+};
+
+use crate::nexus_widgets::{CompletionPopup, HistorySearchBar, NexusInputBar};
 
 use crate::blocks::InputMode;
 use super::completion::{CompletionWidget, CompletionOutput};
@@ -364,5 +371,291 @@ impl InputWidget {
                 history.remove(0);
             }
         }
+    }
+}
+
+// =========================================================================
+// View contributions
+// =========================================================================
+
+impl InputWidget {
+    /// Build the overlays section (completion popup, history search bar).
+    pub fn layout_overlays(&self, mut col: Column) -> Column {
+        if self.completion.is_active() {
+            col = col.push(CompletionPopup {
+                completions: &self.completion.completions,
+                selected_index: self.completion.index,
+                hovered_index: self.completion.hovered.get(),
+                scroll: &self.completion.scroll,
+            });
+        }
+
+        if self.history_search.is_active() {
+            col = col.push(HistorySearchBar {
+                query: &self.history_search.query,
+                results: &self.history_search.results,
+                result_index: self.history_search.index,
+                hovered_index: self.history_search.hovered.get(),
+                scroll: &self.history_search.scroll,
+            });
+        }
+
+        col
+    }
+
+    /// Build the attachments section (image thumbnails with remove buttons).
+    pub fn layout_attachments(&self, mut col: Column) -> Column {
+        if self.attachments.is_empty() {
+            return col;
+        }
+
+        let mut attach_row = Row::new().spacing(8.0).padding(4.0);
+        for (i, attachment) in self.attachments.iter().enumerate() {
+            let scale = (60.0_f32 / attachment.width as f32)
+                .min(60.0 / attachment.height as f32)
+                .min(1.0);
+            let w = attachment.width as f32 * scale;
+            let h = attachment.height as f32 * scale;
+            let remove_id = super::source_ids::remove_attachment(i);
+            attach_row = attach_row.push(
+                Column::new()
+                    .spacing(2.0)
+                    .cross_align(CrossAxisAlignment::Center)
+                    .image(ImageElement::new(attachment.image_handle, w, h).corner_radius(4.0))
+                    .push(
+                        ButtonElement::new(remove_id, "\u{2715}")
+                            .background(super::colors::BTN_DENY)
+                            .corner_radius(4.0),
+                    ),
+            );
+        }
+        col = col.push(
+            Column::new()
+                .padding_custom(Padding::new(2.0, 4.0, 0.0, 4.0))
+                .width(Length::Fill)
+                .push(attach_row),
+        );
+        col
+    }
+
+    /// Build the input bar section.
+    pub fn layout_input_bar(
+        &self,
+        mut col: Column,
+        cwd: &str,
+        last_exit_code: Option<i32>,
+        cursor_visible: bool,
+    ) -> Column {
+        let line_count = {
+            let count = self.text_input.text.lines().count()
+                + if self.text_input.text.ends_with('\n') {
+                    1
+                } else {
+                    0
+                };
+            count.max(1).min(6)
+        };
+
+        col = col.push(
+            Column::new()
+                .padding_custom(Padding::new(2.0, 4.0, 4.0, 4.0))
+                .width(Length::Fill)
+                .push(NexusInputBar {
+                    input: &self.text_input,
+                    mode: self.mode,
+                    cwd,
+                    last_exit_code,
+                    cursor_visible,
+                    mode_toggle_id: super::source_ids::mode_toggle(),
+                    line_count,
+                }),
+        );
+        col
+    }
+
+    /// Sync scroll states for completion, history search, and text input from layout snapshot.
+    pub fn sync_scroll_states(&self, snapshot: &mut LayoutSnapshot) {
+        self.completion.scroll.sync_from_snapshot(snapshot);
+        self.history_search.scroll.sync_from_snapshot(snapshot);
+        self.text_input.sync_from_snapshot(snapshot);
+    }
+}
+
+// =========================================================================
+// Event routing
+// =========================================================================
+
+impl InputWidget {
+    /// Whether this widget wants to intercept all keys (overlay mode).
+    pub fn captures_keys(&self) -> bool {
+        self.history_search.is_active() || self.completion.is_active()
+    }
+
+    /// Handle keyboard events. Returns None if the event is not consumed.
+    ///
+    /// Handles three modes:
+    /// 1. History search active → intercepts most keys
+    /// 2. Completion popup active → intercepts navigation keys
+    /// 3. Normal input focused → handles Enter, Tab, ArrowUp/Down, regular keys
+    pub fn on_key(&self, event: &KeyEvent) -> Option<InputMsg> {
+        let KeyEvent::Pressed {
+            key,
+            modifiers,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        // History search mode intercepts most keys
+        if self.history_search.is_active() {
+            return self.on_key_history_search(key, modifiers, event);
+        }
+
+        // Completion popup intercepts navigation keys
+        if self.completion.is_active() {
+            return self.on_key_completion(key, modifiers, event);
+        }
+
+        // Normal input mode (only when focused)
+        if self.text_input.focused {
+            return self.on_key_focused(key, modifiers, event);
+        }
+
+        None
+    }
+
+    fn on_key_history_search(
+        &self,
+        key: &Key,
+        modifiers: &strata::event_context::Modifiers,
+        event: &KeyEvent,
+    ) -> Option<InputMsg> {
+        if modifiers.ctrl {
+            if let Key::Character(c) = key {
+                if c == "r" {
+                    return Some(InputMsg::HistorySearchToggle);
+                }
+            }
+        }
+        match key {
+            Key::Named(NamedKey::Enter) => Some(InputMsg::HistorySearchAccept),
+            Key::Named(NamedKey::Escape) => Some(InputMsg::HistorySearchDismiss),
+            Key::Named(NamedKey::ArrowDown) => {
+                if !self.history_search.results.is_empty()
+                    && self.history_search.index < self.history_search.results.len() - 1
+                {
+                    Some(InputMsg::HistorySearchSelect(
+                        self.history_search.index + 1,
+                    ))
+                } else {
+                    None
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if self.history_search.index > 0 {
+                    Some(InputMsg::HistorySearchSelect(
+                        self.history_search.index - 1,
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => Some(InputMsg::HistorySearchKey(event.clone())),
+        }
+    }
+
+    fn on_key_completion(
+        &self,
+        key: &Key,
+        modifiers: &strata::event_context::Modifiers,
+        event: &KeyEvent,
+    ) -> Option<InputMsg> {
+        match key {
+            Key::Named(NamedKey::Tab) if modifiers.shift => Some(InputMsg::CompletionNav(-1)),
+            Key::Named(NamedKey::Tab) => Some(InputMsg::CompletionNav(1)),
+            Key::Named(NamedKey::ArrowDown) => Some(InputMsg::CompletionNav(1)),
+            Key::Named(NamedKey::ArrowUp) => Some(InputMsg::CompletionNav(-1)),
+            Key::Named(NamedKey::Enter) => Some(InputMsg::CompletionAccept),
+            Key::Named(NamedKey::Escape) => Some(InputMsg::CompletionDismiss),
+            _ => Some(InputMsg::CompletionDismissAndForward(event.clone())),
+        }
+    }
+
+    fn on_key_focused(
+        &self,
+        key: &Key,
+        modifiers: &strata::event_context::Modifiers,
+        event: &KeyEvent,
+    ) -> Option<InputMsg> {
+        if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.shift {
+            return Some(InputMsg::InsertNewline);
+        }
+        if matches!(key, Key::Named(NamedKey::Tab)) {
+            return Some(InputMsg::TabComplete);
+        }
+        if matches!(key, Key::Named(NamedKey::ArrowUp)) {
+            return Some(InputMsg::HistoryUp);
+        }
+        if matches!(key, Key::Named(NamedKey::ArrowDown)) {
+            return Some(InputMsg::HistoryDown);
+        }
+        Some(InputMsg::Key(event.clone()))
+    }
+
+    /// Handle a widget click within input-owned UI. Returns None if not our widget.
+    pub fn on_click(&self, id: SourceId) -> Option<InputMsg> {
+        if id == super::source_ids::mode_toggle() {
+            return Some(InputMsg::ToggleMode);
+        }
+        // Completion item clicks
+        for i in 0..self.completion.completions.len().min(10) {
+            if id == CompletionPopup::item_id(i) {
+                return Some(InputMsg::CompletionSelect(i));
+            }
+        }
+        // History search result clicks
+        if self.history_search.is_active() {
+            for i in 0..self.history_search.results.len().min(10) {
+                if id == HistorySearchBar::result_id(i) {
+                    return Some(InputMsg::HistorySearchAcceptIndex(i));
+                }
+            }
+        }
+        // Attachment remove buttons
+        for i in 0..self.attachments.len() {
+            if id == super::source_ids::remove_attachment(i) {
+                return Some(InputMsg::RemoveAttachment(i));
+            }
+        }
+        None
+    }
+
+    /// Handle hover tracking for completion/history popups.
+    pub fn on_hover(&self, hit: &Option<HitResult>) {
+        if self.completion.is_active() {
+            let idx = if let Some(HitResult::Widget(id)) = hit {
+                (0..self.completion.completions.len().min(10))
+                    .find(|i| *id == CompletionPopup::item_id(*i))
+            } else {
+                None
+            };
+            self.completion.hovered.set(idx);
+        }
+        if self.history_search.is_active() {
+            let idx = if let Some(HitResult::Widget(id)) = hit {
+                (0..self.history_search.results.len().min(10))
+                    .find(|i| *id == HistorySearchBar::result_id(*i))
+            } else {
+                None
+            };
+            self.history_search.hovered.set(idx);
+        }
+    }
+
+    /// Check if a position is within the input area bounds.
+    pub fn hit_test(&self, x: f32, y: f32) -> bool {
+        let b = self.text_input.bounds();
+        x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height
     }
 }

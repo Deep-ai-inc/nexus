@@ -15,9 +15,14 @@ use crate::blocks::{Block, PtyEvent, VisualJob, VisualJobState};
 use crate::pty::PtyHandle;
 use crate::systems::{kernel_subscription, pty_subscription};
 use strata::{ImageHandle, ImageStore, Subscription};
+use strata::content_address::SourceId;
 use strata::event_context::{Key, KeyEvent, NamedKey};
 
+use crate::blocks::Focus;
+use crate::nexus_widgets::{JobBar, ShellBlockWidget};
+
 use super::message::{NexusMessage, ShellMsg};
+use super::source_ids;
 
 /// Typed output from ShellWidget → orchestrator.
 pub(crate) enum ShellOutput {
@@ -92,6 +97,70 @@ impl ShellWidget {
     /// Whether the shell has pending output that needs a redraw tick.
     pub fn needs_redraw(&self) -> bool {
         self.terminal_dirty
+    }
+
+    // ---- View contributions ----
+
+    /// Push a single shell block into the given scroll column.
+    pub fn push_block(
+        &self,
+        scroll: strata::ScrollColumn,
+        block: &Block,
+        focus: &Focus,
+    ) -> strata::ScrollColumn {
+        let is_focused = matches!(focus, Focus::Block(id) if *id == block.id);
+        scroll.push(ShellBlockWidget {
+            block,
+            kill_id: source_ids::kill(block.id),
+            image_info: self.image_handles.get(&block.id).copied(),
+            is_focused,
+        })
+    }
+
+    /// Build the job bar widget, if any jobs exist.
+    pub fn view_job_bar(&self) -> Option<JobBar<'_>> {
+        if self.jobs.is_empty() {
+            None
+        } else {
+            Some(JobBar { jobs: &self.jobs })
+        }
+    }
+
+    // ---- Event handling ----
+
+    /// Handle a widget click within shell-owned UI. Returns None if not our widget.
+    pub fn on_click(&self, id: SourceId) -> Option<ShellMsg> {
+        // Kill buttons
+        for block in &self.blocks {
+            if block.is_running() && id == source_ids::kill(block.id) {
+                return Some(ShellMsg::KillBlock(block.id));
+            }
+        }
+        // Table sort headers
+        for block in &self.blocks {
+            if let Some(Value::Table { columns, .. }) = &block.native_output {
+                for col_idx in 0..columns.len() {
+                    if id == source_ids::table_sort(block.id, col_idx) {
+                        return Some(ShellMsg::SortTable(block.id, col_idx));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if a hit address belongs to a shell block. Returns the block_id if so.
+    pub fn block_for_source(&self, source_id: SourceId) -> Option<BlockId> {
+        for block in &self.blocks {
+            if source_id == source_ids::shell_term(block.id)
+                || source_id == source_ids::shell_header(block.id)
+                || source_id == source_ids::native(block.id)
+                || source_id == source_ids::table(block.id)
+            {
+                return Some(block.id);
+            }
+        }
+        None
     }
 
     /// Create the subscription for PTY and kernel events.
