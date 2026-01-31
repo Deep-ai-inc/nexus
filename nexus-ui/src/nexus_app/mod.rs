@@ -30,6 +30,7 @@ use shell::ShellWidget;
 use agent::AgentWidget;
 use transient_ui::TransientUi;
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -87,6 +88,10 @@ pub struct NexusState {
     // --- UI state ---
     pub last_edit_time: Instant,
     pub exit_requested: bool,
+
+    // --- FPS tracking (Cell for interior mutability in view()) ---
+    last_frame: Cell<Instant>,
+    fps_smooth: Cell<f32>,
     pub context: NexusContext,
 }
 
@@ -110,6 +115,15 @@ impl Component for NexusState {
     }
 
     fn view(&self, snapshot: &mut strata::LayoutSnapshot, _ids: IdSpace) {
+        // FPS calculation (exponential moving average)
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame.get()).as_secs_f32();
+        self.last_frame.set(now);
+        let instant_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+        let prev = self.fps_smooth.get();
+        let fps = if prev == 0.0 { instant_fps } else { prev * 0.95 + instant_fps * 0.05 };
+        self.fps_smooth.set(fps);
+
         let vp = snapshot.viewport();
         let vw = vp.width;
         let vh = vp.height;
@@ -147,6 +161,14 @@ impl Component for NexusState {
         if let Some(menu) = self.transient.context_menu() {
             render_context_menu(snapshot, menu);
         }
+
+        // FPS counter (top-right corner)
+        snapshot.primitives_mut().add_text(
+            format!("{:.0} FPS", fps),
+            strata::primitives::Point::new(vw - 70.0, 4.0),
+            colors::TEXT_MUTED,
+            14.0,
+        );
     }
 
     fn on_key(&self, event: KeyEvent) -> Option<NexusMessage> {
@@ -224,6 +246,8 @@ impl RootComponent for NexusState {
 
             last_edit_time: Instant::now(),
             exit_requested: false,
+            last_frame: Cell::new(Instant::now()),
+            fps_smooth: Cell::new(0.0),
             context,
         };
 
