@@ -103,7 +103,7 @@ impl Component for NexusState {
             self.last_edit_time = Instant::now();
         }
 
-        let cmd = self.dispatch_update(msg, ctx.images);
+        let cmd = self.dispatch_update(msg, ctx);
 
         self.shell.sync_terminal_size();
         (cmd, ())
@@ -205,7 +205,9 @@ impl RootComponent for NexusState {
 
         let context = NexusContext::new(std::env::current_dir().unwrap_or_default());
 
-        let mut input_widget = InputWidget::new(command_history);
+        let kernel = Arc::new(Mutex::new(kernel));
+
+        let mut input_widget = InputWidget::new(command_history, kernel.clone());
         input_widget.text_input.focused = true;
 
         let state = NexusState {
@@ -227,7 +229,7 @@ impl RootComponent for NexusState {
             cwd,
             next_block_id: 1,
             focus: Focus::Input,
-            kernel: Arc::new(Mutex::new(kernel)),
+            kernel,
             kernel_tx,
 
             window_size: (1200.0, 800.0),

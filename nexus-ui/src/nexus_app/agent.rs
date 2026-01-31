@@ -18,8 +18,14 @@ use super::message::{AgentMsg, NexusMessage};
 
 /// Typed output from AgentWidget → orchestrator.
 pub(crate) enum AgentOutput {
+    /// Nothing happened.
+    None,
     /// Orchestrator should scroll history to bottom.
     ScrollToBottom,
+}
+
+impl Default for AgentOutput {
+    fn default() -> Self { Self::None }
 }
 
 /// Manages all agent-related state: agent blocks, streaming, permissions.
@@ -126,8 +132,25 @@ impl AgentWidget {
         }
     }
 
+    /// Handle a message, returning commands and cross-cutting output.
+    pub fn update(&mut self, msg: AgentMsg, _ctx: &mut strata::component::Ctx) -> (strata::Command<AgentMsg>, AgentOutput) {
+        let output = match msg {
+            AgentMsg::Event(evt) => {
+                self.dirty = true;
+                self.handle_event(evt)
+            }
+            AgentMsg::ToggleThinking(id) => { self.toggle_thinking(id); AgentOutput::None }
+            AgentMsg::ToggleTool(id, idx) => { self.toggle_tool(id, idx); AgentOutput::None }
+            AgentMsg::PermissionGrant(block_id, perm_id) => { self.permission_grant(block_id, perm_id); AgentOutput::None }
+            AgentMsg::PermissionGrantSession(block_id, perm_id) => { self.permission_grant_session(block_id, perm_id); AgentOutput::None }
+            AgentMsg::PermissionDeny(block_id, perm_id) => { self.permission_deny(block_id, perm_id); AgentOutput::None }
+            AgentMsg::Interrupt => { self.interrupt(); AgentOutput::None }
+        };
+        (strata::Command::none(), output)
+    }
+
     /// Handle an agent event from the streaming channel.
-    pub fn handle_event(&mut self, event: AgentEvent) -> AgentOutput {
+    fn handle_event(&mut self, event: AgentEvent) -> AgentOutput {
         // Handle session ID
         if let AgentEvent::SessionStarted { ref session_id } = event {
             self.session_id = Some(session_id.clone());

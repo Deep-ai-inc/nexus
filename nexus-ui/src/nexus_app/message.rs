@@ -76,7 +76,8 @@ pub enum InputMsg {
 pub enum ShellMsg {
     PtyOutput(BlockId, Vec<u8>),
     PtyExited(BlockId, i32),
-    PtyInput(KeyEvent),
+    /// Root resolves the target block and passes its ID.
+    PtyInput(BlockId, KeyEvent),
     /// Root resolves the target block and passes its ID.
     SendInterrupt(BlockId),
     KernelEvent(nexus_api::ShellEvent),

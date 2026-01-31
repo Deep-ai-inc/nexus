@@ -7,18 +7,12 @@ use nexus_api::BlockId;
 use crate::agent_block::AgentBlock;
 use crate::blocks::{Block, UnifiedBlockRef};
 use super::context_menu::ContextTarget;
+use super::message::SelectionMsg;
 use super::source_ids;
+use strata::Command;
+use strata::component::Ctx;
 use strata::content_address::{ContentAddress, SourceId, SourceOrdering};
 use strata::Selection;
-
-/// Typed output from SelectionWidget → orchestrator.
-#[allow(dead_code)]
-pub(crate) enum SelectionOutput {
-    /// Nothing happened.
-    None,
-    /// Text was extracted and should be copied to clipboard.
-    CopyToClipboard(String),
-}
 
 /// Selection state and text extraction logic.
 pub(crate) struct SelectionWidget {
@@ -34,24 +28,26 @@ impl SelectionWidget {
         }
     }
 
-    pub fn start(&mut self, addr: ContentAddress) {
-        self.selection = Some(Selection::new(addr.clone(), addr));
-        self.is_selecting = true;
-    }
-
-    pub fn extend(&mut self, addr: ContentAddress) {
-        if let Some(sel) = &mut self.selection {
-            sel.focus = addr;
+    pub fn update(&mut self, msg: SelectionMsg, _ctx: &mut Ctx) -> (Command<SelectionMsg>, ()) {
+        match msg {
+            SelectionMsg::Start(addr) => {
+                self.selection = Some(Selection::new(addr.clone(), addr));
+                self.is_selecting = true;
+            }
+            SelectionMsg::Extend(addr) => {
+                if let Some(sel) = &mut self.selection {
+                    sel.focus = addr;
+                }
+            }
+            SelectionMsg::End => {
+                self.is_selecting = false;
+            }
+            SelectionMsg::Clear => {
+                self.selection = None;
+                self.is_selecting = false;
+            }
         }
-    }
-
-    pub fn end(&mut self) {
-        self.is_selecting = false;
-    }
-
-    pub fn clear(&mut self) {
-        self.selection = None;
-        self.is_selecting = false;
+        (Command::none(), ())
     }
 
     /// Select all content across all blocks.

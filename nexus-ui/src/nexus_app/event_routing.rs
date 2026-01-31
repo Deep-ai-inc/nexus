@@ -157,8 +157,8 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         }
 
         // When a PTY block is focused, forward keys to it
-        if let Focus::Block(_) = state.focus {
-            return Some(NexusMessage::Shell(ShellMsg::PtyInput(event)));
+        if let Focus::Block(id) = state.focus {
+            return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
         }
 
         // When input is focused, route keys

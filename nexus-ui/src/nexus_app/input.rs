@@ -7,11 +7,12 @@ use nexus_kernel::Kernel;
 use tokio::sync::Mutex;
 
 use strata::event_context::KeyEvent;
-use strata::{TextInputAction, TextInputMouseAction, TextInputState};
+use strata::{Command, TextInputAction, TextInputMouseAction, TextInputState};
 
 use crate::blocks::InputMode;
 use super::completion::{CompletionWidget, CompletionOutput};
 use super::history_search::{HistorySearchWidget, HistorySearchOutput};
+use super::message::InputMsg;
 use super::Attachment;
 
 /// Typed output from InputWidget → orchestrator.
@@ -40,10 +41,12 @@ pub(crate) struct InputWidget {
     // Children
     pub completion: CompletionWidget,
     pub history_search: HistorySearchWidget,
+    // Shared reference for completion/search
+    kernel: Arc<Mutex<Kernel>>,
 }
 
 impl InputWidget {
-    pub fn new(command_history: Vec<String>) -> Self {
+    pub fn new(command_history: Vec<String>, kernel: Arc<Mutex<Kernel>>) -> Self {
         Self {
             text_input: TextInputState::new(),
             mode: InputMode::Shell,
@@ -55,7 +58,45 @@ impl InputWidget {
             agent_history_index: None,
             completion: CompletionWidget::new(),
             history_search: HistorySearchWidget::new(),
+            kernel,
         }
+    }
+
+    /// Handle a message, returning commands and cross-cutting output.
+    pub fn update(&mut self, msg: InputMsg, _ctx: &mut strata::component::Ctx) -> (Command<InputMsg>, InputOutput) {
+        let output = match msg {
+            InputMsg::Key(event) => self.handle_key(&event),
+            InputMsg::Mouse(action) => { self.handle_mouse(action); InputOutput::None }
+            InputMsg::Submit(text) => self.submit(text),
+            InputMsg::ToggleMode => { self.toggle_mode(); InputOutput::None }
+            InputMsg::HistoryUp => { self.history_up(); InputOutput::None }
+            InputMsg::HistoryDown => { self.history_down(); InputOutput::None }
+            InputMsg::InsertNewline => { self.insert_newline(); InputOutput::None }
+            InputMsg::RemoveAttachment(idx) => { self.remove_attachment(idx); InputOutput::None }
+
+            InputMsg::TabComplete => { self.tab_complete(); InputOutput::None }
+            InputMsg::CompletionNav(delta) => { self.completion_nav(delta); InputOutput::None }
+            InputMsg::CompletionAccept => { self.completion_accept(); InputOutput::None }
+            InputMsg::CompletionDismiss => { self.completion_dismiss(); InputOutput::None }
+            InputMsg::CompletionDismissAndForward(event) => {
+                self.completion_dismiss();
+                self.handle_key(&event)
+            }
+            InputMsg::CompletionSelect(index) => { self.completion_select(index); InputOutput::None }
+            InputMsg::CompletionScroll(action) => { self.completion.apply_scroll(action); InputOutput::None }
+
+            InputMsg::HistorySearchToggle => { self.history_search_toggle(); InputOutput::None }
+            InputMsg::HistorySearchKey(key_event) => {
+                self.history_search_key(key_event);
+                InputOutput::None
+            }
+            InputMsg::HistorySearchAccept => { self.history_search_accept(); InputOutput::None }
+            InputMsg::HistorySearchDismiss => { self.history_search_dismiss(); InputOutput::None }
+            InputMsg::HistorySearchSelect(index) => { self.history_search_select(index); InputOutput::None }
+            InputMsg::HistorySearchAcceptIndex(index) => { self.history_search_accept_index(index); InputOutput::None }
+            InputMsg::HistorySearchScroll(action) => { self.history_search.apply_scroll(action); InputOutput::None }
+        };
+        (Command::none(), output)
     }
 
     /// Handle a key event on the text input. Returns InputOutput if submit occurred.
@@ -158,10 +199,10 @@ impl InputWidget {
     // ---- Completion delegation ----
 
     /// Trigger tab completion.
-    pub fn tab_complete(&mut self, kernel: &Arc<Mutex<Kernel>>) -> InputOutput {
-        let output = self.completion.tab_complete(&self.text_input.text, self.text_input.cursor, kernel);
+    pub fn tab_complete(&mut self) {
+        let kernel = self.kernel.clone();
+        let output = self.completion.tab_complete(&self.text_input.text, self.text_input.cursor, &kernel);
         self.apply_completion_output(output);
-        InputOutput::None
     }
 
     /// Navigate completions by delta.
@@ -194,8 +235,9 @@ impl InputWidget {
     }
 
     /// Handle a key in history search.
-    pub fn history_search_key(&mut self, key_event: KeyEvent, kernel: &Arc<Mutex<Kernel>>) {
-        self.history_search.handle_key(key_event, kernel);
+    pub fn history_search_key(&mut self, key_event: KeyEvent) {
+        let kernel = self.kernel.clone();
+        self.history_search.handle_key(key_event, &kernel);
     }
 
     /// Accept current history search result.

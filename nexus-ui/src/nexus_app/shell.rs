@@ -37,6 +37,16 @@ pub(crate) enum ShellOutput {
         command: String,
         output: String,
     },
+    /// A PTY block exited. Root decides focus based on current focus state.
+    BlockExited {
+        id: BlockId,
+    },
+    /// PTY input forwarding failed (block gone). Root should focus input.
+    PtyInputFailed,
+}
+
+impl Default for ShellOutput {
+    fn default() -> Self { Self::None }
 }
 
 /// Manages all shell-related state: terminal blocks, PTY handles, jobs, images.
@@ -108,6 +118,26 @@ impl ShellWidget {
         Subscription::batch(subs)
     }
 
+    /// Handle a message, returning commands and cross-cutting output.
+    pub fn update(&mut self, msg: ShellMsg, ctx: &mut strata::component::Ctx) -> (strata::Command<ShellMsg>, ShellOutput) {
+        let output = match msg {
+            ShellMsg::PtyOutput(id, data) => self.handle_pty_output(id, data),
+            ShellMsg::PtyExited(id, exit_code) => self.handle_pty_exited(id, exit_code),
+            ShellMsg::KernelEvent(evt) => self.handle_kernel_event(evt, ctx.images),
+            ShellMsg::SendInterrupt(id) => { self.send_interrupt_to(id); ShellOutput::None }
+            ShellMsg::KillBlock(id) => { self.kill_block(id); ShellOutput::None }
+            ShellMsg::PtyInput(block_id, event) => {
+                if self.forward_key(block_id, &event) {
+                    ShellOutput::None
+                } else {
+                    ShellOutput::PtyInputFailed
+                }
+            }
+            ShellMsg::SortTable(block_id, col_idx) => { self.sort_table(block_id, col_idx); ShellOutput::None }
+        };
+        (strata::Command::none(), output)
+    }
+
     /// Execute a command (kernel or external PTY).
     /// The orchestrator should handle "clear" before calling this.
     pub fn execute(
@@ -146,13 +176,8 @@ impl ShellWidget {
         }
     }
 
-    /// Handle PTY exit.
-    pub fn handle_pty_exited(
-        &mut self,
-        id: BlockId,
-        exit_code: i32,
-        current_focus: &crate::blocks::Focus,
-    ) -> ShellOutput {
+    /// Handle PTY exit. Returns the exited block ID so root can decide focus.
+    pub fn handle_pty_exited(&mut self, id: BlockId, exit_code: i32) -> ShellOutput {
         if let Some(&idx) = self.block_index.get(&id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.state = if exit_code == 0 {
@@ -166,11 +191,7 @@ impl ShellWidget {
         }
         self.pty_handles.retain(|h| h.block_id != id);
         self.last_exit_code = Some(exit_code);
-        if *current_focus == crate::blocks::Focus::Block(id) {
-            ShellOutput::FocusInput
-        } else {
-            ShellOutput::None
-        }
+        ShellOutput::BlockExited { id }
     }
 
     /// Handle a kernel event.
