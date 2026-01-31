@@ -45,6 +45,32 @@ use crate::systems::{agent_subscription, kernel_subscription, pty_subscription, 
 use crate::widgets::job_indicator::{VisualJob, VisualJobState};
 
 // =========================================================================
+// Source ID helpers — single source of truth for all source ID strings
+// =========================================================================
+
+/// Source IDs for shell and agent blocks.
+pub(crate) mod source_ids {
+    use super::*;
+
+    pub fn shell_header(id: BlockId) -> SourceId { SourceId::named(&format!("shell_header_{}", id.0)) }
+    pub fn shell_term(id: BlockId) -> SourceId { SourceId::named(&format!("shell_term_{}", id.0)) }
+    pub fn native(id: BlockId) -> SourceId { SourceId::named(&format!("native_{}", id.0)) }
+    pub fn table(id: BlockId) -> SourceId { SourceId::named(&format!("table_{}", id.0)) }
+    pub fn table_sort(id: BlockId, col: usize) -> SourceId { SourceId::named(&format!("sort_{}_{}", id.0, col)) }
+    pub fn kill(id: BlockId) -> SourceId { SourceId::named(&format!("kill_{}", id.0)) }
+
+    pub fn agent_query(id: BlockId) -> SourceId { SourceId::named(&format!("agent_query_{}", id.0)) }
+    pub fn agent_thinking(id: BlockId) -> SourceId { SourceId::named(&format!("agent_thinking_{}", id.0)) }
+    pub fn agent_response(id: BlockId) -> SourceId { SourceId::named(&format!("agent_response_{}", id.0)) }
+    pub fn agent_thinking_toggle(id: BlockId) -> SourceId { SourceId::named(&format!("thinking_{}", id.0)) }
+    pub fn agent_stop(id: BlockId) -> SourceId { SourceId::named(&format!("stop_{}", id.0)) }
+    pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId { SourceId::named(&format!("tool_toggle_{}_{}", id.0, i)) }
+    pub fn agent_perm_deny(id: BlockId) -> SourceId { SourceId::named(&format!("perm_deny_{}", id.0)) }
+    pub fn agent_perm_allow(id: BlockId) -> SourceId { SourceId::named(&format!("perm_allow_{}", id.0)) }
+    pub fn agent_perm_always(id: BlockId) -> SourceId { SourceId::named(&format!("perm_always_{}", id.0)) }
+}
+
+// =========================================================================
 // Color palette (matches real Nexus app)
 // =========================================================================
 pub(crate) mod colors {
@@ -1158,17 +1184,19 @@ impl StrataApp for NexusApp {
             for block_ref in &unified {
                 match block_ref {
                     UnifiedBlockRef::Shell(block) => {
-                        let kill_id = SourceId::named(&format!("kill_{}", block.id.0));
+                        let kill_id = source_ids::kill(block.id);
                         let image_info = state.image_handles.get(&block.id).copied();
+                        let is_focused = matches!(state.focus, Focus::Block(id) if id == block.id);
                         scroll = scroll.push(ShellBlockWidget {
                             block,
                             kill_id,
                             image_info,
+                            is_focused,
                         });
                     }
                     UnifiedBlockRef::Agent(block) => {
-                        let thinking_id = SourceId::named(&format!("thinking_{}", block.id.0));
-                        let stop_id = SourceId::named(&format!("stop_{}", block.id.0));
+                        let thinking_id = source_ids::agent_thinking_toggle(block.id);
+                        let stop_id = source_ids::agent_stop(block.id);
                         scroll = scroll.push(AgentBlockWidget {
                             block,
                             thinking_toggle_id: thinking_id,
@@ -1317,7 +1345,7 @@ impl StrataApp for NexusApp {
             // Check if hit is on a terminal block (by matching source IDs)
             if let Some(HitResult::Content(ref addr)) = hit {
                 for block in &state.blocks {
-                    let term_id = SourceId::named(&format!("shell_term_{}", block.id.0));
+                    let term_id = source_ids::shell_term(block.id);
                     if addr.source_id == term_id {
                         return MouseResponse::message(NexusMessage::ShowContextMenu(
                             position.x, position.y,
@@ -1440,7 +1468,7 @@ impl StrataApp for NexusApp {
                 // Kill buttons
                 for block in &state.blocks {
                     if block.is_running() {
-                        let kill_id = SourceId::named(&format!("kill_{}", block.id.0));
+                        let kill_id = source_ids::kill(block.id);
                         if *id == kill_id {
                             return MouseResponse::message(NexusMessage::KillBlock(block.id));
                         }
@@ -1449,20 +1477,20 @@ impl StrataApp for NexusApp {
 
                 // Agent thinking toggles
                 for block in &state.agent_blocks {
-                    let thinking_id = SourceId::named(&format!("thinking_{}", block.id.0));
+                    let thinking_id = source_ids::agent_thinking_toggle(block.id);
                     if *id == thinking_id {
                         return MouseResponse::message(NexusMessage::ToggleThinking(block.id));
                     }
 
                     // Stop button
-                    let stop_id = SourceId::named(&format!("stop_{}", block.id.0));
+                    let stop_id = source_ids::agent_stop(block.id);
                     if *id == stop_id {
                         return MouseResponse::message(NexusMessage::AgentInterrupt);
                     }
 
                     // Tool toggles
                     for (i, _tool) in block.tools.iter().enumerate() {
-                        let toggle_id = SourceId::named(&format!("tool_toggle_{}_{}", block.id.0, i));
+                        let toggle_id = source_ids::agent_tool_toggle(block.id, i);
                         if *id == toggle_id {
                             return MouseResponse::message(NexusMessage::ToggleTool(block.id, i));
                         }
@@ -1470,9 +1498,9 @@ impl StrataApp for NexusApp {
 
                     // Permission buttons
                     if let Some(ref perm) = block.pending_permission {
-                        let deny_id = SourceId::named(&format!("perm_deny_{}", block.id.0));
-                        let allow_id = SourceId::named(&format!("perm_allow_{}", block.id.0));
-                        let always_id = SourceId::named(&format!("perm_always_{}", block.id.0));
+                        let deny_id = source_ids::agent_perm_deny(block.id);
+                        let allow_id = source_ids::agent_perm_allow(block.id);
+                        let always_id = source_ids::agent_perm_always(block.id);
 
                         if *id == deny_id {
                             return MouseResponse::message(NexusMessage::PermissionDeny(block.id, perm.id.clone()));
@@ -1490,7 +1518,7 @@ impl StrataApp for NexusApp {
                 for block in &state.blocks {
                     if let Some(Value::Table { columns, .. }) = &block.native_output {
                         for col_idx in 0..columns.len() {
-                            let sort_id = SourceId::named(&format!("sort_{}_{}", block.id.0, col_idx));
+                            let sort_id = source_ids::table_sort(block.id, col_idx);
                             if *id == sort_id {
                                 return MouseResponse::message(NexusMessage::SortTable(block.id, col_idx));
                             }
@@ -1501,11 +1529,8 @@ impl StrataApp for NexusApp {
                 // Content selection start (clicked text)
             }
 
-            // Text content selection
+            // Text content selection (start immediately, even if input was focused)
             if let Some(HitResult::Content(addr)) = hit {
-                if state.input.focused {
-                    return MouseResponse::message(NexusMessage::BlurAll);
-                }
                 let capture_source = addr.source_id;
                 return MouseResponse::message_and_capture(
                     NexusMessage::SelectionStart(addr),
@@ -2168,88 +2193,252 @@ fn extract_block_text(state: &NexusState, target: &ContextTarget) -> Option<Stri
     }
 }
 
-/// Extract the text content within a selection from terminal blocks.
+/// Extract the text content within a selection, supporting cross-source selections.
 ///
-/// Walks all blocks checking their terminal source ID, then extracts the
-/// selected character range from the parser grid.
+/// Uses source ordering to determine which sources fall within the selection,
+/// then extracts the relevant text range from each (terminal grid, native output,
+/// or agent response).
 fn extract_selected_text(state: &NexusState, sel: &Selection) -> String {
-    // Only handle same-source selections
-    if sel.anchor.source_id != sel.focus.source_id {
+    // Get source ordering from the most recent layout snapshot
+    // We rebuild a mini ordering from known sources in document order
+    let ordering = build_source_ordering(state);
+    let sources = sel.sources(&ordering);
+
+    if sources.is_empty() {
         return String::new();
     }
 
-    let source_id = sel.anchor.source_id;
+    let (start, end) = sel.normalized(&ordering);
+    let mut parts: Vec<String> = Vec::new();
 
-    // Normalize anchor/focus to start/end by content_offset
-    let (start_offset, end_offset) = if sel.anchor.content_offset <= sel.focus.content_offset {
-        (sel.anchor.content_offset, sel.focus.content_offset)
-    } else {
-        (sel.focus.content_offset, sel.anchor.content_offset)
-    };
+    for source_id in &sources {
+        let is_start = *source_id == start.source_id;
+        let is_end = *source_id == end.source_id;
 
-    if start_offset == end_offset {
-        return String::new();
+        if let Some(text) = extract_source_text(state, *source_id, is_start, is_end, &start, &end) {
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
     }
 
-    // Try terminal blocks
+    parts.join("\n")
+}
+
+/// Build a source ordering reflecting current document order.
+///
+/// Sources appear in the order blocks are rendered: shell blocks (terminal or native),
+/// then agent blocks. This matches the view() layout pass.
+fn build_source_ordering(state: &NexusState) -> crate::strata::content_address::SourceOrdering {
+    let mut ordering = crate::strata::content_address::SourceOrdering::new();
+    let unified = state.unified_blocks();
+    for block_ref in &unified {
+        match block_ref {
+            UnifiedBlockRef::Shell(block) => {
+                // Header (command line) comes first
+                ordering.register(source_ids::shell_header(block.id));
+                // Then content: native output, table, or terminal
+                if let Some(ref value) = block.native_output {
+                    if matches!(value, nexus_api::Value::Table { .. }) {
+                        ordering.register(source_ids::table(block.id));
+                    } else {
+                        ordering.register(source_ids::native(block.id));
+                    }
+                } else {
+                    ordering.register(source_ids::shell_term(block.id));
+                }
+            }
+            UnifiedBlockRef::Agent(block) => {
+                ordering.register(source_ids::agent_query(block.id));
+                if !block.thinking.is_empty() && !block.thinking_collapsed {
+                    ordering.register(source_ids::agent_thinking(block.id));
+                }
+                if !block.response.is_empty() {
+                    ordering.register(source_ids::agent_response(block.id));
+                }
+            }
+        }
+    }
+    ordering
+}
+
+/// Extract text from a single source within a selection range.
+fn extract_source_text(
+    state: &NexusState,
+    source_id: SourceId,
+    is_start: bool,
+    is_end: bool,
+    start: &ContentAddress,
+    end: &ContentAddress,
+) -> Option<String> {
+    // Shell blocks
     for block in &state.blocks {
-        let expected_id = SourceId::named(&format!("shell_term_{}", block.id.0));
-        if expected_id != source_id {
-            continue;
+        // Command header
+        let header_id = source_ids::shell_header(block.id);
+        if header_id == source_id {
+            let text = format!("$ {}", block.command);
+            let lines: Vec<&str> = text.lines().collect();
+            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
         }
 
-        // Skip blocks with native output — they don't use terminal rendering
-        if block.native_output.is_some() {
-            continue;
+        // Terminal output
+        let term_id = source_ids::shell_term(block.id);
+        if term_id == source_id && block.native_output.is_none() {
+            let grid = if block.parser.is_alternate_screen() || block.is_running() {
+                block.parser.grid()
+            } else {
+                block.parser.grid_with_scrollback()
+            };
+            let cols = grid.cols() as usize;
+            if cols == 0 {
+                return Some(String::new());
+            }
+
+            let start_offset = if is_start { start.content_offset } else { 0 };
+            let total_cells = grid.content_rows() as usize * cols;
+            let end_offset = if is_end { end.content_offset } else { total_cells };
+
+            if start_offset >= end_offset {
+                return Some(String::new());
+            }
+
+            let rows: Vec<Vec<nexus_term::Cell>> = grid.rows_iter().map(|r| r.to_vec()).collect();
+            return Some(extract_grid_range(&rows, cols, start_offset, end_offset));
         }
 
-        let grid = if block.parser.is_alternate_screen() || block.is_running() {
-            block.parser.grid()
-        } else {
-            block.parser.grid_with_scrollback()
-        };
-        let cols = grid.cols() as usize;
-        if cols == 0 {
-            return String::new();
+        // Native output (multi-item: each line is a separate item)
+        let native_id = source_ids::native(block.id);
+        if native_id == source_id {
+            if let Some(ref value) = block.native_output {
+                let full_text = value.to_text();
+                let lines: Vec<&str> = full_text.lines().collect();
+                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+            }
         }
 
-        let start_row = start_offset / cols;
-        let start_col = start_offset % cols;
-        let end_row = end_offset / cols;
-        let end_col = end_offset % cols;
+        // Table output (multi-item: headers first, then cell texts row-major)
+        let table_id = source_ids::table(block.id);
+        if table_id == source_id {
+            if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
+                let mut lines: Vec<String> = Vec::new();
+                // Headers come first (matching render order)
+                for col in columns {
+                    lines.push(col.name.clone());
+                }
+                // Then data cells row-major
+                for row in rows {
+                    for cell in row {
+                        let text = cell.to_text();
+                        for l in text.lines() {
+                            lines.push(l.to_string());
+                        }
+                    }
+                }
+                let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+                return Some(extract_multi_item_range(&line_refs, is_start, is_end, start, end));
+            }
+        }
+    }
 
-        let mut result = String::new();
-        let rows: Vec<Vec<nexus_term::Cell>> = grid.rows_iter()
-            .map(|row| row.to_vec())
+    // Agent blocks
+    for block in &state.agent_blocks {
+        // Query
+        let query_id = source_ids::agent_query(block.id);
+        if query_id == source_id {
+            // Query renders as "? " + query text (two items in a Row)
+            let lines: Vec<&str> = vec!["?", &block.query];
+            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+        }
+
+        // Thinking
+        let thinking_id = source_ids::agent_thinking(block.id);
+        if thinking_id == source_id {
+            let preview = if block.thinking.len() > 500 {
+                format!("{}...", &block.thinking[..500])
+            } else {
+                block.thinking.clone()
+            };
+            let lines: Vec<&str> = preview.lines().collect();
+            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+        }
+
+        // Response
+        let response_id = source_ids::agent_response(block.id);
+        if response_id == source_id {
+            if block.response.is_empty() {
+                return None;
+            }
+            // Response is rendered line-by-line, each as a multi-item source
+            let lines: Vec<&str> = block.response.lines().collect();
+            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+        }
+    }
+
+    None
+}
+
+/// Extract a range of characters from a terminal grid.
+fn extract_grid_range(rows: &[Vec<nexus_term::Cell>], cols: usize, start: usize, end: usize) -> String {
+    let start_row = start / cols;
+    let start_col = start % cols;
+    let end_row = end / cols;
+    let end_col = end % cols;
+
+    let mut result = String::new();
+    for row_idx in start_row..=end_row {
+        if row_idx >= rows.len() {
+            break;
+        }
+        let row = &rows[row_idx];
+        let col_start = if row_idx == start_row { start_col } else { 0 };
+        let col_end = if row_idx == end_row { end_col } else { row.len() };
+
+        let line: String = row.iter()
+            .skip(col_start)
+            .take(col_end.saturating_sub(col_start))
+            .map(|cell| cell.c)
             .collect();
 
-        for row_idx in start_row..=end_row {
-            if row_idx >= rows.len() {
-                break;
-            }
-            let row = &rows[row_idx];
-            let col_start = if row_idx == start_row { start_col } else { 0 };
-            let col_end = if row_idx == end_row { end_col } else { row.len() };
-
-            let line: String = row.iter()
-                .skip(col_start)
-                .take(col_end.saturating_sub(col_start))
-                .map(|cell| cell.c)
-                .collect();
-
-            result.push_str(line.trim_end());
-            if row_idx < end_row {
-                result.push('\n');
-            }
+        result.push_str(line.trim_end());
+        if row_idx < end_row {
+            result.push('\n');
         }
+    }
+    result
+}
 
-        return result;
+/// Extract text from a multi-item source (each line is a separate item).
+///
+/// `item_index` identifies the line, `content_offset` the character within that line.
+fn extract_multi_item_range(
+    lines: &[&str],
+    is_start: bool,
+    is_end: bool,
+    start: &ContentAddress,
+    end: &ContentAddress,
+) -> String {
+    if lines.is_empty() {
+        return String::new();
     }
 
-    // If no terminal block matched, the selection might be on native text output.
-    // Native output uses TextElement without source IDs, so selection isn't
-    // supported there yet. For now, return empty.
-    String::new()
+    let start_item = if is_start { start.item_index } else { 0 };
+    let end_item = if is_end { end.item_index } else { lines.len().saturating_sub(1) };
+
+    if start_item > end_item || start_item >= lines.len() {
+        return String::new();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for i in start_item..=end_item.min(lines.len() - 1) {
+        let line = lines[i];
+        let chars: Vec<char> = line.chars().collect();
+        let from = if i == start_item && is_start { start.content_offset.min(chars.len()) } else { 0 };
+        let to = if i == end_item && is_end { end.content_offset.min(chars.len()) } else { chars.len() };
+        if from <= to {
+            parts.push(chars[from..to].iter().collect());
+        }
+    }
+    parts.join("\n")
 }
 
 // =========================================================================

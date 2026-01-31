@@ -129,6 +129,16 @@ impl Rect {
         }
     }
 
+    /// Compute the smallest rectangle that contains both `self` and `other`.
+    #[inline]
+    pub fn union(&self, other: &Rect) -> Rect {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        Rect { x, y, width: right - x, height: bottom - y }
+    }
+
     /// Check if this rectangle intersects with another.
     #[inline]
     pub fn intersects(&self, other: &Rect) -> bool {

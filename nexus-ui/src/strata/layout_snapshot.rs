@@ -621,9 +621,18 @@ impl LayoutSnapshot {
     ///
     /// Sources should be registered in document order (top to bottom).
     /// The order of registration determines the document order for selection.
+    ///
+    /// If the source is already registered, new items are appended and bounds
+    /// are expanded. This allows multiple widgets (e.g. per-line TextElements)
+    /// to share a single source for cross-line selection.
     pub fn register_source(&mut self, source_id: SourceId, layout: SourceLayout) {
         self.source_ordering.register(source_id);
-        self.sources.insert(source_id, layout);
+        if let Some(existing) = self.sources.get_mut(&source_id) {
+            existing.bounds = existing.bounds.union(&layout.bounds);
+            existing.items.extend(layout.items);
+        } else {
+            self.sources.insert(source_id, layout);
+        }
     }
 
     /// Get the layout for a source.

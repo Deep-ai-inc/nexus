@@ -10,6 +10,7 @@ use nexus_kernel::{Completion, CompletionKind};
 use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus};
 use crate::blocks::Block;
 use crate::strata::content_address::SourceId;
+use crate::strata::nexus_app::source_ids;
 use crate::strata::gpu::ImageHandle;
 use crate::strata::layout::containers::{
     ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
@@ -29,6 +30,7 @@ pub struct ShellBlockWidget<'a> {
     pub block: &'a Block,
     pub kill_id: SourceId,
     pub image_info: Option<(ImageHandle, u32, u32)>,
+    pub is_focused: bool,
 }
 
 impl Widget for ShellBlockWidget<'_> {
@@ -44,12 +46,14 @@ impl Widget for ShellBlockWidget<'_> {
         };
 
         // Header row: status + command + [Kill/duration]
+        let header_source = source_ids::shell_header(block.id);
         let mut header = Row::new()
             .spacing(8.0)
             .cross_align(CrossAxisAlignment::Center)
             .push(
                 TextElement::new(format!("{} $ {}", status_icon, block.command))
-                    .color(status_color),
+                    .color(status_color)
+                    .source(header_source),
             )
             .spacer(1.0);
 
@@ -83,14 +87,19 @@ impl Widget for ShellBlockWidget<'_> {
             .spacing(4.0)
             .background(colors::BG_BLOCK)
             .corner_radius(4.0)
-            .width(Length::Fill)
-            .push(header);
+            .width(Length::Fill);
+
+        if self.is_focused {
+            content = content.border(Color::rgb(0.3, 0.7, 1.0), 2.0);
+        }
+
+        content = content.push(header);
 
         // Render output: native structured data takes priority over terminal
         if let Some(value) = &block.native_output {
             content = render_native_value(content, value, block, self.image_info);
         } else if content_rows > 0 {
-            let source_id = SourceId::named(&format!("shell_term_{}", block.id.0));
+            let source_id = source_ids::shell_term(block.id);
             let mut term = TerminalElement::new(source_id, cols, content_rows)
                 .cell_size(8.4, 18.0);
 
@@ -112,7 +121,8 @@ impl Widget for ShellBlockWidget<'_> {
         match block.state {
             BlockState::Failed(code) | BlockState::Killed(code) => {
                 content = content.push(
-                    TextElement::new(format!("exit {}", code)).color(colors::ERROR),
+                    TextElement::new(format!("exit {}", code)).color(colors::ERROR)
+                        .source(header_source),
                 );
             }
             _ => {}
@@ -135,18 +145,18 @@ pub struct AgentBlockWidget<'a> {
 impl<'a> AgentBlockWidget<'a> {
     /// Generate a stable SourceId for a tool toggle button.
     fn tool_toggle_id(block_id: BlockId, tool_index: usize) -> SourceId {
-        SourceId::named(&format!("tool_toggle_{}_{}", block_id.0, tool_index))
+        source_ids::agent_tool_toggle(block_id, tool_index)
     }
 
     /// Generate a stable SourceId for permission buttons.
     fn perm_deny_id(block_id: BlockId) -> SourceId {
-        SourceId::named(&format!("perm_deny_{}", block_id.0))
+        source_ids::agent_perm_deny(block_id)
     }
     fn perm_allow_id(block_id: BlockId) -> SourceId {
-        SourceId::named(&format!("perm_allow_{}", block_id.0))
+        source_ids::agent_perm_allow(block_id)
     }
     fn perm_always_id(block_id: BlockId) -> SourceId {
-        SourceId::named(&format!("perm_always_{}", block_id.0))
+        source_ids::agent_perm_always(block_id)
     }
 }
 
@@ -162,11 +172,12 @@ impl Widget for AgentBlockWidget<'_> {
             .width(Length::Fill);
 
         // Query line
+        let query_source = source_ids::agent_query(block.id);
         content = content.push(
             Row::new()
                 .spacing(4.0)
-                .push(TextElement::new("? ").color(colors::TEXT_PURPLE))
-                .push(TextElement::new(&block.query).color(colors::TEXT_QUERY)),
+                .push(TextElement::new("? ").color(colors::TEXT_PURPLE).source(query_source))
+                .push(TextElement::new(&block.query).color(colors::TEXT_QUERY).source(query_source)),
         );
 
         // Thinking section
@@ -181,6 +192,7 @@ impl Widget for AgentBlockWidget<'_> {
 
             if !block.thinking_collapsed {
                 // Show thinking text indented
+                let thinking_source = source_ids::agent_thinking(block.id);
                 let thinking_preview = if block.thinking.len() > 500 {
                     format!("{}...", &block.thinking[..500])
                 } else {
@@ -190,7 +202,7 @@ impl Widget for AgentBlockWidget<'_> {
                     content = content.push(
                         Row::new()
                             .fixed_spacer(16.0)
-                            .push(TextElement::new(line).color(colors::THINKING)),
+                            .push(TextElement::new(line).color(colors::THINKING).source(thinking_source)),
                     );
                 }
             }
@@ -214,7 +226,8 @@ impl Widget for AgentBlockWidget<'_> {
 
         // Response text
         if !block.response.is_empty() {
-            content = content.push(build_response_text(&block.response));
+            let response_source = source_ids::agent_response(block.id);
+            content = content.push(build_response_text(&block.response, response_source));
         }
 
         // Status footer
@@ -375,7 +388,7 @@ fn build_permission_dialog(
 }
 
 /// Build response text with basic markdown rendering.
-fn build_response_text(response: &str) -> Column {
+fn build_response_text(response: &str, source_id: SourceId) -> Column {
     let mut col = Column::new().spacing(2.0);
 
     let mut in_code_block = false;
@@ -392,7 +405,7 @@ fn build_response_text(response: &str) -> Column {
                     .width(Length::Fill);
                 let mut code_inner = code_col;
                 for code_line in code_lines.drain(..) {
-                    code_inner = code_inner.push(TextElement::new(code_line).color(colors::CODE_TEXT));
+                    code_inner = code_inner.push(TextElement::new(code_line).color(colors::CODE_TEXT).source(source_id));
                 }
                 col = col.push(code_inner);
                 in_code_block = false;
@@ -402,21 +415,21 @@ fn build_response_text(response: &str) -> Column {
         } else if in_code_block {
             code_lines.push(line.to_string());
         } else if line.starts_with("# ") {
-            col = col.push(TextElement::new(&line[2..]).color(colors::TEXT_PRIMARY).size(16.0));
+            col = col.push(TextElement::new(&line[2..]).color(colors::TEXT_PRIMARY).size(16.0).source(source_id));
         } else if line.starts_with("## ") {
-            col = col.push(TextElement::new(&line[3..]).color(colors::TEXT_PRIMARY).size(15.0));
+            col = col.push(TextElement::new(&line[3..]).color(colors::TEXT_PRIMARY).size(15.0).source(source_id));
         } else if line.starts_with("**") && line.ends_with("**") && line.len() > 4 {
-            col = col.push(TextElement::new(&line[2..line.len()-2]).color(colors::TEXT_PRIMARY));
+            col = col.push(TextElement::new(&line[2..line.len()-2]).color(colors::TEXT_PRIMARY).source(source_id));
         } else if line.starts_with("- ") || line.starts_with("* ") {
             col = col.push(
                 Row::new()
-                    .push(TextElement::new("  \u{00B7} ").color(colors::TEXT_MUTED))
-                    .push(TextElement::new(&line[2..]).color(colors::TEXT_PRIMARY)),
+                    .push(TextElement::new("  \u{00B7} ").color(colors::TEXT_MUTED).source(source_id))
+                    .push(TextElement::new(&line[2..]).color(colors::TEXT_PRIMARY).source(source_id)),
             );
         } else if line.is_empty() {
             col = col.fixed_spacer(4.0);
         } else {
-            col = col.push(TextElement::new(line).color(colors::TEXT_PRIMARY));
+            col = col.push(TextElement::new(line).color(colors::TEXT_PRIMARY).source(source_id));
         }
     }
 
@@ -429,7 +442,7 @@ fn build_response_text(response: &str) -> Column {
             .width(Length::Fill);
         let mut code_inner = code_col;
         for code_line in code_lines {
-            code_inner = code_inner.push(TextElement::new(code_line).color(colors::CODE_TEXT));
+            code_inner = code_inner.push(TextElement::new(code_line).color(colors::CODE_TEXT).source(source_id));
         }
         col = col.push(code_inner);
     }
@@ -931,7 +944,7 @@ fn render_native_value(
         }
 
         Value::Table { columns, rows } => {
-            let source_id = SourceId::named(&format!("table_{}", block_id.0));
+            let source_id = source_ids::table(block_id);
             let mut table = TableElement::new(source_id);
 
             // Estimate column widths from data
@@ -939,7 +952,7 @@ fn render_native_value(
 
             // Add column headers with sort support
             for (i, col) in columns.iter().enumerate() {
-                let sort_id = SourceId::named(&format!("sort_{}_{}", block_id.0, i));
+                let sort_id = source_ids::table_sort(block_id, i);
                 let header_name = if block.table_sort.column == Some(i) {
                     if block.table_sort.ascending {
                         format!("{} \u{25B2}", col.name) // ▲
@@ -983,6 +996,8 @@ fn render_native_value(
                 })
                 .collect();
 
+            let source_id = source_ids::native(block_id);
+
             if file_entries.len() == items.len() && !file_entries.is_empty() {
                 // Render as file list with colors
                 for entry in &file_entries {
@@ -992,14 +1007,14 @@ fn render_native_value(
                     } else {
                         entry.name.clone()
                     };
-                    parent = parent.push(TextElement::new(display).color(color));
+                    parent = parent.push(TextElement::new(display).color(color).source(source_id));
                 }
                 parent
             } else {
                 // Generic list
                 for item in items {
                     parent = parent.push(
-                        TextElement::new(item.to_text()).color(colors::TEXT_PRIMARY),
+                        TextElement::new(item.to_text()).color(colors::TEXT_PRIMARY).source(source_id),
                     );
                 }
                 parent
@@ -1013,23 +1028,26 @@ fn render_native_value(
             } else {
                 entry.name.clone()
             };
-            parent.push(TextElement::new(display).color(color))
+            let source_id = source_ids::native(block_id);
+            parent.push(TextElement::new(display).color(color).source(source_id))
         }
 
         Value::Record(fields) => {
+            let source_id = source_ids::native(block_id);
             for (key, val) in fields {
                 parent = parent.push(
                     Row::new()
                         .spacing(8.0)
-                        .push(TextElement::new(format!("{}:", key)).color(colors::TEXT_SECONDARY))
-                        .push(TextElement::new(val.to_text()).color(colors::TEXT_PRIMARY)),
+                        .push(TextElement::new(format!("{}:", key)).color(colors::TEXT_SECONDARY).source(source_id))
+                        .push(TextElement::new(val.to_text()).color(colors::TEXT_PRIMARY).source(source_id)),
                 );
             }
             parent
         }
 
         Value::Error { message, .. } => {
-            parent.push(TextElement::new(message).color(colors::ERROR))
+            let source_id = source_ids::native(block_id);
+            parent.push(TextElement::new(message).color(colors::ERROR).source(source_id))
         }
 
         // All other types: render as text
@@ -1038,8 +1056,9 @@ fn render_native_value(
             if text.is_empty() {
                 parent
             } else {
+                let source_id = source_ids::native(block_id);
                 for line in text.lines() {
-                    parent = parent.push(TextElement::new(line).color(colors::TEXT_PRIMARY));
+                    parent = parent.push(TextElement::new(line).color(colors::TEXT_PRIMARY).source(source_id));
                 }
                 parent
             }

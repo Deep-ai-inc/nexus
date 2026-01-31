@@ -899,7 +899,6 @@ pub struct TableElement {
     pub header_height: f32,
     pub stripe_color: Option<Color>,
     pub separator_color: Color,
-    cache_key: u64,
 }
 
 impl TableElement {
@@ -916,7 +915,6 @@ impl TableElement {
             header_height: 26.0,
             stripe_color: Some(Color::rgba(1.0, 1.0, 1.0, 0.02)),
             separator_color: Color::rgba(1.0, 1.0, 1.0, 0.12),
-            cache_key: 0,
         }
     }
 
@@ -981,13 +979,25 @@ fn render_table(
 
     // Header text + register sortable headers as widgets
     let mut col_x = x;
+    let char_width = 8.4_f32;
     for col in &table.columns {
+        let tx = col_x + cell_pad;
+        let ty = y + 4.0;
         snapshot.primitives_mut().add_text_cached(
             col.name.clone(),
-            Point::new(col_x + cell_pad, y + 4.0),
+            Point::new(tx, ty),
             table.header_text_color,
             hash_text(&col.name),
         );
+        // Register header text for selection
+        {
+            use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+            let text_layout = TextLayout::simple(
+                col.name.clone(), table.header_text_color.pack(),
+                tx, ty, char_width, table.line_height,
+            );
+            snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
+        }
         if let Some(sort_id) = col.sort_id {
             snapshot.register_widget(sort_id, Rect::new(col_x, y, col.width, table.header_height));
         }
@@ -1006,6 +1016,7 @@ fn render_table(
     // Data rows — variable height based on wrapped line count
     let data_y = sep_y + 1.0;
     let mut ry = data_y;
+    let char_width = 8.4_f32;
     for (row_idx, row) in table.rows.iter().enumerate() {
         let rh = table.row_height_for(row);
 
@@ -1025,22 +1036,39 @@ fn render_table(
                 if cell.lines.len() <= 1 {
                     // Single line (fast path)
                     let text = if cell.lines.len() == 1 { &cell.lines[0] } else { &cell.text };
+                    let tx = col_x + cell_pad;
+                    let ty = ry + 2.0;
                     snapshot.primitives_mut().add_text_cached(
                         text.clone(),
-                        Point::new(col_x + cell_pad, ry + 2.0),
+                        Point::new(tx, ty),
                         cell.color,
                         hash_text(text) ^ (row_idx as u64),
                     );
+                    // Register for selection
+                    use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                    let text_layout = TextLayout::simple(
+                        text.clone(), cell.color.pack(),
+                        tx, ty, char_width, table.line_height,
+                    );
+                    snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
                 } else {
                     // Multi-line wrapped cell
                     for (line_idx, line) in cell.lines.iter().enumerate() {
+                        let tx = col_x + cell_pad;
                         let ly = ry + 2.0 + line_idx as f32 * table.line_height;
                         snapshot.primitives_mut().add_text_cached(
                             line.clone(),
-                            Point::new(col_x + cell_pad, ly),
+                            Point::new(tx, ly),
                             cell.color,
                             hash_text(line) ^ (row_idx as u64) ^ ((line_idx as u64) << 32),
                         );
+                        // Register for selection
+                        use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                        let text_layout = TextLayout::simple(
+                            line.clone(), cell.color.pack(),
+                            tx, ly, char_width, table.line_height,
+                        );
+                        snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
                     }
                 }
                 col_x += table.columns[col_idx].width;
