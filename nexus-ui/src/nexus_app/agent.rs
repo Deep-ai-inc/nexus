@@ -48,10 +48,8 @@ pub(crate) struct AgentWidget {
 }
 
 impl AgentWidget {
-    pub fn new(
-        event_tx: mpsc::UnboundedSender<AgentEvent>,
-        event_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
-    ) -> Self {
+    pub fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
             blocks: Vec::new(),
             block_index: HashMap::new(),
@@ -61,7 +59,7 @@ impl AgentWidget {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             dirty: false,
             session_id: None,
-            event_rx,
+            event_rx: Arc::new(Mutex::new(event_rx)),
         }
     }
 

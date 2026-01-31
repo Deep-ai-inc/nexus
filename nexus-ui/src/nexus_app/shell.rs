@@ -75,10 +75,9 @@ pub(crate) struct ShellWidget {
 
 impl ShellWidget {
     pub fn new(
-        pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
-        pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
         kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
     ) -> Self {
+        let (pty_tx, pty_rx) = mpsc::unbounded_channel();
         Self {
             blocks: Vec::new(),
             block_index: HashMap::new(),
@@ -90,7 +89,7 @@ impl ShellWidget {
             last_exit_code: None,
             image_handles: HashMap::new(),
             jobs: Vec::new(),
-            pty_rx,
+            pty_rx: Arc::new(Mutex::new(pty_rx)),
             kernel_rx,
         }
     }

@@ -33,7 +33,7 @@ use transient_ui::TransientUi;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, Mutex};
 
 use nexus_kernel::Kernel;
 
@@ -194,9 +194,6 @@ impl RootComponent for NexusState {
             .map(|entries| entries.into_iter().rev().map(|e| e.command).collect())
             .unwrap_or_default();
 
-        let (pty_tx, pty_rx) = mpsc::unbounded_channel();
-        let (agent_event_tx, agent_event_rx) = mpsc::unbounded_channel();
-
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~".to_string());
@@ -210,15 +207,8 @@ impl RootComponent for NexusState {
 
         let state = NexusState {
             input: input_widget,
-            shell: ShellWidget::new(
-                pty_tx,
-                Arc::new(Mutex::new(pty_rx)),
-                Arc::new(Mutex::new(kernel_rx)),
-            ),
-            agent: AgentWidget::new(
-                agent_event_tx,
-                Arc::new(Mutex::new(agent_event_rx)),
-            ),
+            shell: ShellWidget::new(Arc::new(Mutex::new(kernel_rx))),
+            agent: AgentWidget::new(),
             selection: SelectionWidget::new(),
 
             scroll: ScrollModel::new(),
