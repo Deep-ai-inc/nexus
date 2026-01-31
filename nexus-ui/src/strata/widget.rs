@@ -185,7 +185,7 @@ mod tests {
         }
 
         fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect) {
-            pipeline.add_text(&self.text, bounds.x, bounds.y, Color::WHITE);
+            pipeline.add_text(&self.text, bounds.x, bounds.y, Color::WHITE, 14.0);
         }
     }
 

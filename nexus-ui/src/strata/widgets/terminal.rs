@@ -226,7 +226,7 @@ impl StrataWidget<TerminalMessage> for TerminalWidget {
             }
 
             if !line.trim().is_empty() {
-                pipeline.add_text(&line, bounds.x, y, current_fg);
+                pipeline.add_text(&line, bounds.x, y, current_fg, 14.0);
             }
         }
     }

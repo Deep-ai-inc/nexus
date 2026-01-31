@@ -151,7 +151,7 @@ impl StrataWidget<TextMessage> for TextWidget {
     }
 
     fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect) {
-        pipeline.add_text(&self.text, bounds.x, bounds.y, self.attrs.color);
+        pipeline.add_text(&self.text, bounds.x, bounds.y, self.attrs.color, self.attrs.font_size);
     }
 }
 

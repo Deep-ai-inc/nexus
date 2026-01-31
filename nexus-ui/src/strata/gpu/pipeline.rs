@@ -1042,11 +1042,13 @@ impl StrataPipeline {
     // Text rendering
     // =========================================================================
 
-    /// Add a text string to render.
-    pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: Color) {
+    /// Add a text string to render at a specific font size.
+    pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: Color, font_size: f32) {
         let packed_color = color.pack();
+        let metrics = self.glyph_atlas.metrics_for_size(font_size);
+        let ascent = metrics.ascent;
+        let cell_width = metrics.cell_width;
         let mut cursor_x = x;
-        let ascent = self.glyph_atlas.ascent;
 
         for ch in text.chars() {
             if ch == '\n' {
@@ -1054,16 +1056,17 @@ impl StrataPipeline {
                 continue;
             }
 
-            let glyph = self.glyph_atlas.get_glyph(ch);
+            let glyph = self.glyph_atlas.get_glyph(ch, font_size);
 
             // Skip zero-size glyphs (spaces, etc.) but advance cursor
             if glyph.width == 0 || glyph.height == 0 {
-                cursor_x += self.glyph_atlas.cell_width;
+                cursor_x += cell_width;
                 continue;
             }
 
-            let glyph_x = cursor_x + glyph.offset_x as f32;
-            let glyph_y = y + ascent - glyph.offset_y as f32 - glyph.height as f32;
+            // Pixel-align glyph positions to avoid subpixel blur
+            let glyph_x = (cursor_x + glyph.offset_x as f32).round();
+            let glyph_y = (y + ascent - glyph.offset_y as f32 - glyph.height as f32).round();
 
             // Convert u16 atlas UVs to f32 tl/br
             let tl_u = Self::uv_to_f32(glyph.uv_x);
@@ -1083,7 +1086,7 @@ impl StrataPipeline {
                 clip_rect: NO_CLIP,
             });
 
-            cursor_x += self.glyph_atlas.cell_width;
+            cursor_x += cell_width;
         }
     }
 

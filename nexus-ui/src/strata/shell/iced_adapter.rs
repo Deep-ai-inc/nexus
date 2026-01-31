@@ -816,7 +816,7 @@ impl PipelineWrapper {
                         let x = grid_layout.bounds.x * scale;
                         let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
                         let color = crate::strata::primitives::Color::unpack(row.color);
-                        pipeline.add_text(&row.text, x, y, color);
+                        pipeline.add_text(&row.text, x, y, color, BASE_FONT_SIZE * scale);
                         maybe_clip(pipeline, start, grid_clip, scale);
                     }
                 }
@@ -831,6 +831,7 @@ impl PipelineWrapper {
                 prim.position.x * scale,
                 prim.position.y * scale,
                 prim.color,
+                prim.font_size * scale,
             );
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
@@ -883,6 +884,7 @@ impl PipelineWrapper {
             let start = pipeline.instance_count();
             pipeline.add_text(
                 &prim.text, prim.position.x * scale, prim.position.y * scale, prim.color,
+                prim.font_size * scale,
             );
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }

@@ -2506,12 +2506,12 @@ fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuState) {
         p.add_rounded_rect(item_rect, 4.0, bg);
 
         // Label
-        p.add_text(item.label(), Point::new(ix + 10.0, iy + 6.0), Color::rgb(0.92, 0.92, 0.92));
+        p.add_text(item.label(), Point::new(ix + 10.0, iy + 6.0), Color::rgb(0.92, 0.92, 0.92), 14.0);
 
         // Shortcut hint (right-aligned)
         let shortcut = item.shortcut();
         if !shortcut.is_empty() {
-            p.add_text(shortcut, Point::new(ix + iw - 36.0, iy + 6.0), Color::rgb(0.45, 0.45, 0.5));
+            p.add_text(shortcut, Point::new(ix + iw - 36.0, iy + 6.0), Color::rgb(0.45, 0.45, 0.5), 14.0);
         }
     }
 }

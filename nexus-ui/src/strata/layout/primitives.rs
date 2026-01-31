@@ -109,6 +109,7 @@ pub struct TextRun {
     pub text: String,
     pub position: Point,
     pub color: Color,
+    pub font_size: f32,
     pub cache_key: Option<u64>,
     pub clip_rect: Option<Rect>,
 }
@@ -287,24 +288,25 @@ impl PrimitiveBatch {
         self
     }
 
-    /// Add a pre-positioned text run.
+    /// Add a pre-positioned text run at the given font size.
     ///
     /// Use `cache_key` if the text content is stable (e.g., hash of the string).
     /// This enables the text engine to skip reshaping if nothing changed.
     #[inline]
-    pub fn add_text(&mut self, text: impl Into<String>, position: Point, color: Color) -> &mut Self {
+    pub fn add_text(&mut self, text: impl Into<String>, position: Point, color: Color, font_size: f32) -> &mut Self {
         let clip_rect = self.current_clip();
         self.text_runs.push(TextRun {
             text: text.into(),
             position,
             color,
+            font_size,
             cache_key: None,
             clip_rect,
         });
         self
     }
 
-    /// Add text with an explicit cache key.
+    /// Add text with an explicit cache key at the given font size.
     ///
     /// The cache key should be stable across frames for unchanged content.
     /// Typically: `hash(source_id, content)` or a row/line ID.
@@ -314,6 +316,7 @@ impl PrimitiveBatch {
         text: impl Into<String>,
         position: Point,
         color: Color,
+        font_size: f32,
         cache_key: u64,
     ) -> &mut Self {
         let clip_rect = self.current_clip();
@@ -321,6 +324,7 @@ impl PrimitiveBatch {
             text: text.into(),
             position,
             color,
+            font_size,
             cache_key: Some(cache_key),
             clip_rect,
         });

@@ -11,9 +11,10 @@ use crate::strata::primitives::{Color, Rect, Size};
 use crate::strata::scroll_state::ScrollState;
 use crate::strata::text_input_state::TextInputState;
 
-// Layout metrics (centralized; will come from font system in production)
+// Layout metrics derived from fontdue for JetBrains Mono at 14px base size.
 const CHAR_WIDTH: f32 = 8.4;
 const LINE_HEIGHT: f32 = 18.0;
+const BASE_FONT_SIZE: f32 = 14.0;
 
 /// Sizing mode for a container axis.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -371,6 +372,7 @@ fn render_text_input(
             input.placeholder.clone(),
             Point::new(text_x, text_y),
             input.placeholder_color,
+            BASE_FONT_SIZE,
             hash_text(&input.placeholder),
         );
     } else {
@@ -378,6 +380,7 @@ fn render_text_input(
             input.text,
             Point::new(text_x, text_y),
             input.text_color,
+            BASE_FONT_SIZE,
             input.cache_key,
         );
     }
@@ -471,6 +474,7 @@ fn render_text_input_multiline(
             input.placeholder.clone(),
             Point::new(text_x, text_y),
             input.placeholder_color,
+            BASE_FONT_SIZE,
             hash_text(&input.placeholder),
         );
     } else {
@@ -482,6 +486,7 @@ fn render_text_input_multiline(
                     line.to_string(),
                     Point::new(text_x, ly),
                     input.text_color,
+                    BASE_FONT_SIZE,
                     hash_text(line).wrapping_add(line_idx as u64),
                 );
             }
@@ -579,13 +584,26 @@ impl TextElement {
     }
 
     /// Estimate size for layout (uses character count heuristic).
+    ///
+    /// Scales metrics proportionally when a non-default font size is set.
+    /// JetBrains Mono scales linearly, so this is a good approximation.
     fn estimate_size(&self, default_char_width: f32, default_line_height: f32) -> Size {
         if let Some(size) = self.measured_size {
             return size;
         }
-        // Simple estimate: char_count * char_width
+        let (cw, lh) = if let Some(fs) = self.size {
+            let scale = fs / BASE_FONT_SIZE;
+            (default_char_width * scale, default_line_height * scale)
+        } else {
+            (default_char_width, default_line_height)
+        };
         let char_count = self.text.chars().count() as f32;
-        Size::new(char_count * default_char_width, default_line_height)
+        Size::new(char_count * cw, lh)
+    }
+
+    /// Get the effective font size for this element.
+    fn font_size(&self) -> f32 {
+        self.size.unwrap_or(BASE_FONT_SIZE)
     }
 }
 
@@ -987,6 +1005,7 @@ fn render_table(
             col.name.clone(),
             Point::new(tx, ty),
             table.header_text_color,
+            BASE_FONT_SIZE,
             hash_text(&col.name),
         );
         // Register header text for selection
@@ -1042,6 +1061,7 @@ fn render_table(
                         text.clone(),
                         Point::new(tx, ty),
                         cell.color,
+                        BASE_FONT_SIZE,
                         hash_text(text) ^ (row_idx as u64),
                     );
                     // Register for selection
@@ -1060,6 +1080,7 @@ fn render_table(
                             line.clone(),
                             Point::new(tx, ly),
                             cell.color,
+                            BASE_FONT_SIZE,
                             hash_text(line) ^ (row_idx as u64) ^ ((line_idx as u64) << 32),
                         );
                         // Register for selection
@@ -1531,16 +1552,18 @@ impl Column {
 
             match child {
                 LayoutChild::Text(t) => {
+                    let fs = t.font_size();
                     let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
                     let x = cross_x(size.width);
 
                     use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
+                        let scale = fs / BASE_FONT_SIZE;
                         let text_layout = TextLayout::simple(
                             t.text.clone(),
                             t.color.pack(),
                             x, y,
-                            CHAR_WIDTH, LINE_HEIGHT,
+                            CHAR_WIDTH * scale, LINE_HEIGHT * scale,
                         );
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
                     }
@@ -1549,6 +1572,7 @@ impl Column {
                         t.text,
                         crate::strata::primitives::Point::new(x, y),
                         t.color,
+                        fs,
                         t.cache_key,
                     );
 
@@ -1592,6 +1616,7 @@ impl Column {
                         btn.label,
                         crate::strata::primitives::Point::new(bx + btn.padding.left, y + btn.padding.top),
                         btn.text_color,
+                        BASE_FONT_SIZE,
                         btn.cache_key,
                     );
                     snapshot.register_widget(btn.id, btn_rect);
@@ -2152,16 +2177,18 @@ impl Row {
 
             match child {
                 LayoutChild::Text(t) => {
+                    let fs = t.font_size();
                     let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
                     let y = cross_y(size.height);
 
                     use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
+                        let scale = fs / BASE_FONT_SIZE;
                         let text_layout = TextLayout::simple(
                             t.text.clone(),
                             t.color.pack(),
                             x, y,
-                            CHAR_WIDTH, LINE_HEIGHT,
+                            CHAR_WIDTH * scale, LINE_HEIGHT * scale,
                         );
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
                     }
@@ -2170,6 +2197,7 @@ impl Row {
                         t.text,
                         crate::strata::primitives::Point::new(x, y),
                         t.color,
+                        fs,
                         t.cache_key,
                     );
 
@@ -2213,6 +2241,7 @@ impl Row {
                         btn.label,
                         crate::strata::primitives::Point::new(x + btn.padding.left, by + btn.padding.top),
                         btn.text_color,
+                        BASE_FONT_SIZE,
                         btn.cache_key,
                     );
                     snapshot.register_widget(btn.id, btn_rect);
@@ -2611,13 +2640,15 @@ impl ScrollColumn {
 
                 match child {
                     LayoutChild::Text(t) => {
+                        let fs = t.font_size();
                         use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
                         if let Some(source_id) = t.source_id {
+                            let scale = fs / BASE_FONT_SIZE;
                             let text_layout = TextLayout::simple(
                                 t.text.clone(),
                                 t.color.pack(),
                                 content_x, screen_y,
-                                CHAR_WIDTH, LINE_HEIGHT,
+                                CHAR_WIDTH * scale, LINE_HEIGHT * scale,
                             );
                             snapshot.register_source(source_id, SourceLayout::text(text_layout));
                         }
@@ -2626,6 +2657,7 @@ impl ScrollColumn {
                             t.text,
                             crate::strata::primitives::Point::new(content_x, screen_y),
                             t.color,
+                            fs,
                             t.cache_key,
                         );
                     }
@@ -2661,6 +2693,7 @@ impl ScrollColumn {
                             btn.label,
                             crate::strata::primitives::Point::new(content_x + btn.padding.left, screen_y + btn.padding.top),
                             btn.text_color,
+                            BASE_FONT_SIZE,
                             btn.cache_key,
                         );
                         snapshot.register_widget(btn.id, btn_rect);

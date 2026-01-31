@@ -825,6 +825,7 @@ impl StrataApp for DemoApp {
             format!("{:.0} FPS", fps),
             Point::new(vw - 70.0, 4.0),
             colors::TEXT_MUTED,
+            14.0,
         );
     }
 
@@ -968,7 +969,7 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
 
     let p = snapshot.primitives_mut();
 
-    p.add_text("Context Menu", Point::new(x, y), colors::TEXT_SECONDARY);
+    p.add_text("Context Menu", Point::new(x, y), colors::TEXT_SECONDARY, 14.0);
 
     let my = y + 22.0;
 
@@ -988,13 +989,13 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
     // Copy (hover)
     let iy = my + 4.0;
     p.add_rounded_rect(Rect::new(ix, iy, iw, row_h - 2.0), 4.0, colors::BG_HOVER);
-    p.add_text("Copy", Point::new(ix + 8.0, iy + 4.0), Color::WHITE);
-    p.add_text("\u{2318}C", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+    p.add_text("Copy", Point::new(ix + 8.0, iy + 4.0), Color::WHITE, 14.0);
+    p.add_text("\u{2318}C", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED, 14.0);
 
     // Paste
     let iy = iy + row_h;
-    p.add_text("Paste", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY);
-    p.add_text("\u{2318}V", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+    p.add_text("Paste", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY, 14.0);
+    p.add_text("\u{2318}V", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED, 14.0);
 
     // Separator
     let iy = iy + row_h;
@@ -1006,12 +1007,12 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
 
     // Select All
     let iy = iy + sep_gap;
-    p.add_text("Select All", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY);
-    p.add_text("\u{2318}A", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+    p.add_text("Select All", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY, 14.0);
+    p.add_text("\u{2318}A", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED, 14.0);
 
     // Clear Selection (disabled)
     let iy = iy + row_h;
-    p.add_text("Clear Selection", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_MUTED);
+    p.add_text("Clear Selection", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_MUTED, 14.0);
 
     // Separator
     let iy = iy + row_h;
@@ -1023,8 +1024,8 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
 
     // Search
     let iy = iy + sep_gap;
-    p.add_text("Search", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY);
-    p.add_text("\u{2318}F", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED);
+    p.add_text("Search", Point::new(ix + 8.0, iy + 4.0), colors::TEXT_PRIMARY, 14.0);
+    p.add_text("\u{2318}F", Point::new(ix + iw - 30.0, iy + 4.0), colors::TEXT_MUTED, 14.0);
 }
 
 // =========================================================================
@@ -1035,20 +1036,20 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
     let p = snapshot.primitives_mut();
 
     p.add_rounded_rect(Rect::new(x, y, width, 180.0), 6.0, colors::BG_BLOCK);
-    p.add_text("Drawing Styles", Point::new(x + 10.0, y + 6.0), colors::TEXT_SECONDARY);
+    p.add_text("Drawing Styles", Point::new(x + 10.0, y + 6.0), colors::TEXT_SECONDARY, 14.0);
 
     let lx = x + 14.0;
     let lw = width - 28.0;
 
     // --- Solid lines (various thickness) ---
     let ly = y + 32.0;
-    p.add_text("Solid", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_text("Solid", Point::new(lx, ly), colors::TEXT_MUTED, 14.0);
     p.add_line(Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw * 0.5, ly + 9.0), 1.0, colors::RUNNING);
     p.add_line(Point::new(lx + lw * 0.5 + 8.0, ly + 9.0), Point::new(lx + lw, ly + 9.0), 2.0, colors::SUCCESS);
 
     // --- Dashed lines ---
     let ly = ly + 24.0;
-    p.add_text("Dashed", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_text("Dashed", Point::new(lx, ly), colors::TEXT_MUTED, 14.0);
     p.add_line_styled(
         Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw, ly + 9.0),
         1.5, colors::WARNING, LineStyle::Dashed,
@@ -1056,7 +1057,7 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
 
     // --- Dotted lines ---
     let ly = ly + 24.0;
-    p.add_text("Dotted", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_text("Dotted", Point::new(lx, ly), colors::TEXT_MUTED, 14.0);
     p.add_line_styled(
         Point::new(lx + 50.0, ly + 9.0), Point::new(lx + lw, ly + 9.0),
         1.5, colors::ERROR, LineStyle::Dotted,
@@ -1064,7 +1065,7 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
 
     // --- Polyline (zigzag) ---
     let ly = ly + 24.0;
-    p.add_text("Poly", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_text("Poly", Point::new(lx, ly), colors::TEXT_MUTED, 14.0);
     let seg_w = (lw - 50.0) / 8.0;
     let zigzag: Vec<Point> = (0..9)
         .map(|i| {
@@ -1077,7 +1078,7 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
 
     // --- Polyline (animated sine wave) ---
     let ly = ly + 28.0;
-    p.add_text("Curve", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_text("Curve", Point::new(lx, ly), colors::TEXT_MUTED, 14.0);
     let curve_w = lw - 50.0;
     let phase = time * 2.0;
     let curve: Vec<Point> = (0..40)
@@ -1092,7 +1093,7 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
 
     // --- Dashed polyline (animated wave) ---
     let ly = ly + 28.0;
-    p.add_text("Wave", Point::new(lx, ly), colors::TEXT_MUTED);
+    p.add_text("Wave", Point::new(lx, ly), colors::TEXT_MUTED, 14.0);
     let wave_phase = time * 3.0;
     let wave: Vec<Point> = (0..40)
         .map(|i| {

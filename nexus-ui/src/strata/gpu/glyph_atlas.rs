@@ -1,7 +1,8 @@
 //! Glyph Atlas for GPU text rendering.
 //!
 //! Lazily rasterizes glyphs using fontdue and packs them into a texture atlas.
-//! Optimized with O(1) ASCII lookup and pre-calculated UVs.
+//! Supports multiple font sizes in a single shared atlas. Base-size ASCII glyphs
+//! use an O(1) lookup; other sizes use a HashMap keyed by `(char, size_key)`.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -23,6 +24,20 @@ fn get_font() -> &'static Font {
     })
 }
 
+/// Quantize a font size to 0.5px granularity to bound cache entries.
+#[inline]
+fn size_key(font_size: f32) -> u16 {
+    (font_size * 2.0).round() as u16
+}
+
+/// Per-size font metrics.
+#[derive(Debug, Clone, Copy)]
+pub struct SizeMetrics {
+    pub cell_width: f32,
+    pub cell_height: f32,
+    pub ascent: f32,
+}
+
 /// A cached glyph with pre-calculated UVs.
 #[derive(Debug, Clone, Copy)]
 pub struct CachedGlyph {
@@ -37,13 +52,21 @@ pub struct CachedGlyph {
     pub uv_h: u16,
 }
 
-/// Glyph atlas that lazily rasterizes and packs glyphs.
+/// Glyph atlas that lazily rasterizes and packs glyphs at multiple sizes.
+///
+/// All sizes share a single atlas texture. Base-size ASCII uses a fast array
+/// lookup; other (char, size) pairs use a HashMap.
 pub struct GlyphAtlas {
+    /// Base font size (used for the fast ASCII cache path).
     font_size: f32,
-    /// Cache for non-ASCII glyphs.
-    glyphs: HashMap<char, CachedGlyph>,
-    /// Fast O(1) lookup for ASCII characters.
+    /// Pre-computed size_key for the base font size.
+    base_size_key: u16,
+    /// Cache for non-base-size glyphs (and non-ASCII base-size glyphs).
+    glyphs: HashMap<(char, u16), CachedGlyph>,
+    /// Fast O(1) lookup for ASCII characters at the base font size.
     ascii_cache: [Option<CachedGlyph>; 128],
+    /// Per-size font metrics, lazily computed.
+    size_metrics: HashMap<u16, SizeMetrics>,
     /// Atlas texture data (RGBA).
     atlas_data: Vec<u8>,
     /// Atlas dimensions.
@@ -58,14 +81,14 @@ pub struct GlyphAtlas {
     /// of all glyph writes since last upload.
     dirty_region: Option<(u32, u32, u32, u32)>,
     resized: bool,
-    /// Font metrics.
+    /// Base font metrics (convenience accessors for the common case).
     pub cell_width: f32,
     pub cell_height: f32,
     pub ascent: f32,
 }
 
 impl GlyphAtlas {
-    /// Create a new glyph atlas with the given font size.
+    /// Create a new glyph atlas with the given base font size.
     pub fn new(font_size: f32) -> Self {
         let font = get_font();
 
@@ -76,14 +99,15 @@ impl GlyphAtlas {
         let cell_height = line_metrics.new_line_size;
         let ascent = line_metrics.ascent;
 
+        let base_key = size_key(font_size);
+        let mut size_metrics = HashMap::new();
+        size_metrics.insert(base_key, SizeMetrics { cell_width, cell_height, ascent });
+
         let atlas_width = 512;
         let atlas_height = 512;
         let mut atlas_data = vec![0u8; (atlas_width * atlas_height * 4) as usize];
 
         // Reserve a 1x1 white pixel at (0,0) for solid quads (selection, backgrounds).
-        // This enables the "white pixel trick" for branchless ubershader rendering:
-        // - Glyphs sample their actual texture region
-        // - Solid quads sample this white pixel, so color * 1.0 = color
         atlas_data[0] = 255; // R
         atlas_data[1] = 255; // G
         atlas_data[2] = 255; // B
@@ -91,8 +115,10 @@ impl GlyphAtlas {
 
         Self {
             font_size,
+            base_size_key: base_key,
             glyphs: HashMap::new(),
             ascii_cache: [None; 128],
+            size_metrics,
             atlas_data,
             atlas_width,
             atlas_height,
@@ -117,43 +143,65 @@ impl GlyphAtlas {
     /// sample the exact same texel regardless of quad size.
     #[inline]
     pub fn white_pixel_uv(&self) -> (u16, u16, u16, u16) {
-        // The white pixel is at (0,0) with size 1x1.
-        // To avoid bilinear filtering artifacts, we sample the CENTER of the pixel:
-        //   center_u = 0.5 / atlas_width
-        //   center_v = 0.5 / atlas_height
-        // And use ZERO UV size so the UV doesn't change across the quad.
         let center_u = (0.5 / self.atlas_width as f32) * 65535.0;
         let center_v = (0.5 / self.atlas_height as f32) * 65535.0;
         (
-            center_u as u16,  // uv_x: center of white pixel
-            center_v as u16,  // uv_y: center of white pixel
-            0,                // uv_w: ZERO - don't interpolate across quad
-            0,                // uv_h: ZERO - don't interpolate across quad
+            center_u as u16,
+            center_v as u16,
+            0,
+            0,
         )
     }
 
-    /// Get or create a cached glyph for the given character.
+    /// Get font metrics for a specific size. Lazily computed and cached.
+    pub fn metrics_for_size(&mut self, font_size: f32) -> SizeMetrics {
+        let key = size_key(font_size);
+        if let Some(&m) = self.size_metrics.get(&key) {
+            return m;
+        }
+        let font = get_font();
+        let effective_size = key as f32 / 2.0;
+        let char_metrics = font.metrics('M', effective_size);
+        let line_metrics = font.horizontal_line_metrics(effective_size).unwrap();
+        let m = SizeMetrics {
+            cell_width: char_metrics.advance_width,
+            cell_height: line_metrics.new_line_size,
+            ascent: line_metrics.ascent,
+        };
+        self.size_metrics.insert(key, m);
+        m
+    }
+
+    /// Get or create a cached glyph for the given character at a specific font size.
     #[inline]
-    pub fn get_glyph(&mut self, ch: char) -> CachedGlyph {
-        // Fast path: ASCII
-        if ch < '\u{80}' {
+    pub fn get_glyph(&mut self, ch: char, font_size: f32) -> CachedGlyph {
+        let key = size_key(font_size);
+
+        // Fast path: base-size ASCII
+        if key == self.base_size_key && ch < '\u{80}' {
             let idx = ch as usize;
             if let Some(g) = self.ascii_cache[idx] {
                 return g;
             }
         }
 
-        // Slow path: HashMap or rasterize
-        if !self.glyphs.contains_key(&ch) {
-            self.rasterize_and_cache(ch);
+        // Slow path: HashMap lookup or rasterize
+        let glyph_key = (ch, key);
+        if let Some(&g) = self.glyphs.get(&glyph_key) {
+            return g;
         }
-        *self.glyphs.get(&ch).unwrap()
+
+        self.rasterize_and_cache(ch, font_size);
+        *self.glyphs.get(&glyph_key).unwrap()
     }
 
-    /// Rasterize a glyph and add it to the atlas.
-    fn rasterize_and_cache(&mut self, ch: char) {
+    /// Rasterize a glyph at a specific font size and add it to the atlas.
+    fn rasterize_and_cache(&mut self, ch: char, font_size: f32) {
+        let key = size_key(font_size);
+        let effective_size = key as f32 / 2.0;
+
         let font = get_font();
-        let (metrics, bitmap) = font.rasterize(ch, self.font_size);
+        let (metrics, bitmap) = font.rasterize(ch, effective_size);
 
         let width = metrics.width as u32;
         let height = metrics.height as u32;
@@ -204,10 +252,11 @@ impl GlyphAtlas {
             uv_h: (height as f32 * inv_h) as u16,
         };
 
-        if ch < '\u{80}' {
+        // Store in base-size ASCII cache if applicable
+        if key == self.base_size_key && ch < '\u{80}' {
             self.ascii_cache[ch as usize] = Some(glyph);
         }
-        self.glyphs.insert(ch, glyph);
+        self.glyphs.insert((ch, key), glyph);
     }
 
     /// Find space in atlas for a glyph.
@@ -259,6 +308,7 @@ impl GlyphAtlas {
     fn clear_atlas(&mut self) {
         self.glyphs.clear();
         self.ascii_cache = [None; 128];
+        // Keep size_metrics — they don't depend on atlas state
         self.atlas_data.fill(0);
         // Re-write the white pixel at (0,0)
         self.atlas_data[0] = 255; // R
@@ -300,11 +350,12 @@ impl GlyphAtlas {
         self.resized = false;
     }
 
-    /// Pre-cache common ASCII characters.
+    /// Pre-cache common ASCII characters at the base font size.
     pub fn precache_ascii(&mut self) {
+        let base_size = self.font_size;
         for ch in (32u8..=126u8).map(|b| b as char) {
             if self.ascii_cache[ch as usize].is_none() {
-                self.rasterize_and_cache(ch);
+                self.rasterize_and_cache(ch, base_size);
             }
         }
     }
