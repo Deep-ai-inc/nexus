@@ -35,7 +35,7 @@ impl NexusCommand for UlimitCommand {
                 "-u" => resource = Some(Resource::MaxProcesses),
                 "-v" => resource = Some(Resource::VirtualMemory),
                 arg if !arg.starts_with('-') => {
-                    new_value = Some(arg.clone());
+                    new_value = Some(arg);
                 }
                 _ => {}
             }

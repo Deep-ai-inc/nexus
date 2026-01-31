@@ -361,65 +361,6 @@ fn command_to_task<M: Send + 'static>(mut cmd: Command<M>) -> Task<ShellMessage<
     Task::batch(tasks)
 }
 
-/// Convert an iced Event to a Strata Event.
-fn convert_event(event: &Event) -> Option<crate::strata::event_context::Event> {
-    match event {
-        Event::Mouse(mouse_event) => {
-            let strata_event = match mouse_event {
-                iced::mouse::Event::ButtonPressed(button) => MouseEvent::ButtonPressed {
-                    button: convert_mouse_button(*button),
-                    position: Point::ORIGIN, // Will be filled from cursor position
-                },
-                iced::mouse::Event::ButtonReleased(button) => MouseEvent::ButtonReleased {
-                    button: convert_mouse_button(*button),
-                    position: Point::ORIGIN,
-                },
-                iced::mouse::Event::CursorMoved { position } => MouseEvent::CursorMoved {
-                    position: Point::new(position.x, position.y),
-                },
-                iced::mouse::Event::CursorEntered => MouseEvent::CursorEntered,
-                iced::mouse::Event::CursorLeft => MouseEvent::CursorLeft,
-                iced::mouse::Event::WheelScrolled { delta } => MouseEvent::WheelScrolled {
-                    delta: match delta {
-                        iced::mouse::ScrollDelta::Lines { x, y } => ScrollDelta::Lines {
-                            x: *x,
-                            y: *y,
-                        },
-                        iced::mouse::ScrollDelta::Pixels { x, y } => ScrollDelta::Pixels {
-                            x: *x,
-                            y: *y,
-                        },
-                    },
-                    position: Point::ORIGIN,
-                },
-            };
-            Some(crate::strata::event_context::Event::Mouse(strata_event))
-        }
-
-        Event::Keyboard(keyboard_event) => {
-            let strata_event = match keyboard_event {
-                iced::keyboard::Event::KeyPressed { key, modifiers, text, .. } => {
-                    KeyEvent::Pressed {
-                        key: convert_key(key),
-                        modifiers: convert_modifiers(*modifiers),
-                        text: text.as_ref().map(|s| s.to_string()),
-                    }
-                }
-                iced::keyboard::Event::KeyReleased { key, modifiers, .. } => {
-                    KeyEvent::Released {
-                        key: convert_key(key),
-                        modifiers: convert_modifiers(*modifiers),
-                    }
-                }
-                _ => return None,
-            };
-            Some(crate::strata::event_context::Event::Keyboard(strata_event))
-        }
-
-        _ => None,
-    }
-}
-
 /// Convert an iced mouse event to a Strata MouseEvent.
 fn convert_mouse_event(
     event: &iced::mouse::Event,

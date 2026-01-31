@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache,
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping,
 };
 use lru::LruCache;
 
@@ -131,8 +131,6 @@ impl CacheKey {
 
 /// Text engine with cosmic-text and caching.
 pub struct TextEngine {
-    /// Swash cache for glyph rasterization.
-    swash_cache: SwashCache,
 
     /// LRU cache for shaped text.
     cache: LruCache<CacheKey, ShapedText>,
@@ -150,7 +148,6 @@ impl TextEngine {
     /// Create a new text engine with specified cache capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            swash_cache: SwashCache::new(),
             cache: LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap()),
             default_attrs: TextAttrs::default(),
         }

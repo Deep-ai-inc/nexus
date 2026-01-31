@@ -80,7 +80,6 @@ pub(crate) mod colors {
     pub const BG_APP: Color = Color { r: 0.07, g: 0.07, b: 0.09, a: 1.0 };
     pub const BG_BLOCK: Color = Color { r: 0.12, g: 0.12, b: 0.14, a: 1.0 };
     pub const BG_INPUT: Color = Color { r: 0.1, g: 0.1, b: 0.12, a: 1.0 };
-    pub const BG_CARD: Color = Color { r: 0.16, g: 0.16, b: 0.18, a: 1.0 };
 
     // Status (matched from theme.rs)
     pub const SUCCESS: Color = Color { r: 0.3, g: 0.8, b: 0.5, a: 1.0 };
@@ -113,7 +112,6 @@ pub(crate) mod colors {
     pub const BTN_KILL: Color = Color { r: 0.7, g: 0.2, b: 0.2, a: 1.0 };
 
     // Borders (matched from theme.rs BORDER_DEFAULT + view/mod.rs)
-    pub const BORDER_SUBTLE: Color = Color { r: 0.2, g: 0.2, b: 0.22, a: 1.0 };
     pub const BORDER_INPUT: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.08 };
 
     // Welcome screen (matched from app/view/welcome.rs)
@@ -122,8 +120,6 @@ pub(crate) mod colors {
     pub const CARD_BG: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.03 };
     pub const CARD_BORDER: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.06 };
 
-    // Cursor
-    pub const CURSOR: Color = Color { r: 0.9, g: 0.9, b: 0.9, a: 0.8 };
 }
 
 // =========================================================================
