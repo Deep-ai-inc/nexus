@@ -76,16 +76,56 @@ The difference is invisible until you need it:
 ## Architecture
 
 ```
-nexus/
-├── nexus-kernel/     # Shell interpreter (bash-compatible parser, evaluator)
-├── nexus-ui/         # Native GUI (Iced framework)
-├── nexus-api/        # Structured data types (Value, Events)
-└── nexus-term/       # Legacy command support (PTY, ANSI parsing)
+┌─────────────────────────────────────────────────────────────────┐
+│  PRESENTATION                                                   │
+│  strata            Standalone GPU UI engine (WGPU, cosmic-text)│
+│    Primitives, layout, GPU pipeline, text engine, event system │
+│                                                                 │
+│  nexus-ui          Nexus shell frontend (depends on strata)    │
+│    ├─ nexus_app       App shell, state, subscriptions          │
+│    ├─ nexus_widgets   Nexus-specific widget implementations    │
+│    └─ blocks/         Command output blocks (structured + PTY) │
+└────────────┬───────────────────────────┬────────────────────────┘
+             │                           │
+┌────────────▼──────────────┐ ┌──────────▼────────────────────────┐
+│  SHELL INTERPRETER        │ │  AGENT SYSTEM                     │
+│  nexus-kernel             │ │  nexus-agent                      │
+│    ├─ Parser (tree-sitter)│ │    ├─ Agentic loop & tool system  │
+│    ├─ Evaluator (AST)     │ │    ├─ Session management          │
+│    ├─ 40+ native commands │ │    └─ ACP protocol integration    │
+│    ├─ Job control         │ │                                   │
+│    └─ SQLite history      │ │  Composed of:                     │
+│                           │ │    nexus-llm       Multi-provider │
+│  Execution paths:         │ │      (Anthropic, OpenAI, Ollama,  │
+│    Kernel → Value output  │ │       Vertex, Groq, Mistral, ...) │
+│    PTY    → raw terminal  │ │    nexus-executor  Cmd execution  │
+│                           │ │    nexus-fs        File ops       │
+│                           │ │    nexus-web       Web & search   │
+│                           │ │    nexus-sandbox   Policy enforce │
+└────────────┬──────────────┘ └──────────┬────────────────────────┘
+             │                           │
+┌────────────▼───────────────────────────▼────────────────────────┐
+│  INFRASTRUCTURE                                                 │
+│  nexus-api         Shared types: Value, ShellEvent, BlockMeta  │
+│    Value = Bool | Int | String | List | Table | Record         │
+│            | FileEntry | Process | GitStatus | Media | ...     │
+│                                                                 │
+│  nexus-term        Headless terminal emulation (alacritty)     │
+│    ANSI parsing, virtual grid for legacy TUI apps              │
+│                                                                 │
+│  nexus-sandbox     macOS Seatbelt, read-only/workspace policies │
+└─────────────────────────────────────────────────────────────────┘
+
+Data flow:
+  Input → Parser → CommandClassification
+    ├─ Kernel path → Evaluator → Native cmd → Value → ShellEvent
+    └─ PTY path    → Subprocess → nexus-term (ANSI) → Grid → ShellEvent
+  All ShellEvents → tokio broadcast → UI subscription → GPU render
 ```
 
-**Native commands** (ls, git, ps, etc.) return structured data (`Value` types).
-**Legacy commands** run in a PTY with proper terminal emulation.
-**The UI** renders both seamlessly.
+**Native commands** (ls, git, ps, etc.) return structured `Value` types.
+**Legacy commands** (vim, htop, etc.) run in a PTY with full terminal emulation.
+**The UI** renders both seamlessly through Strata, the sole GPU-accelerated rendering layer.
 
 ## Status
 
@@ -110,12 +150,12 @@ cargo build --release
 cargo run -p nexus-ui --release
 ```
 
-### Strata GUI Library Demo
+### Strata Demo
 
-Nexus includes **Strata**, a custom GPU-accelerated GUI library. To run the demo:
+**Strata** is now its own workspace crate — a standalone GPU-accelerated GUI engine. To run its demo:
 
 ```bash
-cargo run -p nexus-ui --example strata_demo
+cargo run -p nexus-ui -- --demo
 ```
 
 ## License
