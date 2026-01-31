@@ -18,7 +18,7 @@ use crate::strata::layout::containers::{
 };
 use crate::strata::primitives::Color;
 use crate::strata::scroll_state::ScrollState;
-use crate::widgets::job_indicator::{VisualJob, VisualJobState};
+use crate::blocks::{VisualJob, VisualJobState};
 
 use super::nexus_app::colors;
 

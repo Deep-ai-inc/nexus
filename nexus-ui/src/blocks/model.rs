@@ -6,7 +6,32 @@ use nexus_api::{BlockId, BlockState, OutputFormat, Value};
 use nexus_term::TerminalParser;
 
 use crate::agent_block::AgentBlock;
-use crate::widgets::table::TableSort;
+
+/// Sort state for a table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableSort {
+    /// Which column is being sorted (by index).
+    pub column: Option<usize>,
+    /// Sort direction (true = ascending, false = descending).
+    pub ascending: bool,
+}
+
+impl TableSort {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Toggle sort on a column. If already sorting by this column, reverse direction.
+    /// If sorting by a different column, start ascending.
+    pub fn toggle(&mut self, column_index: usize) {
+        if self.column == Some(column_index) {
+            self.ascending = !self.ascending;
+        } else {
+            self.column = Some(column_index);
+            self.ascending = true;
+        }
+    }
+}
 
 /// Unified block type - either a shell command or agent conversation.
 #[derive(Debug)]
@@ -130,4 +155,42 @@ pub enum InputMode {
 pub enum PtyEvent {
     Output(Vec<u8>),
     Exited(i32),
+}
+
+/// A job displayed in the status bar.
+#[derive(Debug, Clone)]
+pub struct VisualJob {
+    pub id: u32,
+    pub command: String,
+    pub state: VisualJobState,
+}
+
+/// Visual state of a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualJobState {
+    Running,
+    Stopped,
+}
+
+impl VisualJob {
+    pub fn new(id: u32, command: String, state: VisualJobState) -> Self {
+        Self { id, command, state }
+    }
+
+    /// Get a shortened display name for the job.
+    pub fn display_name(&self) -> String {
+        if self.command.len() > 20 {
+            format!("{}...", &self.command[..17])
+        } else {
+            self.command.clone()
+        }
+    }
+
+    /// Get the icon for this job state.
+    pub fn icon(&self) -> &'static str {
+        match self.state {
+            VisualJobState::Running => "●",
+            VisualJobState::Stopped => "⏸",
+        }
+    }
 }

@@ -1,10 +1,9 @@
 //! Nexus - The converged shell runtime.
 //!
-//! Main entry point for the Iced-based GUI.
+//! Main entry point for the GPU-accelerated Nexus UI.
 //!
 //! Flags:
-//!   --strata       Launch the Strata-based Nexus UI
-//!   --strata-demo  Launch the Strata demo/playground UI
+//!   --demo  Launch the Strata demo/playground UI
 
 use tracing_subscriber::EnvFilter;
 
@@ -15,15 +14,12 @@ fn main() -> iced::Result {
 
     let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "--strata") {
-        tracing::info!("Starting Nexus (Strata)");
-        nexus_ui::strata::nexus_app::run().map_err(strata_err)
-    } else if args.iter().any(|a| a == "--strata-demo") {
+    if args.iter().any(|a| a == "--demo") {
         tracing::info!("Starting Strata demo");
         nexus_ui::strata::demo::run().map_err(strata_err)
     } else {
-        tracing::info!("Starting Nexus shell");
-        nexus_ui::app::run()
+        tracing::info!("Starting Nexus");
+        nexus_ui::strata::nexus_app::run().map_err(strata_err)
     }
 }
 

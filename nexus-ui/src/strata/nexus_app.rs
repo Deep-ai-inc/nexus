@@ -3,7 +3,7 @@
 //! The Strata-based Nexus UI, built on the GPU-accelerated layout system.
 //! This is the replacement for the legacy Iced widget-based UI.
 //!
-//! Run with: `cargo run -p nexus-ui -- --strata`
+//! Run with: `cargo run -p nexus-ui`
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ use crate::strata::{
     TextInputState,
 };
 use crate::systems::{agent_subscription, kernel_subscription, pty_subscription, spawn_agent_task};
-use crate::widgets::job_indicator::{VisualJob, VisualJobState};
+use crate::blocks::{VisualJob, VisualJobState};
 
 // =========================================================================
 // Source ID helpers — single source of truth for all source ID strings
@@ -1164,8 +1164,8 @@ impl StrataApp for NexusApp {
         let vh = vp.height;
 
         // Recalculate terminal size from viewport
-        let char_width = crate::constants::DEFAULT_FONT_SIZE * crate::constants::CHAR_WIDTH_RATIO;
-        let line_height = crate::constants::DEFAULT_FONT_SIZE * crate::constants::LINE_HEIGHT_FACTOR;
+        let char_width = 14.0 * 0.607; // font_size * char_width_ratio
+        let line_height = 14.0 * 1.4; // font_size * line_height_factor
         let h_padding = 4.0 + 6.0 * 2.0; // outer padding + block padding
         let v_padding = 44.0;
         let cols = ((vw - h_padding) / char_width) as u16;
