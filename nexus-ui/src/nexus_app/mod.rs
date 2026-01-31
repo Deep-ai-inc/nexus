@@ -193,7 +193,7 @@ impl Component for NexusState {
         }
 
         // Drag ghost preview (overlay — above everything except context menus)
-        if let drag_state::DragStatus::Active(ref active) = self.drag.status {
+        if let drag_state::DragStatus::Active(drag_state::ActiveKind::Drag(ref active)) = self.drag.status {
             use strata::primitives::Color;
             let ghost_text = active.payload.preview_text();
             let gx = active.current_pos.x + 12.0;
@@ -269,7 +269,7 @@ impl Component for NexusState {
             self.agent.subscription(),
         ];
 
-        if self.shell.needs_redraw() || self.agent.needs_redraw() {
+        if self.shell.needs_redraw() || self.agent.needs_redraw() || self.drag.auto_scroll.get().is_some() {
             subs.push(Subscription::from_iced(
                 iced::time::every(std::time::Duration::from_millis(16))
                     .map(|_| NexusMessage::Tick),

@@ -9,7 +9,7 @@ use strata::{MouseResponse, ScrollAction, route_mouse};
 use crate::blocks::Focus;
 use crate::nexus_widgets::JobBar;
 
-use super::drag_state::{DragStatus, DRAG_THRESHOLD_SQ};
+use super::drag_state::{ActiveKind, DragStatus, PendingIntent, DRAG_THRESHOLD_SQ};
 use super::message::{
     AgentMsg, ContextMenuMsg, DragMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg,
 };
@@ -154,23 +154,51 @@ pub(super) fn on_mouse(
     // ── Drag state machine intercept ──────────────────────────────
     // When a drag is Pending or Active, all mouse events are routed here.
     match &state.drag.status {
-        DragStatus::Active(_) => {
-            return match &event {
-                MouseEvent::CursorMoved { position, .. } => {
-                    MouseResponse::message(NexusMessage::Drag(DragMsg::Move(*position)))
-                }
-                MouseEvent::ButtonReleased {
-                    button: MouseButton::Left,
-                    ..
-                } => {
-                    let zone = super::file_drop::resolve_drop_zone(state, &hit);
-                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Drop(zone)))
-                }
-                MouseEvent::CursorLeft => {
-                    // Cursor left the window during an active drag → hand off to OS
-                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::GoOutbound))
-                }
-                _ => MouseResponse::none(),
+        DragStatus::Active(kind) => {
+            return match kind {
+                ActiveKind::Drag(_) => match &event {
+                    MouseEvent::CursorMoved { position, .. } => {
+                        update_auto_scroll(state, position);
+                        MouseResponse::message(NexusMessage::Drag(DragMsg::Move(*position)))
+                    }
+                    MouseEvent::ButtonReleased {
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        state.drag.auto_scroll.set(None);
+                        let zone = super::file_drop::resolve_drop_zone(state, &hit);
+                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Drop(zone)))
+                    }
+                    MouseEvent::CursorLeft => {
+                        state.drag.auto_scroll.set(None);
+                        // Cursor left the window during an active drag → hand off to OS
+                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::GoOutbound))
+                    }
+                    _ => MouseResponse::none(),
+                },
+                ActiveKind::Selecting { .. } => match &event {
+                    MouseEvent::CursorMoved { position, .. } => {
+                        update_auto_scroll(state, position);
+                        if let Some(HitResult::Content(addr)) = hit {
+                            MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(addr)))
+                        } else {
+                            MouseResponse::none()
+                        }
+                    }
+                    MouseEvent::ButtonReleased {
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        state.drag.auto_scroll.set(None);
+                        // Cancel resets drag status to Inactive; dispatch_drag emits SelectionMsg::End
+                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
+                    }
+                    MouseEvent::CursorLeft => {
+                        state.drag.auto_scroll.set(None);
+                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
+                    }
+                    _ => MouseResponse::none(),
+                },
             };
         }
         DragStatus::Pending { origin, .. } => {
@@ -234,9 +262,38 @@ pub(super) fn on_mouse(
     // Widget clicks → delegate to children
     if let MouseEvent::ButtonPressed {
         button: MouseButton::Left,
+        position,
         ..
     } = &event
     {
+        // Z-order: Selection > Anchor > Text
+        // If clicking inside an existing non-collapsed selection, start a selection drag.
+        if let Some(HitResult::Content(addr)) = &hit {
+            if let Some(ref sel) = state.selection.selection {
+                if !sel.is_collapsed() {
+                    let ordering = super::selection::build_source_ordering(
+                        &state.shell.blocks,
+                        &state.agent.blocks,
+                    );
+                    if sel.contains(addr, &ordering) {
+                        let text = state
+                            .selection
+                            .extract_selected_text(&state.shell.blocks, &state.agent.blocks)
+                            .unwrap_or_default();
+                        let intent = PendingIntent::SelectionDrag {
+                            source: addr.source_id,
+                            text,
+                            origin_addr: addr.clone(),
+                        };
+                        return MouseResponse::message_and_capture(
+                            NexusMessage::Drag(DragMsg::Start(intent, *position)),
+                            addr.source_id,
+                        );
+                    }
+                }
+            }
+        }
+
         if let Some(HitResult::Widget(id)) = &hit {
             // Try each child in order
             if let Some(msg) = state.input.on_click(*id) {
@@ -251,12 +308,11 @@ pub(super) fn on_mouse(
 
             // Anchor clicks → start pending drag (click fires on release if <5px)
             if let Some(payload) = state.shell.drag_payload_for_anchor(*id) {
-                if let MouseEvent::ButtonPressed { position, .. } = &event {
-                    return MouseResponse::message_and_capture(
-                        NexusMessage::Drag(DragMsg::Start(payload, *position, *id)),
-                        *id,
-                    );
-                }
+                let intent = PendingIntent::Anchor { source: *id, payload };
+                return MouseResponse::message_and_capture(
+                    NexusMessage::Drag(DragMsg::Start(intent, *position)),
+                    *id,
+                );
             }
 
             // Job pills (cross-cutting: shell data → root scroll action)
@@ -267,11 +323,15 @@ pub(super) fn on_mouse(
             }
         }
 
-        // Text content selection (cross-child)
+        // Text content selection — immediate Active(Selecting), no hysteresis
         if let Some(HitResult::Content(addr)) = hit {
+            let mode = state.drag.click_tracker.register_click(
+                *position,
+                std::time::Instant::now(),
+            );
             let capture_source = addr.source_id;
             return MouseResponse::message_and_capture(
-                NexusMessage::Selection(SelectionMsg::Start(addr)),
+                NexusMessage::Drag(DragMsg::StartSelecting(addr, mode)),
                 capture_source,
             );
         }
@@ -279,30 +339,6 @@ pub(super) fn on_mouse(
         // Clicked empty space: blur inputs
         if state.input.text_input.focused {
             return MouseResponse::message(NexusMessage::BlurAll);
-        }
-    }
-
-    // Selection drag
-    if let MouseEvent::CursorMoved { .. } = &event {
-        if let CaptureState::Captured(_) = capture {
-            if let Some(HitResult::Content(addr)) = hit {
-                return MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(
-                    addr,
-                )));
-            }
-        }
-    }
-
-    // Selection release
-    if let MouseEvent::ButtonReleased {
-        button: MouseButton::Left,
-        ..
-    } = &event
-    {
-        if let CaptureState::Captured(_) = capture {
-            return MouseResponse::message_and_release(NexusMessage::Selection(
-                SelectionMsg::End,
-            ));
         }
     }
 
@@ -373,4 +409,32 @@ fn route_context_menu_click(state: &NexusState, hit: &Option<HitResult>) -> Opti
         }
     }
     Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss))
+}
+
+/// Compute auto-scroll speed based on cursor distance from scroll container edges.
+///
+/// 40px edge zone, proportional speed up to 8px per tick (~480px/s at 60fps).
+/// Negative = scroll up (toward top of content), positive = scroll down.
+fn update_auto_scroll(state: &NexusState, pos: &strata::primitives::Point) {
+    let bounds = state.scroll.state.bounds.get();
+    let edge = 40.0;
+    let max_speed = 8.0;
+
+    let speed = if pos.y < bounds.y + edge {
+        // Near top → scroll up (negative offset = toward top)
+        let dist = bounds.y + edge - pos.y;
+        -(dist / edge) * max_speed
+    } else if pos.y > bounds.y + bounds.height - edge {
+        // Near bottom → scroll down (positive offset = toward bottom)
+        let dist = pos.y - (bounds.y + bounds.height - edge);
+        (dist / edge) * max_speed
+    } else {
+        0.0
+    };
+
+    if speed.abs() > 0.1 {
+        state.drag.auto_scroll.set(Some(speed));
+    } else {
+        state.drag.auto_scroll.set(None);
+    }
 }

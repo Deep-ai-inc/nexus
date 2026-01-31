@@ -69,8 +69,10 @@ pub enum DropZone {
 /// Internal drag-and-drop messages.
 #[derive(Debug, Clone)]
 pub enum DragMsg {
-    /// Begin a pending drag (mouse down on draggable element).
-    Start(super::drag_state::DragPayload, strata::primitives::Point, strata::content_address::SourceId),
+    /// Begin a pending interaction (mouse down on draggable/ambiguous element).
+    Start(super::drag_state::PendingIntent, strata::primitives::Point),
+    /// Begin text selection immediately (no hysteresis — raw text click).
+    StartSelecting(ContentAddress, super::drag_state::SelectMode),
     /// Mouse moved past the 5px threshold — activate the drag.
     Activate(strata::primitives::Point),
     /// Mouse moved while drag is active.
@@ -167,7 +169,7 @@ pub enum AgentMsg {
 
 #[derive(Debug, Clone)]
 pub enum SelectionMsg {
-    Start(ContentAddress),
+    Start(ContentAddress, super::drag_state::SelectMode),
     Extend(ContentAddress),
     End,
     Clear,

@@ -18,6 +18,7 @@ use strata::Selection;
 pub(crate) struct SelectionWidget {
     pub selection: Option<Selection>,
     pub is_selecting: bool,
+    pub select_mode: super::drag_state::SelectMode,
 }
 
 impl SelectionWidget {
@@ -25,12 +26,14 @@ impl SelectionWidget {
         Self {
             selection: None,
             is_selecting: false,
+            select_mode: super::drag_state::SelectMode::Char,
         }
     }
 
     pub fn update(&mut self, msg: SelectionMsg, _ctx: &mut Ctx) -> (Command<SelectionMsg>, ()) {
         match msg {
-            SelectionMsg::Start(addr) => {
+            SelectionMsg::Start(addr, mode) => {
+                self.select_mode = mode;
                 self.selection = Some(Selection::new(addr.clone(), addr));
                 self.is_selecting = true;
             }
@@ -172,7 +175,7 @@ pub(crate) fn extract_block_text(
 // =========================================================================
 
 /// Build a source ordering reflecting current document order.
-fn build_source_ordering(blocks: &[Block], agent_blocks: &[AgentBlock]) -> SourceOrdering {
+pub(crate) fn build_source_ordering(blocks: &[Block], agent_blocks: &[AgentBlock]) -> SourceOrdering {
     let mut ordering = SourceOrdering::new();
     let unified = build_unified_refs(blocks, agent_blocks);
     for block_ref in &unified {

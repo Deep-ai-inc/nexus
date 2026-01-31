@@ -6,7 +6,7 @@ use strata::Command;
 use crate::blocks::Focus;
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
-use super::drag_state::{ActiveDrag, DragStatus};
+use super::drag_state::{ActiveDrag, ActiveKind, DragStatus, PendingIntent};
 use super::file_drop;
 use super::input::InputOutput;
 use super::message::{AnchorAction, ContextMenuMsg, DragMsg, DropZone, FileDropMsg, NexusMessage, ShellMsg};
@@ -122,7 +122,7 @@ impl NexusState {
             }
             NexusMessage::Tick => { self.on_output_arrived(); Command::none() }
             NexusMessage::FileDrop(m) => self.dispatch_file_drop(m),
-            NexusMessage::Drag(m) => { self.dispatch_drag(m); Command::none() }
+            NexusMessage::Drag(m) => { self.dispatch_drag(m, ctx); Command::none() }
         }
     }
 }
@@ -170,62 +170,114 @@ impl NexusState {
         Command::none()
     }
 
-    fn dispatch_drag(&mut self, msg: DragMsg) {
+    fn dispatch_drag(&mut self, msg: DragMsg, ctx: &mut strata::component::Ctx) {
         match msg {
-            DragMsg::Start(payload, origin, source) => {
+            DragMsg::Start(intent, origin) => {
                 self.drag.status = DragStatus::Pending {
                     origin,
-                    payload,
-                    source,
+                    intent,
                 };
             }
+            DragMsg::StartSelecting(addr, mode) => {
+                // Immediate Active — no Pending hysteresis for raw text clicks.
+                self.selection.update(
+                    super::message::SelectionMsg::Start(addr.clone(), mode),
+                    ctx,
+                );
+                self.drag.status = DragStatus::Active(ActiveKind::Selecting {
+                    start_addr: addr,
+                    mode,
+                });
+            }
             DragMsg::Activate(position) => {
-                if let DragStatus::Pending { origin, payload, source } =
+                if let DragStatus::Pending { origin, intent } =
                     std::mem::replace(&mut self.drag.status, DragStatus::Inactive)
                 {
-                    self.drag.status = DragStatus::Active(ActiveDrag {
-                        payload,
-                        origin,
-                        current_pos: position,
-                        source,
-                    });
+                    match intent {
+                        PendingIntent::Anchor { source, payload } => {
+                            self.drag.status = DragStatus::Active(ActiveKind::Drag(ActiveDrag {
+                                payload,
+                                origin,
+                                current_pos: position,
+                                source,
+                            }));
+                        }
+                        PendingIntent::SelectionDrag { source, text, .. } => {
+                            self.drag.status = DragStatus::Active(ActiveKind::Drag(ActiveDrag {
+                                payload: super::drag_state::DragPayload::Selection {
+                                    text,
+                                    structured: None,
+                                },
+                                origin,
+                                current_pos: position,
+                                source,
+                            }));
+                        }
+                        // Future intents — no-op for now
+                        _ => {
+                            self.drag.status = DragStatus::Inactive;
+                        }
+                    }
                 }
             }
             DragMsg::Move(position) => {
-                if let DragStatus::Active(ref mut active) = self.drag.status {
+                if let DragStatus::Active(ActiveKind::Drag(ref mut active)) = self.drag.status {
                     active.current_pos = position;
                 }
             }
             DragMsg::Drop(zone) => {
-                if let DragStatus::Active(active) =
+                if let DragStatus::Active(ActiveKind::Drag(active)) =
                     std::mem::replace(&mut self.drag.status, DragStatus::Inactive)
                 {
                     self.handle_internal_drop(active, zone);
+                } else {
+                    self.drag.status = DragStatus::Inactive;
                 }
             }
             DragMsg::GoOutbound => {
-                if let DragStatus::Active(active) =
+                if let DragStatus::Active(ActiveKind::Drag(active)) =
                     std::mem::replace(&mut self.drag.status, DragStatus::Inactive)
                 {
                     let source = self.payload_to_drag_source(&active);
                     if let Err(e) = strata::platform::start_drag(&source) {
                         tracing::warn!("Outbound drag failed: {}", e);
                     }
+                } else {
+                    self.drag.status = DragStatus::Inactive;
                 }
             }
             DragMsg::Cancel => {
-                // If Pending, treat as normal click — forward to the anchor handler.
-                if let DragStatus::Pending { source, .. } =
-                    std::mem::replace(&mut self.drag.status, DragStatus::Inactive)
-                {
-                    // Re-dispatch click to anchor handler (no fake mouse events)
-                    if let Some(msg) = self.shell.on_click_anchor(source) {
-                        if let ShellMsg::OpenAnchor(_, ref action) = msg {
-                            self.exec_anchor_action(action);
+                let prev = std::mem::replace(&mut self.drag.status, DragStatus::Inactive);
+                match prev {
+                    DragStatus::Pending { intent, .. } => {
+                        match intent {
+                            PendingIntent::Anchor { source, .. } => {
+                                // Re-dispatch click to anchor handler
+                                if let Some(msg) = self.shell.on_click_anchor(source) {
+                                    if let ShellMsg::OpenAnchor(_, ref action) = msg {
+                                        self.exec_anchor_action(action);
+                                    }
+                                }
+                            }
+                            PendingIntent::SelectionDrag { origin_addr, .. } => {
+                                // Click inside selection without drag → clear selection, place caret
+                                self.selection.update(
+                                    super::message::SelectionMsg::Start(origin_addr, super::drag_state::SelectMode::Char),
+                                    ctx,
+                                );
+                            }
+                            // Future intents — no-op
+                            _ => {}
                         }
                     }
-                } else {
-                    self.drag.status = DragStatus::Inactive;
+                    DragStatus::Active(ActiveKind::Selecting { .. }) => {
+                        // Selection ended (mouse released or cursor left)
+                        self.selection.update(
+                            super::message::SelectionMsg::End,
+                            ctx,
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
