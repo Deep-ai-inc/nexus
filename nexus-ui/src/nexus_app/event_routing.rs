@@ -268,28 +268,52 @@ pub(super) fn on_mouse(
     {
         // Z-order: Selection > Anchor > Text
         // If clicking inside an existing non-collapsed selection, start a selection drag.
-        if let Some(HitResult::Content(addr)) = &hit {
-            if let Some(ref sel) = state.selection.selection {
-                if !sel.is_collapsed() {
-                    let ordering = super::selection::build_source_ordering(
-                        &state.shell.blocks,
-                        &state.agent.blocks,
-                    );
-                    if sel.contains(addr, &ordering) {
-                        let text = state
-                            .selection
-                            .extract_selected_text(&state.shell.blocks, &state.agent.blocks)
-                            .unwrap_or_default();
-                        let intent = PendingIntent::SelectionDrag {
-                            source: addr.source_id,
-                            text,
-                            origin_addr: addr.clone(),
-                        };
-                        return MouseResponse::message_and_capture(
-                            NexusMessage::Drag(DragMsg::Start(intent, *position)),
-                            addr.source_id,
+        // This applies to both Content hits (raw text) and Widget hits (anchors inside
+        // selection) — clicking a link within selected text should drag the selection,
+        // not open the link.
+        if let Some(ref sel) = state.selection.selection {
+            if !sel.is_collapsed() {
+                let hit_in_selection = match &hit {
+                    Some(HitResult::Content(addr)) => {
+                        let ordering = super::selection::build_source_ordering(
+                            &state.shell.blocks,
+                            &state.agent.blocks,
                         );
+                        if sel.contains(addr, &ordering) {
+                            Some((addr.source_id, addr.clone()))
+                        } else {
+                            None
+                        }
                     }
+                    Some(HitResult::Widget(id)) => {
+                        let ordering = super::selection::build_source_ordering(
+                            &state.shell.blocks,
+                            &state.agent.blocks,
+                        );
+                        // Widget's SourceId within selection range → treat as selection drag
+                        if sel.sources(&ordering).contains(id) {
+                            Some((*id, strata::content_address::ContentAddress::start_of(*id)))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+
+                if let Some((source, origin_addr)) = hit_in_selection {
+                    let text = state
+                        .selection
+                        .extract_selected_text(&state.shell.blocks, &state.agent.blocks)
+                        .unwrap_or_default();
+                    let intent = PendingIntent::SelectionDrag {
+                        source,
+                        text,
+                        origin_addr,
+                    };
+                    return MouseResponse::message_and_capture(
+                        NexusMessage::Drag(DragMsg::Start(intent, *position)),
+                        source,
+                    );
                 }
             }
         }
