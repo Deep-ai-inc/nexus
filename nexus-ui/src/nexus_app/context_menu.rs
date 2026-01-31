@@ -3,7 +3,6 @@
 use std::cell::Cell;
 
 use nexus_api::BlockId;
-use strata::content_address::SourceId;
 use strata::layout_snapshot::LayoutSnapshot;
 use strata::primitives::{Color, Point, Rect};
 
@@ -84,7 +83,7 @@ pub fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuStat
         let item_rect = Rect::new(ix, iy, iw, row_h - 2.0);
 
         // Register as clickable widget
-        let item_id = SourceId::named(&format!("ctx_menu_{}", i));
+        let item_id = super::source_ids::ctx_menu_item(i);
         snapshot.register_widget(item_id, item_rect);
 
         let p = snapshot.overlay_primitives_mut();

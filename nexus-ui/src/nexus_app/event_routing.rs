@@ -1,7 +1,6 @@
 //! Event routing — dispatches keyboard and mouse events to the appropriate widgets.
 
 use nexus_api::Value;
-use strata::content_address::SourceId;
 use strata::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
@@ -65,19 +64,24 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
             };
         }
 
-        // Completion popup intercepts keys when visible
+        // Completion popup intercepts navigation keys when visible.
+        // Non-navigation keys dismiss the popup and fall through to normal input handling.
         if state.input.completion.is_active() {
-            return match key {
+            match key {
                 Key::Named(NamedKey::Tab) if modifiers.shift => {
-                    Some(NexusMessage::CompletionNav(-1))
+                    return Some(NexusMessage::CompletionNav(-1));
                 }
-                Key::Named(NamedKey::Tab) => Some(NexusMessage::CompletionNav(1)),
-                Key::Named(NamedKey::ArrowDown) => Some(NexusMessage::CompletionNav(1)),
-                Key::Named(NamedKey::ArrowUp) => Some(NexusMessage::CompletionNav(-1)),
-                Key::Named(NamedKey::Enter) => Some(NexusMessage::CompletionAccept),
-                Key::Named(NamedKey::Escape) => Some(NexusMessage::CompletionDismiss),
-                _ => Some(NexusMessage::CompletionDismiss),
-            };
+                Key::Named(NamedKey::Tab) => return Some(NexusMessage::CompletionNav(1)),
+                Key::Named(NamedKey::ArrowDown) => return Some(NexusMessage::CompletionNav(1)),
+                Key::Named(NamedKey::ArrowUp) => return Some(NexusMessage::CompletionNav(-1)),
+                Key::Named(NamedKey::Enter) => return Some(NexusMessage::CompletionAccept),
+                Key::Named(NamedKey::Escape) => return Some(NexusMessage::CompletionDismiss),
+                _ => {
+                    // Dismiss completion but don't consume the key — fall through
+                    // to normal input routing so the keystroke is not lost.
+                    return Some(NexusMessage::CompletionDismissAndForward(event));
+                }
+            }
         }
 
         // Cmd shortcuts (global)
@@ -205,9 +209,17 @@ pub(super) fn on_mouse(
         }
 
         if let Some(HitResult::Content(ref addr)) = hit {
+            // Match shell block content
             for block in &state.shell.blocks {
                 let term_id = source_ids::shell_term(block.id);
-                if addr.source_id == term_id {
+                let header_id = source_ids::shell_header(block.id);
+                let native_id = source_ids::native(block.id);
+                let table_id = source_ids::table(block.id);
+                if addr.source_id == term_id
+                    || addr.source_id == header_id
+                    || addr.source_id == native_id
+                    || addr.source_id == table_id
+                {
                     return MouseResponse::message(NexusMessage::ShowContextMenu(
                         position.x,
                         position.y,
@@ -216,8 +228,26 @@ pub(super) fn on_mouse(
                     ));
                 }
             }
+            // Match agent block content
+            for block in &state.agent.blocks {
+                let query_id = source_ids::agent_query(block.id);
+                let thinking_id = source_ids::agent_thinking(block.id);
+                let response_id = source_ids::agent_response(block.id);
+                if addr.source_id == query_id
+                    || addr.source_id == thinking_id
+                    || addr.source_id == response_id
+                {
+                    return MouseResponse::message(NexusMessage::ShowContextMenu(
+                        position.x,
+                        position.y,
+                        vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                        ContextTarget::AgentBlock(block.id),
+                    ));
+                }
+            }
         }
 
+        // Fallback: right-click on non-content area (e.g., widget chrome)
         if hit.is_some() {
             if let Some(block) = state.shell.blocks.last() {
                 return MouseResponse::message(NexusMessage::ShowContextMenu(
@@ -243,7 +273,7 @@ pub(super) fn on_mouse(
         if let Some(ref menu) = state.context_menu {
             let idx = if let Some(HitResult::Widget(id)) = &hit {
                 (0..menu.items.len())
-                    .find(|i| *id == SourceId::named(&format!("ctx_menu_{}", i)))
+                    .find(|i| *id == source_ids::ctx_menu_item(*i))
             } else {
                 None
             };
@@ -280,7 +310,7 @@ pub(super) fn on_mouse(
         if let Some(ref menu) = state.context_menu {
             if let Some(HitResult::Widget(id)) = &hit {
                 for (i, item) in menu.items.iter().enumerate() {
-                    if *id == SourceId::named(&format!("ctx_menu_{}", i)) {
+                    if *id == source_ids::ctx_menu_item(i) {
                         return MouseResponse::message(NexusMessage::ContextMenuAction(*item));
                     }
                 }
@@ -297,7 +327,7 @@ pub(super) fn on_mouse(
     {
         if let Some(HitResult::Widget(id)) = &hit {
             // Mode toggle
-            if *id == SourceId::named("mode_toggle") {
+            if *id == source_ids::mode_toggle() {
                 return MouseResponse::message(NexusMessage::ToggleMode);
             }
 
@@ -319,7 +349,7 @@ pub(super) fn on_mouse(
 
             // Attachment remove buttons
             for i in 0..state.input.attachments.len() {
-                let remove_id = SourceId::named(&format!("remove_attach_{}", i));
+                let remove_id = source_ids::remove_attachment(i);
                 if *id == remove_id {
                     return MouseResponse::message(NexusMessage::RemoveAttachment(i));
                 }

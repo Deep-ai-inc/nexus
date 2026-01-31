@@ -126,7 +126,7 @@ impl HistorySearchWidget {
     }
 
     /// Handle scroll action on the results list.
-    pub fn scroll(&mut self, action: ScrollAction) {
+    pub fn apply_scroll(&mut self, action: ScrollAction) {
         self.scroll.apply(action);
     }
 

@@ -14,10 +14,7 @@ use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
 use crate::systems::spawn_agent_task;
 
 /// Typed output from AgentWidget → orchestrator.
-#[allow(dead_code)]
 pub(crate) enum AgentOutput {
-    /// Nothing happened.
-    None,
     /// Orchestrator should scroll history to bottom.
     ScrollToBottom,
 }
@@ -62,6 +59,7 @@ impl AgentWidget {
         self.block_index.insert(block_id, idx);
         self.blocks.push(agent_block);
         self.active = Some(block_id);
+        self.dirty = true;
 
         // Reset cancel flag
         self.cancel_flag.store(false, Ordering::SeqCst);

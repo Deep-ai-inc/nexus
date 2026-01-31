@@ -69,6 +69,8 @@ impl CompletionWidget {
             self.scroll.offset = 0.0;
             CompletionOutput::None
         } else {
+            self.completions.clear();
+            self.index = None;
             CompletionOutput::None
         }
     }
@@ -129,7 +131,7 @@ impl CompletionWidget {
     }
 
     /// Handle scroll action on the completion popup.
-    pub fn scroll(&mut self, action: ScrollAction) {
+    pub fn apply_scroll(&mut self, action: ScrollAction) {
         self.scroll.apply(action);
     }
 }

@@ -55,6 +55,8 @@ pub enum NexusMessage {
     CompletionNav(isize),
     CompletionAccept,
     CompletionDismiss,
+    /// Dismiss completion and forward the key event to normal input handling.
+    CompletionDismissAndForward(KeyEvent),
 
     // History search (Ctrl+R)
     HistorySearchToggle,

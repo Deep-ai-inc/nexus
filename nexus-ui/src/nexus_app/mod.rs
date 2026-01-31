@@ -35,7 +35,6 @@ use nexus_kernel::Kernel;
 use crate::agent_adapter::AgentEvent;
 use crate::blocks::{Focus, PtyEvent, UnifiedBlockRef};
 use crate::context::NexusContext;
-use strata::content_address::SourceId;
 use strata::event_context::{CaptureState, KeyEvent, MouseEvent};
 use strata::layout_snapshot::HitResult;
 use crate::nexus_widgets::{
@@ -92,6 +91,8 @@ pub struct NexusState {
     pub context_menu: Option<ContextMenuState>,
     pub exit_requested: bool,
     pub context: NexusContext,
+    /// When true, auto-scroll to bottom on new output. Set false when user scrolls up.
+    pub follow_output: bool,
 }
 
 impl NexusState {
@@ -172,6 +173,7 @@ impl StrataApp for NexusApp {
             context_menu: None,
             exit_requested: false,
             context,
+            follow_output: true,
         };
 
         (state, Command::none())
@@ -225,8 +227,19 @@ impl StrataApp for NexusApp {
             NexusMessage::CompletionNav(delta) => state.input.completion_nav(delta),
             NexusMessage::CompletionAccept => state.input.completion_accept(),
             NexusMessage::CompletionDismiss => state.input.completion_dismiss(),
+            NexusMessage::CompletionDismissAndForward(event) => {
+                state.input.completion_dismiss();
+                if let InputOutput::Submit {
+                    text,
+                    is_agent,
+                    attachments,
+                } = state.input.handle_key(&event)
+                {
+                    return handle_submit(state, text, is_agent, attachments);
+                }
+            }
             NexusMessage::CompletionSelect(index) => state.input.completion_select(index),
-            NexusMessage::CompletionScroll(action) => state.input.completion.scroll(action),
+            NexusMessage::CompletionScroll(action) => state.input.completion.apply_scroll(action),
 
             // === History search → InputWidget (routes to HistorySearchWidget child) ===
             NexusMessage::HistorySearchToggle => state.input.history_search_toggle(),
@@ -239,7 +252,7 @@ impl StrataApp for NexusApp {
             NexusMessage::HistorySearchAcceptIndex(index) => {
                 state.input.history_search_accept_index(index);
             }
-            NexusMessage::HistorySearchScroll(action) => state.input.history_search.scroll(action),
+            NexusMessage::HistorySearchScroll(action) => state.input.history_search.apply_scroll(action),
 
             // === Shell → ShellWidget ===
             NexusMessage::PtyOutput(id, data) => {
@@ -295,9 +308,15 @@ impl StrataApp for NexusApp {
             NexusMessage::Copy => handle_copy(state),
 
             // === Scroll ===
-            NexusMessage::HistoryScroll(action) => state.history_scroll.apply(action),
+            NexusMessage::HistoryScroll(action) => {
+                state.history_scroll.apply(action);
+                // Detect if user scrolled away from bottom
+                let max = state.history_scroll.max.get();
+                state.follow_output = (max - state.history_scroll.offset).abs() < 2.0;
+            }
             NexusMessage::ScrollToJob(_) => {
                 state.history_scroll.offset = state.history_scroll.max.get();
+                state.follow_output = true;
             }
 
             // === Context menu ===
@@ -323,6 +342,7 @@ impl StrataApp for NexusApp {
                 state.shell.clear();
                 state.agent.clear();
                 state.history_scroll.offset = 0.0;
+                state.follow_output = true;
                 state.focus = Focus::Input;
                 state.input.text_input.focused = true;
             }
@@ -335,7 +355,9 @@ impl StrataApp for NexusApp {
                 if state.shell.terminal_dirty || state.agent.dirty {
                     state.shell.terminal_dirty = false;
                     state.agent.dirty = false;
-                    state.history_scroll.offset = state.history_scroll.max.get();
+                    if state.follow_output {
+                        state.history_scroll.offset = state.history_scroll.max.get();
+                    }
                 }
             }
         }
@@ -449,7 +471,7 @@ impl StrataApp for NexusApp {
                     .min(1.0);
                 let w = attachment.width as f32 * scale;
                 let h = attachment.height as f32 * scale;
-                let remove_id = SourceId::named(&format!("remove_attach_{}", i));
+                let remove_id = source_ids::remove_attachment(i);
                 attach_row = attach_row.push(
                     Column::new()
                         .spacing(2.0)
@@ -482,7 +504,7 @@ impl StrataApp for NexusApp {
                     cwd: &state.cwd,
                     last_exit_code: state.shell.last_exit_code,
                     cursor_visible,
-                    mode_toggle_id: SourceId::named("mode_toggle"),
+                    mode_toggle_id: source_ids::mode_toggle(),
                     line_count: {
                         let count = state.input.text_input.text.lines().count()
                             + if state.input.text_input.text.ends_with('\n') {
@@ -587,14 +609,17 @@ fn process_shell_output(state: &mut NexusState, output: ShellOutput) {
             state.focus = Focus::Input;
             state.input.text_input.focused = true;
             state.history_scroll.offset = state.history_scroll.max.get();
+            state.follow_output = true;
         }
         ShellOutput::FocusBlock(id) => {
             state.focus = Focus::Block(id);
             state.input.text_input.focused = false;
             state.history_scroll.offset = state.history_scroll.max.get();
+            state.follow_output = true;
         }
         ShellOutput::ScrollToBottom => {
             state.history_scroll.offset = state.history_scroll.max.get();
+            state.follow_output = true;
         }
         ShellOutput::CwdChanged(path) => {
             state.cwd = path.display().to_string();
@@ -609,15 +634,17 @@ fn process_shell_output(state: &mut NexusState, output: ShellOutput) {
             state.focus = Focus::Input;
             state.input.text_input.focused = true;
             state.history_scroll.offset = state.history_scroll.max.get();
+            state.follow_output = true;
         }
     }
 }
 
 fn process_agent_output(state: &mut NexusState, output: AgentOutput) {
     match output {
-        AgentOutput::None => {}
         AgentOutput::ScrollToBottom => {
-            state.history_scroll.offset = state.history_scroll.max.get();
+            if state.follow_output {
+                state.history_scroll.offset = state.history_scroll.max.get();
+            }
         }
     }
 }
@@ -650,12 +677,11 @@ fn handle_submit(
             .agent
             .spawn(block_id, text, contextualized_query, attachments, &state.cwd);
         state.history_scroll.offset = state.history_scroll.max.get();
+        state.follow_output = true;
     } else {
-        // Handle built-in: clear
+        // Handle built-in: clear — route through ClearScreen for consistent behavior
         if text.trim() == "clear" {
-            state.shell.clear();
-            state.agent.clear();
-            return Command::none();
+            return Command::message(NexusMessage::ClearScreen);
         }
 
         let block_id = state.next_id();

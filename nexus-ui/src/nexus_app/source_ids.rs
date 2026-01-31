@@ -19,3 +19,8 @@ pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId { SourceId::named(&f
 pub fn agent_perm_deny(id: BlockId) -> SourceId { SourceId::named(&format!("perm_deny_{}", id.0)) }
 pub fn agent_perm_allow(id: BlockId) -> SourceId { SourceId::named(&format!("perm_allow_{}", id.0)) }
 pub fn agent_perm_always(id: BlockId) -> SourceId { SourceId::named(&format!("perm_always_{}", id.0)) }
+
+// Global UI
+pub fn mode_toggle() -> SourceId { SourceId::named("mode_toggle") }
+pub fn remove_attachment(i: usize) -> SourceId { SourceId::named(&format!("remove_attach_{}", i)) }
+pub fn ctx_menu_item(i: usize) -> SourceId { SourceId::named(&format!("ctx_menu_{}", i)) }
