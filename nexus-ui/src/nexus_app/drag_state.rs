@@ -177,9 +177,9 @@ pub enum DragPayload {
 }
 
 impl DragPayload {
-    /// Short display text for the ghost preview (max 40 chars).
+    /// Display text for the ghost preview (max 8 lines, 80 chars each).
     pub fn preview_text(&self) -> String {
-        let text = match self {
+        let raw = match self {
             Self::Text(s) => s.clone(),
             Self::FilePath(p) => p.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -188,11 +188,24 @@ impl DragPayload {
             Self::Block(id) => format!("Block #{}", id.0),
             Self::Selection { text, .. } => text.clone(),
         };
-        if text.len() > 40 {
-            format!("{}...", &text[..37])
-        } else {
-            text
+        let max_lines = 8;
+        let max_line_len = 80;
+        let lines: Vec<&str> = raw.lines().collect();
+        let truncated_lines = lines.len() > max_lines;
+        let mut result: Vec<String> = lines.iter()
+            .take(max_lines)
+            .map(|line| {
+                if line.len() > max_line_len {
+                    format!("{}...", &line[..max_line_len - 3])
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        if truncated_lines {
+            result.push("...".to_string());
         }
+        result.join("\n")
     }
 }
 

@@ -196,10 +196,14 @@ impl Component for NexusState {
         if let drag_state::DragStatus::Active(drag_state::ActiveKind::Drag(ref active)) = self.drag.status {
             use strata::primitives::Color;
             let ghost_text = active.payload.preview_text();
+            let ghost_font_size = 13.0;
+            let metrics = strata::gpu::metrics_for_size(ghost_font_size);
+            let line_count = ghost_text.lines().count().max(1) as f32;
+            let max_line_chars = ghost_text.lines().map(|l| l.len()).max().unwrap_or(0);
             let gx = active.current_pos.x + 12.0;
             let gy = active.current_pos.y + 12.0;
-            let text_w = ghost_text.len() as f32 * 7.5 + 16.0; // approximate
-            let text_h = 24.0;
+            let text_w = max_line_chars as f32 * metrics.cell_width + 16.0;
+            let text_h = line_count * metrics.cell_height + 8.0;
             let p = snapshot.overlay_primitives_mut();
             p.add_rounded_rect(
                 Rect::new(gx, gy, text_w, text_h),

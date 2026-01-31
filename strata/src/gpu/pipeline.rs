@@ -1048,11 +1048,14 @@ impl StrataPipeline {
         let metrics = self.glyph_atlas.metrics_for_size(font_size);
         let ascent = metrics.ascent;
         let cell_width = metrics.cell_width;
+        let line_height = metrics.cell_height;
         let mut cursor_x = x;
+        let mut cursor_y = y;
 
         for ch in text.chars() {
             if ch == '\n' {
                 cursor_x = x;
+                cursor_y += line_height;
                 continue;
             }
 
@@ -1066,7 +1069,7 @@ impl StrataPipeline {
 
             // Pixel-align glyph positions to avoid subpixel blur
             let glyph_x = (cursor_x + glyph.offset_x as f32).round();
-            let glyph_y = (y + ascent - glyph.offset_y as f32 - glyph.height as f32).round();
+            let glyph_y = (cursor_y + ascent - glyph.offset_y as f32 - glyph.height as f32).round();
 
             // Convert u16 atlas UVs to f32 tl/br
             let tl_u = Self::uv_to_f32(glyph.uv_x);

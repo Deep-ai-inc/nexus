@@ -30,6 +30,22 @@ fn size_key(font_size: f32) -> u16 {
     (font_size * 2.0).round() as u16
 }
 
+/// Get font metrics for a given size without needing a GlyphAtlas instance.
+///
+/// Uses the same embedded font as the GPU pipeline. Suitable for layout
+/// calculations outside the render path (ghost previews, text measurement).
+pub fn metrics_for_size(font_size: f32) -> SizeMetrics {
+    let font = get_font();
+    let effective_size = size_key(font_size) as f32 / 2.0;
+    let char_metrics = font.metrics('M', effective_size);
+    let line_metrics = font.horizontal_line_metrics(effective_size).unwrap();
+    SizeMetrics {
+        cell_width: char_metrics.advance_width,
+        cell_height: line_metrics.new_line_size,
+        ascent: line_metrics.ascent,
+    }
+}
+
 /// Per-size font metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct SizeMetrics {
