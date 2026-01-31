@@ -4,7 +4,7 @@
 //! using Strata's layout primitives. Each widget takes references to backend
 //! data models and builds a layout tree.
 
-use nexus_api::{BlockId, BlockState, FileType, Value};
+use nexus_api::{BlockId, BlockState, FileType, Value, format_value_for_display};
 use nexus_kernel::{Completion, CompletionKind};
 
 use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus};
@@ -970,9 +970,13 @@ fn render_native_value(
             let cell_padding = 16.0_f32;
             for row in rows {
                 let cells: Vec<TableCell> = row.iter().enumerate().map(|(col_idx, cell)| {
-                    let text = cell.to_text();
+                    let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
+                        format_value_for_display(cell, fmt)
+                    } else {
+                        cell.to_text()
+                    };
                     let col_width = col_widths.get(col_idx).copied().unwrap_or(400.0);
-                    let max_chars = ((col_width - cell_padding) / char_w).max(1.0) as usize;
+                    let max_chars = ((col_width - cell_padding) / char_w + 0.5).max(1.0) as usize;
                     let lines = wrap_cell_text(&text, max_chars);
                     TableCell {
                         text,
@@ -1092,8 +1096,12 @@ fn estimate_column_widths(columns: &[nexus_api::TableColumn], rows: &[Vec<Value>
         let max_data_len = rows.iter()
             .filter_map(|row| row.get(i))
             .map(|v| {
-                v.to_text()
-                    .lines()
+                let text = if let Some(fmt) = col.format {
+                    format_value_for_display(v, fmt)
+                } else {
+                    v.to_text()
+                };
+                text.lines()
                     .map(|l| l.len())
                     .max()
                     .unwrap_or(0)
