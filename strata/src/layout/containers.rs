@@ -6,7 +6,7 @@
 
 use crate::content_address::SourceId;
 use crate::gpu::ImageHandle;
-use crate::layout_snapshot::LayoutSnapshot;
+use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
 use crate::primitives::{Color, Rect, Size};
 use crate::scroll_state::ScrollState;
 use crate::text_input_state::TextInputState;
@@ -398,6 +398,7 @@ fn render_text_input(
 
     // Register for hit-testing
     snapshot.register_widget(input.id, input_rect);
+    snapshot.set_cursor_hint(input.id, CursorIcon::Text);
 }
 
 /// Render a multiline text input element (code editor style).
@@ -507,6 +508,7 @@ fn render_text_input_multiline(
 
     // Register for hit-testing
     snapshot.register_widget(input.id, input_rect);
+    snapshot.set_cursor_hint(input.id, CursorIcon::Text);
 }
 
 /// Convert a char offset to (line, col) within newline-delimited text.
@@ -1019,6 +1021,7 @@ fn render_table(
         }
         if let Some(sort_id) = col.sort_id {
             snapshot.register_widget(sort_id, Rect::new(col_x, y, col.width, table.header_height));
+            snapshot.set_cursor_hint(sort_id, CursorIcon::Pointer);
         }
         col_x += col.width;
     }
@@ -1620,6 +1623,7 @@ impl Column {
                         btn.cache_key,
                     );
                     snapshot.register_widget(btn.id, btn_rect);
+                    snapshot.set_cursor_hint(btn.id, CursorIcon::Pointer);
                     y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::TextInput(input) => {
@@ -2245,6 +2249,7 @@ impl Row {
                         btn.cache_key,
                     );
                     snapshot.register_widget(btn.id, btn_rect);
+                    snapshot.set_cursor_hint(btn.id, CursorIcon::Pointer);
                     x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::TextInput(input) => {
@@ -2697,6 +2702,7 @@ impl ScrollColumn {
                             btn.cache_key,
                         );
                         snapshot.register_widget(btn.id, btn_rect);
+                        snapshot.set_cursor_hint(btn.id, CursorIcon::Pointer);
                     }
                     LayoutChild::TextInput(input) => {
                         let w = match input.width {
@@ -2771,6 +2777,7 @@ impl ScrollColumn {
             // anywhere in the scrollbar gutter initiates a drag.
             let track_hit = Rect::new(bounds.x + bounds.width - SCROLLBAR_GUTTER, bounds.y, SCROLLBAR_GUTTER, viewport_h);
             snapshot.register_widget(self.thumb_id, track_hit);
+            snapshot.set_cursor_hint(self.thumb_id, CursorIcon::Grab);
 
             // Store track info so the app can convert mouse Y → scroll offset
             use crate::layout_snapshot::ScrollTrackInfo;

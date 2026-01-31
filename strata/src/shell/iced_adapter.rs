@@ -514,6 +514,26 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             pending_image_unloads: self.pending_image_unloads.clone(),
         }
     }
+
+    fn mouse_interaction(
+        &self,
+        _state: &Self::State,
+        _bounds: iced::Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> iced::mouse::Interaction {
+        use crate::layout_snapshot::CursorIcon;
+
+        let Some(pos) = cursor.position() else {
+            return iced::mouse::Interaction::default();
+        };
+
+        match self.snapshot.cursor_at(Point::new(pos.x, pos.y)) {
+            CursorIcon::Arrow => iced::mouse::Interaction::Idle,
+            CursorIcon::Text => iced::mouse::Interaction::Text,
+            CursorIcon::Pointer => iced::mouse::Interaction::Pointer,
+            CursorIcon::Grab => iced::mouse::Interaction::Grab,
+        }
+    }
 }
 
 impl shader::Primitive for StrataPrimitive {

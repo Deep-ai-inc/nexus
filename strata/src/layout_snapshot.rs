@@ -30,6 +30,23 @@ pub enum HitResult {
     Widget(SourceId),
 }
 
+/// Cursor icon hint for mouse interaction feedback.
+///
+/// Set by widgets during layout to indicate what cursor should display
+/// when hovering over them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorIcon {
+    /// Default arrow cursor (non-interactive areas).
+    #[default]
+    Arrow,
+    /// Text selection cursor (I-beam) for content areas.
+    Text,
+    /// Pointer/hand cursor for clickable elements.
+    Pointer,
+    /// Grab cursor for draggable elements (scrollbar thumb).
+    Grab,
+}
+
 /// Anchor position for overlays relative to a widget.
 #[derive(Debug, Clone, Copy)]
 pub enum Anchor {
@@ -445,6 +462,9 @@ pub struct LayoutSnapshot {
     /// Maps scroll container ID → (track_y, track_height, thumb_height, max_scroll).
     /// Used to convert mouse Y position to scroll offset during thumb dragging.
     scroll_tracks: HashMap<SourceId, ScrollTrackInfo>,
+
+    /// Cursor hints for widgets. Set during layout, queried by mouse_interaction().
+    cursor_hints: HashMap<SourceId, CursorIcon>,
 }
 
 impl Default for LayoutSnapshot {
@@ -467,6 +487,7 @@ impl LayoutSnapshot {
             widget_bounds: HashMap::new(),
             scroll_limits: HashMap::new(),
             scroll_tracks: HashMap::new(),
+            cursor_hints: HashMap::new(),
         }
     }
 
@@ -481,6 +502,7 @@ impl LayoutSnapshot {
         self.widget_bounds.clear();
         self.scroll_limits.clear();
         self.scroll_tracks.clear();
+        self.cursor_hints.clear();
     }
 
     /// Get read-only access to the primitive batch.
@@ -527,6 +549,24 @@ impl LayoutSnapshot {
     /// Get the bounds of a registered widget.
     pub fn widget_bounds(&self, id: &SourceId) -> Option<Rect> {
         self.widget_bounds.get(id).copied()
+    }
+
+    /// Set a cursor hint for a widget. Called during layout by framework containers.
+    pub fn set_cursor_hint(&mut self, id: SourceId, cursor: CursorIcon) {
+        self.cursor_hints.insert(id, cursor);
+    }
+
+    /// Resolve the cursor icon for a screen position.
+    ///
+    /// Resolution: Content → Text, Widget → hint (default Arrow), None → Arrow.
+    pub fn cursor_at(&self, pos: Point) -> CursorIcon {
+        match self.hit_test(pos) {
+            Some(HitResult::Content(_)) => CursorIcon::Text,
+            Some(HitResult::Widget(id)) => {
+                self.cursor_hints.get(&id).copied().unwrap_or_default()
+            }
+            None => CursorIcon::Arrow,
+        }
     }
 
     /// Compute the position of an overlay anchored to a widget.
