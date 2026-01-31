@@ -16,6 +16,7 @@ use strata::layout::containers::{
     ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
     ScrollColumn, TableCell, TableElement, TerminalElement, TextElement, Widget,
 };
+use strata::layout_snapshot::CursorIcon;
 use strata::primitives::Color;
 use strata::scroll_state::ScrollState;
 use crate::blocks::{VisualJob, VisualJobState};
@@ -968,6 +969,7 @@ fn render_native_value(
             // Add data rows with line wrapping
             let char_w = 8.4_f32;
             let cell_padding = 16.0_f32;
+            let mut anchor_idx = 0usize;
             for row in rows {
                 let cells: Vec<TableCell> = row.iter().enumerate().map(|(col_idx, cell)| {
                     let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
@@ -978,10 +980,18 @@ fn render_native_value(
                     let col_width = col_widths.get(col_idx).copied().unwrap_or(400.0);
                     let max_chars = ((col_width - cell_padding) / char_w + 0.5).max(1.0) as usize;
                     let lines = wrap_cell_text(&text, max_chars);
+                    let widget_id = if is_anchor_value(cell) {
+                        let id = source_ids::anchor(block_id, anchor_idx);
+                        anchor_idx += 1;
+                        Some(id)
+                    } else {
+                        None
+                    };
                     TableCell {
                         text,
                         lines,
                         color: value_text_color(cell),
+                        widget_id,
                     }
                 }).collect();
                 table = table.row(cells);
@@ -1003,15 +1013,21 @@ fn render_native_value(
             let source_id = source_ids::native(block_id);
 
             if file_entries.len() == items.len() && !file_entries.is_empty() {
-                // Render as file list with colors
-                for entry in &file_entries {
+                // Render as file list with colors — each entry is a clickable anchor
+                for (i, entry) in file_entries.iter().enumerate() {
                     let color = file_entry_color(entry);
                     let display = if let Some(target) = &entry.symlink_target {
                         format!("{} -> {}", entry.name, target.display())
                     } else {
                         entry.name.clone()
                     };
-                    parent = parent.push(TextElement::new(display).color(color).source(source_id));
+                    let anchor_id = source_ids::anchor(block_id, i);
+                    parent = parent.push(
+                        Row::new()
+                            .id(anchor_id)
+                            .cursor_hint(CursorIcon::Pointer)
+                            .push(TextElement::new(display).color(color).source(source_id)),
+                    );
                 }
                 parent
             } else {
@@ -1033,7 +1049,13 @@ fn render_native_value(
                 entry.name.clone()
             };
             let source_id = source_ids::native(block_id);
-            parent.push(TextElement::new(display).color(color).source(source_id))
+            let anchor_id = source_ids::anchor(block_id, 0);
+            parent.push(
+                Row::new()
+                    .id(anchor_id)
+                    .cursor_hint(CursorIcon::Pointer)
+                    .push(TextElement::new(display).color(color).source(source_id)),
+            )
         }
 
         Value::Record(fields) => {
@@ -1163,6 +1185,14 @@ fn wrap_cell_text(text: &str, max_chars: usize) -> Vec<String> {
         result.push(String::new());
     }
     result
+}
+
+/// Whether a Value is anchor-worthy (clickable in the UI).
+pub(crate) fn is_anchor_value(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Path(_) | Value::FileEntry(_) | Value::Process(_) | Value::GitCommit(_)
+    )
 }
 
 /// Get display color for a file entry.

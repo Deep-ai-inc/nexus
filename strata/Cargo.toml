@@ -11,3 +11,9 @@ bytemuck = { workspace = true }
 wgpu = { workspace = true }
 image = { workspace = true }
 lru = "0.12"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWindow", "NSView", "NSPasteboard", "NSDragging", "NSEvent", "NSImage", "NSDraggingItem", "NSDraggingSession", "NSPasteboardItem", "NSWorkspace"] }
+objc2-foundation = { version = "0.2", features = ["NSURL", "NSArray", "NSString", "NSGeometry", "NSThread"] }

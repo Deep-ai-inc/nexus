@@ -1,26 +1,39 @@
 //! Context menu types and rendering.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 
 use nexus_api::BlockId;
 use strata::layout_snapshot::LayoutSnapshot;
 use strata::primitives::{Color, Point, Rect};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuItem {
     Copy,
     Paste,
     SelectAll,
     Clear,
+    CopyCommand,
+    CopyOutput,
+    CopyAsJson,
+    CopyAsTsv,
+    Rerun,
+    RevealInFinder(PathBuf),
 }
 
 impl ContextMenuItem {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> &str {
         match self {
             Self::Copy => "Copy",
             Self::Paste => "Paste",
             Self::SelectAll => "Select All",
             Self::Clear => "Clear",
+            Self::CopyCommand => "Copy Command",
+            Self::CopyOutput => "Copy Output",
+            Self::CopyAsJson => "Copy as JSON",
+            Self::CopyAsTsv => "Copy as TSV",
+            Self::Rerun => "Rerun",
+            Self::RevealInFinder(_) => "Reveal in Finder",
         }
     }
 
@@ -29,7 +42,7 @@ impl ContextMenuItem {
             Self::Copy => "\u{2318}C",
             Self::Paste => "\u{2318}V",
             Self::SelectAll => "\u{2318}A",
-            Self::Clear => "",
+            _ => "",
         }
     }
 }

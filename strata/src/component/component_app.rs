@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 
 use crate::app::{Command, MouseResponse, StrataApp, Subscription};
 use crate::content_address::Selection;
-use crate::event_context::{CaptureState, KeyEvent, MouseEvent};
+use crate::event_context::{CaptureState, FileDropEvent, KeyEvent, MouseEvent};
 use crate::gpu::ImageStore;
 use crate::layout_snapshot::{HitResult, LayoutSnapshot};
 use crate::primitives::Color;
@@ -88,6 +88,14 @@ where
         capture: &CaptureState,
     ) -> MouseResponse<C::Message> {
         state.on_mouse(event, hit, capture)
+    }
+
+    fn on_file_drop(
+        state: &C,
+        event: FileDropEvent,
+        hit: Option<HitResult>,
+    ) -> Option<C::Message> {
+        state.on_file_drop(event, hit)
     }
 
     fn subscription(state: &C) -> Subscription<C::Message> {

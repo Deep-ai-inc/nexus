@@ -63,6 +63,9 @@ pub mod component;
 pub mod widget;
 pub mod widgets;
 
+// Platform-specific (native drag, etc.)
+pub mod platform;
+
 // GPU pipeline
 pub mod gpu;
 
@@ -71,10 +74,10 @@ pub use primitives::{Color, Rect, Size, Constraints, Point};
 pub use content_address::{ContentAddress, SourceId, Selection, SourceOrdering};
 pub use layout_snapshot::{Anchor, CursorIcon, Decoration, HitResult, LayoutSnapshot, ScrollTrackInfo, SourceLayout, ItemLayout, TextLayout, GridLayout, GridRow};
 pub use event_context::{
-    CaptureState, Event, EventContext, Key, KeyEvent, Modifiers, MouseButton, MouseEvent,
-    NamedKey, ScrollDelta,
+    CaptureState, Event, EventContext, FileDropEvent, Key, KeyEvent, Modifiers, MouseButton,
+    MouseEvent, NamedKey, ScrollDelta,
 };
-pub use app::{StrataApp, Command, Subscription, AppConfig, MouseResponse, CaptureRequest};
+pub use app::{StrataApp, Command, Subscription, AppConfig, MouseResponse, CaptureRequest, DragSource};
 pub use widget::{StrataWidget, StrataWidgetExt, EventResult, BoxedWidget};
 pub use text_engine::{TextEngine, TextAttrs, ShapedText, FontFamily};
 pub use widgets::{TextWidget, TerminalWidget};

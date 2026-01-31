@@ -9,6 +9,7 @@
 //! drag selection when the cursor leaves the widget bounds.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 
 use crate::content_address::SourceId;
 use crate::layout_snapshot::LayoutSnapshot;
@@ -166,6 +167,17 @@ pub enum MouseEvent {
         delta: ScrollDelta,
         position: Point,
     },
+}
+
+/// File drop events from the OS (drag files onto the window).
+#[derive(Debug, Clone)]
+pub enum FileDropEvent {
+    /// A file is being hovered over the window.
+    Hovered(PathBuf),
+    /// A file was dropped onto the window.
+    Dropped(PathBuf),
+    /// All hovered files left the window.
+    HoverLeft,
 }
 
 /// Scroll delta types.

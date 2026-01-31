@@ -3,6 +3,8 @@
 //! Nested enum structure: each child component has its own message type,
 //! wrapped by the root `NexusMessage` enum. Cross-cutting messages stay at root.
 
+use std::path::PathBuf;
+
 use nexus_api::BlockId;
 use strata::content_address::ContentAddress;
 use strata::event_context::KeyEvent;
@@ -32,6 +34,53 @@ pub enum NexusMessage {
     BlurAll,
     Tick,
     ScrollToJob(u32),
+    FileDrop(FileDropMsg),
+    Drag(DragMsg),
+}
+
+/// File drop messages (from OS → Nexus).
+#[derive(Debug, Clone)]
+pub enum FileDropMsg {
+    /// A file is being hovered over a drop zone.
+    Hovered(PathBuf, DropZone),
+    /// A file was dropped onto a drop zone.
+    Dropped(PathBuf, DropZone),
+    /// Hover left the window.
+    HoverLeft,
+    /// Async file read completed (for agent panel drops).
+    FileLoaded(PathBuf, Vec<u8>),
+    /// Async file read failed.
+    FileLoadFailed(PathBuf, String),
+}
+
+/// Where a file drop is targeting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropZone {
+    /// The input bar.
+    InputBar,
+    /// The agent panel.
+    AgentPanel,
+    /// A shell block.
+    ShellBlock(BlockId),
+    /// Empty area (fallback to input bar).
+    Empty,
+}
+
+/// Internal drag-and-drop messages.
+#[derive(Debug, Clone)]
+pub enum DragMsg {
+    /// Begin a pending drag (mouse down on draggable element).
+    Start(super::drag_state::DragPayload, strata::primitives::Point, strata::content_address::SourceId),
+    /// Mouse moved past the 5px threshold — activate the drag.
+    Activate(strata::primitives::Point),
+    /// Mouse moved while drag is active.
+    Move(strata::primitives::Point),
+    /// Mouse released over a drop zone.
+    Drop(DropZone),
+    /// Drag cancelled (mouse released before threshold, or Escape).
+    Cancel,
+    /// Cursor left the window during an active drag — hand off to OS.
+    GoOutbound,
 }
 
 // =========================================================================
@@ -83,6 +132,18 @@ pub enum ShellMsg {
     KernelEvent(nexus_api::ShellEvent),
     KillBlock(BlockId),
     SortTable(BlockId, usize),
+    OpenAnchor(BlockId, AnchorAction),
+}
+
+/// Action to perform when a clickable anchor is activated.
+#[derive(Debug, Clone)]
+pub enum AnchorAction {
+    /// Reveal a path in Finder (`open -R`).
+    RevealPath(PathBuf),
+    /// Open a URL in the default browser.
+    OpenUrl(String),
+    /// Copy a string to the clipboard (PID, git hash, etc.).
+    CopyToClipboard(String),
 }
 
 // =========================================================================

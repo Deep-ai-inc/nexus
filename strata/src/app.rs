@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::content_address::{Selection, SourceId};
-use crate::event_context::{CaptureState, KeyEvent, MouseEvent};
+use crate::event_context::{CaptureState, FileDropEvent, KeyEvent, MouseEvent};
 use crate::gpu::ImageStore;
 use crate::layout_snapshot::{HitResult, LayoutSnapshot};
 
@@ -321,6 +321,18 @@ pub trait StrataApp: Sized + 'static {
         MouseResponse::none()
     }
 
+    /// Handle a file drop event from the OS.
+    ///
+    /// Called when the user drags files onto the window. The `hit` parameter
+    /// contains what's at the cursor position for drop target resolution.
+    fn on_file_drop(
+        _state: &Self::State,
+        _event: FileDropEvent,
+        _hit: Option<HitResult>,
+    ) -> Option<Self::Message> {
+        None
+    }
+
     /// Handle a keyboard event.
     ///
     /// Called by the shell on key press/release. Dispatched globally
@@ -354,6 +366,22 @@ pub trait StrataApp: Sized + 'static {
     fn should_exit(_state: &Self::State) -> bool {
         false
     }
+}
+
+/// Request to start an OS-level outbound drag.
+///
+/// The app layer decides *what* to drag; the platform layer handles *how*.
+#[derive(Debug, Clone)]
+pub enum DragSource {
+    /// Drag a file — the OS shows the file icon, Finder accepts it.
+    File(std::path::PathBuf),
+    /// Drag file content that doesn't exist on disk yet.
+    /// The OS creates a promised file on drop (NSFilePromiseProvider on macOS).
+    FilePromise { filename: String, data: Vec<u8> },
+    /// Drag plain text.
+    Text(String),
+    /// Drag TSV (spreadsheets accept structured paste).
+    Tsv(String),
 }
 
 /// Configuration for running a Strata application.

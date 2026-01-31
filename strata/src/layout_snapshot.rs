@@ -45,6 +45,10 @@ pub enum CursorIcon {
     Pointer,
     /// Grab cursor for draggable elements (scrollbar thumb).
     Grab,
+    /// Grabbing cursor — drag in progress.
+    Grabbing,
+    /// Copy cursor — drop will copy/insert data.
+    Copy,
 }
 
 /// Anchor position for overlays relative to a widget.

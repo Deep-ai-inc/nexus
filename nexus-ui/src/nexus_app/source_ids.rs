@@ -26,6 +26,7 @@ const STOP: u64 = 10;
 const PERM_DENY: u64 = 11;
 const PERM_ALLOW: u64 = 12;
 const PERM_ALWAYS: u64 = 13;
+const ANCHOR: u64 = 14;
 
 // --- Shell block IDs ---
 
@@ -50,6 +51,10 @@ pub fn agent_perm_always(id: BlockId) -> SourceId { block_space(id).id(PERM_ALWA
 
 pub fn table_sort(id: BlockId, col: usize) -> SourceId {
     block_space(id).child(TABLE).id(col as u64)
+}
+
+pub fn anchor(id: BlockId, index: usize) -> SourceId {
+    block_space(id).child(ANCHOR).id(index as u64)
 }
 
 pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId {

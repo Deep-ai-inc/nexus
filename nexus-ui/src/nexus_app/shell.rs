@@ -22,8 +22,9 @@ use crate::blocks::Focus;
 use crate::nexus_widgets::{JobBar, ShellBlockWidget};
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
-use super::message::{ContextMenuMsg, NexusMessage, ShellMsg};
+use super::message::{AnchorAction, ContextMenuMsg, NexusMessage, ShellMsg};
 use super::source_ids;
+use crate::nexus_widgets::is_anchor_value;
 
 /// Typed output from ShellWidget → orchestrator.
 pub(crate) enum ShellOutput {
@@ -168,11 +169,32 @@ impl ShellWidget {
         y: f32,
     ) -> Option<ContextMenuMsg> {
         let block_id = self.block_for_source(source_id)?;
-        Some(ContextMenuMsg::Show(
-            x, y,
-            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-            ContextTarget::Block(block_id),
-        ))
+        let block = self.block_index.get(&block_id)
+            .and_then(|&idx| self.blocks.get(idx));
+
+        let mut items = vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll];
+
+        if let Some(block) = block {
+            // Offer CopyCommand for any block with a command
+            if !block.command.is_empty() {
+                items.push(ContextMenuItem::CopyCommand);
+            }
+            // Offer structured export for table output
+            if let Some(Value::Table { .. }) = &block.native_output {
+                items.push(ContextMenuItem::CopyAsTsv);
+                items.push(ContextMenuItem::CopyAsJson);
+            }
+            // Offer CopyOutput for finished blocks
+            if !block.is_running() {
+                items.push(ContextMenuItem::CopyOutput);
+            }
+            // Offer Rerun for finished blocks
+            if !block.is_running() && !block.command.is_empty() {
+                items.push(ContextMenuItem::Rerun);
+            }
+        }
+
+        Some(ContextMenuMsg::Show(x, y, items, ContextTarget::Block(block_id)))
     }
 
     /// Build a fallback context menu (last block) for right-click on empty area.
@@ -183,6 +205,130 @@ impl ShellWidget {
             vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
             ContextTarget::Block(block.id),
         ))
+    }
+
+    /// Handle a click on an anchor widget. Returns None if not an anchor we own.
+    pub fn on_click_anchor(&self, id: SourceId) -> Option<ShellMsg> {
+        for block in &self.blocks {
+            if let Some(value) = &block.native_output {
+                if let Some(action) = self.resolve_anchor(block.id, value, id) {
+                    return Some(ShellMsg::OpenAnchor(block.id, action));
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve an anchor SourceId to an AnchorAction by walking the block's output.
+    /// Uses the same iteration order as rendering to match indices.
+    fn resolve_anchor(&self, block_id: BlockId, value: &Value, target: SourceId) -> Option<AnchorAction> {
+        match value {
+            Value::Table { rows, .. } => {
+                let mut anchor_idx = 0usize;
+                for row in rows {
+                    for cell in row {
+                        if is_anchor_value(cell) {
+                            if target == source_ids::anchor(block_id, anchor_idx) {
+                                return Some(value_to_anchor_action(cell));
+                            }
+                            anchor_idx += 1;
+                        }
+                    }
+                }
+                None
+            }
+            Value::List(items) => {
+                // File entry lists: anchor index = item position
+                let file_entries: Vec<&nexus_api::FileEntry> = items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::FileEntry(entry) => Some(entry.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                if file_entries.len() == items.len() && !file_entries.is_empty() {
+                    for (i, entry) in file_entries.iter().enumerate() {
+                        if target == source_ids::anchor(block_id, i) {
+                            return Some(AnchorAction::RevealPath(entry.path.clone()));
+                        }
+                    }
+                }
+                None
+            }
+            Value::FileEntry(entry) => {
+                if target == source_ids::anchor(block_id, 0) {
+                    Some(AnchorAction::RevealPath(entry.path.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve an anchor SourceId to a DragPayload for internal drag-and-drop.
+    /// Returns None if the id doesn't match any anchor.
+    pub fn drag_payload_for_anchor(&self, id: SourceId) -> Option<super::drag_state::DragPayload> {
+        for block in &self.blocks {
+            if let Some(value) = &block.native_output {
+                if let Some(payload) = self.resolve_drag_payload(block.id, value, id) {
+                    return Some(payload);
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_drag_payload(&self, block_id: BlockId, value: &Value, target: SourceId) -> Option<super::drag_state::DragPayload> {
+        use super::drag_state::DragPayload;
+
+        match value {
+            Value::Table { columns, rows } => {
+                let mut anchor_idx = 0usize;
+                for (row_index, row) in rows.iter().enumerate() {
+                    for (col_idx, cell) in row.iter().enumerate() {
+                        if is_anchor_value(cell) {
+                            if target == source_ids::anchor(block_id, anchor_idx) {
+                                // Extract the most useful text from this cell
+                                let display = semantic_text_for_value(cell, columns.get(col_idx));
+                                return Some(DragPayload::TableRow {
+                                    block_id,
+                                    row_index,
+                                    display,
+                                });
+                            }
+                            anchor_idx += 1;
+                        }
+                    }
+                }
+                None
+            }
+            Value::List(items) => {
+                let file_entries: Vec<&nexus_api::FileEntry> = items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::FileEntry(entry) => Some(entry.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                if file_entries.len() == items.len() && !file_entries.is_empty() {
+                    for (i, entry) in file_entries.iter().enumerate() {
+                        if target == source_ids::anchor(block_id, i) {
+                            return Some(DragPayload::FilePath(entry.path.clone()));
+                        }
+                    }
+                }
+                None
+            }
+            Value::FileEntry(entry) => {
+                if target == source_ids::anchor(block_id, 0) {
+                    Some(DragPayload::FilePath(entry.path.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Check if a hit address belongs to a shell block. Returns the block_id if so.
@@ -239,6 +385,10 @@ impl ShellWidget {
                 }
             }
             ShellMsg::SortTable(block_id, col_idx) => { self.sort_table(block_id, col_idx); ShellOutput::None }
+            ShellMsg::OpenAnchor(_, _) => {
+                // Handled at the root level in state_update.rs
+                ShellOutput::None
+            }
         };
         (strata::Command::none(), output)
     }
@@ -697,5 +847,29 @@ pub(crate) fn strata_key_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
                 _ => None,
             }
         }
+    }
+}
+
+/// Convert a structured Value to the appropriate anchor action.
+/// Extract the most semantically useful text for drag-and-drop from a value.
+/// For file entries, returns the path. For processes, returns the PID.
+/// For git commits, returns the hash. Falls back to `to_text()`.
+fn semantic_text_for_value(value: &Value, _column: Option<&nexus_api::TableColumn>) -> String {
+    match value {
+        Value::Path(p) => super::file_drop::shell_quote(p),
+        Value::FileEntry(entry) => super::file_drop::shell_quote(&entry.path),
+        Value::Process(info) => info.pid.to_string(),
+        Value::GitCommit(info) => info.short_hash.clone(),
+        _ => value.to_text(),
+    }
+}
+
+fn value_to_anchor_action(value: &Value) -> AnchorAction {
+    match value {
+        Value::Path(p) => AnchorAction::RevealPath(p.clone()),
+        Value::FileEntry(entry) => AnchorAction::RevealPath(entry.path.clone()),
+        Value::Process(info) => AnchorAction::CopyToClipboard(info.pid.to_string()),
+        Value::GitCommit(info) => AnchorAction::CopyToClipboard(info.short_hash.clone()),
+        _ => AnchorAction::CopyToClipboard(value.to_text()),
     }
 }

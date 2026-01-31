@@ -260,6 +260,29 @@ fn update<A: StrataApp>(
                 }
             }
 
+            // Handle file drop events
+            if let Event::Window(ref win_event) = event {
+                use crate::event_context::FileDropEvent;
+                let file_event = match win_event {
+                    iced::window::Event::FileHovered(path) => Some(FileDropEvent::Hovered(path.clone())),
+                    iced::window::Event::FileDropped(path) => Some(FileDropEvent::Dropped(path.clone())),
+                    iced::window::Event::FilesHoveredLeft => Some(FileDropEvent::HoverLeft),
+                    _ => None,
+                };
+                if let Some(fe) = file_event {
+                    let hit = {
+                        let cache = state.cached_snapshot.borrow();
+                        cache.as_ref().and_then(|snapshot| {
+                            state.cursor_position.and_then(|pos| snapshot.hit_test(pos))
+                        })
+                    };
+                    if let Some(msg) = A::on_file_drop(&state.app, fe, hit) {
+                        let cmd = A::update(&mut state.app, msg, &mut state.image_store);
+                        return command_to_task(cmd);
+                    }
+                }
+            }
+
             Task::none()
         }
 
@@ -532,6 +555,8 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             CursorIcon::Text => iced::mouse::Interaction::Text,
             CursorIcon::Pointer => iced::mouse::Interaction::Pointer,
             CursorIcon::Grab => iced::mouse::Interaction::Grab,
+            CursorIcon::Grabbing => iced::mouse::Interaction::Grabbing,
+            CursorIcon::Copy => iced::mouse::Interaction::Pointer, // Iced has no Copy cursor; use Pointer
         }
     }
 }

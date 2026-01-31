@@ -9,8 +9,9 @@ use strata::{MouseResponse, ScrollAction, route_mouse};
 use crate::blocks::Focus;
 use crate::nexus_widgets::JobBar;
 
+use super::drag_state::{DragStatus, DRAG_THRESHOLD_SQ};
 use super::message::{
-    AgentMsg, ContextMenuMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg,
+    AgentMsg, ContextMenuMsg, DragMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg,
 };
 use super::source_ids;
 use super::NexusState;
@@ -33,6 +34,11 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
     else {
         return None;
     };
+
+    // Phase 0: Active drag — Escape cancels
+    if state.drag.is_active() && matches!(key, Key::Named(NamedKey::Escape)) {
+        return Some(NexusMessage::Drag(DragMsg::Cancel));
+    }
 
     // Phase 1: Input overlay intercepts (history search, completion)
     if state.input.captures_keys() {
@@ -145,6 +151,52 @@ pub(super) fn on_mouse(
     hit: Option<HitResult>,
     capture: &CaptureState,
 ) -> MouseResponse<NexusMessage> {
+    // ── Drag state machine intercept ──────────────────────────────
+    // When a drag is Pending or Active, all mouse events are routed here.
+    match &state.drag.status {
+        DragStatus::Active(_) => {
+            return match &event {
+                MouseEvent::CursorMoved { position, .. } => {
+                    MouseResponse::message(NexusMessage::Drag(DragMsg::Move(*position)))
+                }
+                MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    let zone = super::file_drop::resolve_drop_zone(state, &hit);
+                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Drop(zone)))
+                }
+                MouseEvent::CursorLeft => {
+                    // Cursor left the window during an active drag → hand off to OS
+                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::GoOutbound))
+                }
+                _ => MouseResponse::none(),
+            };
+        }
+        DragStatus::Pending { origin, .. } => {
+            return match &event {
+                MouseEvent::CursorMoved { position, .. } => {
+                    let dx = position.x - origin.x;
+                    let dy = position.y - origin.y;
+                    if dx * dx + dy * dy > DRAG_THRESHOLD_SQ {
+                        MouseResponse::message(NexusMessage::Drag(DragMsg::Activate(*position)))
+                    } else {
+                        MouseResponse::none()
+                    }
+                }
+                MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    // Cancel pending drag → the handler re-dispatches the original click
+                    MouseResponse::message(NexusMessage::Drag(DragMsg::Cancel))
+                }
+                _ => MouseResponse::none(),
+            };
+        }
+        DragStatus::Inactive => {} // Fall through to normal routing
+    }
+
     // Composable scroll + input handlers
     route_mouse!(&event, &hit, capture, [
         state.input.completion.scroll       => |a| NexusMessage::Input(InputMsg::CompletionScroll(a)),
@@ -195,6 +247,16 @@ pub(super) fn on_mouse(
             }
             if let Some(msg) = state.agent.on_click(*id) {
                 return MouseResponse::message(NexusMessage::Agent(msg));
+            }
+
+            // Anchor clicks → start pending drag (click fires on release if <5px)
+            if let Some(payload) = state.shell.drag_payload_for_anchor(*id) {
+                if let MouseEvent::ButtonPressed { position, .. } = &event {
+                    return MouseResponse::message_and_capture(
+                        NexusMessage::Drag(DragMsg::Start(payload, *position, *id)),
+                        *id,
+                    );
+                }
             }
 
             // Job pills (cross-cutting: shell data → root scroll action)
@@ -306,7 +368,7 @@ fn route_context_menu_click(state: &NexusState, hit: &Option<HitResult>) -> Opti
     if let Some(HitResult::Widget(id)) = hit {
         for (i, item) in menu.items.iter().enumerate() {
             if *id == source_ids::ctx_menu_item(i) {
-                return Some(NexusMessage::ContextMenu(ContextMenuMsg::Action(*item)));
+                return Some(NexusMessage::ContextMenu(ContextMenuMsg::Action(item.clone())));
             }
         }
     }

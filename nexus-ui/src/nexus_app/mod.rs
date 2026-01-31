@@ -17,11 +17,13 @@ pub(crate) mod agent;
 mod event_routing;
 pub(crate) mod scroll_model;
 pub(crate) mod transient_ui;
+pub(crate) mod drag_state;
+pub(crate) mod file_drop;
 mod state_policy;
 mod state_update;
 mod state_view;
 
-pub use message::{NexusMessage, InputMsg, ShellMsg, AgentMsg, SelectionMsg, ContextMenuMsg};
+pub use message::{NexusMessage, InputMsg, ShellMsg, AgentMsg, SelectionMsg, ContextMenuMsg, DragMsg};
 use context_menu::render_context_menu;
 use input::InputWidget;
 use scroll_model::ScrollModel;
@@ -41,7 +43,7 @@ use nexus_kernel::Kernel;
 use crate::blocks::Focus;
 use crate::context::NexusContext;
 use strata::component::{Component, ComponentApp, Ctx, IdSpace, RootComponent};
-use strata::event_context::{CaptureState, KeyEvent, MouseEvent};
+use strata::event_context::{CaptureState, FileDropEvent, KeyEvent, MouseEvent};
 use strata::layout_snapshot::HitResult;
 use strata::primitives::Rect;
 use strata::{
@@ -88,6 +90,8 @@ pub struct NexusState {
     // --- UI state ---
     pub last_edit_time: Instant,
     pub exit_requested: bool,
+    pub drop_highlight: Option<message::DropZone>,
+    pub(crate) drag: drag_state::DragState,
 
     // --- FPS tracking (Cell for interior mutability in view()) ---
     last_frame: Cell<Instant>,
@@ -162,6 +166,58 @@ impl Component for NexusState {
             render_context_menu(snapshot, menu);
         }
 
+        // Drop target highlight
+        if let Some(ref zone) = self.drop_highlight {
+            use strata::primitives::Color;
+            let accent = Color::rgba(0.3, 0.6, 1.0, 0.15);
+            let border_color = Color::rgba(0.3, 0.6, 1.0, 0.8);
+            // Full-window glow overlay
+            let p = snapshot.overlay_primitives_mut();
+            p.add_rounded_rect(Rect::new(0.0, 0.0, vw, vh), 0.0, accent);
+            p.add_border(Rect::new(2.0, 2.0, vw - 4.0, vh - 4.0), 4.0, 2.0, border_color);
+            // Label indicating drop zone
+            let label = match zone {
+                message::DropZone::InputBar => "Drop to insert path",
+                message::DropZone::AgentPanel => "Drop to attach file",
+                message::DropZone::ShellBlock(_) => "Drop to insert path",
+                message::DropZone::Empty => "Drop to insert path",
+            };
+            p.add_text(
+                label.to_string(),
+                strata::primitives::Point::new(vw / 2.0 - 60.0, vh / 2.0),
+                Color::rgba(0.8, 0.9, 1.0, 0.9),
+                16.0,
+            );
+        }
+
+        // Drag ghost preview (overlay — above everything except context menus)
+        if let drag_state::DragStatus::Active(ref active) = self.drag.status {
+            use strata::primitives::Color;
+            let ghost_text = active.payload.preview_text();
+            let gx = active.current_pos.x + 12.0;
+            let gy = active.current_pos.y + 12.0;
+            let text_w = ghost_text.len() as f32 * 7.5 + 16.0; // approximate
+            let text_h = 24.0;
+            let p = snapshot.overlay_primitives_mut();
+            p.add_rounded_rect(
+                Rect::new(gx, gy, text_w, text_h),
+                6.0,
+                Color::rgba(0.15, 0.15, 0.2, 0.92),
+            );
+            p.add_border(
+                Rect::new(gx, gy, text_w, text_h),
+                6.0,
+                1.0,
+                Color::rgba(0.4, 0.6, 1.0, 0.6),
+            );
+            p.add_text(
+                ghost_text,
+                strata::primitives::Point::new(gx + 8.0, gy + 4.0),
+                Color::rgba(0.9, 0.95, 1.0, 0.95),
+                13.0,
+            );
+        }
+
         // FPS counter (top-right corner)
         snapshot.primitives_mut().add_text(
             format!("{:.0} FPS", fps),
@@ -182,6 +238,27 @@ impl Component for NexusState {
         capture: &CaptureState,
     ) -> MouseResponse<NexusMessage> {
         event_routing::on_mouse(self, event, hit, capture)
+    }
+
+    fn on_file_drop(
+        &self,
+        event: FileDropEvent,
+        hit: Option<HitResult>,
+    ) -> Option<NexusMessage> {
+        use message::FileDropMsg;
+        match event {
+            FileDropEvent::Hovered(path) => {
+                let zone = file_drop::resolve_drop_zone(self, &hit);
+                Some(NexusMessage::FileDrop(FileDropMsg::Hovered(path, zone)))
+            }
+            FileDropEvent::Dropped(path) => {
+                let zone = file_drop::resolve_drop_zone(self, &hit);
+                Some(NexusMessage::FileDrop(FileDropMsg::Dropped(path, zone)))
+            }
+            FileDropEvent::HoverLeft => {
+                Some(NexusMessage::FileDrop(FileDropMsg::HoverLeft))
+            }
+        }
     }
 
     fn subscription(&self) -> Subscription<NexusMessage> {
@@ -246,6 +323,8 @@ impl RootComponent for NexusState {
 
             last_edit_time: Instant::now(),
             exit_requested: false,
+            drop_highlight: None,
+            drag: drag_state::DragState::new(),
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             context,

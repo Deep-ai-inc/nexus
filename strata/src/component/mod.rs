@@ -23,7 +23,7 @@ pub use slot::{MsgMap, Slot};
 
 use crate::app::{Command, MouseResponse, Subscription};
 use crate::content_address::Selection;
-use crate::event_context::{CaptureState, KeyEvent, MouseEvent};
+use crate::event_context::{CaptureState, FileDropEvent, KeyEvent, MouseEvent};
 use crate::gpu::ImageStore;
 use crate::layout_snapshot::{HitResult, LayoutSnapshot};
 
@@ -75,6 +75,15 @@ pub trait Component {
         _capture: &CaptureState,
     ) -> MouseResponse<Self::Message> {
         MouseResponse::none()
+    }
+
+    /// Handle a file drop event from the OS.
+    fn on_file_drop(
+        &self,
+        _event: FileDropEvent,
+        _hit: Option<HitResult>,
+    ) -> Option<Self::Message> {
+        None
     }
 
     /// Create subscriptions for external event streams.

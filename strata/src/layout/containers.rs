@@ -901,6 +901,9 @@ pub struct TableCell {
     /// Pre-wrapped lines. If empty, `text` is rendered as a single line.
     pub lines: Vec<String>,
     pub color: Color,
+    /// Optional widget ID for clickable cells (anchors).
+    /// When set, the cell registers as a clickable widget with `CursorIcon::Pointer`.
+    pub widget_id: Option<SourceId>,
 }
 
 /// A table element with column headers and data rows.
@@ -1095,6 +1098,12 @@ fn render_table(
                         snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
                     }
                 }
+                // Register clickable cell as widget
+                if let Some(wid) = cell.widget_id {
+                    let cell_rect = Rect::new(col_x, ry, table.columns[col_idx].width, rh);
+                    snapshot.register_widget(wid, cell_rect);
+                    snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                }
                 col_x += table.columns[col_idx].width;
             }
         }
@@ -1136,6 +1145,8 @@ pub struct Column {
     border_width: f32,
     /// Shadow: (blur_radius, color).
     shadow: Option<(f32, Color)>,
+    /// Cursor hint when hovering (requires `id` to take effect).
+    cursor_hint: Option<CursorIcon>,
 }
 
 impl Default for Column {
@@ -1161,6 +1172,7 @@ impl Column {
             border_color: None,
             border_width: 0.0,
             shadow: None,
+            cursor_hint: None,
         }
     }
 
@@ -1716,6 +1728,9 @@ impl Column {
         // Register widget ID for hit-testing and overlay anchoring
         if let Some(id) = self.id {
             snapshot.register_widget(id, bounds);
+            if let Some(cursor) = self.cursor_hint {
+                snapshot.set_cursor_hint(id, cursor);
+            }
         }
 
         if clips {
@@ -1756,6 +1771,8 @@ pub struct Row {
     border_width: f32,
     /// Shadow: (blur_radius, color).
     shadow: Option<(f32, Color)>,
+    /// Cursor hint when hovering (requires `id` to take effect).
+    cursor_hint: Option<CursorIcon>,
 }
 
 impl Default for Row {
@@ -1781,12 +1798,19 @@ impl Row {
             border_color: None,
             border_width: 0.0,
             shadow: None,
+            cursor_hint: None,
         }
     }
 
     /// Set widget ID for hit-testing and overlay anchoring.
     pub fn id(mut self, id: SourceId) -> Self {
         self.id = Some(id);
+        self
+    }
+
+    /// Set cursor hint for hover feedback (requires `id` to take effect).
+    pub fn cursor_hint(mut self, cursor: CursorIcon) -> Self {
+        self.cursor_hint = Some(cursor);
         self
     }
 
@@ -2341,6 +2365,9 @@ impl Row {
         // Register widget ID for hit-testing and overlay anchoring
         if let Some(id) = self.id {
             snapshot.register_widget(id, bounds);
+            if let Some(cursor) = self.cursor_hint {
+                snapshot.set_cursor_hint(id, cursor);
+            }
         }
 
         if clips {
