@@ -106,17 +106,78 @@ Text editor-style input with proper cursor movement, selections, and multi-line 
 ---
 
 ### 5. Copy/Paste Friction
-**Pain:** Shift-click to select, invisible newlines, pasted commands execute immediately (security risk).
+**Pain:** Shift-click to select, invisible newlines, pasted commands execute immediately (security risk). Copy a table and get misaligned spaces. Copy across commands and prompts leak in. No format awareness.
 
-**Solution:** Native clipboard. Click-drag to select. Tables copy as TSV. Pasted text goes to input buffer, not executed until Enter.
+**Solution:** Native clipboard with structured data awareness. Text selection works across blocks like a traditional terminal, but what lands on the clipboard is intelligent. Paste is always safe.
 
 **Status:** 🔨 In progress.
 
+#### Selection Model
+
+Text selection works the way you expect — click and drag across output, across block boundaries. The familiar terminal "paint across everything" behavior stays.
+
+**Chrome stripping.** Copied text never includes block status indicators, timestamps, or prompt decorations (the `➜ ~` prefix). You get just content. When a selection spans across a command line, the command text itself is included (e.g., `grep "foo"`) but the prompt chrome is not — so the result reads like a clean shell transcript.
+
+**WYSIWYG for truncated output.** If a block was paginated or visually truncated (e.g., `less`, a long `cat`), selection copies exactly what is rendered on screen. "Copy Full Output" lives in the right-click menu for when you want everything.
+
+#### Structured Copy
+
+**Tables produce multi-format clipboard entries.** When a selection lands entirely within a table, the clipboard gets three simultaneous representations: plain text (space-aligned), TSV (for spreadsheets), and JSON array (for code). The receiving app picks the best format automatically.
+
+**Partial table selection snaps to columns.** Select within a table and Nexus snaps to cell boundaries. Select three cells in the PID column → `1234\n5678\n9012`, not half-truncated rows. Standard click+drag in tables behaves like a spreadsheet (cell selection). Alt+drag forces raw text selection ignoring cell boundaries.
+
+**Header inclusion.** Partial table copies (e.g., rows 5–10) do not include the header row by default. Hold Shift while copying (or toggle in settings) to include headers. Rationale: spreadsheet users want headers, text editor users don't — the default should be the less surprising behavior (no phantom header row), with an easy override.
+
+**Mixed-region selection.** When a selection spans a table region and a non-table region (or two different structured types), Nexus falls back to plain text for the entire clipboard entry. Attempting to combine TSV + JSON in one clipboard payload would confuse receiving apps. The right-click menu can still offer "Copy Table as TSV" / "Copy JSON Block" individually.
+
+#### Semantic Copy
+
+Beyond text selection, structured output contains discrete **copyable tokens** — paths, PIDs, IP addresses, branch names, URLs. Cmd+click a token to copy it directly without drag-selecting. The value knows what it is: copying a path gives you a properly quoted path, copying a PID gives you just the number.
+
+#### Block-Level Copy Actions
+
+Right-click a block (or use a keyboard shortcut) for options beyond text selection:
+- **Copy output** — just the output text
+- **Copy command** — just the command that produced it
+- **Copy as JSON / TSV / Markdown** — structured export
+- **Copy full output** — for truncated/paginated blocks, the complete output
+- **Copy command + output** — formatted for sharing (command prefixed with `$ `)
+
+#### Paste Behavior
+
+**Never auto-executes.** Pasted text always goes into the input buffer. Period. No trailing newline triggers execution. When text is pasted, it gets a subtle visual flash/highlight to confirm "I caught this, it's safe, it won't run until you press Enter."
+
+**Multi-line awareness.** Pasting multi-line content auto-enters multi-line input mode. Pasting a single line with a trailing newline strips the newline.
+
+**Paste detection.** Nexus inspects pasted content and shows a non-blocking inline suggestion (accept with Tab, ignore with Enter):
+- JSON blob → offers to pretty-print or pipe through `jq`
+- File path → offers to `cat` / `ls` it
+- URL → offers to `curl` or `open` it
+- Stack trace → links each frame to local source files if they exist
+- Multi-line shell script → enters multi-line mode
+- Command with `$ ` prefix (copied from docs/READMEs) → strips the prefix
+- Git SHA → offers to `git show <hash>`
+- Issue reference (`JIRA-1234`, `#123`) → offers to open the ticket
+
+#### Clipboard History
+
+Cmd+Shift+V opens a searchable clipboard history. Entries from structured copies show as mini previews (table snippets, JSON previews) rather than raw text walls.
+
 **Implementation:**
-- [ ] Native text selection with mouse
-- [ ] Copy structured data (tables → TSV, records → JSON)
-- [ ] Paste goes to input, never auto-executes
-- [ ] Right-click → Copy menu
+- [ ] Text selection across blocks with chrome stripping
+- [ ] WYSIWYG copy for truncated/paginated output
+- [ ] Multi-format clipboard for table selections (text, TSV, JSON)
+- [ ] Cell-snapping selection in tables (Alt+drag for raw override)
+- [ ] Header inclusion toggle (Shift+copy or setting)
+- [ ] Plain text fallback for mixed-region selections
+- [ ] Cmd+click semantic token copy (paths, PIDs, IPs, etc.)
+- [ ] Right-click block copy menu (output, command, structured formats)
+- [ ] "Copy Full Output" for truncated blocks
+- [ ] Paste never executes, visual flash on paste
+- [ ] Multi-line paste enters multi-line input mode
+- [ ] Paste detection with inline suggestions (JSON, paths, URLs, SHAs, issue refs)
+- [ ] `$ ` prefix stripping on paste
+- [ ] Clipboard history panel (Cmd+Shift+V) with structured previews
 
 ---
 
@@ -365,6 +426,150 @@ Text editor-style input with proper cursor movement, selections, and multi-line 
 
 ---
 
+### 21. Drag and Drop Is Nonexistent
+**Pain:** Terminals have zero drag and drop support. You can't drag a file in, drag output out, or move data between blocks. Everything requires manual copying and retyping paths.
+
+**Solution:** Full native drag and drop, leveraging Nexus's structured `Value` types and block-based architecture to make drops context-aware.
+
+**Status:** 🔨 Planned.
+
+#### From Outside → Nexus
+- Drop files from Finder onto the **input bar** → inserts properly quoted absolute paths. Multiple files → space-separated quoted paths.
+- Drop files onto a **running block** → sends the path to stdin or opens it in that context.
+- Drop files onto the **agent panel** → attaches as context for the AI conversation.
+- Drop an image → preview inline if native command supports `Value::Image`, otherwise insert path.
+- Drop text from other apps onto input → pastes into input buffer at cursor (never auto-executes).
+- Drop a URL → offers: `curl`, `open`, or insert as text.
+- Drop a folder onto the **tab bar** → `cd` into it in a new tab. This is how you open a project.
+
+#### Within Nexus (Block-to-Block)
+- Drag a table row from `ps aux` output → drops the PID. Nexus knows the schema, so it extracts the semantically useful field, not raw text.
+- Drag an entire block → drops the full output, or offers a choice: raw text, JSON, the command itself.
+- Drag a file path from `ls` output → inserts the quoted path. Knows it's a path, not arbitrary text.
+- Drag blocks to **reorder** them in session history, or pin important results to the top.
+- Drag a block to a **second pane** → side-by-side comparison of two command outputs.
+- Drag a block to the **tab bar** → pins it as a persistent reference panel.
+- Drag one block onto another → proposes piping them: `cmd1 | cmd2`. Visually building a pipeline.
+
+#### From Nexus → Outside
+- Drag a file listing row to Finder → copies/moves the actual file.
+- Drag block output to Finder → creates a file with that content (auto-named, e.g., `ps-aux-2026-01-31.tsv`).
+- Drag a table block into a spreadsheet → exports as TSV/CSV, not raw terminal text with ANSI garbage.
+- Drag a code block into an editor → clean text, no line numbers or prompts.
+
+#### Visual Design
+- **Drop targets glow** contextually — input bar, agent panel, block gutters, tab bar all highlight when dragging something relevant.
+- **Ghost preview** — while dragging, a small preview shows what will happen: "Insert path", "Pipe as stdin", "Open in new tab".
+- **Smart field extraction** — when dragging from a table, hold a modifier key to pick which column to extract (PID vs. process name vs. CPU%).
+- **Undo** — every drag-and-drop action is undoable with Cmd+Z.
+
+**Why this is impossible elsewhere:** Traditional terminals can't do this because everything is flat text in a scrollback buffer. There's no concept of "this region is a PID" or "this block is a table." Nexus already has `Value` types and discrete blocks — drag and drop is a natural extension of that structure.
+
+**Implementation:**
+- [ ] Accept file drops from OS onto input bar (insert quoted paths)
+- [ ] Accept file drops onto agent panel (attach as context)
+- [ ] Accept folder drops onto tab bar (cd in new tab)
+- [ ] Accept text/URL drops onto input bar
+- [ ] Drag table rows/cells between blocks (smart field extraction)
+- [ ] Drag blocks to reorder, pin, or open in split pane
+- [ ] Drag block onto block to compose pipelines
+- [ ] Export blocks to Finder as files (TSV/JSON/text)
+- [ ] Export table blocks to external apps as structured data
+- [ ] Drop target highlighting and ghost previews
+- [ ] Modifier key for column selection when dragging from tables
+- [ ] Undo support for all drag-and-drop actions
+
+---
+
+### 22. Filesystem Operations Are Irreversible
+**Pain:** `rm` is permanent. `mv` to the wrong place requires remembering where it was. One typo and data is gone. The terminal gives you unlimited power with zero safety net.
+
+**Solution:** Every built-in command that modifies the filesystem records a reversible undo plan. Cmd+Z on a block reverses its side effects. Third-party commands can participate through a plugin system and selective filesystem watching.
+
+**Status:** 🔨 Planned.
+
+#### Built-in Commands (Full Undo)
+
+All Nexus-native filesystem commands are Rust implementations that return structured `Value` types. They don't shell out to `/bin/rm`. They record their own undo plans:
+
+- **`rm`** — Moves files to `~/.nexus/trash/<timestamp>-<hash>/` instead of unlinking. Records original path, permissions, and ownership in a manifest. The block shows "Deleted 3 files" but the undo plan is stored silently alongside the block in SQLite.
+- **`mv`** — Records source and destination. Undo is `mv` in reverse.
+- **`cp`** — Records what was created. Undo deletes the copies.
+- **`mkdir`** — Records created directories. Undo removes them (if still empty, warns otherwise).
+- **`chmod` / `chown`** — Records previous mode/owner. Undo restores it.
+- **File writes** (from the AI agent's edit tool, or a native `sed`-equivalent) — Snapshots the original file content before modification using **reflink (CoW) copies** where supported (APFS on macOS, Btrfs/XFS on Linux). A `cp --reflink=always` creates an instant snapshot consuming zero extra disk until the original diverges. This makes undo for file edits instantaneous even on multi-gigabyte files. Falls back to a regular copy on filesystems without reflink support.
+
+Each block gets an **undo plan** — a structured list of reverse operations stored alongside the block in SQLite. Not a diff, not a journal — a concrete list: "move this file back here", "restore this content", "delete this copy."
+
+#### The Sudo Barrier
+
+If you run `sudo rm /etc/nginx/sites-enabled/default`, Nexus runs as your user and can't move that file to `~/.nexus/trash/`. Solution:
+
+- Nexus detects `sudo` in the command.
+- It creates a temporary trash location inside the target's parent directory (or `/tmp`), and uses `sudo mv` to move the file there, then records the undo plan.
+- When you Cmd+Z a sudo block, Nexus prompts for the password (or uses the cached sudo timestamp) to execute the restoration with elevated privileges.
+
+#### External / Third-Party Commands (Best-Effort Undo)
+
+Nexus can't control what `git`, `docker`, or arbitrary scripts do internally. Three mechanisms provide undo, applied in order of preference:
+
+**1. Plugin system (preferred).** Third-party tools register an undo provider with pattern-matched commands and corresponding reverse operations:
+- A `git` plugin knows that `git checkout -- file` can be undone via reflog.
+- A `docker` plugin knows how to handle container operations.
+- Community-maintained plugins are safer and faster than filesystem diffing. A `git.lua` that maps `git checkout` → `git restore` is better than trying to diff the `.git` directory.
+
+**2. Pre-snapshot heuristic.** Nexus parses the command and if it matches a known destructive pattern (`git checkout`, `docker rm`, `make clean`, commands touching known files), it snapshots affected files *before* execution. Opt-in per command pattern and configurable. False positives cost a bit of disk. False negatives mean no undo — no worse than today. Uses reflink copies when available.
+
+**3. Filesystem watch (selective).** Only triggered if the command matches a configured pattern (e.g., `make`, `npm install`, `tar`). Snapshots the working directory's file tree metadata (paths, sizes, mtimes) before execution, diffs after. Heavy watching of the full subtree for every unknown command would introduce lag — so this is pattern-gated, not universal.
+
+For unknown commands with no plugin and no watch pattern, Nexus simply doesn't offer undo. This is honest and no worse than every terminal today.
+
+#### Undo UX
+
+- Every block with a reversible operation shows a subtle **undo icon** in the gutter (visible on hover).
+- **Hover to preview.** Hovering the undo icon shows a tooltip with the exact plan: "Undo will: Restore `data.csv` to `/Users/you/project/`, delete `data.json`." This builds trust — users can see exactly what will happen before committing.
+- **Cmd+Z** undoes the most recent reversible block. Repeated Cmd+Z walks back through the undo stack. Each press reverses one command's effects (block-scoped, not character-scoped).
+- **`undo`** is also a native command: `undo` (last block), `undo b3` (specific block), `undo --list` (show all undoable operations with their age and scope).
+
+#### Conflict Detection
+
+Before executing an undo, Nexus checks whether the world has changed:
+
+- You `rm foo.txt`, then something else creates a new `foo.txt` → warns: "foo.txt already exists and differs from the original. Overwrite / Keep both / Cancel?"
+- You `mv a.txt b.txt`, then modify `b.txt` → warns: "b.txt has been modified since it was moved. Restore original at a.txt, or move current version back?"
+- Undo plans whose preconditions can't be verified (trash files garbage-collected, original location deleted) are marked as expired with an explanation.
+
+#### Trash Management
+
+Trash lives at `~/.nexus/trash/` with a manifest per entry (original path, timestamp, size, permissions).
+
+- **Garbage collection:** configurable retention period (default: 30 days) and disk quota (default: 1 GB). Oldest items evicted first when either limit is hit.
+- **`trash list`** — show trashed items with original paths and age.
+- **`trash restore <item>`** — restore to original location.
+- **`trash empty`** — permanently delete all trashed items.
+- **Trash is browseable via autocomplete.** `cp ~/.nexus/trash/<Tab>` completes deleted files by their *original names* (e.g., `data.csv`), mapping transparently through the hash structure. The trash acts as a virtual filesystem — you don't need to know the internal storage format.
+
+**Implementation:**
+- [ ] Undo plan data structure and SQLite schema
+- [ ] Native `rm` → move to trash with manifest
+- [ ] Reflink (CoW) snapshots for file edits (APFS/Btrfs/XFS, fallback to regular copy)
+- [ ] Native `mv` → record source/dest, reversible
+- [ ] Native `cp` → record created files, reversible
+- [ ] Native `mkdir`, `chmod`, `chown` → record previous state, reversible
+- [ ] Sudo detection: trash via elevated temp directory, undo with sudo prompt
+- [ ] Undo gutter icon with hover-to-preview tooltip
+- [ ] Cmd+Z block-scoped undo with stack
+- [ ] `undo` native command (last, specific block, --list)
+- [ ] Conflict detection and interactive resolution prompts
+- [ ] Plugin/hook system for third-party undo providers
+- [ ] Pre-snapshot heuristic for known destructive external commands
+- [ ] Selective filesystem watch for configured command patterns
+- [ ] Trash management commands (list, restore, empty)
+- [ ] Trash garbage collection (time-based + disk quota)
+- [ ] Trash browseable via autocomplete (original filenames)
+
+---
+
 ## Priority Order
 
 ### P0 — Core Experience
@@ -374,21 +579,23 @@ Text editor-style input with proper cursor movement, selections, and multi-line 
 4. **#5 Copy/Paste** — Native, safe, structured
 
 ### P1 — Polish
-5. **#14 Progress** — Spinners, progress bars
-6. **#19 Autocomplete** — Context-aware suggestions
-7. **#11 Dangerous Globs** — Preview before delete
-8. **#12 Sudo Trap** — Re-run with elevation
+5. **#21 Drag and Drop** — Native DnD with structured data awareness
+6. **#22 Filesystem Undo** — Reversible operations, trash, conflict detection
+7. **#14 Progress** — Spinners, progress bars
+8. **#19 Autocomplete** — Context-aware suggestions
+9. **#11 Dangerous Globs** — Preview before delete
+10. **#12 Sudo Trap** — Re-run with elevation
 
 ### P2 — Rich Features
-9. **#9 Images/Media** — Inline rendering
-10. **#10 Theming** — Settings UI
-11. **#4 Unicode** — Verify wide character handling
-12. **#8 Reflow** — Edge case handling
+11. **#9 Images/Media** — Inline rendering
+12. **#10 Theming** — Settings UI
+13. **#4 Unicode** — Verify wide character handling
+14. **#8 Reflow** — Edge case handling
 
 ### P3 — Advanced
-13. **#18 Script Linting** — Syntax warnings
-14. **#20 Accessibility** — Screen reader support
-15. **#16 SSH** — Remote agent protocol
+15. **#18 Script Linting** — Syntax warnings
+16. **#20 Accessibility** — Screen reader support
+17. **#16 SSH** — Remote agent protocol
 
 ---
 
