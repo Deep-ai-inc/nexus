@@ -9,7 +9,6 @@ use strata::{MouseResponse, ScrollAction, route_mouse};
 use crate::blocks::Focus;
 use crate::nexus_widgets::JobBar;
 
-use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::message::{
     AgentMsg, ContextMenuMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg,
 };
@@ -90,13 +89,12 @@ fn route_global_shortcut(
                     if state.agent.is_active() {
                         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
                     }
-                    if let Focus::Block(id) = state.focus {
+                    let focused = match state.focus {
+                        Focus::Block(id) => Some(id),
+                        _ => None,
+                    };
+                    if let Some(id) = state.shell.interrupt_target(focused) {
                         return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(id)));
-                    }
-                    if let Some(block) =
-                        state.shell.blocks.iter().rev().find(|b| b.is_running())
-                    {
-                        return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(block.id)));
                     }
                     return None;
                 }
@@ -258,57 +256,30 @@ fn route_right_click(
     position: &strata::primitives::Point,
     hit: &Option<HitResult>,
 ) -> MouseResponse<NexusMessage> {
+    let (x, y) = (position.x, position.y);
+
     // Input area right-click
-    if state.input.hit_test(position.x, position.y) {
-        return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-            position.x,
-            position.y,
-            vec![
-                ContextMenuItem::Paste,
-                ContextMenuItem::SelectAll,
-                ContextMenuItem::Clear,
-            ],
-            ContextTarget::Input,
-        )));
+    if let Some(msg) = state.input.context_menu(x, y) {
+        return MouseResponse::message(NexusMessage::ContextMenu(msg));
     }
 
-    // Content area right-click — delegate to children for target identification
+    // Content area right-click — delegate to children
     if let Some(HitResult::Content(addr)) = hit {
-        if let Some(block_id) = state.shell.block_for_source(addr.source_id) {
-            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-                position.x,
-                position.y,
-                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                ContextTarget::Block(block_id),
-            )));
+        if let Some(msg) = state.shell.context_menu_for_source(addr.source_id, x, y) {
+            return MouseResponse::message(NexusMessage::ContextMenu(msg));
         }
-        if let Some(block_id) = state.agent.block_for_source(addr.source_id) {
-            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-                position.x,
-                position.y,
-                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                ContextTarget::AgentBlock(block_id),
-            )));
+        if let Some(msg) = state.agent.context_menu_for_source(addr.source_id, x, y) {
+            return MouseResponse::message(NexusMessage::ContextMenu(msg));
         }
     }
 
     // Fallback: right-click on non-content area
     if hit.is_some() {
-        if let Some(block) = state.shell.blocks.last() {
-            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-                position.x,
-                position.y,
-                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                ContextTarget::Block(block.id),
-            )));
+        if let Some(msg) = state.shell.fallback_context_menu(x, y) {
+            return MouseResponse::message(NexusMessage::ContextMenu(msg));
         }
-        if let Some(block) = state.agent.blocks.last() {
-            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
-                position.x,
-                position.y,
-                vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                ContextTarget::AgentBlock(block.id),
-            )));
+        if let Some(msg) = state.agent.fallback_context_menu(x, y) {
+            return MouseResponse::message(NexusMessage::ContextMenu(msg));
         }
     }
 

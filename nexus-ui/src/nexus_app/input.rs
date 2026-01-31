@@ -18,6 +18,8 @@ use crate::nexus_widgets::{CompletionPopup, HistorySearchBar, NexusInputBar};
 
 use crate::blocks::InputMode;
 use super::completion::{CompletionWidget, CompletionOutput};
+use super::context_menu::{ContextMenuItem, ContextTarget};
+use super::message::ContextMenuMsg;
 use super::history_search::{HistorySearchWidget, HistorySearchOutput};
 use super::message::InputMsg;
 use super::Attachment;
@@ -657,5 +659,21 @@ impl InputWidget {
     pub fn hit_test(&self, x: f32, y: f32) -> bool {
         let b = self.text_input.bounds();
         x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height
+    }
+
+    /// Build a context menu for a right-click on the input area.
+    pub fn context_menu(&self, x: f32, y: f32) -> Option<ContextMenuMsg> {
+        if !self.hit_test(x, y) {
+            return None;
+        }
+        Some(ContextMenuMsg::Show(
+            x, y,
+            vec![
+                ContextMenuItem::Paste,
+                ContextMenuItem::SelectAll,
+                ContextMenuItem::Clear,
+            ],
+            ContextTarget::Input,
+        ))
     }
 }

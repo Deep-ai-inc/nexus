@@ -21,7 +21,8 @@ use strata::event_context::{Key, KeyEvent, NamedKey};
 use crate::blocks::Focus;
 use crate::nexus_widgets::{JobBar, ShellBlockWidget};
 
-use super::message::{NexusMessage, ShellMsg};
+use super::context_menu::{ContextMenuItem, ContextTarget};
+use super::message::{ContextMenuMsg, NexusMessage, ShellMsg};
 use super::source_ids;
 
 /// Typed output from ShellWidget → orchestrator.
@@ -147,6 +148,42 @@ impl ShellWidget {
             }
         }
         None
+    }
+
+    /// The block that should receive an interrupt (Ctrl+C).
+    /// Prefers the focused block if provided, otherwise the last running block.
+    pub fn interrupt_target(&self, focused: Option<BlockId>) -> Option<BlockId> {
+        if let Some(id) = focused {
+            if self.pty_handles.iter().any(|h| h.block_id == id) {
+                return Some(id);
+            }
+        }
+        self.blocks.iter().rev().find(|b| b.is_running()).map(|b| b.id)
+    }
+
+    /// Build a context menu for a right-click on shell content.
+    pub fn context_menu_for_source(
+        &self,
+        source_id: SourceId,
+        x: f32,
+        y: f32,
+    ) -> Option<ContextMenuMsg> {
+        let block_id = self.block_for_source(source_id)?;
+        Some(ContextMenuMsg::Show(
+            x, y,
+            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+            ContextTarget::Block(block_id),
+        ))
+    }
+
+    /// Build a fallback context menu (last block) for right-click on empty area.
+    pub fn fallback_context_menu(&self, x: f32, y: f32) -> Option<ContextMenuMsg> {
+        let block = self.blocks.last()?;
+        Some(ContextMenuMsg::Show(
+            x, y,
+            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+            ContextTarget::Block(block.id),
+        ))
     }
 
     /// Check if a hit address belongs to a shell block. Returns the block_id if so.

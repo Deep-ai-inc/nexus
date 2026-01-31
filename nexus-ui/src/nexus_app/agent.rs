@@ -16,7 +16,8 @@ use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
 use crate::nexus_widgets::AgentBlockWidget;
 use crate::systems::{agent_subscription, spawn_agent_task};
 
-use super::message::{AgentMsg, NexusMessage};
+use super::context_menu::{ContextMenuItem, ContextTarget};
+use super::message::{AgentMsg, ContextMenuMsg, NexusMessage};
 use super::source_ids;
 
 /// Typed output from AgentWidget → orchestrator.
@@ -113,6 +114,31 @@ impl AgentWidget {
             }
         }
         None
+    }
+
+    /// Build a context menu for a right-click on agent content.
+    pub fn context_menu_for_source(
+        &self,
+        source_id: SourceId,
+        x: f32,
+        y: f32,
+    ) -> Option<ContextMenuMsg> {
+        let block_id = self.block_for_source(source_id)?;
+        Some(ContextMenuMsg::Show(
+            x, y,
+            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+            ContextTarget::AgentBlock(block_id),
+        ))
+    }
+
+    /// Build a fallback context menu (last block) for right-click on empty area.
+    pub fn fallback_context_menu(&self, x: f32, y: f32) -> Option<ContextMenuMsg> {
+        let block = self.blocks.last()?;
+        Some(ContextMenuMsg::Show(
+            x, y,
+            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+            ContextTarget::AgentBlock(block.id),
+        ))
     }
 
     /// Check if a hit address belongs to an agent block. Returns the block_id if so.
