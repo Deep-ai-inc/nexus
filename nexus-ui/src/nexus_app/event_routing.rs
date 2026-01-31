@@ -117,7 +117,7 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
 
         // Escape: dismiss overlays, interrupt agent, leave PTY focus, clear selection
         if matches!(key, Key::Named(NamedKey::Escape)) {
-            if state.context_menu.is_some() {
+            if state.transient.context_menu().is_some() {
                 return Some(NexusMessage::DismissContextMenu);
             }
             if state.agent.is_active() {
@@ -179,7 +179,7 @@ pub(super) fn on_mouse(
     route_mouse!(&event, &hit, capture, [
         state.input.completion.scroll       => NexusMessage::CompletionScroll,
         state.input.history_search.scroll   => NexusMessage::HistorySearchScroll,
-        state.history_scroll                => NexusMessage::HistoryScroll,
+        state.scroll.state                  => NexusMessage::HistoryScroll,
         state.input.text_input              => NexusMessage::InputMouse,
     ]);
 
@@ -270,7 +270,7 @@ pub(super) fn on_mouse(
 
     // Hover tracking for popups
     if let MouseEvent::CursorMoved { .. } = &event {
-        if let Some(ref menu) = state.context_menu {
+        if let Some(menu) = state.transient.context_menu() {
             let idx = if let Some(HitResult::Widget(id)) = &hit {
                 (0..menu.items.len())
                     .find(|i| *id == source_ids::ctx_menu_item(*i))
@@ -307,7 +307,7 @@ pub(super) fn on_mouse(
         ..
     } = &event
     {
-        if let Some(ref menu) = state.context_menu {
+        if let Some(menu) = state.transient.context_menu() {
             if let Some(HitResult::Widget(id)) = &hit {
                 for (i, item) in menu.items.iter().enumerate() {
                     if *id == source_ids::ctx_menu_item(i) {
