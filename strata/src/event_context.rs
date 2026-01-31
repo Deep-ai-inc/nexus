@@ -10,9 +10,9 @@
 
 use std::cell::RefCell;
 
-use crate::strata::content_address::SourceId;
-use crate::strata::layout_snapshot::LayoutSnapshot;
-use crate::strata::primitives::Point;
+use crate::content_address::SourceId;
+use crate::layout_snapshot::LayoutSnapshot;
+use crate::primitives::Point;
 
 /// Capture state for pointer events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +361,7 @@ impl From<KeyEvent> for Event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strata::layout_snapshot::LayoutSnapshot;
+    use crate::layout_snapshot::LayoutSnapshot;
 
     #[test]
     fn capture_pointer() {

@@ -5,13 +5,13 @@
 
 use std::cell::RefCell;
 
-use crate::strata::content_address::SourceId;
-use crate::strata::event_context::{Event, EventContext, MouseButton, MouseEvent};
-use crate::strata::gpu::StrataPipeline;
-use crate::strata::layout_snapshot::{LayoutSnapshot, SourceLayout, TextLayout};
-use crate::strata::primitives::{Color, Constraints, Rect, Size};
-use crate::strata::text_engine::{ShapedText, TextAttrs, TextEngine};
-use crate::strata::widget::{EventResult, StrataWidget};
+use crate::content_address::SourceId;
+use crate::event_context::{Event, EventContext, MouseButton, MouseEvent};
+use crate::gpu::StrataPipeline;
+use crate::layout_snapshot::{LayoutSnapshot, SourceLayout, TextLayout};
+use crate::primitives::{Color, Constraints, Rect, Size};
+use crate::text_engine::{ShapedText, TextAttrs, TextEngine};
+use crate::widget::{EventResult, StrataWidget};
 
 /// Messages that a TextWidget can produce.
 #[derive(Debug, Clone)]
@@ -137,7 +137,7 @@ impl StrataWidget<TextMessage> for TextWidget {
                 position,
             }) => {
                 // Hit-test to find cursor position
-                if let Some(crate::strata::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {
+                if let Some(crate::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {
                     if addr.source_id == self.source_id {
                         return EventResult::Message(TextMessage::Clicked {
                             cursor_position: addr.content_offset,

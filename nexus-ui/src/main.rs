@@ -16,15 +16,15 @@ fn main() -> iced::Result {
 
     if args.iter().any(|a| a == "--demo") {
         tracing::info!("Starting Strata demo");
-        nexus_ui::strata::demo::run().map_err(strata_err)
+        strata::demo::run().map_err(strata_err)
     } else {
         tracing::info!("Starting Nexus");
-        nexus_ui::strata::nexus_app::run().map_err(strata_err)
+        nexus_ui::nexus_app::run().map_err(strata_err)
     }
 }
 
-fn strata_err(e: nexus_ui::strata::shell::Error) -> iced::Error {
+fn strata_err(e: strata::shell::Error) -> iced::Error {
     match e {
-        nexus_ui::strata::shell::Error::Iced(ice) => ice,
+        strata::shell::Error::Iced(ice) => ice,
     }
 }

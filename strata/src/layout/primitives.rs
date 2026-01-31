@@ -3,8 +3,8 @@
 //! The fastest path for rendering. Primitives added here map 1:1 to GPU instances
 //! with zero abstraction overhead. Use for backgrounds, decorations, canvas drawing.
 
-use crate::strata::gpu::ImageHandle;
-use crate::strata::primitives::{Color, Point, Rect};
+use crate::gpu::ImageHandle;
+use crate::primitives::{Color, Point, Rect};
 
 /// A batch of primitives ready for GPU rendering.
 ///

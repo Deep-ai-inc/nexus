@@ -11,6 +11,7 @@ path = "src/main.rs"
 nexus-api = { workspace = true }
 nexus-kernel = { workspace = true }
 nexus-term = { workspace = true }
+strata = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -24,9 +25,4 @@ iced = { workspace = true }
 portable-pty = { workspace = true }
 arboard = { workspace = true }  # Clipboard support
 image = { workspace = true }  # Image processing for clipboard images
-fontdue = { workspace = true }  # Glyph rasterization for GPU atlas
-cosmic-text = { workspace = true }  # Text shaping and layout
-lru = "0.12"  # LRU cache for text shaping results
-bytemuck = { workspace = true }  # Safe transmutes for GPU buffers
-wgpu = { workspace = true }  # GPU access for custom shaders
 nix = { workspace = true }  # Unix signal handling for CLI cancellation

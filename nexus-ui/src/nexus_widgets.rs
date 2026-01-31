@@ -9,18 +9,18 @@ use nexus_kernel::{Completion, CompletionKind};
 
 use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus};
 use crate::blocks::Block;
-use crate::strata::content_address::SourceId;
-use crate::strata::nexus_app::source_ids;
-use crate::strata::gpu::ImageHandle;
-use crate::strata::layout::containers::{
+use strata::content_address::SourceId;
+use crate::nexus_app::source_ids;
+use strata::gpu::ImageHandle;
+use strata::layout::containers::{
     ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
     ScrollColumn, TableCell, TableElement, TerminalElement, TextElement, Widget,
 };
-use crate::strata::primitives::Color;
-use crate::strata::scroll_state::ScrollState;
+use strata::primitives::Color;
+use strata::scroll_state::ScrollState;
 use crate::blocks::{VisualJob, VisualJobState};
 
-use super::nexus_app::colors;
+use crate::nexus_app::colors;
 
 // =========================================================================
 // Shell Block Widget — renders a real Block with TerminalParser data
@@ -594,7 +594,7 @@ impl Widget for JobBar<'_> {
 // =========================================================================
 
 pub struct NexusInputBar<'a> {
-    pub input: &'a crate::strata::TextInputState,
+    pub input: &'a strata::TextInputState,
     pub mode: crate::blocks::InputMode,
     pub cwd: &'a str,
     pub last_exit_code: Option<i32>,
@@ -606,7 +606,7 @@ pub struct NexusInputBar<'a> {
 impl Widget for NexusInputBar<'_> {
     fn build(self) -> LayoutChild {
         use crate::blocks::InputMode;
-        use crate::strata::TextInputElement;
+        use strata::TextInputElement;
 
         // Mode button
         let (mode_label, mode_color, mode_bg, prompt_char) = match self.mode {

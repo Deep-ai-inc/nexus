@@ -5,11 +5,11 @@
 
 use std::cell::Cell;
 
-use crate::strata::app::MouseResponse;
-use crate::strata::content_address::SourceId;
-use crate::strata::event_context::{CaptureState, MouseButton, MouseEvent, ScrollDelta};
-use crate::strata::layout_snapshot::{HitResult, LayoutSnapshot, ScrollTrackInfo};
-use crate::strata::primitives::{Point, Rect};
+use crate::app::MouseResponse;
+use crate::content_address::SourceId;
+use crate::event_context::{CaptureState, MouseButton, MouseEvent, ScrollDelta};
+use crate::layout_snapshot::{HitResult, LayoutSnapshot, ScrollTrackInfo};
+use crate::primitives::{Point, Rect};
 
 /// Grab tolerance for scrollbar thumb clicks (absorbs float rounding).
 const GRAB_TOLERANCE: f32 = 4.0;

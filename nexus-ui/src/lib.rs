@@ -1,17 +1,19 @@
 //! Nexus UI - GPU-accelerated terminal interface.
 //!
 //! This crate provides the graphical user interface for the Nexus terminal,
-//! built on the Strata GPU rendering system.
+//! built on the Strata GPU rendering engine.
 //!
 //! # Module Organization
 //!
-//! - `strata`: GPU-accelerated layout and rendering engine
+//! - `nexus_app`: Main application (StrataApp implementation)
+//! - `nexus_widgets`: UI widget components
 //! - `blocks`: Block types and management
 //! - `systems`: External system integrations (PTY, kernel, agent)
 //! - `context`: Nexus context for environment info
 
-// Strata: High-performance GUI abstraction layer
-pub mod strata;
+// Nexus application (StrataApp implementation)
+pub mod nexus_app;
+pub mod nexus_widgets;
 
 // Context system (minimal dependencies)
 pub mod context;

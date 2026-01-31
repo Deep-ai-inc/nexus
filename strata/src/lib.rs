@@ -1,4 +1,4 @@
-//! Strata: High-Performance GUI Abstraction Layer
+//! Strata: High-Performance GPU UI Engine
 //!
 //! Strata provides a unified content addressing and layout system that enables:
 //! - Cross-widget text selection
@@ -52,15 +52,11 @@ pub mod app;
 // Shell integration (iced adapter)
 pub mod shell;
 
-// Demo application for testing
+// Demo application
 pub mod demo;
 pub mod demo_widgets;
 
-// Strata-based Nexus application (replacing legacy Iced UI)
-pub mod nexus_app;
-pub mod nexus_widgets;
-
-// Widget system (legacy - being replaced by layout system)
+// Widget system
 pub mod widget;
 pub mod widgets;
 

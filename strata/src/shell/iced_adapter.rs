@@ -11,15 +11,15 @@ use std::sync::{Arc, Mutex};
 use iced::widget::shader::{self, wgpu};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
 
-use crate::strata::app::{AppConfig, Command, StrataApp};
-use crate::strata::content_address::Selection;
-use crate::strata::layout_snapshot::HitResult;
-use crate::strata::gpu::{ImageHandle, PendingImage, StrataPipeline};
-use crate::strata::event_context::{
+use crate::app::{AppConfig, Command, StrataApp};
+use crate::content_address::Selection;
+use crate::layout_snapshot::HitResult;
+use crate::gpu::{ImageHandle, PendingImage, StrataPipeline};
+use crate::event_context::{
     CaptureState, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey, ScrollDelta,
 };
-use crate::strata::layout_snapshot::LayoutSnapshot;
-use crate::strata::primitives::{Point, Rect};
+use crate::layout_snapshot::LayoutSnapshot;
+use crate::primitives::{Point, Rect};
 
 /// Error type for shell operations.
 #[derive(Debug)]
@@ -82,7 +82,7 @@ struct ShellState<A: StrataApp> {
     frame: u64,
 
     /// Shared image store for dynamic image loading.
-    image_store: crate::strata::gpu::ImageStore,
+    image_store: crate::gpu::ImageStore,
 
     /// Cached layout snapshot from the most recent view() call.
     /// Reused by update() for hit-testing to avoid rebuilding layout twice per frame.
@@ -115,7 +115,7 @@ impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
 
 /// Initialize the shell state.
 fn init<A: StrataApp>() -> (ShellState<A>, Task<ShellMessage<A::Message>>) {
-    let mut image_store = crate::strata::gpu::ImageStore::new();
+    let mut image_store = crate::gpu::ImageStore::new();
     let (app_state, cmd) = A::init(&mut image_store);
 
     let shell_state = ShellState {
@@ -212,7 +212,7 @@ fn update<A: StrataApp>(
                         let response = A::on_mouse(&state.app, strata_event, hit, &state.capture);
 
                         // Process capture request
-                        use crate::strata::app::CaptureRequest;
+                        use crate::app::CaptureRequest;
                         match response.capture {
                             CaptureRequest::Capture(source) => {
                                 state.capture = CaptureState::Captured(source);
@@ -403,8 +403,8 @@ fn convert_mouse_button(button: iced::mouse::Button) -> MouseButton {
     }
 }
 
-fn convert_key(key: &iced::keyboard::Key) -> crate::strata::event_context::Key {
-    use crate::strata::event_context::Key;
+fn convert_key(key: &iced::keyboard::Key) -> crate::event_context::Key {
+    use crate::event_context::Key;
 
     match key {
         iced::keyboard::Key::Named(named) => {
@@ -464,7 +464,7 @@ struct StrataShaderProgram {
     /// Layout snapshot wrapped in Arc to avoid deep copying when iced clones.
     snapshot: Arc<LayoutSnapshot>,
     selection: Option<Selection>,
-    background: crate::strata::primitives::Color,
+    background: crate::primitives::Color,
     /// Frame counter - changing this triggers iced to redraw.
     frame: u64,
     /// Pending image uploads (drained by prepare on first access).
@@ -479,7 +479,7 @@ struct StrataPrimitive {
     /// Layout snapshot wrapped in Arc to avoid deep copying.
     snapshot: Arc<LayoutSnapshot>,
     selection: Option<Selection>,
-    background: crate::strata::primitives::Color,
+    background: crate::primitives::Color,
     frame: u64,
     /// Pending image uploads (drained by prepare on first access).
     pending_images: Arc<Mutex<Vec<PendingImage>>>,
@@ -599,7 +599,7 @@ impl PipelineWrapper {
         selection: Option<&Selection>,
         bounds: &iced::Rectangle,
         viewport: &iced::advanced::graphics::Viewport,
-        background: crate::strata::primitives::Color,
+        background: crate::primitives::Color,
         pending_images: Vec<PendingImage>,
         pending_unloads: Vec<ImageHandle>,
     ) {
@@ -652,16 +652,16 @@ impl PipelineWrapper {
 
         /// Convert an optional clip rect to GPU format [x, y, w, h] with scaling.
         #[inline]
-        fn clip_to_gpu(clip: &Option<crate::strata::primitives::Rect>, scale: f32) -> Option<[f32; 4]> {
+        fn clip_to_gpu(clip: &Option<crate::primitives::Rect>, scale: f32) -> Option<[f32; 4]> {
             clip.map(|c| [c.x * scale, c.y * scale, c.width * scale, c.height * scale])
         }
 
         /// Apply clip from a primitive to the pipeline instances added since `start`.
         #[inline]
         fn maybe_clip(
-            pipeline: &mut crate::strata::gpu::StrataPipeline,
+            pipeline: &mut crate::gpu::StrataPipeline,
             start: usize,
-            clip: &Option<crate::strata::primitives::Rect>,
+            clip: &Option<crate::primitives::Rect>,
             scale: f32,
         ) {
             if let Some(gpu_clip) = clip_to_gpu(clip, scale) {
@@ -792,21 +792,21 @@ impl PipelineWrapper {
                 let selection_rects = snapshot.selection_bounds(sel);
                 let scaled_rects: Vec<_> = selection_rects
                     .iter()
-                    .map(|r| crate::strata::primitives::Rect {
+                    .map(|r| crate::primitives::Rect {
                         x: r.x * scale,
                         y: r.y * scale,
                         width: r.width * scale,
                         height: r.height * scale,
                     })
                     .collect();
-                pipeline.add_solid_rects(&scaled_rects, crate::strata::gpu::SELECTION_COLOR);
+                pipeline.add_solid_rects(&scaled_rects, crate::gpu::SELECTION_COLOR);
             }
         }
 
         // 4. Grid content from sources (terminals use this path)
         for (_source_id, source_layout) in snapshot.sources_in_order() {
             for item in &source_layout.items {
-                if let crate::strata::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
+                if let crate::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
                     let grid_clip = &grid_layout.clip_rect;
                     for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
                         if row.text.trim().is_empty() {
@@ -815,7 +815,7 @@ impl PipelineWrapper {
                         let start = pipeline.instance_count();
                         let x = grid_layout.bounds.x * scale;
                         let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
-                        let color = crate::strata::primitives::Color::unpack(row.color);
+                        let color = crate::primitives::Color::unpack(row.color);
                         pipeline.add_text(&row.text, x, y, color, BASE_FONT_SIZE * scale);
                         maybe_clip(pipeline, start, grid_clip, scale);
                     }
@@ -943,10 +943,10 @@ impl PipelineWrapper {
 /// Helper to render a decoration primitive via the ubershader pipeline.
 fn render_decoration(
     pipeline: &mut StrataPipeline,
-    decoration: &crate::strata::layout_snapshot::Decoration,
+    decoration: &crate::layout_snapshot::Decoration,
     scale: f32,
 ) {
-    use crate::strata::layout_snapshot::Decoration;
+    use crate::layout_snapshot::Decoration;
 
     match decoration {
         Decoration::SolidRect { rect, color } => {
@@ -984,15 +984,15 @@ fn render_decoration(
 
 /// Convert layout LineStyle to GPU LineStyle.
 fn convert_line_style(
-    style: crate::strata::layout::primitives::LineStyle,
-) -> crate::strata::gpu::LineStyle {
+    style: crate::layout::primitives::LineStyle,
+) -> crate::gpu::LineStyle {
     match style {
-        crate::strata::layout::primitives::LineStyle::Solid => crate::strata::gpu::LineStyle::Solid,
-        crate::strata::layout::primitives::LineStyle::Dashed => {
-            crate::strata::gpu::LineStyle::Dashed
+        crate::layout::primitives::LineStyle::Solid => crate::gpu::LineStyle::Solid,
+        crate::layout::primitives::LineStyle::Dashed => {
+            crate::gpu::LineStyle::Dashed
         }
-        crate::strata::layout::primitives::LineStyle::Dotted => {
-            crate::strata::gpu::LineStyle::Dotted
+        crate::layout::primitives::LineStyle::Dotted => {
+            crate::gpu::LineStyle::Dotted
         }
     }
 }

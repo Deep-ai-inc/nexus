@@ -6,13 +6,13 @@
 
 use std::cell::Cell;
 
-use crate::strata::app::MouseResponse;
-use crate::strata::content_address::SourceId;
-use crate::strata::event_context::{
+use crate::app::MouseResponse;
+use crate::content_address::SourceId;
+use crate::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
-use crate::strata::layout_snapshot::{HitResult, LayoutSnapshot};
-use crate::strata::primitives::Rect;
+use crate::layout_snapshot::{HitResult, LayoutSnapshot};
+use crate::primitives::Rect;
 
 /// Monospace character width (must match containers.rs CHAR_WIDTH).
 const CHAR_WIDTH: f32 = 8.4;

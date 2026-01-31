@@ -1,0 +1,13 @@
+[package]
+name = "strata"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+iced = { workspace = true }
+cosmic-text = { workspace = true }
+fontdue = { workspace = true }
+bytemuck = { workspace = true }
+wgpu = { workspace = true }
+image = { workspace = true }
+lru = "0.12"

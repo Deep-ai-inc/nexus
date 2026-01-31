@@ -12,7 +12,7 @@ use cosmic_text::{
 };
 use lru::LruCache;
 
-use crate::strata::primitives::Color;
+use crate::primitives::Color;
 
 /// Global font system (expensive to create, shared across engine instances).
 static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();

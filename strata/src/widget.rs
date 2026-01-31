@@ -24,11 +24,11 @@
 //! Widgets render to the GPU pipeline through `render()`. The pipeline handles
 //! batching and instanced rendering for efficiency.
 
-use crate::strata::content_address::SourceId;
-use crate::strata::event_context::{Event, EventContext};
-use crate::strata::gpu::StrataPipeline;
-use crate::strata::layout_snapshot::LayoutSnapshot;
-use crate::strata::primitives::{Constraints, Rect, Size};
+use crate::content_address::SourceId;
+use crate::event_context::{Event, EventContext};
+use crate::gpu::StrataPipeline;
+use crate::layout_snapshot::LayoutSnapshot;
+use crate::primitives::{Constraints, Rect, Size};
 
 /// Result of handling an event.
 #[derive(Debug, Clone)]
@@ -146,8 +146,8 @@ impl<M, W: StrataWidget<M>> StrataWidgetExt<M> for W {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strata::content_address::SourceId;
-    use crate::strata::primitives::Color;
+    use crate::content_address::SourceId;
+    use crate::primitives::Color;
 
     /// A simple test widget that renders a single line of text.
     struct TestWidget {

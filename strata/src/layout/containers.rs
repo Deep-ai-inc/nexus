@@ -4,12 +4,12 @@
 //! The layout computation happens ONCE when `layout()` is called,
 //! not during widget construction.
 
-use crate::strata::content_address::SourceId;
-use crate::strata::gpu::ImageHandle;
-use crate::strata::layout_snapshot::LayoutSnapshot;
-use crate::strata::primitives::{Color, Rect, Size};
-use crate::strata::scroll_state::ScrollState;
-use crate::strata::text_input_state::TextInputState;
+use crate::content_address::SourceId;
+use crate::gpu::ImageHandle;
+use crate::layout_snapshot::LayoutSnapshot;
+use crate::primitives::{Color, Rect, Size};
+use crate::scroll_state::ScrollState;
+use crate::text_input_state::TextInputState;
 
 // Layout metrics derived from fontdue for JetBrains Mono at 14px base size.
 const CHAR_WIDTH: f32 = 8.4;
@@ -337,7 +337,7 @@ fn render_text_input(
     input: TextInputElement,
     x: f32, y: f32, w: f32, h: f32,
 ) {
-    use crate::strata::primitives::Point;
+    use crate::primitives::Point;
 
     let input_rect = Rect::new(x, y, w, h);
 
@@ -410,7 +410,7 @@ fn render_text_input_multiline(
     input: TextInputElement,
     x: f32, y: f32, w: f32, h: f32,
 ) {
-    use crate::strata::primitives::Point;
+    use crate::primitives::Point;
 
     let input_rect = Rect::new(x, y, w, h);
 
@@ -985,7 +985,7 @@ fn render_table(
     table: TableElement,
     x: f32, y: f32, w: f32, _h: f32,
 ) {
-    use crate::strata::primitives::Point;
+    use crate::primitives::Point;
 
     let cell_pad = 8.0;
 
@@ -1010,7 +1010,7 @@ fn render_table(
         );
         // Register header text for selection
         {
-            use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+            use crate::layout_snapshot::{SourceLayout, TextLayout};
             let text_layout = TextLayout::simple(
                 col.name.clone(), table.header_text_color.pack(),
                 tx, ty, char_width, table.line_height,
@@ -1065,7 +1065,7 @@ fn render_table(
                         hash_text(text) ^ (row_idx as u64),
                     );
                     // Register for selection
-                    use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                    use crate::layout_snapshot::{SourceLayout, TextLayout};
                     let text_layout = TextLayout::simple(
                         text.clone(), cell.color.pack(),
                         tx, ty, char_width, table.line_height,
@@ -1084,7 +1084,7 @@ fn render_table(
                             hash_text(line) ^ (row_idx as u64) ^ ((line_idx as u64) << 32),
                         );
                         // Register for selection
-                        use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                        use crate::layout_snapshot::{SourceLayout, TextLayout};
                         let text_layout = TextLayout::simple(
                             line.clone(), cell.color.pack(),
                             tx, ly, char_width, table.line_height,
@@ -1556,7 +1556,7 @@ impl Column {
                     let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
                     let x = cross_x(size.width);
 
-                    use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                    use crate::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
                         let scale = fs / BASE_FONT_SIZE;
                         let text_layout = TextLayout::simple(
@@ -1570,7 +1570,7 @@ impl Column {
 
                     snapshot.primitives_mut().add_text_cached(
                         t.text,
-                        crate::strata::primitives::Point::new(x, y),
+                        crate::primitives::Point::new(x, y),
                         t.color,
                         fs,
                         t.cache_key,
@@ -1582,7 +1582,7 @@ impl Column {
                     let size = t.size();
                     let x = cross_x(size.width);
 
-                    use crate::strata::layout_snapshot::{GridLayout, GridRow, SourceLayout};
+                    use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
                     let rows_content: Vec<GridRow> = t.row_content.into_iter()
                         .map(|(text, color)| GridRow { text, color })
                         .collect();
@@ -1614,7 +1614,7 @@ impl Column {
                     snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
                     snapshot.primitives_mut().add_text_cached(
                         btn.label,
-                        crate::strata::primitives::Point::new(bx + btn.padding.left, y + btn.padding.top),
+                        crate::primitives::Point::new(bx + btn.padding.left, y + btn.padding.top),
                         btn.text_color,
                         BASE_FONT_SIZE,
                         btn.cache_key,
@@ -2181,7 +2181,7 @@ impl Row {
                     let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
                     let y = cross_y(size.height);
 
-                    use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                    use crate::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
                         let scale = fs / BASE_FONT_SIZE;
                         let text_layout = TextLayout::simple(
@@ -2195,7 +2195,7 @@ impl Row {
 
                     snapshot.primitives_mut().add_text_cached(
                         t.text,
-                        crate::strata::primitives::Point::new(x, y),
+                        crate::primitives::Point::new(x, y),
                         t.color,
                         fs,
                         t.cache_key,
@@ -2207,7 +2207,7 @@ impl Row {
                     let size = t.size();
                     let y = cross_y(size.height);
 
-                    use crate::strata::layout_snapshot::{GridLayout, GridRow, SourceLayout};
+                    use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
                     let rows_content: Vec<GridRow> = t.row_content.into_iter()
                         .map(|(text, color)| GridRow { text, color })
                         .collect();
@@ -2239,7 +2239,7 @@ impl Row {
                     snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
                     snapshot.primitives_mut().add_text_cached(
                         btn.label,
-                        crate::strata::primitives::Point::new(x + btn.padding.left, by + btn.padding.top),
+                        crate::primitives::Point::new(x + btn.padding.left, by + btn.padding.top),
                         btn.text_color,
                         BASE_FONT_SIZE,
                         btn.cache_key,
@@ -2641,7 +2641,7 @@ impl ScrollColumn {
                 match child {
                     LayoutChild::Text(t) => {
                         let fs = t.font_size();
-                        use crate::strata::layout_snapshot::{SourceLayout, TextLayout};
+                        use crate::layout_snapshot::{SourceLayout, TextLayout};
                         if let Some(source_id) = t.source_id {
                             let scale = fs / BASE_FONT_SIZE;
                             let text_layout = TextLayout::simple(
@@ -2655,7 +2655,7 @@ impl ScrollColumn {
 
                         snapshot.primitives_mut().add_text_cached(
                             t.text,
-                            crate::strata::primitives::Point::new(content_x, screen_y),
+                            crate::primitives::Point::new(content_x, screen_y),
                             t.color,
                             fs,
                             t.cache_key,
@@ -2664,7 +2664,7 @@ impl ScrollColumn {
                     LayoutChild::Terminal(t) => {
                         let size = t.size();
 
-                        use crate::strata::layout_snapshot::{GridLayout, GridRow, SourceLayout};
+                        use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
                         let rows_content: Vec<GridRow> = t.row_content.into_iter()
                             .map(|(text, color)| GridRow { text, color })
                             .collect();
@@ -2691,7 +2691,7 @@ impl ScrollColumn {
                         snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
                         snapshot.primitives_mut().add_text_cached(
                             btn.label,
-                            crate::strata::primitives::Point::new(content_x + btn.padding.left, screen_y + btn.padding.top),
+                            crate::primitives::Point::new(content_x + btn.padding.left, screen_y + btn.padding.top),
                             btn.text_color,
                             BASE_FONT_SIZE,
                             btn.cache_key,
@@ -2773,7 +2773,7 @@ impl ScrollColumn {
             snapshot.register_widget(self.thumb_id, track_hit);
 
             // Store track info so the app can convert mouse Y → scroll offset
-            use crate::strata::layout_snapshot::ScrollTrackInfo;
+            use crate::layout_snapshot::ScrollTrackInfo;
             snapshot.set_scroll_track(self.id, ScrollTrackInfo {
                 track_y: bounds.y,
                 track_height: viewport_h,

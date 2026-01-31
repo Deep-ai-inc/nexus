@@ -18,7 +18,7 @@ static FONT: OnceLock<Font> = OnceLock::new();
 /// Get the shared font instance.
 fn get_font() -> &'static Font {
     FONT.get_or_init(|| {
-        let font_bytes = include_bytes!("../../../fonts/JetBrainsMono-Regular.ttf");
+        let font_bytes = include_bytes!("../../fonts/JetBrainsMono-Regular.ttf");
         Font::from_bytes(font_bytes as &[u8], FontSettings::default())
             .expect("Failed to load embedded font")
     })

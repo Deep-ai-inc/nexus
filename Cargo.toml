@@ -14,6 +14,7 @@ members = [
     "nexus-executor",
     "nexus-agent",
     "nexus-fs",
+    "strata",
 ]
 
 [workspace.package]
@@ -84,3 +85,4 @@ nexus-web = { path = "nexus-web" }
 nexus-executor = { path = "nexus-executor" }
 nexus-agent = { path = "nexus-agent" }
 nexus-fs = { path = "nexus-fs" }
+strata = { path = "strata" }

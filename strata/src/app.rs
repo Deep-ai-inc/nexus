@@ -6,10 +6,10 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::strata::content_address::{Selection, SourceId};
-use crate::strata::event_context::{CaptureState, KeyEvent, MouseEvent};
-use crate::strata::gpu::ImageStore;
-use crate::strata::layout_snapshot::{HitResult, LayoutSnapshot};
+use crate::content_address::{Selection, SourceId};
+use crate::event_context::{CaptureState, KeyEvent, MouseEvent};
+use crate::gpu::ImageStore;
+use crate::layout_snapshot::{HitResult, LayoutSnapshot};
 
 /// Response from a mouse event handler.
 ///
@@ -310,8 +310,8 @@ pub trait StrataApp: Sized + 'static {
     }
 
     /// Background color for the application window.
-    fn background_color(_state: &Self::State) -> crate::strata::primitives::Color {
-        crate::strata::primitives::Color::BLACK
+    fn background_color(_state: &Self::State) -> crate::primitives::Color {
+        crate::primitives::Color::BLACK
     }
 
     /// Whether the application should exit.
@@ -332,7 +332,7 @@ pub struct AppConfig {
     pub antialiasing: bool,
 
     /// Background color.
-    pub background_color: crate::strata::primitives::Color,
+    pub background_color: crate::primitives::Color,
 }
 
 impl Default for AppConfig {
@@ -341,7 +341,7 @@ impl Default for AppConfig {
             title: String::from("Strata App"),
             window_size: (1200.0, 800.0),
             antialiasing: true,
-            background_color: crate::strata::primitives::Color::BLACK,
+            background_color: crate::primitives::Color::BLACK,
         }
     }
 }

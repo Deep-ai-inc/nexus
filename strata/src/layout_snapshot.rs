@@ -13,10 +13,10 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::strata::content_address::{ContentAddress, Selection, SourceId, SourceOrdering};
-use crate::strata::layout::PrimitiveBatch;
-use crate::strata::primitives::{Color, Point, Rect, Size};
-use crate::strata::text_engine::ShapedText;
+use crate::content_address::{ContentAddress, Selection, SourceId, SourceOrdering};
+use crate::layout::PrimitiveBatch;
+use crate::primitives::{Color, Point, Rect, Size};
+use crate::text_engine::ShapedText;
 
 /// Result of a hit test.
 ///

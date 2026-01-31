@@ -2,12 +2,12 @@
 //!
 //! A widget for rendering terminal grid content with cell-based hit-testing.
 
-use crate::strata::content_address::SourceId;
-use crate::strata::event_context::{Event, EventContext};
-use crate::strata::gpu::StrataPipeline;
-use crate::strata::layout_snapshot::{GridLayout, GridRow, LayoutSnapshot, SourceLayout};
-use crate::strata::primitives::{Color, Constraints, Rect, Size};
-use crate::strata::widget::{EventResult, StrataWidget};
+use crate::content_address::SourceId;
+use crate::event_context::{Event, EventContext};
+use crate::gpu::StrataPipeline;
+use crate::layout_snapshot::{GridLayout, GridRow, LayoutSnapshot, SourceLayout};
+use crate::primitives::{Color, Constraints, Rect, Size};
+use crate::widget::{EventResult, StrataWidget};
 
 /// Messages that a TerminalWidget can produce.
 #[derive(Debug, Clone)]
@@ -184,14 +184,14 @@ impl StrataWidget<TerminalMessage> for TerminalWidget {
     }
 
     fn event(&mut self, ctx: &EventContext, event: &Event) -> EventResult<TerminalMessage> {
-        use crate::strata::event_context::{MouseButton, MouseEvent};
+        use crate::event_context::{MouseButton, MouseEvent};
 
         match event {
             Event::Mouse(MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
                 position,
             }) => {
-                if let Some(crate::strata::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {
+                if let Some(crate::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {
                     if addr.source_id == self.source_id {
                         // Convert content_offset to (col, row)
                         let col = (addr.content_offset % self.cols as usize) as u16;

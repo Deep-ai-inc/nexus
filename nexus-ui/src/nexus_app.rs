@@ -23,19 +23,19 @@ use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
 use crate::blocks::{Block, Focus, InputMode, PtyEvent, UnifiedBlockRef};
 use crate::context::NexusContext;
 use crate::pty::PtyHandle;
-use crate::route_mouse;
+use strata::route_mouse;
 use crate::shell_context::build_shell_context;
-use crate::strata::content_address::{ContentAddress, SourceId};
-use crate::strata::event_context::{
+use strata::content_address::{ContentAddress, SourceId};
+use strata::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
-use crate::strata::layout_snapshot::HitResult;
-use crate::strata::nexus_widgets::{
+use strata::layout_snapshot::HitResult;
+use crate::nexus_widgets::{
     AgentBlockWidget, CompletionPopup, HistorySearchBar, JobBar, NexusInputBar,
     ShellBlockWidget, WelcomeScreen,
 };
-use crate::strata::primitives::Rect;
-use crate::strata::{
+use strata::primitives::Rect;
+use strata::{
     AppConfig, ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
     ImageStore, LayoutSnapshot, Length, MouseResponse, Padding, Row, ScrollAction, ScrollColumn,
     ScrollState, Selection, StrataApp, Subscription, TextInputAction, TextInputMouseAction,
@@ -74,7 +74,7 @@ pub(crate) mod source_ids {
 // Color palette (matches real Nexus app)
 // =========================================================================
 pub(crate) mod colors {
-    use crate::strata::primitives::Color;
+    use strata::primitives::Color;
 
     // Backgrounds (matched from theme.rs BG_PRIMARY/SECONDARY/TERTIARY + view/mod.rs)
     pub const BG_APP: Color = Color { r: 0.07, g: 0.07, b: 0.09, a: 1.0 };
@@ -1767,7 +1767,7 @@ impl StrataApp for NexusApp {
         String::from("Nexus (Strata)")
     }
 
-    fn background_color(_state: &Self::State) -> crate::strata::primitives::Color {
+    fn background_color(_state: &Self::State) -> strata::primitives::Color {
         colors::BG_APP
     }
 
@@ -2240,8 +2240,8 @@ fn extract_selected_text(state: &NexusState, sel: &Selection) -> String {
 ///
 /// Sources appear in the order blocks are rendered: shell blocks (terminal or native),
 /// then agent blocks. This matches the view() layout pass.
-fn build_source_ordering(state: &NexusState) -> crate::strata::content_address::SourceOrdering {
-    let mut ordering = crate::strata::content_address::SourceOrdering::new();
+fn build_source_ordering(state: &NexusState) -> strata::content_address::SourceOrdering {
+    let mut ordering = strata::content_address::SourceOrdering::new();
     let unified = state.unified_blocks();
     for block_ref in &unified {
         match block_ref {
@@ -2457,7 +2457,7 @@ fn extract_multi_item_range(
 // =========================================================================
 
 fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuState) {
-    use crate::strata::primitives::{Color, Point, Rect};
+    use strata::primitives::{Color, Point, Rect};
 
     let w = 200.0_f32;
     let row_h = 30.0_f32;
@@ -2615,8 +2615,8 @@ fn scroll_to_index(scroll: &mut ScrollState, index: usize, item_height: f32, vie
 // Entry point
 // =========================================================================
 
-pub fn run() -> Result<(), crate::strata::shell::Error> {
-    crate::strata::shell::run_with_config::<NexusApp>(AppConfig {
+pub fn run() -> Result<(), strata::shell::Error> {
+    strata::shell::run_with_config::<NexusApp>(AppConfig {
         title: String::from("Nexus (Strata)"),
         window_size: (1200.0, 800.0),
         antialiasing: true,

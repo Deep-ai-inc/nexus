@@ -28,7 +28,7 @@ use iced::widget::shader::wgpu;
 use wgpu::util::StagingBelt;
 
 use super::glyph_atlas::GlyphAtlas;
-use crate::strata::primitives::{Color, Rect};
+use crate::primitives::{Color, Rect};
 
 /// Opaque handle to a loaded image in the pipeline's image atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

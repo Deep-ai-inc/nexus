@@ -13,14 +13,14 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use crate::route_mouse;
-use crate::strata::content_address::{ContentAddress, SourceId};
-use crate::strata::demo_widgets::{Card, ShellBlock, StatusIndicator, StatusPanel};
-use crate::strata::event_context::{
+use crate::content_address::{ContentAddress, SourceId};
+use crate::demo_widgets::{Card, ShellBlock, StatusIndicator, StatusPanel};
+use crate::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
-use crate::strata::layout_snapshot::HitResult;
-use crate::strata::primitives::{Color, Point, Rect};
-use crate::strata::{
+use crate::layout_snapshot::HitResult;
+use crate::primitives::{Color, Point, Rect};
+use crate::{
     AppConfig, ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
     ImageStore, LayoutSnapshot, Length, LineStyle, MouseResponse, Padding, Row, ScrollAction,
     ScrollColumn, ScrollState, Selection, StrataApp, Subscription, TableCell, TableElement,
@@ -31,7 +31,7 @@ use crate::strata::{
 // Nexus color palette (matches real app)
 // =========================================================================
 pub(crate) mod colors {
-    use crate::strata::primitives::Color;
+    use crate::primitives::Color;
 
     // Backgrounds
     pub const BG_APP: Color = Color { r: 0.04, g: 0.04, b: 0.06, a: 1.0 };
@@ -1107,8 +1107,8 @@ fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32
 }
 
 /// Run the demo application.
-pub fn run() -> Result<(), crate::strata::shell::Error> {
-    crate::strata::shell::run_with_config::<DemoApp>(AppConfig {
+pub fn run() -> Result<(), crate::shell::Error> {
+    crate::shell::run_with_config::<DemoApp>(AppConfig {
         title: String::from("Strata — Nexus Widget Demo"),
         window_size: (1050.0, 672.0),
         antialiasing: true,
