@@ -664,7 +664,27 @@ impl LayoutSnapshot {
 
     /// Hit test with separate x, y coordinates.
     pub fn hit_test_xy(&self, x: f32, y: f32) -> Option<HitResult> {
-        // 1. Priority: Check content sources (text/terminal) in document order
+        // 1. Priority: Small interactive widgets (buttons, sort headers).
+        //    These take precedence over content to ensure clickability even
+        //    when overlapping with selectable text.  Large container widgets
+        //    (scroll areas) are deferred to step 3.
+        const INTERACTIVE_MAX_AREA: f32 = 40_000.0; // ~200x200
+        let mut best_widget: Option<(SourceId, f32)> = None;
+        for (id, rect) in &self.widget_bounds {
+            if rect.contains_xy(x, y) {
+                let area = rect.width * rect.height;
+                if area <= INTERACTIVE_MAX_AREA {
+                    if best_widget.is_none() || area < best_widget.unwrap().1 {
+                        best_widget = Some((*id, area));
+                    }
+                }
+            }
+        }
+        if let Some((id, _)) = best_widget {
+            return Some(HitResult::Widget(id));
+        }
+
+        // 2. Content sources (text/terminal) in document order.
         for source_id in self.source_ordering.sources_in_order() {
             let Some(layout) = self.sources.get(source_id) else {
                 continue;
@@ -694,18 +714,19 @@ impl LayoutSnapshot {
             }
         }
 
-        // 2. Fallback: Check widget bounds (buttons, panels, etc.)
-        // Prefer the smallest matching widget (most specific hit target).
-        let mut best: Option<(SourceId, f32)> = None;
+        // 3. Fallback: Large container widgets (scroll areas, etc.)
+        let mut best_container: Option<(SourceId, f32)> = None;
         for (id, rect) in &self.widget_bounds {
             if rect.contains_xy(x, y) {
                 let area = rect.width * rect.height;
-                if best.is_none() || area < best.unwrap().1 {
-                    best = Some((*id, area));
+                if area > INTERACTIVE_MAX_AREA {
+                    if best_container.is_none() || area < best_container.unwrap().1 {
+                        best_container = Some((*id, area));
+                    }
                 }
             }
         }
-        if let Some((id, _)) = best {
+        if let Some((id, _)) = best_container {
             return Some(HitResult::Widget(id));
         }
 
@@ -875,8 +896,15 @@ impl LayoutSnapshot {
                 continue;
             };
 
-            if current_order > start_order && current_order < end_order {
-                // Entire source is selected
+            // Fast path: entire source is selected — use combined bounds
+            let fully_before_start = current_order > start_order
+                || (current_order == start_order
+                    && start.item_index == 0
+                    && start.content_offset == 0);
+            let fully_after_end = current_order < end_order
+                || (current_order == end_order
+                    && end.item_index >= layout.items.len());
+            if fully_before_start && fully_after_end {
                 rects.push(layout.bounds);
             } else {
                 // Partial selection - need to compute per-item bounds

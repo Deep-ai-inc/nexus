@@ -1026,7 +1026,22 @@ impl StrataApp for NexusApp {
                         return Command::message(NexusMessage::Paste);
                     }
                     ContextMenuItem::SelectAll => {
-                        state.input.select_all();
+                        match target.as_ref() {
+                            Some(ContextTarget::Input) | None => {
+                                state.input.select_all();
+                            }
+                            Some(ContextTarget::Block(_)) | Some(ContextTarget::AgentBlock(_)) => {
+                                let ordering = build_source_ordering(state);
+                                let sources = ordering.sources_in_order();
+                                if let (Some(&first), Some(&last)) = (sources.first(), sources.last()) {
+                                    state.selection = Some(Selection::new(
+                                        ContentAddress::start_of(first),
+                                        ContentAddress::new(last, usize::MAX, usize::MAX),
+                                    ));
+                                    state.is_selecting = false;
+                                }
+                            }
+                        }
                     }
                     ContextMenuItem::Clear => {
                         state.input.text.clear();
