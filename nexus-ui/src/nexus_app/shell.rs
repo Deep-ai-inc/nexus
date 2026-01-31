@@ -1,6 +1,6 @@
 //! Shell widget — owns terminal blocks, PTY handles, jobs, and image handles.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +24,6 @@ use crate::nexus_widgets::{JobBar, ShellBlockWidget};
 use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::message::{AnchorAction, ContextMenuMsg, NexusMessage, ShellMsg};
 use super::source_ids;
-use crate::nexus_widgets::is_anchor_value;
 
 /// Typed output from ShellWidget → orchestrator.
 pub(crate) enum ShellOutput {
@@ -56,6 +55,18 @@ impl Default for ShellOutput {
     fn default() -> Self { Self::None }
 }
 
+/// An anchor entry resolved during rendering — stores both the click action
+/// and drag payload so click/drag handling is an O(1) HashMap lookup.
+///
+/// Populated during `view()` (the single source of truth), read during
+/// `on_click_anchor()` and `drag_payload_for_anchor()`.
+#[derive(Debug, Clone)]
+pub(crate) struct AnchorEntry {
+    pub block_id: BlockId,
+    pub action: AnchorAction,
+    pub drag_payload: super::drag_state::DragPayload,
+}
+
 /// Manages all shell-related state: terminal blocks, PTY handles, jobs, images.
 pub(crate) struct ShellWidget {
     pub blocks: Vec<Block>,
@@ -68,6 +79,10 @@ pub(crate) struct ShellWidget {
     pub last_exit_code: Option<i32>,
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
     pub jobs: Vec<VisualJob>,
+
+    /// Anchor registry — populated during view(), read during click/drag handling.
+    /// Keyed by SourceId, provides O(1) lookup for both AnchorAction and DragPayload.
+    pub(crate) anchor_registry: RefCell<HashMap<SourceId, AnchorEntry>>,
 
     // --- Subscription channels (owned by this widget) ---
     pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
@@ -90,6 +105,7 @@ impl ShellWidget {
             last_exit_code: None,
             image_handles: HashMap::new(),
             jobs: Vec::new(),
+            anchor_registry: RefCell::new(HashMap::new()),
             pty_rx: Arc::new(Mutex::new(pty_rx)),
             kernel_rx,
         }
@@ -98,6 +114,12 @@ impl ShellWidget {
     /// Whether the shell has pending output that needs a redraw tick.
     pub fn needs_redraw(&self) -> bool {
         self.terminal_dirty
+    }
+
+    /// Clear the anchor registry. Called at the start of each view() pass
+    /// before blocks re-populate it.
+    pub fn clear_anchor_registry(&self) {
+        self.anchor_registry.borrow_mut().clear();
     }
 
     // ---- View contributions ----
@@ -115,6 +137,7 @@ impl ShellWidget {
             kill_id: source_ids::kill(block.id),
             image_info: self.image_handles.get(&block.id).copied(),
             is_focused,
+            anchor_registry: &self.anchor_registry,
         })
     }
 
@@ -208,127 +231,18 @@ impl ShellWidget {
     }
 
     /// Handle a click on an anchor widget. Returns None if not an anchor we own.
+    /// Look up an anchor by SourceId in the registry (O(1)).
+    /// The registry is populated during view() — the single source of truth.
     pub fn on_click_anchor(&self, id: SourceId) -> Option<ShellMsg> {
-        for block in &self.blocks {
-            if let Some(value) = &block.native_output {
-                if let Some(action) = self.resolve_anchor(block.id, value, id) {
-                    return Some(ShellMsg::OpenAnchor(block.id, action));
-                }
-            }
-        }
-        None
+        let registry = self.anchor_registry.borrow();
+        let entry = registry.get(&id)?;
+        Some(ShellMsg::OpenAnchor(entry.block_id, entry.action.clone()))
     }
 
-    /// Resolve an anchor SourceId to an AnchorAction by walking the block's output.
-    /// Uses the same iteration order as rendering to match indices.
-    fn resolve_anchor(&self, block_id: BlockId, value: &Value, target: SourceId) -> Option<AnchorAction> {
-        match value {
-            Value::Table { rows, .. } => {
-                let mut anchor_idx = 0usize;
-                for row in rows {
-                    for cell in row {
-                        if is_anchor_value(cell) {
-                            if target == source_ids::anchor(block_id, anchor_idx) {
-                                return Some(value_to_anchor_action(cell));
-                            }
-                            anchor_idx += 1;
-                        }
-                    }
-                }
-                None
-            }
-            Value::List(items) => {
-                // File entry lists: anchor index = item position
-                let file_entries: Vec<&nexus_api::FileEntry> = items
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::FileEntry(entry) => Some(entry.as_ref()),
-                        _ => None,
-                    })
-                    .collect();
-                if file_entries.len() == items.len() && !file_entries.is_empty() {
-                    for (i, entry) in file_entries.iter().enumerate() {
-                        if target == source_ids::anchor(block_id, i) {
-                            return Some(AnchorAction::RevealPath(entry.path.clone()));
-                        }
-                    }
-                }
-                None
-            }
-            Value::FileEntry(entry) => {
-                if target == source_ids::anchor(block_id, 0) {
-                    Some(AnchorAction::RevealPath(entry.path.clone()))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Resolve an anchor SourceId to a DragPayload for internal drag-and-drop.
-    /// Returns None if the id doesn't match any anchor.
+    /// Look up a drag payload by SourceId in the registry (O(1)).
     pub fn drag_payload_for_anchor(&self, id: SourceId) -> Option<super::drag_state::DragPayload> {
-        for block in &self.blocks {
-            if let Some(value) = &block.native_output {
-                if let Some(payload) = self.resolve_drag_payload(block.id, value, id) {
-                    return Some(payload);
-                }
-            }
-        }
-        None
-    }
-
-    fn resolve_drag_payload(&self, block_id: BlockId, value: &Value, target: SourceId) -> Option<super::drag_state::DragPayload> {
-        use super::drag_state::DragPayload;
-
-        match value {
-            Value::Table { columns, rows } => {
-                let mut anchor_idx = 0usize;
-                for (row_index, row) in rows.iter().enumerate() {
-                    for (col_idx, cell) in row.iter().enumerate() {
-                        if is_anchor_value(cell) {
-                            if target == source_ids::anchor(block_id, anchor_idx) {
-                                // Extract the most useful text from this cell
-                                let display = semantic_text_for_value(cell, columns.get(col_idx));
-                                return Some(DragPayload::TableRow {
-                                    block_id,
-                                    row_index,
-                                    display,
-                                });
-                            }
-                            anchor_idx += 1;
-                        }
-                    }
-                }
-                None
-            }
-            Value::List(items) => {
-                let file_entries: Vec<&nexus_api::FileEntry> = items
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::FileEntry(entry) => Some(entry.as_ref()),
-                        _ => None,
-                    })
-                    .collect();
-                if file_entries.len() == items.len() && !file_entries.is_empty() {
-                    for (i, entry) in file_entries.iter().enumerate() {
-                        if target == source_ids::anchor(block_id, i) {
-                            return Some(DragPayload::FilePath(entry.path.clone()));
-                        }
-                    }
-                }
-                None
-            }
-            Value::FileEntry(entry) => {
-                if target == source_ids::anchor(block_id, 0) {
-                    Some(DragPayload::FilePath(entry.path.clone()))
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
+        let registry = self.anchor_registry.borrow();
+        registry.get(&id).map(|e| e.drag_payload.clone())
     }
 
     /// Check if a hit address belongs to a shell block. Returns the block_id if so.
@@ -854,7 +768,7 @@ pub(crate) fn strata_key_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
 /// Extract the most semantically useful text for drag-and-drop from a value.
 /// For file entries, returns the path. For processes, returns the PID.
 /// For git commits, returns the hash. Falls back to `to_text()`.
-fn semantic_text_for_value(value: &Value, _column: Option<&nexus_api::TableColumn>) -> String {
+pub(crate) fn semantic_text_for_value(value: &Value, _column: Option<&nexus_api::TableColumn>) -> String {
     match value {
         Value::Path(p) => super::file_drop::shell_quote(p),
         Value::FileEntry(entry) => super::file_drop::shell_quote(&entry.path),
@@ -864,7 +778,7 @@ fn semantic_text_for_value(value: &Value, _column: Option<&nexus_api::TableColum
     }
 }
 
-fn value_to_anchor_action(value: &Value) -> AnchorAction {
+pub(crate) fn value_to_anchor_action(value: &Value) -> AnchorAction {
     match value {
         Value::Path(p) => AnchorAction::RevealPath(p.clone()),
         Value::FileEntry(entry) => AnchorAction::RevealPath(entry.path.clone()),

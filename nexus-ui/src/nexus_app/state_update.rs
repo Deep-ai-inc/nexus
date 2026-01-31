@@ -281,13 +281,20 @@ impl NexusState {
                 strata::DragSource::Text(display.clone())
             }
             DragPayload::Block(id) => {
-                // Export block output as text or TSV
+                // Export block output as text or TSV.
+                // For table data, write a temp file so the platform layer stays I/O-free.
                 if let Some(&idx) = self.shell.block_index.get(id) {
                     if let Some(block) = self.shell.blocks.get(idx) {
                         if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
                             let tsv = table_to_tsv(columns, rows);
                             let filename = format!("{}-output.tsv", block.command.split_whitespace().next().unwrap_or("block"));
-                            return strata::DragSource::FilePromise { filename, data: tsv.into_bytes() };
+                            match write_drag_temp_file(&filename, tsv.as_bytes()) {
+                                Ok(path) => return strata::DragSource::File(path),
+                                Err(e) => {
+                                    tracing::warn!("Failed to write drag temp file: {}", e);
+                                    return strata::DragSource::Tsv(tsv);
+                                }
+                            }
                         }
                         if let Some(ref value) = block.native_output {
                             return strata::DragSource::Text(value.to_text());
@@ -567,6 +574,16 @@ impl NexusState {
 }
 
 /// Convert a table Value to TSV (tab-separated values) string.
+/// Write ephemeral drag data to a temp file, returning the path.
+/// Keeps the platform drag layer I/O-free.
+fn write_drag_temp_file(filename: &str, data: &[u8]) -> Result<std::path::PathBuf, std::io::Error> {
+    let temp_dir = std::env::temp_dir().join("nexus-drag");
+    std::fs::create_dir_all(&temp_dir)?;
+    let path = temp_dir.join(filename);
+    std::fs::write(&path, data)?;
+    Ok(path)
+}
+
 fn table_to_tsv(columns: &[TableColumn], rows: &[Vec<Value>]) -> String {
     let mut buf = String::new();
     // Header row

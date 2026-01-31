@@ -374,10 +374,9 @@ pub trait StrataApp: Sized + 'static {
 #[derive(Debug, Clone)]
 pub enum DragSource {
     /// Drag a file — the OS shows the file icon, Finder accepts it.
+    /// For ephemeral data (e.g. table exports), the app layer writes to a temp
+    /// file and passes the path here — keeping the platform layer I/O-free.
     File(std::path::PathBuf),
-    /// Drag file content that doesn't exist on disk yet.
-    /// The OS creates a promised file on drop (NSFilePromiseProvider on macOS).
-    FilePromise { filename: String, data: Vec<u8> },
     /// Drag plain text.
     Text(String),
     /// Drag TSV (spreadsheets accept structured paste).

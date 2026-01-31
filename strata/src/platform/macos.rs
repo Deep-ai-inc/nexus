@@ -58,17 +58,6 @@ pub fn start_drag(source: &DragSource) -> Result<(), String> {
                 set_file_url_on_pasteboard(&pb_item, path)?;
                 drag_image = file_icon(path);
             }
-            DragSource::FilePromise { filename, data } => {
-                // Write to a temp file and drag that.
-                let temp_dir = std::env::temp_dir().join("nexus-drag");
-                let _ = std::fs::create_dir_all(&temp_dir);
-                let temp_path = temp_dir.join(filename);
-                std::fs::write(&temp_path, data)
-                    .map_err(|e| format!("Failed to write temp file: {}", e))?;
-
-                set_file_url_on_pasteboard(&pb_item, &temp_path)?;
-                drag_image = file_icon(&temp_path);
-            }
             DragSource::Text(text) => {
                 let ns_text = NSString::from_str(text);
                 let success: bool = pb_item.setString_forType(&ns_text, NSPasteboardTypeString);

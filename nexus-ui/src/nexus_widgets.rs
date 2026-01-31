@@ -4,12 +4,17 @@
 //! using Strata's layout primitives. Each widget takes references to backend
 //! data models and builds a layout tree.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use nexus_api::{BlockId, BlockState, FileType, Value, format_value_for_display};
 use nexus_kernel::{Completion, CompletionKind};
 
 use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus};
 use crate::blocks::Block;
 use strata::content_address::SourceId;
+use crate::nexus_app::drag_state::DragPayload;
+use crate::nexus_app::shell::{AnchorEntry, value_to_anchor_action, semantic_text_for_value};
 use crate::nexus_app::source_ids;
 use strata::gpu::ImageHandle;
 use strata::layout::containers::{
@@ -32,6 +37,9 @@ pub struct ShellBlockWidget<'a> {
     pub kill_id: SourceId,
     pub image_info: Option<(ImageHandle, u32, u32)>,
     pub is_focused: bool,
+    /// Shared anchor registry — populated during rendering so click/drag
+    /// handling can do O(1) lookups without re-iterating the Value tree.
+    pub(crate) anchor_registry: &'a RefCell<HashMap<SourceId, AnchorEntry>>,
 }
 
 impl Widget for ShellBlockWidget<'_> {
@@ -98,7 +106,7 @@ impl Widget for ShellBlockWidget<'_> {
 
         // Render output: native structured data takes priority over terminal
         if let Some(value) = &block.native_output {
-            content = render_native_value(content, value, block, self.image_info);
+            content = render_native_value(content, value, block, self.image_info, self.anchor_registry);
         } else if content_rows > 0 {
             let source_id = source_ids::shell_term(block.id);
             let mut term = TerminalElement::new(source_id, cols, content_rows)
@@ -902,6 +910,7 @@ fn render_native_value(
     value: &Value,
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
+    anchor_registry: &RefCell<HashMap<SourceId, AnchorEntry>>,
 ) -> Column {
     let block_id = block.id;
     match value {
@@ -982,6 +991,15 @@ fn render_native_value(
                     let lines = wrap_cell_text(&text, max_chars);
                     let widget_id = if is_anchor_value(cell) {
                         let id = source_ids::anchor(block_id, anchor_idx);
+                        anchor_registry.borrow_mut().insert(id, AnchorEntry {
+                            block_id,
+                            action: value_to_anchor_action(cell),
+                            drag_payload: DragPayload::TableRow {
+                                block_id,
+                                row_index: anchor_idx,
+                                display: semantic_text_for_value(cell, columns.get(col_idx)),
+                            },
+                        });
                         anchor_idx += 1;
                         Some(id)
                     } else {
@@ -1022,6 +1040,12 @@ fn render_native_value(
                         entry.name.clone()
                     };
                     let anchor_id = source_ids::anchor(block_id, i);
+                    let file_value = Value::FileEntry(Box::new((*entry).clone()));
+                    anchor_registry.borrow_mut().insert(anchor_id, AnchorEntry {
+                        block_id,
+                        action: value_to_anchor_action(&file_value),
+                        drag_payload: DragPayload::FilePath(entry.path.clone()),
+                    });
                     parent = parent.push(
                         Row::new()
                             .id(anchor_id)
@@ -1050,6 +1074,11 @@ fn render_native_value(
             };
             let source_id = source_ids::native(block_id);
             let anchor_id = source_ids::anchor(block_id, 0);
+            anchor_registry.borrow_mut().insert(anchor_id, AnchorEntry {
+                block_id,
+                action: value_to_anchor_action(value),
+                drag_payload: DragPayload::FilePath(entry.path.clone()),
+            });
             parent.push(
                 Row::new()
                     .id(anchor_id)
