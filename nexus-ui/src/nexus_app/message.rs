@@ -1,4 +1,7 @@
 //! Message types that drive the Nexus application update loop.
+//!
+//! Nested enum structure: each child component has its own message type,
+//! wrapped by the root `NexusMessage` enum. Cross-cutting messages stay at root.
 
 use nexus_api::BlockId;
 use strata::content_address::ContentAddress;
@@ -8,85 +11,113 @@ use strata::{ScrollAction, TextInputMouseAction};
 use crate::agent_adapter::AgentEvent;
 use super::context_menu::{ContextMenuItem, ContextTarget};
 
+// =========================================================================
+// Root message
+// =========================================================================
+
 #[derive(Debug, Clone)]
 pub enum NexusMessage {
-    // Input
-    InputKey(KeyEvent),
-    InputMouse(TextInputMouseAction),
+    Input(InputMsg),
+    Shell(ShellMsg),
+    Agent(AgentMsg),
+    Selection(SelectionMsg),
+
+    // Cross-cutting (root handles directly)
+    Scroll(ScrollAction),
+    ContextMenu(ContextMenuMsg),
+    Paste,
+    Copy,
+    ClearScreen,
+    CloseWindow,
+    BlurAll,
+    Tick,
+    ScrollToJob(u32),
+}
+
+// =========================================================================
+// Input component messages
+// =========================================================================
+
+#[derive(Debug, Clone)]
+pub enum InputMsg {
+    Key(KeyEvent),
+    Mouse(TextInputMouseAction),
     Submit(String),
     ToggleMode,
     HistoryUp,
     HistoryDown,
+    InsertNewline,
+    RemoveAttachment(usize),
 
-    // Terminal / PTY
-    PtyOutput(BlockId, Vec<u8>),
-    PtyExited(BlockId, i32),
-    PtyInput(KeyEvent),
-    SendInterrupt,
-    KernelEvent(nexus_api::ShellEvent),
-    KillBlock(BlockId),
-
-    // Agent
-    AgentEvent(AgentEvent),
-    ToggleThinking(BlockId),
-    ToggleTool(BlockId, usize),
-    PermissionGrant(BlockId, String),
-    PermissionGrantSession(BlockId, String),
-    PermissionDeny(BlockId, String),
-    AgentInterrupt,
-
-    // Scroll
-    HistoryScroll(ScrollAction),
-    CompletionScroll(ScrollAction),
-    HistorySearchScroll(ScrollAction),
-
-    // Selection
-    SelectionStart(ContentAddress),
-    SelectionExtend(ContentAddress),
-    SelectionEnd,
-    ClearSelection,
-    Copy,
-
-    // Table sorting
-    SortTable(BlockId, usize),
-
-    // Completions
+    // Completion
     TabComplete,
     CompletionNav(isize),
     CompletionAccept,
     CompletionDismiss,
-    /// Dismiss completion and forward the key event to normal input handling.
     CompletionDismissAndForward(KeyEvent),
+    CompletionSelect(usize),
+    CompletionScroll(ScrollAction),
 
-    // History search (Ctrl+R)
+    // History search
     HistorySearchToggle,
     HistorySearchKey(KeyEvent),
     HistorySearchAccept,
     HistorySearchDismiss,
     HistorySearchSelect(usize),
     HistorySearchAcceptIndex(usize),
+    HistorySearchScroll(ScrollAction),
+}
 
-    // Completion click
-    CompletionSelect(usize),
+// =========================================================================
+// Shell component messages
+// =========================================================================
 
-    // Job indicator
-    ScrollToJob(u32),
+#[derive(Debug, Clone)]
+pub enum ShellMsg {
+    PtyOutput(BlockId, Vec<u8>),
+    PtyExited(BlockId, i32),
+    PtyInput(KeyEvent),
+    /// Root resolves the target block and passes its ID.
+    SendInterrupt(BlockId),
+    KernelEvent(nexus_api::ShellEvent),
+    KillBlock(BlockId),
+    SortTable(BlockId, usize),
+}
 
-    // Clipboard
-    Paste,
-    RemoveAttachment(usize),
+// =========================================================================
+// Agent component messages
+// =========================================================================
 
-    // Context menu
-    ShowContextMenu(f32, f32, Vec<ContextMenuItem>, ContextTarget),
-    ContextMenuAction(ContextMenuItem),
-    DismissContextMenu,
+#[derive(Debug, Clone)]
+pub enum AgentMsg {
+    Event(AgentEvent),
+    ToggleThinking(BlockId),
+    ToggleTool(BlockId, usize),
+    PermissionGrant(BlockId, String),
+    PermissionGrantSession(BlockId, String),
+    PermissionDeny(BlockId, String),
+    Interrupt,
+}
 
-    // Multiline input
-    InsertNewline,
+// =========================================================================
+// Selection component messages
+// =========================================================================
 
-    // Window
-    ClearScreen,
-    CloseWindow,
-    BlurAll,
-    Tick,
+#[derive(Debug, Clone)]
+pub enum SelectionMsg {
+    Start(ContentAddress),
+    Extend(ContentAddress),
+    End,
+    Clear,
+}
+
+// =========================================================================
+// Context menu messages
+// =========================================================================
+
+#[derive(Debug, Clone)]
+pub enum ContextMenuMsg {
+    Show(f32, f32, Vec<ContextMenuItem>, ContextTarget),
+    Action(ContextMenuItem),
+    Dismiss,
 }

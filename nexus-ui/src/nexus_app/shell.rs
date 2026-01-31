@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_api::{BlockId, BlockState, ShellEvent, Value};
 use nexus_kernel::{CommandClassification, Kernel};
@@ -13,9 +13,11 @@ use nexus_term::TerminalParser;
 
 use crate::blocks::{Block, PtyEvent, VisualJob, VisualJobState};
 use crate::pty::PtyHandle;
-use strata::{ImageHandle, ImageStore};
+use crate::systems::{kernel_subscription, pty_subscription};
+use strata::{ImageHandle, ImageStore, Subscription};
 use strata::event_context::{Key, KeyEvent, NamedKey};
-use tokio::sync::mpsc;
+
+use super::message::{NexusMessage, ShellMsg};
 
 /// Typed output from ShellWidget → orchestrator.
 pub(crate) enum ShellOutput {
@@ -49,10 +51,18 @@ pub(crate) struct ShellWidget {
     pub last_exit_code: Option<i32>,
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
     pub jobs: Vec<VisualJob>,
+
+    // --- Subscription channels (owned by this widget) ---
+    pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
+    kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
 }
 
 impl ShellWidget {
-    pub fn new(pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>) -> Self {
+    pub fn new(
+        pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
+        pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
+        kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
+    ) -> Self {
         Self {
             blocks: Vec::new(),
             block_index: HashMap::new(),
@@ -64,7 +74,38 @@ impl ShellWidget {
             last_exit_code: None,
             image_handles: HashMap::new(),
             jobs: Vec::new(),
+            pty_rx,
+            kernel_rx,
         }
+    }
+
+    /// Whether the shell has pending output that needs a redraw tick.
+    pub fn needs_redraw(&self) -> bool {
+        self.terminal_dirty
+    }
+
+    /// Create the subscription for PTY and kernel events.
+    ///
+    /// Returns `Subscription<NexusMessage>` directly because iced's
+    /// `Subscription::map` panics on capturing closures, so we can't
+    /// return `Subscription<ShellMsg>` and `map_msg` at the root.
+    pub fn subscription(&self) -> Subscription<NexusMessage> {
+        let mut subs = Vec::new();
+
+        let pty_rx = self.pty_rx.clone();
+        subs.push(Subscription::from_iced(
+            pty_subscription(pty_rx).map(|(id, evt)| match evt {
+                PtyEvent::Output(data) => NexusMessage::Shell(ShellMsg::PtyOutput(id, data)),
+                PtyEvent::Exited(code) => NexusMessage::Shell(ShellMsg::PtyExited(id, code)),
+            }),
+        ));
+
+        let kernel_rx = self.kernel_rx.clone();
+        subs.push(Subscription::from_iced(
+            kernel_subscription(kernel_rx).map(|evt| NexusMessage::Shell(ShellMsg::KernelEvent(evt))),
+        ));
+
+        Subscription::batch(subs)
     }
 
     /// Execute a command (kernel or external PTY).
@@ -255,17 +296,9 @@ impl ShellWidget {
     }
 
     /// Send interrupt (Ctrl+C) to focused or last running PTY.
-    pub fn send_interrupt(&self, focus: &crate::blocks::Focus) {
-        let target = match focus {
-            crate::blocks::Focus::Block(id) => Some(*id),
-            crate::blocks::Focus::Input => {
-                self.blocks.iter().rev().find(|b| b.is_running()).map(|b| b.id)
-            }
-        };
-        if let Some(id) = target {
-            if let Some(handle) = self.pty_handles.iter().find(|h| h.block_id == id) {
-                let _ = handle.send_interrupt();
-            }
+    pub fn send_interrupt_to(&self, id: BlockId) {
+        if let Some(handle) = self.pty_handles.iter().find(|h| h.block_id == id) {
+            let _ = handle.send_interrupt();
         }
     }
 

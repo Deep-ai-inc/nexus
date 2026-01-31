@@ -56,6 +56,9 @@ pub mod shell;
 pub mod demo;
 pub mod demo_widgets;
 
+// Component system
+pub mod component;
+
 // Widget system
 pub mod widget;
 pub mod widgets;

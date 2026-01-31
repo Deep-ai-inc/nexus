@@ -5,13 +5,16 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use nexus_api::{BlockId, Value};
+use strata::Subscription;
 
 use crate::agent_adapter::{AgentEvent, PermissionResponse};
 use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
-use crate::systems::spawn_agent_task;
+use crate::systems::{agent_subscription, spawn_agent_task};
+
+use super::message::{AgentMsg, NexusMessage};
 
 /// Typed output from AgentWidget → orchestrator.
 pub(crate) enum AgentOutput {
@@ -29,10 +32,16 @@ pub(crate) struct AgentWidget {
     pub cancel_flag: Arc<AtomicBool>,
     pub dirty: bool,
     pub session_id: Option<String>,
+
+    // --- Subscription channel (owned by this widget) ---
+    event_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
 }
 
 impl AgentWidget {
-    pub fn new(event_tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+    pub fn new(
+        event_tx: mpsc::UnboundedSender<AgentEvent>,
+        event_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
+    ) -> Self {
         Self {
             blocks: Vec::new(),
             block_index: HashMap::new(),
@@ -42,7 +51,25 @@ impl AgentWidget {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             dirty: false,
             session_id: None,
+            event_rx,
         }
+    }
+
+    /// Whether the agent has pending output that needs a redraw tick.
+    pub fn needs_redraw(&self) -> bool {
+        self.dirty
+    }
+
+    /// Create the subscription for agent events.
+    ///
+    /// Returns `Subscription<NexusMessage>` directly because iced's
+    /// `Subscription::map` panics on capturing closures, so we can't
+    /// return `Subscription<AgentMsg>` and `map_msg` at the root.
+    pub fn subscription(&self) -> Subscription<NexusMessage> {
+        let rx = self.event_rx.clone();
+        Subscription::from_iced(
+            agent_subscription(rx).map(|evt| NexusMessage::Agent(AgentMsg::Event(evt))),
+        )
     }
 
     /// Spawn an agent task.

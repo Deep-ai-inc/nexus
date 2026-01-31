@@ -172,6 +172,28 @@ impl<M> Command<M> {
         }
     }
 
+    /// Map the message type using a function item.
+    ///
+    /// Wraps each future in an async adapter (one `Box::pin` per future).
+    /// Commands are not hot-path, so this allocation is acceptable.
+    /// Uses `fn` pointer (not closure) so it's `Copy` — ideal for enum
+    /// variant constructors like `ParentMsg::Child`.
+    pub fn map_msg<N: Send + 'static>(self, f: fn(M) -> N) -> Command<N>
+    where
+        M: Send + 'static,
+    {
+        Command {
+            futures: self
+                .futures
+                .into_iter()
+                .map(|fut| {
+                    Box::pin(async move { f(fut.await) })
+                        as Pin<Box<dyn Future<Output = N> + Send>>
+                })
+                .collect(),
+        }
+    }
+
     /// Check if this command has no work to do.
     pub fn is_empty(&self) -> bool {
         self.futures.is_empty()
@@ -213,6 +235,20 @@ impl<M> Subscription<M> {
     pub fn batch(subscriptions: impl IntoIterator<Item = Subscription<M>>) -> Self {
         Self {
             subs: subscriptions.into_iter().flat_map(|s| s.subs).collect(),
+        }
+    }
+
+    /// Map the message type using a function item.
+    ///
+    /// Internally creates a closure per iced subscription. Subscriptions are
+    /// rebuilt per-frame but the mapping is applied to async event streams,
+    /// not per-frame — this is not hot-path.
+    pub fn map_msg<N: 'static>(self, f: fn(M) -> N) -> Subscription<N>
+    where
+        M: 'static,
+    {
+        Subscription {
+            subs: self.subs.into_iter().map(|s| s.map(move |m| f(m))).collect(),
         }
     }
 

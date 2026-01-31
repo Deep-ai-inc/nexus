@@ -21,7 +21,7 @@ mod state_policy;
 mod state_update;
 mod state_view;
 
-pub use message::NexusMessage;
+pub use message::{NexusMessage, InputMsg, ShellMsg, AgentMsg, SelectionMsg, ContextMenuMsg};
 use context_menu::render_context_menu;
 use input::InputWidget;
 use scroll_model::ScrollModel;
@@ -37,16 +37,16 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_kernel::Kernel;
 
-use crate::blocks::{Focus, PtyEvent};
+use crate::blocks::Focus;
 use crate::context::NexusContext;
+use strata::component::{Component, ComponentApp, Ctx, IdSpace, RootComponent};
 use strata::event_context::{CaptureState, KeyEvent, MouseEvent};
 use strata::layout_snapshot::HitResult;
 use strata::primitives::Rect;
 use strata::{
     AppConfig, Column, Command, ImageStore, Length, MouseResponse, Padding, ScrollColumn,
-    StrataApp, Subscription,
+    Subscription,
 };
-use crate::systems::{agent_subscription, kernel_subscription, pty_subscription};
 
 // =========================================================================
 // Attachment (clipboard image paste)
@@ -80,9 +80,6 @@ pub struct NexusState {
     pub focus: Focus,
     pub kernel: Arc<Mutex<Kernel>>,
     pub kernel_tx: broadcast::Sender<nexus_api::ShellEvent>,
-    pub kernel_rx: Arc<Mutex<broadcast::Receiver<nexus_api::ShellEvent>>>,
-    pub pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(nexus_api::BlockId, PtyEvent)>>>,
-    pub agent_event_rx: Arc<Mutex<mpsc::UnboundedReceiver<crate::agent_adapter::AgentEvent>>>,
 
     // --- Layout ---
     pub window_size: (f32, f32),
@@ -94,24 +91,102 @@ pub struct NexusState {
 }
 
 // =========================================================================
-// ApplyOutput — enforced convention for domain output processing
+// Component Implementation
 // =========================================================================
 
-pub(crate) trait ApplyOutput<O> {
-    fn apply_output(&mut self, output: O);
+impl Component for NexusState {
+    type Message = NexusMessage;
+    type Output = ();
+
+    fn update(&mut self, msg: NexusMessage, ctx: &mut Ctx) -> (Command<NexusMessage>, ()) {
+        if matches!(&msg, NexusMessage::Input(InputMsg::Key(_) | InputMsg::Mouse(_))) {
+            self.last_edit_time = Instant::now();
+        }
+
+        let cmd = self.dispatch_update(msg, ctx.images);
+
+        self.shell.sync_terminal_size();
+        (cmd, ())
+    }
+
+    fn view(&self, snapshot: &mut strata::LayoutSnapshot, _ids: IdSpace) {
+        let vp = snapshot.viewport();
+        let vw = vp.width;
+        let vh = vp.height;
+
+        let (cols, rows) = NexusState::compute_terminal_size(vw, vh);
+        self.shell.terminal_size.set((cols, rows));
+
+        let cursor_visible = self.cursor_visible();
+
+        let scroll = ScrollColumn::from_state(&self.scroll.state)
+            .spacing(4.0)
+            .width(Length::Fill)
+            .height(Length::Fill);
+        let scroll = self.layout_blocks(scroll);
+
+        let mut main_col = Column::new()
+            .width(Length::Fixed(vw))
+            .height(Length::Fixed(vh))
+            .padding(0.0);
+
+        main_col = main_col.push(
+            Column::new()
+                .padding_custom(Padding::new(2.0, 4.0, 0.0, 4.0))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .push(scroll),
+        );
+
+        main_col = self.layout_overlays(main_col);
+        main_col = self.layout_attachments(main_col);
+        main_col = self.layout_input_bar(main_col, cursor_visible);
+
+        main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
+
+        self.sync_scroll_states(snapshot);
+
+        if let Some(menu) = self.transient.context_menu() {
+            render_context_menu(snapshot, menu);
+        }
+    }
+
+    fn on_key(&self, event: KeyEvent) -> Option<NexusMessage> {
+        event_routing::on_key(self, event)
+    }
+
+    fn on_mouse(
+        &self,
+        event: MouseEvent,
+        hit: Option<HitResult>,
+        capture: &CaptureState,
+    ) -> MouseResponse<NexusMessage> {
+        event_routing::on_mouse(self, event, hit, capture)
+    }
+
+    fn subscription(&self) -> Subscription<NexusMessage> {
+        let mut subs = vec![
+            self.shell.subscription(),
+            self.agent.subscription(),
+        ];
+
+        if self.shell.needs_redraw() || self.agent.needs_redraw() {
+            subs.push(Subscription::from_iced(
+                iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| NexusMessage::Tick),
+            ));
+        }
+
+        Subscription::batch(subs)
+    }
+
+    fn selection(&self) -> Option<&strata::Selection> {
+        self.selection.selection.as_ref()
+    }
 }
 
-// =========================================================================
-// StrataApp Implementation
-// =========================================================================
-
-pub struct NexusApp;
-
-impl StrataApp for NexusApp {
-    type State = NexusState;
-    type Message = NexusMessage;
-
-    fn init(_images: &mut ImageStore) -> (Self::State, Command<Self::Message>) {
+impl RootComponent for NexusState {
+    fn create(_images: &mut ImageStore) -> (Self, Command<NexusMessage>) {
         let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
         let kernel_tx = kernel.event_sender().clone();
 
@@ -135,8 +210,15 @@ impl StrataApp for NexusApp {
 
         let state = NexusState {
             input: input_widget,
-            shell: ShellWidget::new(pty_tx),
-            agent: AgentWidget::new(agent_event_tx),
+            shell: ShellWidget::new(
+                pty_tx,
+                Arc::new(Mutex::new(pty_rx)),
+                Arc::new(Mutex::new(kernel_rx)),
+            ),
+            agent: AgentWidget::new(
+                agent_event_tx,
+                Arc::new(Mutex::new(agent_event_rx)),
+            ),
             selection: SelectionWidget::new(),
 
             scroll: ScrollModel::new(),
@@ -147,9 +229,6 @@ impl StrataApp for NexusApp {
             focus: Focus::Input,
             kernel: Arc::new(Mutex::new(kernel)),
             kernel_tx,
-            kernel_rx: Arc::new(Mutex::new(kernel_rx)),
-            pty_rx: Arc::new(Mutex::new(pty_rx)),
-            agent_event_rx: Arc::new(Mutex::new(agent_event_rx)),
 
             window_size: (1200.0, 800.0),
 
@@ -161,121 +240,16 @@ impl StrataApp for NexusApp {
         (state, Command::none())
     }
 
-    fn update(
-        state: &mut Self::State,
-        message: Self::Message,
-        images: &mut ImageStore,
-    ) -> Command<Self::Message> {
-        if matches!(&message, NexusMessage::InputKey(_) | NexusMessage::InputMouse(_)) {
-            state.last_edit_time = Instant::now();
-        }
-
-        let cmd = state.update(message, images);
-
-        state.shell.sync_terminal_size();
-        cmd
-    }
-
-    fn view(state: &Self::State, snapshot: &mut strata::LayoutSnapshot) {
-        let vp = snapshot.viewport();
-        let vw = vp.width;
-        let vh = vp.height;
-
-        let (cols, rows) = NexusState::compute_terminal_size(vw, vh);
-        state.shell.terminal_size.set((cols, rows));
-
-        let cursor_visible = state.cursor_visible();
-
-        let scroll = ScrollColumn::from_state(&state.scroll.state)
-            .spacing(4.0)
-            .width(Length::Fill)
-            .height(Length::Fill);
-        let scroll = state.layout_blocks(scroll);
-
-        let mut main_col = Column::new()
-            .width(Length::Fixed(vw))
-            .height(Length::Fixed(vh))
-            .padding(0.0);
-
-        main_col = main_col.push(
-            Column::new()
-                .padding_custom(Padding::new(2.0, 4.0, 0.0, 4.0))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .push(scroll),
-        );
-
-        main_col = state.layout_overlays(main_col);
-        main_col = state.layout_attachments(main_col);
-        main_col = state.layout_input_bar(main_col, cursor_visible);
-
-        main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
-
-        state.sync_scroll_states(snapshot);
-
-        if let Some(menu) = state.transient.context_menu() {
-            render_context_menu(snapshot, menu);
-        }
-    }
-
-    fn selection(state: &Self::State) -> Option<&strata::Selection> {
-        state.selection.selection.as_ref()
-    }
-
-    fn on_mouse(
-        state: &Self::State,
-        event: MouseEvent,
-        hit: Option<HitResult>,
-        capture: &CaptureState,
-    ) -> MouseResponse<Self::Message> {
-        event_routing::on_mouse(state, event, hit, capture)
-    }
-
-    fn on_key(state: &Self::State, event: KeyEvent) -> Option<Self::Message> {
-        event_routing::on_key(state, event)
-    }
-
-    fn subscription(state: &Self::State) -> Subscription<Self::Message> {
-        let mut subs = Vec::new();
-
-        let pty_rx = state.pty_rx.clone();
-        subs.push(Subscription::from_iced(
-            pty_subscription(pty_rx).map(|(id, evt)| match evt {
-                PtyEvent::Output(data) => NexusMessage::PtyOutput(id, data),
-                PtyEvent::Exited(code) => NexusMessage::PtyExited(id, code),
-            }),
-        ));
-
-        let kernel_rx = state.kernel_rx.clone();
-        subs.push(Subscription::from_iced(
-            kernel_subscription(kernel_rx).map(NexusMessage::KernelEvent),
-        ));
-
-        let agent_rx = state.agent_event_rx.clone();
-        subs.push(Subscription::from_iced(
-            agent_subscription(agent_rx).map(NexusMessage::AgentEvent),
-        ));
-
-        if state.shell.terminal_dirty || state.agent.dirty {
-            subs.push(Subscription::from_iced(
-                iced::time::every(std::time::Duration::from_millis(16))
-                    .map(|_| NexusMessage::Tick),
-            ));
-        }
-
-        Subscription::batch(subs)
-    }
-
-    fn title(_state: &Self::State) -> String {
+    fn title(&self) -> String {
         String::from("Nexus (Strata)")
     }
 
-    fn background_color(_state: &Self::State) -> strata::primitives::Color {
+    fn background_color(&self) -> strata::primitives::Color {
         colors::BG_APP
     }
 
-    fn should_exit(state: &Self::State) -> bool {
-        state.exit_requested
+    fn should_exit(&self) -> bool {
+        self.exit_requested
     }
 }
 
@@ -284,7 +258,7 @@ impl StrataApp for NexusApp {
 // =========================================================================
 
 pub fn run() -> Result<(), strata::shell::Error> {
-    strata::shell::run_with_config::<NexusApp>(AppConfig {
+    strata::shell::run_with_config::<ComponentApp<NexusState>>(AppConfig {
         title: String::from("Nexus (Strata)"),
         window_size: (1200.0, 800.0),
         antialiasing: true,

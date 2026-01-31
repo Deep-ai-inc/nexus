@@ -11,8 +11,11 @@ use crate::blocks::Focus;
 use crate::nexus_widgets::{CompletionPopup, HistorySearchBar, JobBar};
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
+use super::message::{
+    AgentMsg, ContextMenuMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg,
+};
 use super::source_ids;
-use super::{NexusMessage, NexusState};
+use super::NexusState;
 
 /// Route keyboard events to the appropriate widget or message.
 pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage> {
@@ -32,54 +35,67 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
             if modifiers.ctrl {
                 if let Key::Character(c) = key {
                     if c == "r" {
-                        return Some(NexusMessage::HistorySearchToggle);
+                        return Some(NexusMessage::Input(InputMsg::HistorySearchToggle));
                     }
                 }
             }
             return match key {
-                Key::Named(NamedKey::Enter) => Some(NexusMessage::HistorySearchAccept),
-                Key::Named(NamedKey::Escape) => Some(NexusMessage::HistorySearchDismiss),
+                Key::Named(NamedKey::Enter) => {
+                    Some(NexusMessage::Input(InputMsg::HistorySearchAccept))
+                }
+                Key::Named(NamedKey::Escape) => {
+                    Some(NexusMessage::Input(InputMsg::HistorySearchDismiss))
+                }
                 Key::Named(NamedKey::ArrowDown) => {
                     if !state.input.history_search.results.is_empty()
                         && state.input.history_search.index
                             < state.input.history_search.results.len() - 1
                     {
-                        Some(NexusMessage::HistorySearchSelect(
+                        Some(NexusMessage::Input(InputMsg::HistorySearchSelect(
                             state.input.history_search.index + 1,
-                        ))
+                        )))
                     } else {
                         None
                     }
                 }
                 Key::Named(NamedKey::ArrowUp) => {
                     if state.input.history_search.index > 0 {
-                        Some(NexusMessage::HistorySearchSelect(
+                        Some(NexusMessage::Input(InputMsg::HistorySearchSelect(
                             state.input.history_search.index - 1,
-                        ))
+                        )))
                     } else {
                         None
                     }
                 }
-                _ => Some(NexusMessage::HistorySearchKey(event)),
+                _ => Some(NexusMessage::Input(InputMsg::HistorySearchKey(event))),
             };
         }
 
         // Completion popup intercepts navigation keys when visible.
-        // Non-navigation keys dismiss the popup and fall through to normal input handling.
         if state.input.completion.is_active() {
             match key {
                 Key::Named(NamedKey::Tab) if modifiers.shift => {
-                    return Some(NexusMessage::CompletionNav(-1));
+                    return Some(NexusMessage::Input(InputMsg::CompletionNav(-1)));
                 }
-                Key::Named(NamedKey::Tab) => return Some(NexusMessage::CompletionNav(1)),
-                Key::Named(NamedKey::ArrowDown) => return Some(NexusMessage::CompletionNav(1)),
-                Key::Named(NamedKey::ArrowUp) => return Some(NexusMessage::CompletionNav(-1)),
-                Key::Named(NamedKey::Enter) => return Some(NexusMessage::CompletionAccept),
-                Key::Named(NamedKey::Escape) => return Some(NexusMessage::CompletionDismiss),
+                Key::Named(NamedKey::Tab) => {
+                    return Some(NexusMessage::Input(InputMsg::CompletionNav(1)));
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    return Some(NexusMessage::Input(InputMsg::CompletionNav(1)));
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    return Some(NexusMessage::Input(InputMsg::CompletionNav(-1)));
+                }
+                Key::Named(NamedKey::Enter) => {
+                    return Some(NexusMessage::Input(InputMsg::CompletionAccept));
+                }
+                Key::Named(NamedKey::Escape) => {
+                    return Some(NexusMessage::Input(InputMsg::CompletionDismiss));
+                }
                 _ => {
-                    // Dismiss completion but don't consume the key — fall through
-                    // to normal input routing so the keystroke is not lost.
-                    return Some(NexusMessage::CompletionDismissAndForward(event));
+                    return Some(NexusMessage::Input(InputMsg::CompletionDismissAndForward(
+                        event,
+                    )));
                 }
             }
         }
@@ -93,7 +109,7 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
                     "w" => return Some(NexusMessage::CloseWindow),
                     "c" => return Some(NexusMessage::Copy),
                     "v" => return Some(NexusMessage::Paste),
-                    "." => return Some(NexusMessage::ToggleMode),
+                    "." => return Some(NexusMessage::Input(InputMsg::ToggleMode)),
                     _ => {}
                 }
             }
@@ -103,12 +119,21 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         if modifiers.ctrl {
             if let Key::Character(c) = key {
                 match c.as_str() {
-                    "r" => return Some(NexusMessage::HistorySearchToggle),
+                    "r" => return Some(NexusMessage::Input(InputMsg::HistorySearchToggle)),
                     "c" => {
                         if state.agent.is_active() {
-                            return Some(NexusMessage::AgentInterrupt);
+                            return Some(NexusMessage::Agent(AgentMsg::Interrupt));
                         }
-                        return Some(NexusMessage::SendInterrupt);
+                        // Root handles SendInterrupt by resolving the target block
+                        if let Focus::Block(id) = state.focus {
+                            return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(id)));
+                        }
+                        // When focused on input, send to last running block
+                        if let Some(block) = state.shell.blocks.iter().rev().find(|b| b.is_running())
+                        {
+                            return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(block.id)));
+                        }
+                        return None;
                     }
                     _ => {}
                 }
@@ -118,48 +143,48 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         // Escape: dismiss overlays, interrupt agent, leave PTY focus, clear selection
         if matches!(key, Key::Named(NamedKey::Escape)) {
             if state.transient.context_menu().is_some() {
-                return Some(NexusMessage::DismissContextMenu);
+                return Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss));
             }
             if state.agent.is_active() {
-                return Some(NexusMessage::AgentInterrupt);
+                return Some(NexusMessage::Agent(AgentMsg::Interrupt));
             }
             if matches!(state.focus, Focus::Block(_)) {
                 return Some(NexusMessage::BlurAll);
             }
             if state.selection.selection.is_some() {
-                return Some(NexusMessage::ClearSelection);
+                return Some(NexusMessage::Selection(SelectionMsg::Clear));
             }
         }
 
         // When a PTY block is focused, forward keys to it
         if let Focus::Block(_) = state.focus {
-            return Some(NexusMessage::PtyInput(event));
+            return Some(NexusMessage::Shell(ShellMsg::PtyInput(event)));
         }
 
         // When input is focused, route keys
         if state.input.text_input.focused {
             if matches!(key, Key::Named(NamedKey::Enter)) && modifiers.shift {
-                return Some(NexusMessage::InsertNewline);
+                return Some(NexusMessage::Input(InputMsg::InsertNewline));
             }
             if matches!(key, Key::Named(NamedKey::Tab)) {
-                return Some(NexusMessage::TabComplete);
+                return Some(NexusMessage::Input(InputMsg::TabComplete));
             }
             if matches!(key, Key::Named(NamedKey::ArrowUp)) {
-                return Some(NexusMessage::HistoryUp);
+                return Some(NexusMessage::Input(InputMsg::HistoryUp));
             }
             if matches!(key, Key::Named(NamedKey::ArrowDown)) {
-                return Some(NexusMessage::HistoryDown);
+                return Some(NexusMessage::Input(InputMsg::HistoryDown));
             }
-            return Some(NexusMessage::InputKey(event));
+            return Some(NexusMessage::Input(InputMsg::Key(event)));
         }
 
         // Global shortcuts when input not focused
         match key {
             Key::Named(NamedKey::PageUp) => {
-                return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(300.0)));
+                return Some(NexusMessage::Scroll(ScrollAction::ScrollBy(300.0)));
             }
             Key::Named(NamedKey::PageDown) => {
-                return Some(NexusMessage::HistoryScroll(ScrollAction::ScrollBy(-300.0)));
+                return Some(NexusMessage::Scroll(ScrollAction::ScrollBy(-300.0)));
             }
             _ => {}
         }
@@ -177,10 +202,10 @@ pub(super) fn on_mouse(
 ) -> MouseResponse<NexusMessage> {
     // Composable scroll + input handlers
     route_mouse!(&event, &hit, capture, [
-        state.input.completion.scroll       => NexusMessage::CompletionScroll,
-        state.input.history_search.scroll   => NexusMessage::HistorySearchScroll,
-        state.scroll.state                  => NexusMessage::HistoryScroll,
-        state.input.text_input              => NexusMessage::InputMouse,
+        state.input.completion.scroll       => |a| NexusMessage::Input(InputMsg::CompletionScroll(a)),
+        state.input.history_search.scroll   => |a| NexusMessage::Input(InputMsg::HistorySearchScroll(a)),
+        state.scroll.state                  => NexusMessage::Scroll,
+        state.input.text_input              => |a| NexusMessage::Input(InputMsg::Mouse(a)),
     ]);
 
     // Right-click → context menu
@@ -196,7 +221,7 @@ pub(super) fn on_mouse(
             && position.y >= input_bounds.y
             && position.y <= input_bounds.y + input_bounds.height
         {
-            return MouseResponse::message(NexusMessage::ShowContextMenu(
+            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
                 position.x,
                 position.y,
                 vec![
@@ -205,7 +230,7 @@ pub(super) fn on_mouse(
                     ContextMenuItem::Clear,
                 ],
                 ContextTarget::Input,
-            ));
+            )));
         }
 
         if let Some(HitResult::Content(ref addr)) = hit {
@@ -220,11 +245,13 @@ pub(super) fn on_mouse(
                     || addr.source_id == native_id
                     || addr.source_id == table_id
                 {
-                    return MouseResponse::message(NexusMessage::ShowContextMenu(
-                        position.x,
-                        position.y,
-                        vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                        ContextTarget::Block(block.id),
+                    return MouseResponse::message(NexusMessage::ContextMenu(
+                        ContextMenuMsg::Show(
+                            position.x,
+                            position.y,
+                            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                            ContextTarget::Block(block.id),
+                        ),
                     ));
                 }
             }
@@ -237,33 +264,35 @@ pub(super) fn on_mouse(
                     || addr.source_id == thinking_id
                     || addr.source_id == response_id
                 {
-                    return MouseResponse::message(NexusMessage::ShowContextMenu(
-                        position.x,
-                        position.y,
-                        vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
-                        ContextTarget::AgentBlock(block.id),
+                    return MouseResponse::message(NexusMessage::ContextMenu(
+                        ContextMenuMsg::Show(
+                            position.x,
+                            position.y,
+                            vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
+                            ContextTarget::AgentBlock(block.id),
+                        ),
                     ));
                 }
             }
         }
 
-        // Fallback: right-click on non-content area (e.g., widget chrome)
+        // Fallback: right-click on non-content area
         if hit.is_some() {
             if let Some(block) = state.shell.blocks.last() {
-                return MouseResponse::message(NexusMessage::ShowContextMenu(
+                return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
                     position.x,
                     position.y,
                     vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
                     ContextTarget::Block(block.id),
-                ));
+                )));
             }
             if let Some(block) = state.agent.blocks.last() {
-                return MouseResponse::message(NexusMessage::ShowContextMenu(
+                return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Show(
                     position.x,
                     position.y,
                     vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
                     ContextTarget::AgentBlock(block.id),
-                ));
+                )));
             }
         }
     }
@@ -311,11 +340,13 @@ pub(super) fn on_mouse(
             if let Some(HitResult::Widget(id)) = &hit {
                 for (i, item) in menu.items.iter().enumerate() {
                     if *id == source_ids::ctx_menu_item(i) {
-                        return MouseResponse::message(NexusMessage::ContextMenuAction(*item));
+                        return MouseResponse::message(NexusMessage::ContextMenu(
+                            ContextMenuMsg::Action(*item),
+                        ));
                     }
                 }
             }
-            return MouseResponse::message(NexusMessage::DismissContextMenu);
+            return MouseResponse::message(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss));
         }
     }
 
@@ -328,13 +359,15 @@ pub(super) fn on_mouse(
         if let Some(HitResult::Widget(id)) = &hit {
             // Mode toggle
             if *id == source_ids::mode_toggle() {
-                return MouseResponse::message(NexusMessage::ToggleMode);
+                return MouseResponse::message(NexusMessage::Input(InputMsg::ToggleMode));
             }
 
             // Completion item clicks
             for i in 0..state.input.completion.completions.len().min(10) {
                 if *id == CompletionPopup::item_id(i) {
-                    return MouseResponse::message(NexusMessage::CompletionSelect(i));
+                    return MouseResponse::message(NexusMessage::Input(
+                        InputMsg::CompletionSelect(i),
+                    ));
                 }
             }
 
@@ -342,7 +375,9 @@ pub(super) fn on_mouse(
             if state.input.history_search.is_active() {
                 for i in 0..state.input.history_search.results.len().min(10) {
                     if *id == HistorySearchBar::result_id(i) {
-                        return MouseResponse::message(NexusMessage::HistorySearchAcceptIndex(i));
+                        return MouseResponse::message(NexusMessage::Input(
+                            InputMsg::HistorySearchAcceptIndex(i),
+                        ));
                     }
                 }
             }
@@ -351,7 +386,9 @@ pub(super) fn on_mouse(
             for i in 0..state.input.attachments.len() {
                 let remove_id = source_ids::remove_attachment(i);
                 if *id == remove_id {
-                    return MouseResponse::message(NexusMessage::RemoveAttachment(i));
+                    return MouseResponse::message(NexusMessage::Input(
+                        InputMsg::RemoveAttachment(i),
+                    ));
                 }
             }
 
@@ -367,7 +404,9 @@ pub(super) fn on_mouse(
                 if block.is_running() {
                     let kill_id = source_ids::kill(block.id);
                     if *id == kill_id {
-                        return MouseResponse::message(NexusMessage::KillBlock(block.id));
+                        return MouseResponse::message(NexusMessage::Shell(ShellMsg::KillBlock(
+                            block.id,
+                        )));
                     }
                 }
             }
@@ -376,18 +415,22 @@ pub(super) fn on_mouse(
             for block in &state.agent.blocks {
                 let thinking_id = source_ids::agent_thinking_toggle(block.id);
                 if *id == thinking_id {
-                    return MouseResponse::message(NexusMessage::ToggleThinking(block.id));
+                    return MouseResponse::message(NexusMessage::Agent(AgentMsg::ToggleThinking(
+                        block.id,
+                    )));
                 }
 
                 let stop_id = source_ids::agent_stop(block.id);
                 if *id == stop_id {
-                    return MouseResponse::message(NexusMessage::AgentInterrupt);
+                    return MouseResponse::message(NexusMessage::Agent(AgentMsg::Interrupt));
                 }
 
                 for (i, _tool) in block.tools.iter().enumerate() {
                     let toggle_id = source_ids::agent_tool_toggle(block.id, i);
                     if *id == toggle_id {
-                        return MouseResponse::message(NexusMessage::ToggleTool(block.id, i));
+                        return MouseResponse::message(NexusMessage::Agent(AgentMsg::ToggleTool(
+                            block.id, i,
+                        )));
                     }
                 }
 
@@ -397,21 +440,18 @@ pub(super) fn on_mouse(
                     let always_id = source_ids::agent_perm_always(block.id);
 
                     if *id == deny_id {
-                        return MouseResponse::message(NexusMessage::PermissionDeny(
-                            block.id,
-                            perm.id.clone(),
+                        return MouseResponse::message(NexusMessage::Agent(
+                            AgentMsg::PermissionDeny(block.id, perm.id.clone()),
                         ));
                     }
                     if *id == allow_id {
-                        return MouseResponse::message(NexusMessage::PermissionGrant(
-                            block.id,
-                            perm.id.clone(),
+                        return MouseResponse::message(NexusMessage::Agent(
+                            AgentMsg::PermissionGrant(block.id, perm.id.clone()),
                         ));
                     }
                     if *id == always_id {
-                        return MouseResponse::message(NexusMessage::PermissionGrantSession(
-                            block.id,
-                            perm.id.clone(),
+                        return MouseResponse::message(NexusMessage::Agent(
+                            AgentMsg::PermissionGrantSession(block.id, perm.id.clone()),
                         ));
                     }
                 }
@@ -423,8 +463,8 @@ pub(super) fn on_mouse(
                     for col_idx in 0..columns.len() {
                         let sort_id = source_ids::table_sort(block.id, col_idx);
                         if *id == sort_id {
-                            return MouseResponse::message(NexusMessage::SortTable(
-                                block.id, col_idx,
+                            return MouseResponse::message(NexusMessage::Shell(
+                                ShellMsg::SortTable(block.id, col_idx),
                             ));
                         }
                     }
@@ -436,7 +476,7 @@ pub(super) fn on_mouse(
         if let Some(HitResult::Content(addr)) = hit {
             let capture_source = addr.source_id;
             return MouseResponse::message_and_capture(
-                NexusMessage::SelectionStart(addr),
+                NexusMessage::Selection(SelectionMsg::Start(addr)),
                 capture_source,
             );
         }
@@ -451,7 +491,9 @@ pub(super) fn on_mouse(
     if let MouseEvent::CursorMoved { .. } = &event {
         if let CaptureState::Captured(_) = capture {
             if let Some(HitResult::Content(addr)) = hit {
-                return MouseResponse::message(NexusMessage::SelectionExtend(addr));
+                return MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(
+                    addr,
+                )));
             }
         }
     }
@@ -463,7 +505,9 @@ pub(super) fn on_mouse(
     } = &event
     {
         if let CaptureState::Captured(_) = capture {
-            return MouseResponse::message_and_release(NexusMessage::SelectionEnd);
+            return MouseResponse::message_and_release(NexusMessage::Selection(
+                SelectionMsg::End,
+            ));
         }
     }
 

@@ -31,7 +31,7 @@ impl NexusState {
 
     /// Called on tick when output has arrived. Delegates to ScrollModel.
     pub(super) fn on_output_arrived(&mut self) {
-        if self.shell.terminal_dirty || self.agent.dirty {
+        if self.shell.needs_redraw() || self.agent.needs_redraw() {
             self.shell.terminal_dirty = false;
             self.agent.dirty = false;
             self.scroll.hint();

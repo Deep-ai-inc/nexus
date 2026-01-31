@@ -1,26 +1,65 @@
-//! Source ID helpers — single source of truth for all named SourceIds.
+//! Source ID helpers — single source of truth for all widget SourceIds.
+//!
+//! Uses `IdSpace` for zero-allocation, splitmix64-mixed IDs.
+//! No `format!()` or `String` churn — all computations are pure arithmetic.
 
 use nexus_api::BlockId;
+use strata::component::IdSpace;
 use strata::content_address::SourceId;
 
-pub fn shell_header(id: BlockId) -> SourceId { SourceId::named(&format!("shell_header_{}", id.0)) }
-pub fn shell_term(id: BlockId) -> SourceId { SourceId::named(&format!("shell_term_{}", id.0)) }
-pub fn native(id: BlockId) -> SourceId { SourceId::named(&format!("native_{}", id.0)) }
-pub fn table(id: BlockId) -> SourceId { SourceId::named(&format!("table_{}", id.0)) }
-pub fn table_sort(id: BlockId, col: usize) -> SourceId { SourceId::named(&format!("sort_{}_{}", id.0, col)) }
-pub fn kill(id: BlockId) -> SourceId { SourceId::named(&format!("kill_{}", id.0)) }
+/// Derive a per-block ID namespace from a block's numeric ID.
+const fn block_space(id: BlockId) -> IdSpace {
+    IdSpace::new(id.0)
+}
 
-pub fn agent_query(id: BlockId) -> SourceId { SourceId::named(&format!("agent_query_{}", id.0)) }
-pub fn agent_thinking(id: BlockId) -> SourceId { SourceId::named(&format!("agent_thinking_{}", id.0)) }
-pub fn agent_response(id: BlockId) -> SourceId { SourceId::named(&format!("agent_response_{}", id.0)) }
-pub fn agent_thinking_toggle(id: BlockId) -> SourceId { SourceId::named(&format!("thinking_{}", id.0)) }
-pub fn agent_stop(id: BlockId) -> SourceId { SourceId::named(&format!("stop_{}", id.0)) }
-pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId { SourceId::named(&format!("tool_toggle_{}_{}", id.0, i)) }
-pub fn agent_perm_deny(id: BlockId) -> SourceId { SourceId::named(&format!("perm_deny_{}", id.0)) }
-pub fn agent_perm_allow(id: BlockId) -> SourceId { SourceId::named(&format!("perm_allow_{}", id.0)) }
-pub fn agent_perm_always(id: BlockId) -> SourceId { SourceId::named(&format!("perm_always_{}", id.0)) }
+// Tags for different content types within a block.
+const SHELL_HEADER: u64 = 1;
+const SHELL_TERM: u64 = 2;
+const NATIVE: u64 = 3;
+const TABLE: u64 = 4;
+const KILL: u64 = 5;
+const AGENT_QUERY: u64 = 6;
+const AGENT_THINKING: u64 = 7;
+const AGENT_RESPONSE: u64 = 8;
+const THINKING_TOGGLE: u64 = 9;
+const STOP: u64 = 10;
+const PERM_DENY: u64 = 11;
+const PERM_ALLOW: u64 = 12;
+const PERM_ALWAYS: u64 = 13;
 
-// Global UI
-pub fn mode_toggle() -> SourceId { SourceId::named("mode_toggle") }
-pub fn remove_attachment(i: usize) -> SourceId { SourceId::named(&format!("remove_attach_{}", i)) }
-pub fn ctx_menu_item(i: usize) -> SourceId { SourceId::named(&format!("ctx_menu_{}", i)) }
+// --- Shell block IDs ---
+
+pub fn shell_header(id: BlockId) -> SourceId { block_space(id).id(SHELL_HEADER) }
+pub fn shell_term(id: BlockId) -> SourceId { block_space(id).id(SHELL_TERM) }
+pub fn native(id: BlockId) -> SourceId { block_space(id).id(NATIVE) }
+pub fn table(id: BlockId) -> SourceId { block_space(id).id(TABLE) }
+pub fn kill(id: BlockId) -> SourceId { block_space(id).id(KILL) }
+
+// --- Agent block IDs ---
+
+pub fn agent_query(id: BlockId) -> SourceId { block_space(id).id(AGENT_QUERY) }
+pub fn agent_thinking(id: BlockId) -> SourceId { block_space(id).id(AGENT_THINKING) }
+pub fn agent_response(id: BlockId) -> SourceId { block_space(id).id(AGENT_RESPONSE) }
+pub fn agent_thinking_toggle(id: BlockId) -> SourceId { block_space(id).id(THINKING_TOGGLE) }
+pub fn agent_stop(id: BlockId) -> SourceId { block_space(id).id(STOP) }
+pub fn agent_perm_deny(id: BlockId) -> SourceId { block_space(id).id(PERM_DENY) }
+pub fn agent_perm_allow(id: BlockId) -> SourceId { block_space(id).id(PERM_ALLOW) }
+pub fn agent_perm_always(id: BlockId) -> SourceId { block_space(id).id(PERM_ALWAYS) }
+
+// --- Indexed IDs (block + index dimension) ---
+
+pub fn table_sort(id: BlockId, col: usize) -> SourceId {
+    block_space(id).child(TABLE).id(col as u64)
+}
+
+pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId {
+    block_space(id).child(THINKING_TOGGLE).id(i as u64)
+}
+
+// --- Global UI IDs (no block) ---
+
+const GLOBAL: IdSpace = IdSpace::new(0xFFFF_FFFF_FFFF_FFFF);
+
+pub fn mode_toggle() -> SourceId { GLOBAL.id(1) }
+pub fn remove_attachment(i: usize) -> SourceId { GLOBAL.child(2).id(i as u64) }
+pub fn ctx_menu_item(i: usize) -> SourceId { GLOBAL.child(3).id(i as u64) }
