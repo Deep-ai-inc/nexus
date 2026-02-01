@@ -6,7 +6,7 @@ use strata::Command;
 use crate::blocks::Focus;
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
-use super::drag_state::{ActiveDrag, ActiveKind, DragStatus, PendingIntent};
+use super::drag_state::{ActiveKind, DragStatus, PendingIntent};
 use super::file_drop;
 use super::input::InputOutput;
 use super::message::{AnchorAction, ContextMenuMsg, DragMsg, DropZone, FileDropMsg, NexusMessage, ShellMsg};
@@ -189,61 +189,24 @@ impl NexusState {
                     mode,
                 });
             }
-            DragMsg::Activate(position) => {
-                if let DragStatus::Pending { origin, intent } =
+            DragMsg::Activate(_position) => {
+                if let DragStatus::Pending { intent, .. } =
                     std::mem::replace(&mut self.drag.status, DragStatus::Inactive)
                 {
-                    match intent {
-                        PendingIntent::Anchor { source, payload } => {
-                            self.drag.status = DragStatus::Active(ActiveKind::Drag(ActiveDrag {
-                                payload,
-                                origin,
-                                current_pos: position,
-                                source,
-                            }));
+                    let drag_source = match intent {
+                        PendingIntent::Anchor { payload, .. } => {
+                            Some(self.payload_to_drag_source(&payload))
                         }
-                        PendingIntent::SelectionDrag { source, text, .. } => {
-                            self.drag.status = DragStatus::Active(ActiveKind::Drag(ActiveDrag {
-                                payload: super::drag_state::DragPayload::Selection {
-                                    text,
-                                    structured: None,
-                                },
-                                origin,
-                                current_pos: position,
-                                source,
-                            }));
+                        PendingIntent::SelectionDrag { text, .. } => {
+                            Some(strata::DragSource::Text(text))
                         }
-                        // Future intents — no-op for now
-                        _ => {
-                            self.drag.status = DragStatus::Inactive;
+                        _ => None,
+                    };
+                    if let Some(source) = drag_source {
+                        if let Err(e) = strata::platform::start_drag(&source) {
+                            tracing::warn!("Native drag failed: {}", e);
                         }
                     }
-                }
-            }
-            DragMsg::Move(position) => {
-                if let DragStatus::Active(ActiveKind::Drag(ref mut active)) = self.drag.status {
-                    active.current_pos = position;
-                }
-            }
-            DragMsg::Drop(zone) => {
-                if let DragStatus::Active(ActiveKind::Drag(active)) =
-                    std::mem::replace(&mut self.drag.status, DragStatus::Inactive)
-                {
-                    self.handle_internal_drop(active, zone);
-                } else {
-                    self.drag.status = DragStatus::Inactive;
-                }
-            }
-            DragMsg::GoOutbound => {
-                if let DragStatus::Active(ActiveKind::Drag(active)) =
-                    std::mem::replace(&mut self.drag.status, DragStatus::Inactive)
-                {
-                    let source = self.payload_to_drag_source(&active);
-                    if let Err(e) = strata::platform::start_drag(&source) {
-                        tracing::warn!("Outbound drag failed: {}", e);
-                    }
-                } else {
-                    self.drag.status = DragStatus::Inactive;
                 }
             }
             DragMsg::Cancel => {
@@ -283,31 +246,10 @@ impl NexusState {
         }
     }
 
-    fn handle_internal_drop(&mut self, active: ActiveDrag, _zone: DropZone) {
+    fn payload_to_drag_source(&self, payload: &super::drag_state::DragPayload) -> strata::DragSource {
         use super::drag_state::DragPayload;
 
-        let text_to_insert = match &active.payload {
-            DragPayload::Text(s) => Some(s.clone()),
-            DragPayload::FilePath(p) => Some(file_drop::shell_quote(p)),
-            DragPayload::TableRow { display, .. } => Some(display.clone()),
-            DragPayload::Block(id) => {
-                // Insert the command from the referenced block as pipe composition
-                self.shell.block_index.get(id)
-                    .and_then(|&idx| self.shell.blocks.get(idx))
-                    .map(|b| b.command.clone())
-            }
-            DragPayload::Selection { text, .. } => Some(text.clone()),
-        };
-
-        if let Some(text) = text_to_insert {
-            self.insert_text_at_cursor(&text);
-        }
-    }
-
-    fn payload_to_drag_source(&self, active: &ActiveDrag) -> strata::DragSource {
-        use super::drag_state::DragPayload;
-
-        match &active.payload {
+        match payload {
             DragPayload::FilePath(p) => {
                 if p.exists() {
                     strata::DragSource::File(p.clone())
@@ -317,7 +259,6 @@ impl NexusState {
             }
             DragPayload::Text(s) => strata::DragSource::Text(s.clone()),
             DragPayload::TableRow { block_id, row_index, display } => {
-                // If the block has table output, export the row as TSV.
                 if let Some(&idx) = self.shell.block_index.get(block_id) {
                     if let Some(block) = self.shell.blocks.get(idx) {
                         if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
@@ -333,8 +274,6 @@ impl NexusState {
                 strata::DragSource::Text(display.clone())
             }
             DragPayload::Block(id) => {
-                // Export block output as text or TSV.
-                // For table data, write a temp file so the platform layer stays I/O-free.
                 if let Some(&idx) = self.shell.block_index.get(id) {
                     if let Some(block) = self.shell.blocks.get(idx) {
                         if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
@@ -357,6 +296,18 @@ impl NexusState {
                     }
                 }
                 strata::DragSource::Text(format!("block#{}", id.0))
+            }
+            DragPayload::Image { data, filename } => {
+                let temp_dir = std::env::temp_dir().join("nexus-drag");
+                let _ = std::fs::create_dir_all(&temp_dir);
+                let path = temp_dir.join(filename);
+                match std::fs::write(&path, data) {
+                    Ok(()) => strata::DragSource::Image(path),
+                    Err(e) => {
+                        tracing::warn!("Failed to write image temp file: {}", e);
+                        strata::DragSource::Text(filename.clone())
+                    }
+                }
             }
             DragPayload::Selection { text, structured } => {
                 if let Some(super::drag_state::StructuredSelection::TableRows { columns, rows }) = structured {
@@ -392,6 +343,11 @@ impl NexusState {
             }
             FileDropMsg::Dropped(path, zone) => {
                 self.drop_highlight = None;
+                // Check if this is our own drag data coming back via native round-trip
+                if let Some(text) = file_drop::read_temp_file_content(&path) {
+                    self.insert_text_at_cursor(&text);
+                    return Command::none();
+                }
                 match zone {
                     DropZone::InputBar | DropZone::Empty => {
                         // Insert shell-quoted path at cursor

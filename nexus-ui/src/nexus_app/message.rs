@@ -73,16 +73,10 @@ pub enum DragMsg {
     Start(super::drag_state::PendingIntent, strata::primitives::Point),
     /// Begin text selection immediately (no hysteresis — raw text click).
     StartSelecting(ContentAddress, super::drag_state::SelectMode),
-    /// Mouse moved past the 5px threshold — activate the drag.
+    /// Mouse moved past the 5px threshold — hand off to OS native drag.
     Activate(strata::primitives::Point),
-    /// Mouse moved while drag is active.
-    Move(strata::primitives::Point),
-    /// Mouse released over a drop zone.
-    Drop(DropZone),
     /// Drag cancelled (mouse released before threshold, or Escape).
     Cancel,
-    /// Cursor left the window during an active drag — hand off to OS.
-    GoOutbound,
 }
 
 // =========================================================================

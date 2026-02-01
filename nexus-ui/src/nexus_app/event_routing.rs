@@ -154,51 +154,28 @@ pub(super) fn on_mouse(
     // ── Drag state machine intercept ──────────────────────────────
     // When a drag is Pending or Active, all mouse events are routed here.
     match &state.drag.status {
-        DragStatus::Active(kind) => {
-            return match kind {
-                ActiveKind::Drag(_) => match &event {
-                    MouseEvent::CursorMoved { position, .. } => {
-                        update_auto_scroll(state, position);
-                        MouseResponse::message(NexusMessage::Drag(DragMsg::Move(*position)))
+        DragStatus::Active(ActiveKind::Selecting { .. }) => {
+            return match &event {
+                MouseEvent::CursorMoved { position, .. } => {
+                    update_auto_scroll(state, position);
+                    if let Some(HitResult::Content(addr)) = hit {
+                        MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(addr)))
+                    } else {
+                        MouseResponse::none()
                     }
-                    MouseEvent::ButtonReleased {
-                        button: MouseButton::Left,
-                        ..
-                    } => {
-                        state.drag.auto_scroll.set(None);
-                        let zone = super::file_drop::resolve_drop_zone(state, &hit);
-                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Drop(zone)))
-                    }
-                    MouseEvent::CursorLeft => {
-                        state.drag.auto_scroll.set(None);
-                        // Cursor left the window during an active drag → hand off to OS
-                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::GoOutbound))
-                    }
-                    _ => MouseResponse::none(),
-                },
-                ActiveKind::Selecting { .. } => match &event {
-                    MouseEvent::CursorMoved { position, .. } => {
-                        update_auto_scroll(state, position);
-                        if let Some(HitResult::Content(addr)) = hit {
-                            MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(addr)))
-                        } else {
-                            MouseResponse::none()
-                        }
-                    }
-                    MouseEvent::ButtonReleased {
-                        button: MouseButton::Left,
-                        ..
-                    } => {
-                        state.drag.auto_scroll.set(None);
-                        // Cancel resets drag status to Inactive; dispatch_drag emits SelectionMsg::End
-                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
-                    }
-                    MouseEvent::CursorLeft => {
-                        state.drag.auto_scroll.set(None);
-                        MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
-                    }
-                    _ => MouseResponse::none(),
-                },
+                }
+                MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    state.drag.auto_scroll.set(None);
+                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
+                }
+                MouseEvent::CursorLeft => {
+                    state.drag.auto_scroll.set(None);
+                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
+                }
+                _ => MouseResponse::none(),
             };
         }
         DragStatus::Pending { origin, .. } => {
@@ -343,6 +320,24 @@ pub(super) fn on_mouse(
             for job in &state.shell.jobs {
                 if *id == JobBar::job_pill_id(job.id) {
                     return MouseResponse::message(NexusMessage::ScrollToJob(job.id));
+                }
+            }
+        }
+
+        // Image output — start a pending drag (native OS drag on threshold)
+        {
+            let image_source = match &hit {
+                Some(HitResult::Widget(id)) => Some(*id),
+                Some(HitResult::Content(addr)) => Some(addr.source_id),
+                None => None,
+            };
+            if let Some(src) = image_source {
+                if let Some(payload) = state.shell.image_drag_payload(src) {
+                    let intent = PendingIntent::Anchor { source: src, payload };
+                    return MouseResponse::message_and_capture(
+                        NexusMessage::Drag(DragMsg::Start(intent, *position)),
+                        src,
+                    );
                 }
             }
         }

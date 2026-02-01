@@ -381,6 +381,8 @@ pub enum DragSource {
     Text(String),
     /// Drag TSV (spreadsheets accept structured paste).
     Tsv(String),
+    /// Drag an image file — the OS shows the file icon.
+    Image(std::path::PathBuf),
 }
 
 /// Configuration for running a Strata application.

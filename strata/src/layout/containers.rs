@@ -684,6 +684,10 @@ pub struct ImageElement {
     pub corner_radius: f32,
     /// Tint color (Color::WHITE = no tint).
     pub tint: Color,
+    /// Optional widget ID for hit testing (makes image clickable/draggable).
+    pub widget_id: Option<SourceId>,
+    /// Cursor hint shown when hovering over the image.
+    pub cursor_hint: Option<CursorIcon>,
 }
 
 impl ImageElement {
@@ -695,6 +699,8 @@ impl ImageElement {
             height,
             corner_radius: 0.0,
             tint: Color::WHITE,
+            widget_id: None,
+            cursor_hint: None,
         }
     }
 
@@ -707,6 +713,18 @@ impl ImageElement {
     /// Set tint color (multiplied with image color).
     pub fn tint(mut self, tint: Color) -> Self {
         self.tint = tint;
+        self
+    }
+
+    /// Set a widget ID for hit testing (makes the image clickable/draggable).
+    pub fn widget_id(mut self, id: SourceId) -> Self {
+        self.widget_id = Some(id);
+        self
+    }
+
+    /// Set the cursor icon shown when hovering over this image.
+    pub fn cursor(mut self, cursor: CursorIcon) -> Self {
+        self.cursor_hint = Some(cursor);
         self
     }
 
@@ -1614,12 +1632,19 @@ impl Column {
                 }
                 LayoutChild::Image(img) => {
                     let x = cross_x(img.width);
+                    let img_rect = Rect::new(x, y, img.width, img.height);
                     snapshot.primitives_mut().add_image(
-                        Rect::new(x, y, img.width, img.height),
+                        img_rect,
                         img.handle,
                         img.corner_radius,
                         img.tint,
                     );
+                    if let Some(id) = img.widget_id {
+                        snapshot.register_widget(id, img_rect);
+                        if let Some(cursor) = img.cursor_hint {
+                            snapshot.set_cursor_hint(id, cursor);
+                        }
+                    }
                     y += height + self.spacing + alignment_gap;
                 }
                 LayoutChild::Button(btn) => {
@@ -2252,12 +2277,19 @@ impl Row {
                 }
                 LayoutChild::Image(img) => {
                     let y = cross_y(img.height);
+                    let img_rect = Rect::new(x, y, img.width, img.height);
                     snapshot.primitives_mut().add_image(
-                        Rect::new(x, y, img.width, img.height),
+                        img_rect,
                         img.handle,
                         img.corner_radius,
                         img.tint,
                     );
+                    if let Some(id) = img.widget_id {
+                        snapshot.register_widget(id, img_rect);
+                        if let Some(cursor) = img.cursor_hint {
+                            snapshot.set_cursor_hint(id, cursor);
+                        }
+                    }
                     x += width + self.spacing + alignment_gap;
                 }
                 LayoutChild::Button(btn) => {
@@ -2710,12 +2742,16 @@ impl ScrollColumn {
                         snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
                     }
                     LayoutChild::Image(img) => {
+                        let img_rect = Rect::new(content_x, screen_y, img.width, img.height);
                         snapshot.primitives_mut().add_image(
-                            Rect::new(content_x, screen_y, img.width, img.height),
+                            img_rect,
                             img.handle,
                             img.corner_radius,
                             img.tint,
                         );
+                        if let Some(id) = img.widget_id {
+                            snapshot.register_widget(id, img_rect);
+                        }
                     }
                     LayoutChild::Button(btn) => {
                         let size = btn.estimate_size();

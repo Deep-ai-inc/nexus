@@ -41,6 +41,31 @@ fn is_input_widget(_state: &NexusState, id: SourceId) -> bool {
     id == source_ids::mode_toggle()
 }
 
+// =========================================================================
+// Nexus temp file helpers (for native drag round-trip)
+// =========================================================================
+
+const NEXUS_DRAG_DIR: &str = "nexus-drag";
+
+/// Get the temp directory used for nexus drag files.
+pub fn nexus_temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(NEXUS_DRAG_DIR)
+}
+
+/// Check if a path is a nexus temp file (from our own drag operation).
+pub fn is_nexus_temp_file(path: &std::path::Path) -> bool {
+    path.starts_with(nexus_temp_dir())
+}
+
+/// Read a nexus temp file and return its content as text to insert.
+/// Returns `None` if the file is not a nexus temp file or can't be read.
+pub fn read_temp_file_content(path: &std::path::Path) -> Option<String> {
+    if !is_nexus_temp_file(path) {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// Shell-quote a path for safe insertion into the input bar.
 pub fn shell_quote(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();

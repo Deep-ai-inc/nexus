@@ -27,6 +27,7 @@ const PERM_DENY: u64 = 11;
 const PERM_ALLOW: u64 = 12;
 const PERM_ALWAYS: u64 = 13;
 const ANCHOR: u64 = 14;
+const IMAGE_OUTPUT: u64 = 15;
 
 // --- Shell block IDs ---
 
@@ -35,6 +36,7 @@ pub fn shell_term(id: BlockId) -> SourceId { block_space(id).id(SHELL_TERM) }
 pub fn native(id: BlockId) -> SourceId { block_space(id).id(NATIVE) }
 pub fn table(id: BlockId) -> SourceId { block_space(id).id(TABLE) }
 pub fn kill(id: BlockId) -> SourceId { block_space(id).id(KILL) }
+pub fn image_output(id: BlockId) -> SourceId { block_space(id).id(IMAGE_OUTPUT) }
 
 // --- Agent block IDs ---
 

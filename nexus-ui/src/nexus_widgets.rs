@@ -927,7 +927,10 @@ fn render_native_value(
                     let h = orig_h as f32 * scale;
 
                     parent = parent.image(
-                        ImageElement::new(handle, w, h).corner_radius(4.0),
+                        ImageElement::new(handle, w, h)
+                            .corner_radius(4.0)
+                            .widget_id(source_ids::image_output(block_id))
+                            .cursor(CursorIcon::Grab),
                     );
 
                     // Label

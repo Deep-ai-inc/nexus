@@ -8,7 +8,7 @@
 //! `beginDraggingSessionWithItems:event:source:` on it, bypassing Rust type
 //! checking for the protocol conformance (which is handled at the ObjC level).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -59,20 +59,26 @@ pub fn start_drag(source: &DragSource) -> Result<(), String> {
                 drag_image = file_icon(path);
             }
             DragSource::Text(text) => {
+                // Write temp file so winit FileDropped works for internal round-trip
+                let temp_path = write_drag_temp_file("drag.txt", text.as_bytes())
+                    .map_err(|e| format!("Failed to write drag temp file: {}", e))?;
+                set_file_url_on_pasteboard(&pb_item, &temp_path)?;
+                // Also set text for apps that accept plain text
                 let ns_text = NSString::from_str(text);
-                let success: bool = pb_item.setString_forType(&ns_text, NSPasteboardTypeString);
-                if !success {
-                    return Err("Failed to set text on pasteboard".into());
-                }
-                drag_image = generic_drag_image();
+                pb_item.setString_forType(&ns_text, NSPasteboardTypeString);
+                drag_image = file_icon(&temp_path);
             }
             DragSource::Tsv(tsv) => {
+                let temp_path = write_drag_temp_file("drag.tsv", tsv.as_bytes())
+                    .map_err(|e| format!("Failed to write drag temp file: {}", e))?;
+                set_file_url_on_pasteboard(&pb_item, &temp_path)?;
                 let ns_text = NSString::from_str(tsv);
-                let success: bool = pb_item.setString_forType(&ns_text, NSPasteboardTypeString);
-                if !success {
-                    return Err("Failed to set TSV on pasteboard".into());
-                }
-                drag_image = generic_drag_image();
+                pb_item.setString_forType(&ns_text, NSPasteboardTypeString);
+                drag_image = file_icon(&temp_path);
+            }
+            DragSource::Image(path) => {
+                set_file_url_on_pasteboard(&pb_item, path)?;
+                drag_image = file_icon(path);
             }
         }
 
@@ -132,8 +138,11 @@ fn file_icon(path: &Path) -> Retained<NSImage> {
     unsafe { ws.iconForFile(&ns_path) }
 }
 
-/// Generic drag image for text drags.
-fn generic_drag_image() -> Retained<NSImage> {
-    let size = NSSize::new(32.0, 32.0);
-    unsafe { NSImage::initWithSize(NSImage::alloc(), size) }
+/// Write drag data to a temp file for pasteboard use.
+fn write_drag_temp_file(filename: &str, data: &[u8]) -> Result<PathBuf, std::io::Error> {
+    let temp_dir = std::env::temp_dir().join("nexus-drag");
+    std::fs::create_dir_all(&temp_dir)?;
+    let path = temp_dir.join(filename);
+    std::fs::write(&path, data)?;
+    Ok(path)
 }

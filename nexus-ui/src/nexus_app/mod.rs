@@ -192,38 +192,6 @@ impl Component for NexusState {
             );
         }
 
-        // Drag ghost preview (overlay — above everything except context menus)
-        if let drag_state::DragStatus::Active(drag_state::ActiveKind::Drag(ref active)) = self.drag.status {
-            use strata::primitives::Color;
-            let ghost_text = active.payload.preview_text();
-            let ghost_font_size = 13.0;
-            let metrics = strata::gpu::metrics_for_size(ghost_font_size);
-            let line_count = ghost_text.lines().count().max(1) as f32;
-            let max_line_chars = ghost_text.lines().map(|l| l.len()).max().unwrap_or(0);
-            let gx = active.current_pos.x + 12.0;
-            let gy = active.current_pos.y + 12.0;
-            let text_w = max_line_chars as f32 * metrics.cell_width + 16.0;
-            let text_h = line_count * metrics.cell_height + 8.0;
-            let p = snapshot.overlay_primitives_mut();
-            p.add_rounded_rect(
-                Rect::new(gx, gy, text_w, text_h),
-                6.0,
-                Color::rgba(0.15, 0.15, 0.2, 0.92),
-            );
-            p.add_border(
-                Rect::new(gx, gy, text_w, text_h),
-                6.0,
-                1.0,
-                Color::rgba(0.4, 0.6, 1.0, 0.6),
-            );
-            p.add_text(
-                ghost_text,
-                strata::primitives::Point::new(gx + 8.0, gy + 4.0),
-                Color::rgba(0.9, 0.95, 1.0, 0.95),
-                13.0,
-            );
-        }
-
         // FPS counter (top-right corner)
         snapshot.primitives_mut().add_text(
             format!("{:.0} FPS", fps),

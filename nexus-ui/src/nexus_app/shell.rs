@@ -245,6 +245,37 @@ impl ShellWidget {
         registry.get(&id).map(|e| e.drag_payload.clone())
     }
 
+    /// If a source belongs to a block with image output, return an Image drag payload.
+    pub fn image_drag_payload(&self, source_id: strata::content_address::SourceId) -> Option<super::drag_state::DragPayload> {
+        for block in &self.blocks {
+            if source_id == source_ids::native(block.id)
+                || source_id == source_ids::image_output(block.id)
+            {
+                if let Some(ref value) = block.native_output {
+                    if let Some((data, content_type, metadata)) = value.as_media() {
+                        if content_type.starts_with("image/") {
+                            let ext = match content_type {
+                                "image/png" => "png",
+                                "image/jpeg" | "image/jpg" => "jpg",
+                                "image/gif" => "gif",
+                                "image/webp" => "webp",
+                                "image/svg+xml" => "svg",
+                                _ => "png",
+                            };
+                            let filename = metadata.filename.clone()
+                                .unwrap_or_else(|| format!("image-{}.{}", block.id.0, ext));
+                            return Some(super::drag_state::DragPayload::Image {
+                                data: data.to_vec(),
+                                filename,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Check if a hit address belongs to a shell block. Returns the block_id if so.
     pub fn block_for_source(&self, source_id: SourceId) -> Option<BlockId> {
         for block in &self.blocks {
@@ -252,6 +283,7 @@ impl ShellWidget {
                 || source_id == source_ids::shell_header(block.id)
                 || source_id == source_ids::native(block.id)
                 || source_id == source_ids::table(block.id)
+                || source_id == source_ids::image_output(block.id)
             {
                 return Some(block.id);
             }

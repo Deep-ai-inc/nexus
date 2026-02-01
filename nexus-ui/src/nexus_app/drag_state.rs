@@ -120,8 +120,6 @@ impl PendingIntent {
 /// What kind of active interaction is in progress.
 #[derive(Debug, Clone)]
 pub enum ActiveKind {
-    /// Object drag (anchor, selection-as-object, row). Shows ghost, has drop zones.
-    Drag(ActiveDrag),
     /// Text selection in progress. Drives SelectionMsg::Extend on move.
     Selecting {
         start_addr: ContentAddress,
@@ -146,14 +144,6 @@ impl Default for SelectMode {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ActiveDrag {
-    pub payload: DragPayload,
-    pub origin: Point,
-    pub current_pos: Point,
-    pub source: SourceId,
-}
-
 /// What's being dragged.
 #[derive(Debug, Clone)]
 pub enum DragPayload {
@@ -174,6 +164,11 @@ pub enum DragPayload {
         text: String,
         structured: Option<StructuredSelection>,
     },
+    /// An image (raw data + filename for temp file).
+    Image {
+        data: Vec<u8>,
+        filename: String,
+    },
 }
 
 impl DragPayload {
@@ -187,6 +182,7 @@ impl DragPayload {
             Self::TableRow { display, .. } => display.clone(),
             Self::Block(id) => format!("Block #{}", id.0),
             Self::Selection { text, .. } => text.clone(),
+            Self::Image { filename, .. } => filename.clone(),
         };
         let max_lines = 8;
         let max_line_len = 80;
