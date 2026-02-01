@@ -826,8 +826,14 @@ fn build_question_dialog(
 
     // Free-form text input (the "Other" option)
     if let Some(input) = question_input {
+        let has_options = question.questions.iter().any(|q| !q.options.is_empty());
+        let label = if has_options {
+            "Or type a custom answer:"
+        } else {
+            "Type your answer:"
+        };
         dialog = dialog.push(
-            TextElement::new("Or type a custom answer:").color(colors::TEXT_SECONDARY)
+            TextElement::new(label).color(colors::TEXT_SECONDARY)
         );
         let submit_id = source_ids::agent_question_submit(block_id);
         dialog = dialog.push(

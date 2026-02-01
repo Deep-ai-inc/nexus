@@ -148,20 +148,11 @@ impl AgentWidget {
             if let Some(ref question) = block.pending_question {
                 // Submit button for free-form text input
                 if id == source_ids::agent_question_submit(block.id) {
-                    let text = self.question_input.text.trim().to_string();
-                    if !text.is_empty() {
-                        let answer = build_question_answer(&question.questions, 0, &text);
-                        return Some(AgentMsg::UserQuestionAnswer(
-                            block.id,
-                            question.tool_use_id.clone(),
-                            answer,
-                        ));
-                    }
+                    return Self::make_freeform_answer(question, block.id, &self.question_input.text);
                 }
                 for (q_idx, q) in question.questions.iter().enumerate() {
                     for (o_idx, opt) in q.options.iter().enumerate() {
                         if id == source_ids::agent_question_option(block.id, q_idx, o_idx) {
-                            // Build the answer JSON that the CLI expects
                             let answer = build_question_answer(&question.questions, q_idx, &opt.label);
                             return Some(AgentMsg::UserQuestionAnswer(
                                 block.id,
@@ -576,6 +567,25 @@ impl AgentWidget {
         }
     }
 
+    /// Build a `UserQuestionAnswer` message from free-form text input.
+    /// Returns `None` if the text is empty.
+    fn make_freeform_answer(
+        question: &crate::agent_block::PendingUserQuestion,
+        block_id: BlockId,
+        text: &str,
+    ) -> Option<AgentMsg> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+        let answer = build_question_answer(&question.questions, 0, text);
+        Some(AgentMsg::UserQuestionAnswer(
+            block_id,
+            question.tool_use_id.clone(),
+            answer,
+        ))
+    }
+
     /// Handle a key event for the question free-form text input.
     fn handle_question_key(&mut self, event: &KeyEvent) -> AgentOutput {
         use strata::text_input_state::TextInputAction;
@@ -583,19 +593,15 @@ impl AgentWidget {
         self.question_input.focused = true;
         match self.question_input.handle_key(event, false) {
             TextInputAction::Submit(text) => {
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    return AgentOutput::None;
-                }
-                // Find the block with a pending question and submit the free-form answer.
                 if let Some(block) = self.blocks.iter().find(|b| b.pending_question.is_some()) {
                     let block_id = block.id;
                     if let Some(ref question) = block.pending_question {
-                        let tool_use_id = question.tool_use_id.clone();
-                        // Build answer using the first question's header and the typed text.
-                        let answer = build_question_answer(&question.questions, 0, &text);
-                        self.answer_question(block_id, tool_use_id, answer);
-                        return AgentOutput::ScrollToBottom;
+                        if let Some(AgentMsg::UserQuestionAnswer(bid, tid, answer)) =
+                            Self::make_freeform_answer(question, block_id, &text)
+                        {
+                            self.answer_question(bid, tid, answer);
+                            return AgentOutput::ScrollToBottom;
+                        }
                     }
                 }
                 AgentOutput::None
