@@ -45,6 +45,8 @@ pub(crate) enum AgentOutput {
     None,
     /// Orchestrator should scroll history to bottom.
     ScrollToBottom,
+    /// Orchestrator should set focus to the agent question input.
+    FocusQuestionInput,
 }
 
 impl Default for AgentOutput {
@@ -328,7 +330,6 @@ impl AgentWidget {
                 self.handle_question_key(&event)
             }
             AgentMsg::QuestionInputMouse(action) => {
-                self.question_input.focused = true;
                 self.question_input.apply_mouse(action);
                 AgentOutput::None
             }
@@ -358,11 +359,10 @@ impl AgentWidget {
                 block.response.clear();
                 block.version += 1;
             }
-            // Focus the question text input and clear any stale text.
+            // Clear stale text; focus will be set by the orchestrator.
             self.question_input.text.clear();
             self.question_input.cursor = 0;
-            self.question_input.focused = true;
-            return AgentOutput::ScrollToBottom;
+            return AgentOutput::FocusQuestionInput;
         }
 
         if let Some(block_id) = self.active {
@@ -590,7 +590,6 @@ impl AgentWidget {
     fn handle_question_key(&mut self, event: &KeyEvent) -> AgentOutput {
         use strata::text_input_state::TextInputAction;
 
-        self.question_input.focused = true;
         match self.question_input.handle_key(event, false) {
             TextInputAction::Submit(text) => {
                 if let Some(block) = self.blocks.iter().find(|b| b.pending_question.is_some()) {

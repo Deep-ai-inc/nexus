@@ -132,12 +132,14 @@ impl PartialEq for Block {
 }
 
 /// Focus state - makes illegal states unrepresentable.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Focus {
     /// The command input field is focused.
     Input,
     /// A specific block is focused for interaction.
     Block(BlockId),
+    /// The agent question text input is focused.
+    AgentInput,
 }
 
 /// Input mode - determines how commands are processed.

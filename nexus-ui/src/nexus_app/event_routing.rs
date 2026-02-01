@@ -9,7 +9,7 @@ use strata::{MouseResponse, ScrollAction, route_mouse};
 use crate::blocks::Focus;
 use crate::nexus_widgets::JobBar;
 
-use super::drag_state::{ActiveKind, DragStatus, PendingIntent, DRAG_THRESHOLD_SQ};
+use super::drag_state::PendingIntent;
 use super::message::{
     AgentMsg, ContextMenuMsg, DragMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg,
 };
@@ -55,14 +55,15 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         return route_escape(state);
     }
 
-    // Phase 4: Focused PTY block → forward keys to shell
-    if let Focus::Block(id) = state.focus {
-        return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
-    }
-
-    // Phase 4.5: Pending user question — route keys to question text input
-    if state.agent.has_pending_question() {
-        return Some(NexusMessage::Agent(AgentMsg::QuestionInputKey(event)));
+    // Phase 4: Focus-based routing
+    match state.focus {
+        Focus::Block(id) => {
+            return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
+        }
+        Focus::AgentInput => {
+            return Some(NexusMessage::Agent(AgentMsg::QuestionInputKey(event)));
+        }
+        Focus::Input => {} // fall through to input widget
     }
 
     // Phase 5: Input-focused keys (delegated to InputWidget)
@@ -157,54 +158,14 @@ pub(super) fn on_mouse(
     capture: &CaptureState,
 ) -> MouseResponse<NexusMessage> {
     // ── Drag state machine intercept ──────────────────────────────
-    // When a drag is Pending or Active, all mouse events are routed here.
-    match &state.drag.status {
-        DragStatus::Active(ActiveKind::Selecting { .. }) => {
-            return match &event {
-                MouseEvent::CursorMoved { position, .. } => {
-                    update_auto_scroll(state, position);
-                    if let Some(HitResult::Content(addr)) = hit {
-                        MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(addr)))
-                    } else {
-                        MouseResponse::none()
-                    }
-                }
-                MouseEvent::ButtonReleased {
-                    button: MouseButton::Left,
-                    ..
-                } => {
-                    state.drag.auto_scroll.set(None);
-                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
-                }
-                MouseEvent::CursorLeft => {
-                    state.drag.auto_scroll.set(None);
-                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
-                }
-                _ => MouseResponse::none(),
-            };
-        }
-        DragStatus::Pending { origin, .. } => {
-            return match &event {
-                MouseEvent::CursorMoved { position, .. } => {
-                    let dx = position.x - origin.x;
-                    let dy = position.y - origin.y;
-                    if dx * dx + dy * dy > DRAG_THRESHOLD_SQ {
-                        MouseResponse::message(NexusMessage::Drag(DragMsg::Activate(*position)))
-                    } else {
-                        MouseResponse::none()
-                    }
-                }
-                MouseEvent::ButtonReleased {
-                    button: MouseButton::Left,
-                    ..
-                } => {
-                    // Cancel pending drag → the handler re-dispatches the original click
-                    MouseResponse::message(NexusMessage::Drag(DragMsg::Cancel))
-                }
-                _ => MouseResponse::none(),
-            };
-        }
-        DragStatus::Inactive => {} // Fall through to normal routing
+    if let Some(resp) = super::drag_state::route_drag_mouse(
+        &state.drag.status,
+        &event,
+        hit.clone(),
+        &state.drag.auto_scroll,
+        state.scroll.state.bounds.get(),
+    ) {
+        return resp;
     }
 
     // Composable scroll + input handlers
@@ -251,54 +212,24 @@ pub(super) fn on_mouse(
     {
         // Z-order: Selection > Anchor > Text
         // If clicking inside an existing non-collapsed selection, start a selection drag.
-        // This applies to both Content hits (raw text) and Widget hits (anchors inside
-        // selection) — clicking a link within selected text should drag the selection,
-        // not open the link.
-        if let Some(ref sel) = state.selection.selection {
-            if !sel.is_collapsed() {
-                let hit_in_selection = match &hit {
-                    Some(HitResult::Content(addr)) => {
-                        let ordering = super::selection::build_source_ordering(
-                            &state.shell.blocks,
-                            &state.agent.blocks,
-                        );
-                        if sel.contains(addr, &ordering) {
-                            Some((addr.source_id, addr.clone()))
-                        } else {
-                            None
-                        }
-                    }
-                    Some(HitResult::Widget(id)) => {
-                        let ordering = super::selection::build_source_ordering(
-                            &state.shell.blocks,
-                            &state.agent.blocks,
-                        );
-                        // Widget's SourceId within selection range → treat as selection drag
-                        if sel.sources(&ordering).contains(id) {
-                            Some((*id, strata::content_address::ContentAddress::start_of(*id)))
-                        } else {
-                            None
-                        }
-                    }
-                    None => None,
-                };
-
-                if let Some((source, origin_addr)) = hit_in_selection {
-                    let text = state
-                        .selection
-                        .extract_selected_text(&state.shell.blocks, &state.agent.blocks)
-                        .unwrap_or_default();
-                    let intent = PendingIntent::SelectionDrag {
-                        source,
-                        text,
-                        origin_addr,
-                    };
-                    return MouseResponse::message_and_capture(
-                        NexusMessage::Drag(DragMsg::Start(intent, *position)),
-                        source,
-                    );
-                }
-            }
+        if let Some((source, origin_addr)) = state.selection.hit_in_selection(
+            &hit,
+            &state.shell.blocks,
+            &state.agent.blocks,
+        ) {
+            let text = state
+                .selection
+                .extract_selected_text(&state.shell.blocks, &state.agent.blocks)
+                .unwrap_or_default();
+            let intent = PendingIntent::SelectionDrag {
+                source,
+                text,
+                origin_addr,
+            };
+            return MouseResponse::message_and_capture(
+                NexusMessage::Drag(DragMsg::Start(intent, *position)),
+                source,
+            );
         }
 
         if let Some(HitResult::Widget(id)) = &hit {
@@ -362,7 +293,7 @@ pub(super) fn on_mouse(
         }
 
         // Clicked empty space: blur inputs
-        if state.input.text_input.focused {
+        if matches!(state.focus, Focus::Input) {
             return MouseResponse::message(NexusMessage::BlurAll);
         }
     }
@@ -436,30 +367,3 @@ fn route_context_menu_click(state: &NexusState, hit: &Option<HitResult>) -> Opti
     Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss))
 }
 
-/// Compute auto-scroll speed based on cursor distance from scroll container edges.
-///
-/// 40px edge zone, proportional speed up to 8px per tick (~480px/s at 60fps).
-/// Negative = scroll up (toward top of content), positive = scroll down.
-fn update_auto_scroll(state: &NexusState, pos: &strata::primitives::Point) {
-    let bounds = state.scroll.state.bounds.get();
-    let edge = 40.0;
-    let max_speed = 8.0;
-
-    let speed = if pos.y < bounds.y + edge {
-        // Near top → scroll up (negative offset = toward top)
-        let dist = bounds.y + edge - pos.y;
-        -(dist / edge) * max_speed
-    } else if pos.y > bounds.y + bounds.height - edge {
-        // Near bottom → scroll down (positive offset = toward bottom)
-        let dist = pos.y - (bounds.y + bounds.height - edge);
-        (dist / edge) * max_speed
-    } else {
-        0.0
-    };
-
-    if speed.abs() > 0.1 {
-        state.drag.auto_scroll.set(Some(speed));
-    } else {
-        state.drag.auto_scroll.set(None);
-    }
-}

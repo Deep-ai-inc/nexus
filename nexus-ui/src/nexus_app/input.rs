@@ -123,7 +123,6 @@ impl InputWidget {
 
     /// Handle a mouse action on the text input.
     pub fn handle_mouse(&mut self, action: TextInputMouseAction) {
-        self.text_input.focused = true;
         self.text_input.apply_mouse(action);
     }
 

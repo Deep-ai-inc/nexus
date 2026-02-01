@@ -9,8 +9,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use nexus_api::BlockId;
+use strata::MouseResponse;
 use strata::content_address::{ContentAddress, SourceId};
-use strata::primitives::Point;
+use strata::event_context::{MouseButton, MouseEvent};
+use strata::layout_snapshot::HitResult;
+use strata::primitives::{Point, Rect};
+
+use super::message::{DragMsg, NexusMessage, SelectionMsg};
 
 /// Drag hysteresis threshold in pixels (squared for faster comparison).
 pub const DRAG_THRESHOLD_SQ: f32 = 25.0; // 5px
@@ -255,5 +260,93 @@ impl ClickTracker {
         }
         self.state.set((Some(now), pos, 1));
         SelectMode::Char
+    }
+}
+
+// =========================================================================
+// Drag mouse routing (extracted from event_routing.rs)
+// =========================================================================
+
+/// Route mouse events through the drag state machine.
+///
+/// Returns `Some(response)` if the drag intercepted the event,
+/// `None` if the event should fall through to normal routing.
+pub fn route_drag_mouse(
+    status: &DragStatus,
+    event: &MouseEvent,
+    hit: Option<HitResult>,
+    auto_scroll: &Cell<Option<f32>>,
+    scroll_bounds: Rect,
+) -> Option<MouseResponse<NexusMessage>> {
+    match status {
+        DragStatus::Active(ActiveKind::Selecting { .. }) => {
+            Some(match event {
+                MouseEvent::CursorMoved { position, .. } => {
+                    update_auto_scroll(auto_scroll, scroll_bounds, position);
+                    if let Some(HitResult::Content(addr)) = hit {
+                        MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(addr)))
+                    } else {
+                        MouseResponse::none()
+                    }
+                }
+                MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    auto_scroll.set(None);
+                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
+                }
+                MouseEvent::CursorLeft => {
+                    auto_scroll.set(None);
+                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
+                }
+                _ => MouseResponse::none(),
+            })
+        }
+        DragStatus::Pending { origin, .. } => {
+            Some(match event {
+                MouseEvent::CursorMoved { position, .. } => {
+                    let dx = position.x - origin.x;
+                    let dy = position.y - origin.y;
+                    if dx * dx + dy * dy > DRAG_THRESHOLD_SQ {
+                        MouseResponse::message(NexusMessage::Drag(DragMsg::Activate(*position)))
+                    } else {
+                        MouseResponse::none()
+                    }
+                }
+                MouseEvent::ButtonReleased {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    MouseResponse::message(NexusMessage::Drag(DragMsg::Cancel))
+                }
+                _ => MouseResponse::none(),
+            })
+        }
+        DragStatus::Inactive => None,
+    }
+}
+
+/// Compute auto-scroll speed based on cursor distance from scroll container edges.
+///
+/// 40px edge zone, proportional speed up to 8px per tick (~480px/s at 60fps).
+fn update_auto_scroll(auto_scroll: &Cell<Option<f32>>, bounds: Rect, pos: &Point) {
+    let edge = 40.0;
+    let max_speed = 8.0;
+
+    let speed = if pos.y < bounds.y + edge {
+        let dist = bounds.y + edge - pos.y;
+        -(dist / edge) * max_speed
+    } else if pos.y > bounds.y + bounds.height - edge {
+        let dist = pos.y - (bounds.y + bounds.height - edge);
+        (dist / edge) * max_speed
+    } else {
+        0.0
+    };
+
+    if speed.abs() > 0.1 {
+        auto_scroll.set(Some(speed));
+    } else {
+        auto_scroll.set(None);
     }
 }

@@ -17,14 +17,10 @@ impl NexusState {
 
     // --- Focus ---
 
-    pub(super) fn set_focus_input(&mut self) {
-        self.focus = crate::blocks::Focus::Input;
-        self.input.text_input.focused = true;
-    }
-
-    pub(super) fn set_focus_block(&mut self, id: nexus_api::BlockId) {
-        self.focus = crate::blocks::Focus::Block(id);
-        self.input.text_input.focused = false;
+    pub(super) fn set_focus(&mut self, focus: crate::blocks::Focus) {
+        self.focus = focus;
+        self.input.text_input.focused = matches!(focus, crate::blocks::Focus::Input);
+        self.agent.question_input.focused = matches!(focus, crate::blocks::Focus::AgentInput);
     }
 
     // --- Output-arrived tick ---
@@ -50,14 +46,14 @@ impl NexusState {
         self.agent.clear();
         self.scroll.reset();
         self.transient.dismiss_all(&mut self.input);
-        self.set_focus_input();
+        self.set_focus(crate::blocks::Focus::Input);
     }
 
     // --- Cursor ---
 
     pub(super) fn cursor_visible(&self) -> bool {
-        // Hide main input cursor when a question dialog is active.
-        if self.agent.has_pending_question() {
+        // Hide main input cursor when agent question input has focus.
+        if matches!(self.focus, crate::blocks::Focus::AgentInput) {
             return false;
         }
         let blink_elapsed = Instant::now()

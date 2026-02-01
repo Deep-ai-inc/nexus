@@ -12,6 +12,7 @@ use super::source_ids;
 use strata::Command;
 use strata::component::Ctx;
 use strata::content_address::{ContentAddress, SourceId, SourceOrdering};
+use strata::layout_snapshot::HitResult;
 use strata::Selection;
 
 /// Selection state and text extraction logic.
@@ -63,6 +64,42 @@ impl SelectionWidget {
                 ContentAddress::new(last, usize::MAX, usize::MAX),
             ));
             self.is_selecting = false;
+        }
+    }
+
+    /// Check if a click hit falls inside the current non-collapsed selection.
+    ///
+    /// Returns `(source_id, content_address)` for starting a selection drag,
+    /// or `None` if the click is outside the selection or there is no selection.
+    pub fn hit_in_selection(
+        &self,
+        hit: &Option<HitResult>,
+        shell_blocks: &[Block],
+        agent_blocks: &[AgentBlock],
+    ) -> Option<(SourceId, ContentAddress)> {
+        let sel = self.selection.as_ref()?;
+        if sel.is_collapsed() {
+            return None;
+        }
+
+        match hit {
+            Some(HitResult::Content(addr)) => {
+                let ordering = build_source_ordering(shell_blocks, agent_blocks);
+                if sel.contains(addr, &ordering) {
+                    Some((addr.source_id, addr.clone()))
+                } else {
+                    None
+                }
+            }
+            Some(HitResult::Widget(id)) => {
+                let ordering = build_source_ordering(shell_blocks, agent_blocks);
+                if sel.sources(&ordering).contains(id) {
+                    Some((*id, ContentAddress::start_of(*id)))
+                } else {
+                    None
+                }
+            }
+            None => None,
         }
     }
 

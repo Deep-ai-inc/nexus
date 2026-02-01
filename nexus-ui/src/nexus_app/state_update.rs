@@ -25,11 +25,11 @@ impl NexusState {
         match output {
             ShellOutput::None => {}
             ShellOutput::FocusInput | ShellOutput::PtyInputFailed => {
-                self.set_focus_input();
+                self.set_focus(Focus::Input);
                 self.scroll.force();
             }
             ShellOutput::FocusBlock(id) => {
-                self.set_focus_block(id);
+                self.set_focus(Focus::Block(id));
                 self.scroll.force();
             }
             ShellOutput::ScrollToBottom => {
@@ -41,12 +41,12 @@ impl NexusState {
             }
             ShellOutput::CommandFinished { exit_code, command, output } => {
                 self.context.on_command_finished(command, output, exit_code);
-                self.set_focus_input();
+                self.set_focus(Focus::Input);
                 self.scroll.force();
             }
             ShellOutput::BlockExited { id } => {
                 if self.focus == Focus::Block(id) {
-                    self.set_focus_input();
+                    self.set_focus(Focus::Input);
                     self.scroll.force();
                 }
             }
@@ -57,6 +57,10 @@ impl NexusState {
         match output {
             AgentOutput::None => {}
             AgentOutput::ScrollToBottom => {
+                self.scroll.hint();
+            }
+            AgentOutput::FocusQuestionInput => {
+                self.set_focus(Focus::AgentInput);
                 self.scroll.hint();
             }
         }
@@ -85,8 +89,10 @@ impl NexusState {
     ) -> Command<NexusMessage> {
         match msg {
             NexusMessage::Input(m) => {
+                if matches!(m, super::message::InputMsg::Mouse(_)) {
+                    self.set_focus(Focus::Input);
+                }
                 let (_cmd, output) = self.input.update(m, ctx);
-                // InputWidget never produces async commands currently
                 self.apply_input_output(output)
             }
             NexusMessage::Shell(m) => {
@@ -117,7 +123,7 @@ impl NexusState {
             NexusMessage::CloseWindow => { self.exit_requested = true; Command::none() }
             NexusMessage::BlurAll => {
                 self.transient.dismiss_all(&mut self.input);
-                self.set_focus_input();
+                self.set_focus(Focus::Input);
                 Command::none()
             }
             NexusMessage::Tick => { self.on_output_arrived(); Command::none() }
