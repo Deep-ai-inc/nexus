@@ -78,8 +78,8 @@ The difference is invisible until you need it:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  PRESENTATION                                                   │
-│  strata            Standalone GPU UI engine (WGPU, cosmic-text)│
-│    Primitives, layout, GPU pipeline, text engine, event system │
+│  strata            Custom GPU rendering engine (Iced, WGPU)   │
+│    GPU pipeline, glyph atlas, text engine (cosmic-text)       │
 │                                                                 │
 │  nexus-ui          Nexus shell frontend (depends on strata)    │
 │    ├─ nexus_app       App shell, state, subscriptions          │
@@ -92,13 +92,14 @@ The difference is invisible until you need it:
 │  nexus-kernel             │ │  nexus-agent                      │
 │    ├─ Parser (tree-sitter)│ │    ├─ Agentic loop & tool system  │
 │    ├─ Evaluator (AST)     │ │    ├─ Session management          │
-│    ├─ 40+ native commands │ │    └─ ACP protocol integration    │
+│    ├─ 110+ native commands│ │    └─ ACP protocol integration    │
 │    ├─ Job control         │ │                                   │
 │    └─ SQLite history      │ │  Composed of:                     │
 │                           │ │    nexus-llm       Multi-provider │
 │  Execution paths:         │ │      (Anthropic, OpenAI, Ollama,  │
-│    Kernel → Value output  │ │       Vertex, Groq, Mistral, ...) │
-│    PTY    → raw terminal  │ │    nexus-executor  Cmd execution  │
+│    Kernel → Value output  │ │       Vertex, Groq, Mistral,      │
+│    PTY    → raw terminal  │ │       Cerebras, OpenRouter, ...)   │
+│                           │ │    nexus-executor  Cmd execution  │
 │                           │ │    nexus-fs        File ops       │
 │                           │ │    nexus-web       Web & search   │
 │                           │ │    nexus-sandbox   Policy enforce │
@@ -107,11 +108,12 @@ The difference is invisible until you need it:
 ┌────────────▼───────────────────────────▼────────────────────────┐
 │  INFRASTRUCTURE                                                 │
 │  nexus-api         Shared types: Value, ShellEvent, BlockMeta  │
-│    Value = Bool | Int | String | List | Table | Record         │
-│            | FileEntry | Process | GitStatus | Media | ...     │
+│    Value = Bool | Int | Float | String | Bytes | Path          │
+│            | List | Table | Record | FileEntry | Process       │
+│            | GitStatus | GitCommit | Media | ...               │
 │                                                                 │
-│  nexus-term        Headless terminal emulation (alacritty)     │
-│    ANSI parsing, virtual grid for legacy TUI apps              │
+│  nexus-term        Headless terminal emulation                 │
+│    ANSI parsing via alacritty_terminal, virtual grid for TUIs  │
 │                                                                 │
 │  nexus-sandbox     macOS Seatbelt, read-only/workspace policies │
 └─────────────────────────────────────────────────────────────────┘
@@ -125,23 +127,24 @@ Data flow:
 
 **Native commands** (ls, git, ps, etc.) return structured `Value` types.
 **Legacy commands** (vim, htop, etc.) run in a PTY with full terminal emulation.
-**The UI** renders both seamlessly through Strata, the sole GPU-accelerated rendering layer.
+**The UI** renders both seamlessly through Strata, a custom GPU rendering engine built on Iced with its own pipeline, glyph atlas, and text shaping via cosmic-text.
 
 ## Status
 
 **Working:**
 - Bash-compatible parsing (pipes, loops, redirects, subshells)
-- 65+ native commands with structured output
+- 110+ native commands with structured output
+- Native git commands (status, log, branch, diff, add, commit, remote, stash)
+- Session persistence (SQLite — history with full-text search, blocks)
 - Tilde expansion, glob expansion
 - PTY for external commands
 - Terminal emulation for TUI apps (vim, htop)
 - Output persistence and `|` continuation
+- AI agent with 13 LLM providers, tool use, and ACP protocol
 
 **In Progress:**
 - Interactive table rendering (click to sort/filter)
 - Semantic actions (right-click context menus)
-- Native git commands
-- Session persistence (SQLite)
 
 ## Quick Start
 
@@ -152,7 +155,7 @@ cargo run -p nexus-ui --release
 
 ### Strata Demo
 
-**Strata** is now its own workspace crate — a standalone GPU-accelerated GUI engine. To run its demo:
+**Strata** is its own workspace crate — a custom GPU rendering engine with its own pipeline and text shaping, built on Iced's windowing infrastructure. To run its demo:
 
 ```bash
 cargo run -p nexus-ui -- --demo
