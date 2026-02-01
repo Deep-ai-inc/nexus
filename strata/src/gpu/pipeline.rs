@@ -1127,9 +1127,17 @@ impl StrataPipeline {
         };
         queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
 
+        // Cap instance count to stay within wgpu's maximum buffer size (256 MB).
+        // Each GpuInstance is 64 bytes, so the hard limit is ~4M instances.
+        // We use a slightly lower cap to leave headroom for other allocations.
+        const MAX_INSTANCES: usize = 2 * 1024 * 1024; // 2M instances = 128 MB
+        if self.instances.len() > MAX_INSTANCES {
+            self.instances.truncate(MAX_INSTANCES);
+        }
+
         // Resize instance buffer if needed
         if self.instances.len() > self.instance_capacity {
-            self.instance_capacity = self.instances.len().next_power_of_two();
+            self.instance_capacity = self.instances.len().next_power_of_two().min(MAX_INSTANCES);
             self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Strata Instance Buffer"),
                 size: (self.instance_capacity * std::mem::size_of::<GpuInstance>()) as u64,
