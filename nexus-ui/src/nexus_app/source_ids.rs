@@ -30,6 +30,10 @@ const ANCHOR: u64 = 14;
 const IMAGE_OUTPUT: u64 = 15;
 const QUESTION_OPTION: u64 = 16;
 const QUESTION_SUBMIT: u64 = 17;
+const AGENT_TOOL: u64 = 18;
+const AGENT_PERM_TEXT: u64 = 19;
+const AGENT_QUESTION_TEXT: u64 = 20;
+const AGENT_FOOTER: u64 = 21;
 
 // --- Shell block IDs ---
 
@@ -74,6 +78,14 @@ pub fn agent_question_option(id: BlockId, q: usize, opt: usize) -> SourceId {
 pub fn agent_question_submit(id: BlockId) -> SourceId {
     block_space(id).id(QUESTION_SUBMIT)
 }
+
+pub fn agent_tool(id: BlockId, i: usize) -> SourceId {
+    block_space(id).child(AGENT_TOOL).id(i as u64)
+}
+
+pub fn agent_perm_text(id: BlockId) -> SourceId { block_space(id).id(AGENT_PERM_TEXT) }
+pub fn agent_question_text(id: BlockId) -> SourceId { block_space(id).id(AGENT_QUESTION_TEXT) }
+pub fn agent_footer(id: BlockId) -> SourceId { block_space(id).id(AGENT_FOOTER) }
 
 // --- Global UI IDs (no block) ---
 

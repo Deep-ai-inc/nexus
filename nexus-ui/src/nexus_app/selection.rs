@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use nexus_api::BlockId;
 
-use crate::agent_block::AgentBlock;
+use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation};
 use crate::blocks::{Block, UnifiedBlockRef};
 use super::context_menu::ContextTarget;
 use super::message::SelectionMsg;
@@ -234,9 +234,19 @@ pub(crate) fn build_source_ordering(blocks: &[Block], agent_blocks: &[AgentBlock
                 if !block.thinking.is_empty() && !block.thinking_collapsed {
                     ordering.register(source_ids::agent_thinking(block.id));
                 }
+                for (i, _tool) in block.tools.iter().enumerate() {
+                    ordering.register(source_ids::agent_tool(block.id, i));
+                }
+                if block.pending_permission.is_some() {
+                    ordering.register(source_ids::agent_perm_text(block.id));
+                }
+                if block.pending_question.is_some() {
+                    ordering.register(source_ids::agent_question_text(block.id));
+                }
                 if !block.response.is_empty() {
                     ordering.register(source_ids::agent_response(block.id));
                 }
+                ordering.register(source_ids::agent_footer(block.id));
             }
         }
     }
@@ -350,12 +360,57 @@ fn extract_source_text(
             return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
         }
 
+        for (i, tool) in block.tools.iter().enumerate() {
+            let tool_id = source_ids::agent_tool(block.id, i);
+            if tool_id == source_id {
+                let text = extract_tool_text(tool);
+                let lines: Vec<&str> = text.lines().collect();
+                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+            }
+        }
+
+        if let Some(ref perm) = block.pending_permission {
+            let perm_id = source_ids::agent_perm_text(block.id);
+            if perm_id == source_id {
+                let mut text = String::from("\u{26A0} Permission Required\n");
+                text.push_str(&perm.description);
+                text.push('\n');
+                text.push_str(&perm.action);
+                if let Some(ref dir) = perm.working_dir {
+                    text.push('\n');
+                    text.push_str(&format!("in {}", dir));
+                }
+                let lines: Vec<&str> = text.lines().collect();
+                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+            }
+        }
+
+        if let Some(ref q) = block.pending_question {
+            let q_id = source_ids::agent_question_text(block.id);
+            if q_id == source_id {
+                let mut text = String::from("\u{2753} Claude is asking:\n");
+                for question in &q.questions {
+                    text.push_str(&question.question);
+                    text.push('\n');
+                }
+                let lines: Vec<&str> = text.lines().collect();
+                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+            }
+        }
+
         let response_id = source_ids::agent_response(block.id);
         if response_id == source_id {
             if block.response.is_empty() {
                 return None;
             }
             let lines: Vec<&str> = block.response.lines().collect();
+            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+        }
+
+        let footer_id = source_ids::agent_footer(block.id);
+        if footer_id == source_id {
+            let text = extract_agent_footer_text(block);
+            let lines: Vec<&str> = text.lines().collect();
             return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
         }
     }
@@ -423,4 +478,83 @@ fn extract_multi_item_range(
         }
     }
     parts.join("\n")
+}
+
+/// Gather all visible text from a tool invocation for copy/selection extraction.
+fn extract_tool_text(tool: &ToolInvocation) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Header label (mirrors tool_header_label in nexus_widgets)
+    parts.push(tool.name.clone());
+
+    if let Some(ref msg) = tool.message {
+        parts.push(msg.clone());
+    }
+
+    if tool.collapsed {
+        // Collapsed summary — just the output first line
+        if let Some(ref output) = tool.output {
+            if let Some(first) = output.lines().next() {
+                let truncated = if first.len() > 200 { &first[..200] } else { first };
+                parts.push(truncated.to_string());
+            }
+        }
+    } else {
+        // Expanded body — parameters + output
+        for (name, value) in &tool.parameters {
+            let display = if value.len() > 100 {
+                format!("{}: {}...", name, &value[..100])
+            } else {
+                format!("{}: {}", name, value)
+            };
+            parts.push(display);
+        }
+        if let Some(ref output) = tool.output {
+            parts.push(output.clone());
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Gather footer text from an agent block for copy/selection extraction.
+fn extract_agent_footer_text(block: &AgentBlock) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let status = match &block.state {
+        AgentBlockState::Pending => "Waiting...",
+        AgentBlockState::Streaming => "Streaming...",
+        AgentBlockState::Thinking => "Thinking...",
+        AgentBlockState::Executing => "Executing...",
+        AgentBlockState::Completed => "Completed",
+        AgentBlockState::Failed(err) => err.as_str(),
+        AgentBlockState::AwaitingPermission => "Awaiting permission...",
+        AgentBlockState::Interrupted => "Interrupted",
+    };
+    parts.push(status.to_string());
+
+    if let Some(ms) = block.duration_ms {
+        if ms < 1000 {
+            parts.push(format!("{}ms", ms));
+        } else {
+            parts.push(format!("{:.1}s", ms as f64 / 1000.0));
+        }
+    }
+
+    if let Some(cost) = block.cost_usd {
+        parts.push(format!("${:.4}", cost));
+    }
+
+    let total_tokens = block.input_tokens.unwrap_or(0) + block.output_tokens.unwrap_or(0);
+    if total_tokens > 0 {
+        if total_tokens >= 1_000_000 {
+            parts.push(format!("{:.1}M tokens", total_tokens as f64 / 1_000_000.0));
+        } else if total_tokens >= 1_000 {
+            parts.push(format!("{:.1}k tokens", total_tokens as f64 / 1_000.0));
+        } else {
+            parts.push(format!("{} tokens", total_tokens));
+        }
+    }
+
+    parts.join(" ")
 }
