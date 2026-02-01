@@ -200,6 +200,15 @@ impl NexusState {
                         PendingIntent::SelectionDrag { text, .. } => {
                             Some(strata::DragSource::Text(text))
                         }
+                        PendingIntent::RowDrag { block_id, row_index, .. } => {
+                            let payload = super::drag_state::DragPayload::TableRow {
+                                block_id,
+                                row_index,
+                                display: self.shell.row_display_text(block_id, row_index),
+                            };
+                            Some(self.payload_to_drag_source(&payload))
+                        }
+                        // ColumnResize, ColumnReorder, TerminalCapture — not drag sources
                         _ => None,
                     };
                     if let Some(source) = drag_source {
@@ -279,7 +288,7 @@ impl NexusState {
                         if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
                             let tsv = table_to_tsv(columns, rows);
                             let filename = format!("{}-output.tsv", block.command.split_whitespace().next().unwrap_or("block"));
-                            match write_drag_temp_file(&filename, tsv.as_bytes()) {
+                            match file_drop::write_drag_temp_file(&filename, tsv.as_bytes()) {
                                 Ok(path) => return strata::DragSource::File(path),
                                 Err(e) => {
                                     tracing::warn!("Failed to write drag temp file: {}", e);
@@ -579,17 +588,6 @@ impl NexusState {
             _ => None,
         }
     }
-}
-
-/// Convert a table Value to TSV (tab-separated values) string.
-/// Write ephemeral drag data to a temp file, returning the path.
-/// Keeps the platform drag layer I/O-free.
-fn write_drag_temp_file(filename: &str, data: &[u8]) -> Result<std::path::PathBuf, std::io::Error> {
-    let temp_dir = std::env::temp_dir().join("nexus-drag");
-    std::fs::create_dir_all(&temp_dir)?;
-    let path = temp_dir.join(filename);
-    std::fs::write(&path, data)?;
-    Ok(path)
 }
 
 fn table_to_tsv(columns: &[TableColumn], rows: &[Vec<Value>]) -> String {

@@ -291,6 +291,20 @@ impl ShellWidget {
         None
     }
 
+    /// Get display text for a table row (tab-separated cell values).
+    pub fn row_display_text(&self, block_id: nexus_api::BlockId, row_index: usize) -> String {
+        if let Some(&idx) = self.block_index.get(&block_id) {
+            if let Some(block) = self.blocks.get(idx) {
+                if let Some(nexus_api::Value::Table { rows, .. }) = &block.native_output {
+                    if let Some(row) = rows.get(row_index) {
+                        return row.iter().map(|v| v.to_text()).collect::<Vec<_>>().join("\t");
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
     /// Create the subscription for PTY and kernel events.
     ///
     /// Returns `Subscription<NexusMessage>` directly because iced's

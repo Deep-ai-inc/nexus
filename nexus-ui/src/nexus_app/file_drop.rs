@@ -66,6 +66,16 @@ pub fn read_temp_file_content(path: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Write drag data to a temp file, returning the path.
+/// Does NOT clean stale files — the platform layer does that before each drag.
+pub fn write_drag_temp_file(filename: &str, data: &[u8]) -> Result<std::path::PathBuf, std::io::Error> {
+    let temp_dir = nexus_temp_dir();
+    std::fs::create_dir_all(&temp_dir)?;
+    let path = temp_dir.join(filename);
+    std::fs::write(&path, data)?;
+    Ok(path)
+}
+
 /// Shell-quote a path for safe insertion into the input bar.
 pub fn shell_quote(path: &std::path::Path) -> String {
     let s = path.to_string_lossy();

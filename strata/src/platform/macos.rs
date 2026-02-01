@@ -139,8 +139,17 @@ fn file_icon(path: &Path) -> Retained<NSImage> {
 }
 
 /// Write drag data to a temp file for pasteboard use.
+/// Cleans any stale files from previous drags before writing.
 fn write_drag_temp_file(filename: &str, data: &[u8]) -> Result<PathBuf, std::io::Error> {
     let temp_dir = std::env::temp_dir().join("nexus-drag");
+    // Clean stale files from previous drags
+    if temp_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     std::fs::create_dir_all(&temp_dir)?;
     let path = temp_dir.join(filename);
     std::fs::write(&path, data)?;
