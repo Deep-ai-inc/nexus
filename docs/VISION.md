@@ -570,6 +570,193 @@ Trash lives at `~/.nexus/trash/` with a manifest per entry (original path, times
 
 ---
 
+## The Broader Pain: 40 Things People Hate About Terminals
+
+The 22 problems above are architectural. Below is the full landscape of terminal friction that real people experience — the things that make someone close the terminal and open a GUI instead. Many map to existing numbered problems; others are new surface area. Nexus should attempt to address all of them.
+
+### Already addressed by numbered problems above
+
+| Pain point | Covered by |
+|---|---|
+| Copy/Paste Issues | #5 Copy/Paste |
+| No Mouse Support | #7 Mouse Support |
+| Terminal Customization | #10 Config File Theming |
+| No Undo Button | #22 Filesystem Undo |
+| Fear of Breaking Things | #11 Dangerous Globs, #22 Filesystem Undo |
+| Wildcard Surprises | #11 Dangerous Globs |
+| Permission Issues | #12 The Sudo Trap |
+| Lack of Autocomplete | #19 Autocomplete |
+| Lack of Visual Progress Bars | #14 Silent Commands |
+| History Navigation | #15 History Amnesia |
+| Output Scrolling | #17 Buffer Limits |
+| Escape Sequence Hell | #1 (structured Values) |
+| Command Options/Flags | #13 Argument Anarchy |
+| Copying from the Web | #5 (paste detection strips `$ ` prefix) |
+| Space in Filenames | #5 (paste detection), #21 (drag inserts quoted paths) |
+
+### New pain points Nexus should solve
+
+#### 23. Unintuitive / Cryptic Commands
+**Pain:** `tar -xzvf`, `chmod 755`, `find . -name "*.txt" -exec rm {} \;` — the syntax is hostile to humans. You either memorize it or Google it every time.
+
+**Solution:** Nexus's AI agent is always available. Type what you mean in English, get the command. But more importantly, native commands use readable syntax. And for external commands, inline help and the command palette (#6) surface what's available without memorization.
+
+---
+
+#### 24. Poor Error Messages
+**Pain:** `ENOENT`, `segfault`, `exit code 137` — errors that mean nothing to most people.
+
+**Solution:** Native commands return structured `Value::Error` with human-readable messages. For external commands, Nexus intercepts common cryptic errors and annotates them: "exit code 137" → "Killed (out of memory)". The AI agent can explain any error with full context of what was running.
+
+---
+
+#### 25. Invisible Password Entry
+**Pain:** Type your sudo password, see nothing. Not even asterisks. "Is it working? Did I type it wrong?"
+
+**Solution:** Show asterisks (or dots) during password entry. Nexus controls the PTY and can detect password prompts (sudo, ssh, etc.) and switch to a masked input mode. Simple, obvious, long overdue.
+
+---
+
+#### 26. Stuck Processes / Exiting Programs
+**Pain:** Accidentally opened `vim` and can't get out. A command is running and you don't know how to stop it. `Ctrl+C` doesn't always work.
+
+**Solution:** Every running block has a visible kill button. Nexus detects known "trap" programs (vim, less, man) and shows contextual escape hints: "Press `:q!` to exit vim" or "Press `q` to exit less". For stuck processes, escalation is one click: SIGINT → SIGTERM → SIGKILL.
+
+---
+
+#### 27. Case Sensitivity Confusion
+**Pain:** `cd Documents` works but `cd documents` doesn't. File matching is case-sensitive on Linux, case-insensitive on macOS. Inconsistent and surprising.
+
+**Solution:** Autocomplete is case-insensitive by default. When a command fails due to case mismatch, Nexus suggests the correct casing: "Did you mean `Documents`?" Native commands like `ls` can flag case-sensitive matches.
+
+---
+
+#### 28. Navigation Confusion (Paths and Filesystem)
+**Pain:** "Where am I?" "What's `..`?" "What's the difference between `./folder` and `/folder`?" The filesystem is invisible — you navigate blind.
+
+**Solution:** The prompt always shows current directory. Native `ls` returns structured `FileEntry` values that are clickable and navigable. The AI agent can explain paths. Long-term: a visual breadcrumb bar and optional sidebar file browser.
+
+---
+
+#### 29. "Command Not Found" / PATH Issues
+**Pain:** You installed something, it's on disk, but the terminal can't find it. `$PATH` is a mystery.
+
+**Solution:** When a command isn't found, Nexus searches common installation locations and package managers: "Did you mean `/usr/local/bin/node`? It's not in your PATH." Offers to fix it. The `which` / `where` native command explains exactly what's happening.
+
+---
+
+#### 30. Environment Variables
+**Pain:** "What is `$PATH`?" "How do I set one?" "Why did it disappear when I opened a new tab?"
+
+**Solution:** `env` native command returns a structured, searchable table of all environment variables. Setting variables through Nexus persists them properly (writes to the right rc file). The AI can explain any variable.
+
+---
+
+#### 31. Piping and Redirection
+**Pain:** `|`, `>`, `>>`, `2>&1`, `< /dev/null` — the plumbing is powerful but the syntax is opaque.
+
+**Solution:** Native commands compose naturally with structured data (pipe a table into a filter, pipe into `sort`). The drag-and-drop pipeline builder (#21 — drag block onto block → proposes pipe) makes composition visual. The AI agent can construct pipelines from plain English descriptions.
+
+---
+
+#### 32. Multi-step Processes
+**Pain:** Deploy requires 5 commands in sequence. Miss one and start over.
+
+**Solution:** Nexus supports multi-line input and scripts directly. The AI agent can execute multi-step workflows. Long-term: saved command sequences ("recipes") that can be replayed with one action. Block re-run buttons make repetition trivial.
+
+---
+
+#### 33. Limited Help / Documentation
+**Pain:** `man` pages are dense novels. `--help` output flies past. You end up on StackOverflow anyway.
+
+**Solution:** The AI agent *is* the help system — it has context about your command, your directory, your recent output. Native commands have structured help that the UI can render as a browsable reference rather than a wall of text. The command palette (#6) surfaces commands with descriptions.
+
+---
+
+#### 34. Installing Software / Dependencies
+**Pain:** `brew install`, `apt-get`, `pip install`, `npm install` — every ecosystem has its own package manager with its own quirks. Dependency conflicts, version mismatches, broken installs.
+
+**Solution:** Nexus can't unify package managers, but it can make the experience less painful. Detect failed installs and explain what went wrong. The AI agent knows how to install most tools on your platform. Long-term: a `install` native command that detects your OS and routes to the right package manager.
+
+---
+
+#### 35. Config File Syntax Breakage
+**Pain:** Edit `.zshrc`, make a typo, new terminals won't open. Now you need to fix a config file from a broken shell.
+
+**Solution:** Nexus's own config is a GUI (settings panel, #10). For shell configs, the AI agent can validate syntax before you save. When Nexus detects a broken rc file (shell fails to initialize), it offers to open the file and highlight the error. Nexus itself doesn't depend on rc files to function.
+
+---
+
+#### 36. Zombie / Background Processes
+**Pain:** Started something with `&`, forgot about it. `jobs` shows nothing in a new tab. `ps aux | grep` is the last resort.
+
+**Solution:** Native `ps` returns structured `Value::Table` with process info. Nexus tracks child processes per block and can show which blocks spawned background jobs. Kill buttons work on background processes too. Long-term: a jobs panel showing all active processes across tabs.
+
+---
+
+#### 37. Tar/Archive Confusion
+**Pain:** `tar -xzvf` is a meme for a reason. Every archive format has different flags.
+
+**Solution:** A native `extract` command that auto-detects the format (tar, gz, bz2, xz, zip, 7z) and does the right thing. No flags needed. `extract archive.tar.gz` just works. Shows progress (#14) and lists what was extracted as structured output.
+
+---
+
+#### 38. Prompt Clutter
+**Pain:** A prompt showing `user@hostname:/very/deep/nested/directory/structure/here $` leaves no room to type.
+
+**Solution:** Nexus controls the prompt. It's clean by default — just the last directory component. Full path is always visible in the window title or a breadcrumb bar, not eating your input space. Customizable via settings, not rc file hacking.
+
+---
+
+#### 39. Text Editors in Terminal
+**Pain:** vi keybindings, nano's `^X` meaning Ctrl+X, emacs pinky. Terminal editors are their own skill tree.
+
+**Solution:** Nexus detects full-screen TUI apps and renders them in the terminal emulator. But for quick edits, the AI agent can edit files directly with its edit tool — you describe the change in English. Long-term: a built-in file editor with familiar GUI keybindings (Cmd+S to save, Cmd+Z to undo).
+
+---
+
+#### 40. SSH Key Management
+**Pain:** Generate keys, copy the public key to the right place, add to agent, deal with passphrases. One wrong step and "Permission denied (publickey)."
+
+**Solution:** A native `ssh-setup` command that walks through the process interactively with structured output at each step. The AI agent knows SSH inside and out. When SSH fails, Nexus parses the error and explains exactly what's wrong: "The server rejected your key. Your public key at `~/.ssh/id_ed25519.pub` is not in the server's `authorized_keys`."
+
+---
+
+#### 41. Regex Pain
+**Pain:** Regular expressions are a language within a language. Different flavors in grep vs sed vs awk vs PCRE.
+
+**Solution:** The AI agent writes regex for you — describe what you want to match in English. Native `grep` and `find` support simpler glob patterns alongside regex. When a regex fails or matches unexpectedly, Nexus can show what it matched and why (structured match output with highlights).
+
+---
+
+#### 42. Git via CLI
+**Pain:** Detached HEAD, merge conflicts as raw diff markers, rebase gone wrong. Git's CLI is powerful but terrifying.
+
+**Solution:** Native `git status` and `git log` already return structured values. Merge conflicts could render as a visual diff with accept-left/accept-right/accept-both buttons. The AI agent can resolve conflicts and explain git states. Long-term: structured output for all git operations with contextual actions (click a branch to checkout, click a commit to diff).
+
+---
+
+#### 43. Clearing the Screen
+**Pain:** Not knowing `clear` or `Ctrl+L` exists. Staring at a wall of old output.
+
+**Solution:** Block-based architecture solves this inherently. Each command is isolated. You don't need to clear — just look at the current block. Collapse old blocks to hide them. But `clear` and `Ctrl+L` still work for familiarity.
+
+---
+
+#### 44. Slow Feedback Loop
+**Pain:** Run a command, it fails, edit the command, run again. No indication of what changed or why. Feels like trial and error.
+
+**Solution:** Blocks show exit codes, duration, and structured errors. The AI can explain failures. Re-run button makes iteration instant. Native commands give structured error output that points to exactly what's wrong, not just "failed."
+
+---
+
+#### 45. Terminal Multiplexing
+**Pain:** SSH disconnects kill your process. tmux/screen have their own keybindings to learn. Splits and sessions are hard to manage.
+
+**Solution:** Long-term: Nexus runs as a persistent daemon. Sessions survive disconnects. Tabs and splits are native GUI features — no tmux keybindings to learn. For remote work, the Nexus SSH agent (#16) keeps sessions alive server-side.
+
+---
+
 ## Priority Order
 
 ### P0 — Core Experience
