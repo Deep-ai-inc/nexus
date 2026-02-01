@@ -21,6 +21,38 @@ use crate::agent_adapter::AgentEvent;
 use crate::agent_block::ToolStatus;
 
 // =============================================================================
+// Helpers
+// =============================================================================
+
+/// Deserialize tool result `content` which can be either a plain string
+/// or an array of `[{"type":"text","text":"..."}]` content blocks.
+fn deserialize_tool_content<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    let v = Option::<Value>::deserialize(deserializer)?;
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Array(arr)) => {
+            // Concatenate all text blocks
+            let mut out = String::new();
+            for item in &arr {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text);
+                }
+            }
+            Ok(if out.is_empty() { None } else { Some(out) })
+        }
+        Some(other) => Ok(Some(other.to_string())),
+    }
+}
+
+// =============================================================================
 // CLI Message Types (from Claude Code's stream-json output)
 // =============================================================================
 
@@ -89,6 +121,8 @@ pub enum ContentBlock {
     /// Tool result (in user messages).
     ToolResult {
         tool_use_id: String,
+        /// Content can be a plain string or an array of {type:"text",text:"..."} objects.
+        #[serde(default, deserialize_with = "deserialize_tool_content")]
         content: Option<String>,
         is_error: Option<bool>,
     },
@@ -101,6 +135,7 @@ pub enum ContentBlock {
     /// Server tool result.
     ServerToolResult {
         tool_use_id: String,
+        #[serde(default, deserialize_with = "deserialize_tool_content")]
         content: Option<String>,
     },
 }
