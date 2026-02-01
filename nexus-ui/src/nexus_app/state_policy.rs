@@ -56,6 +56,10 @@ impl NexusState {
     // --- Cursor ---
 
     pub(super) fn cursor_visible(&self) -> bool {
+        // Hide main input cursor when a question dialog is active.
+        if self.agent.has_pending_question() {
+            return false;
+        }
         let blink_elapsed = Instant::now()
             .duration_since(self.last_edit_time)
             .as_millis();

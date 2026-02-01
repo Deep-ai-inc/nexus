@@ -8,8 +8,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 use nexus_api::{BlockId, Value};
-use strata::Subscription;
+use strata::{Subscription, TextInputState};
 use strata::content_address::SourceId;
+use strata::event_context::KeyEvent;
 
 use crate::agent_adapter::{AgentEvent, UserQuestion};
 use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
@@ -63,8 +64,10 @@ pub(crate) struct AgentWidget {
     pub cancel_flag: Arc<AtomicBool>,
     pub dirty: bool,
     pub session_id: Option<String>,
-    /// Working directory (set during spawn, needed for JSONL surgery).
+    /// Working directory (set during spawn).
     pub cwd: String,
+    /// Text input state for free-form answers to AskUserQuestion.
+    pub question_input: TextInputState,
 
     // --- Subscription channel (owned by this widget) ---
     event_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
@@ -84,6 +87,7 @@ impl AgentWidget {
             dirty: false,
             session_id: None,
             cwd: String::new(),
+            question_input: TextInputState::new(),
             event_rx: Arc::new(Mutex::new(event_rx)),
         }
     }
@@ -105,6 +109,11 @@ impl AgentWidget {
             block,
             thinking_toggle_id: source_ids::agent_thinking_toggle(block.id),
             stop_id: source_ids::agent_stop(block.id),
+            question_input: if block.pending_question.is_some() {
+                Some(&self.question_input)
+            } else {
+                None
+            },
         })
     }
 
@@ -137,6 +146,18 @@ impl AgentWidget {
             }
             // User question option buttons
             if let Some(ref question) = block.pending_question {
+                // Submit button for free-form text input
+                if id == source_ids::agent_question_submit(block.id) {
+                    let text = self.question_input.text.trim().to_string();
+                    if !text.is_empty() {
+                        let answer = build_question_answer(&question.questions, 0, &text);
+                        return Some(AgentMsg::UserQuestionAnswer(
+                            block.id,
+                            question.tool_use_id.clone(),
+                            answer,
+                        ));
+                    }
+                }
                 for (q_idx, q) in question.questions.iter().enumerate() {
                     for (o_idx, opt) in q.options.iter().enumerate() {
                         if id == source_ids::agent_question_option(block.id, q_idx, o_idx) {
@@ -312,6 +333,14 @@ impl AgentWidget {
                 self.answer_question(block_id, tool_use_id, answer_json);
                 AgentOutput::ScrollToBottom
             }
+            AgentMsg::QuestionInputKey(event) => {
+                self.handle_question_key(&event)
+            }
+            AgentMsg::QuestionInputMouse(action) => {
+                self.question_input.focused = true;
+                self.question_input.apply_mouse(action);
+                AgentOutput::None
+            }
             AgentMsg::Interrupt => { self.interrupt(); AgentOutput::None }
         };
         (strata::Command::none(), output)
@@ -338,6 +367,10 @@ impl AgentWidget {
                 block.response.clear();
                 block.version += 1;
             }
+            // Focus the question text input and clear any stale text.
+            self.question_input.text.clear();
+            self.question_input.cursor = 0;
+            self.question_input.focused = true;
             return AgentOutput::ScrollToBottom;
         }
 
@@ -506,7 +539,9 @@ impl AgentWidget {
 
     /// Answer a pending user question via MCP permission response.
     pub fn answer_question(&mut self, block_id: BlockId, _tool_use_id: String, answer_json: String) {
-        // Clear pending question from the block
+        // Clear pending question from the block and reset the free-form input.
+        self.question_input.text.clear();
+        self.question_input.cursor = 0;
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.pending_question = None;
@@ -538,6 +573,35 @@ impl AgentWidget {
             };
 
             let _ = tx.send(PermissionDecision::Answer(answers));
+        }
+    }
+
+    /// Handle a key event for the question free-form text input.
+    fn handle_question_key(&mut self, event: &KeyEvent) -> AgentOutput {
+        use strata::text_input_state::TextInputAction;
+
+        self.question_input.focused = true;
+        match self.question_input.handle_key(event, false) {
+            TextInputAction::Submit(text) => {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return AgentOutput::None;
+                }
+                // Find the block with a pending question and submit the free-form answer.
+                if let Some(block) = self.blocks.iter().find(|b| b.pending_question.is_some()) {
+                    let block_id = block.id;
+                    if let Some(ref question) = block.pending_question {
+                        let tool_use_id = question.tool_use_id.clone();
+                        // Build answer using the first question's header and the typed text.
+                        let answer = build_question_answer(&question.questions, 0, &text);
+                        self.answer_question(block_id, tool_use_id, answer);
+                        return AgentOutput::ScrollToBottom;
+                    }
+                }
+                AgentOutput::None
+            }
+            TextInputAction::Changed => AgentOutput::None,
+            TextInputAction::Blur | TextInputAction::Noop => AgentOutput::None,
         }
     }
 

@@ -156,6 +156,10 @@ pub enum AgentMsg {
     PermissionDeny(BlockId, String),
     /// User answered an AskUserQuestion dialog. (block_id, tool_use_id, answer_json)
     UserQuestionAnswer(BlockId, String, String),
+    /// Key event for the free-form question text input.
+    QuestionInputKey(strata::event_context::KeyEvent),
+    /// Mouse event for the free-form question text input.
+    QuestionInputMouse(strata::text_input_state::TextInputMouseAction),
     Interrupt,
 }
 

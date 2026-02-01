@@ -60,6 +60,11 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
     }
 
+    // Phase 4.5: Pending user question — route keys to question text input
+    if state.agent.has_pending_question() {
+        return Some(NexusMessage::Agent(AgentMsg::QuestionInputKey(event)));
+    }
+
     // Phase 5: Input-focused keys (delegated to InputWidget)
     if let Some(msg) = state.input.on_key(&event) {
         return Some(NexusMessage::Input(msg));
@@ -207,6 +212,7 @@ pub(super) fn on_mouse(
         state.input.completion.scroll       => |a| NexusMessage::Input(InputMsg::CompletionScroll(a)),
         state.input.history_search.scroll   => |a| NexusMessage::Input(InputMsg::HistorySearchScroll(a)),
         state.scroll.state                  => NexusMessage::Scroll,
+        state.agent.question_input          => |a| NexusMessage::Agent(AgentMsg::QuestionInputMouse(a)),
         state.input.text_input              => |a| NexusMessage::Input(InputMsg::Mouse(a)),
     ]);
 

@@ -151,6 +151,8 @@ pub struct AgentBlockWidget<'a> {
     pub block: &'a AgentBlock,
     pub thinking_toggle_id: SourceId,
     pub stop_id: SourceId,
+    /// Text input state for free-form question answers (only set when question is pending).
+    pub question_input: Option<&'a strata::TextInputState>,
 }
 
 impl<'a> AgentBlockWidget<'a> {
@@ -235,9 +237,9 @@ impl Widget for AgentBlockWidget<'_> {
             ));
         }
 
-        // User question dialog (AskUserQuestion via JSONL surgery)
+        // User question dialog (AskUserQuestion via MCP permission)
         if let Some(ref question) = block.pending_question {
-            content = content.push(build_question_dialog(question, block.id));
+            content = content.push(build_question_dialog(question, block.id, self.question_input));
         }
 
         // Response text
@@ -790,10 +792,11 @@ fn build_permission_dialog(
     dialog
 }
 
-/// Build a question dialog for AskUserQuestion (JSONL surgery flow).
+/// Build a question dialog for AskUserQuestion (via MCP permission).
 fn build_question_dialog(
     question: &crate::agent_block::PendingUserQuestion,
     block_id: BlockId,
+    question_input: Option<&strata::TextInputState>,
 ) -> Column {
     let mut dialog = Column::new()
         .padding(8.0)
@@ -819,6 +822,29 @@ fn build_question_dialog(
             );
         }
         dialog = dialog.push(row);
+    }
+
+    // Free-form text input (the "Other" option)
+    if let Some(input) = question_input {
+        dialog = dialog.push(
+            TextElement::new("Or type a custom answer:").color(colors::TEXT_SECONDARY)
+        );
+        let submit_id = source_ids::agent_question_submit(block_id);
+        dialog = dialog.push(
+            Row::new().spacing(8.0).width(Length::Fill)
+                .push(
+                    strata::layout::containers::TextInputElement::from_state(input)
+                        .placeholder("Type your answer and press Enter...")
+                        .background(Color::rgb(0.08, 0.08, 0.12))
+                        .border_color(Color::rgb(0.3, 0.3, 0.4))
+                        .width(Length::Fill)
+                )
+                .push(
+                    ButtonElement::new(submit_id, "Submit")
+                        .background(Color::rgb(0.12, 0.25, 0.45))
+                        .corner_radius(4.0)
+                )
+        );
     }
 
     dialog

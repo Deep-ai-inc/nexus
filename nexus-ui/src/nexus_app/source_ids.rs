@@ -29,6 +29,7 @@ const PERM_ALWAYS: u64 = 13;
 const ANCHOR: u64 = 14;
 const IMAGE_OUTPUT: u64 = 15;
 const QUESTION_OPTION: u64 = 16;
+const QUESTION_SUBMIT: u64 = 17;
 
 // --- Shell block IDs ---
 
@@ -67,6 +68,11 @@ pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId {
 /// Source ID for a question option button: block → QUESTION_OPTION → question_idx → option_idx.
 pub fn agent_question_option(id: BlockId, q: usize, opt: usize) -> SourceId {
     block_space(id).child(QUESTION_OPTION).child(q as u64).id(opt as u64)
+}
+
+/// Source ID for the free-form question submit button.
+pub fn agent_question_submit(id: BlockId) -> SourceId {
+    block_space(id).id(QUESTION_SUBMIT)
 }
 
 // --- Global UI IDs (no block) ---
