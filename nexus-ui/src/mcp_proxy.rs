@@ -107,19 +107,22 @@ pub fn run(port: u16) -> ! {
 
                 eprintln!("[mcp-proxy] tool_input keys: {:?}", tool_input.as_object().map(|o| o.keys().collect::<Vec<_>>()));
 
-                let allowed = match ask_ui(port, &args) {
+                let ui_resp = match ask_ui(port, &args) {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("[mcp-proxy] TCP error: {e}");
-                        false
+                        UiResponse { allow: false, updated_input: None }
                     }
                 };
 
                 // CLI schema (zod discriminated union):
                 //   Allow: {"behavior": "allow", "updatedInput": {<original tool input>}}
                 //   Deny:  {"behavior": "deny", "message": "reason"}
-                let result_text = if allowed {
-                    serde_json::json!({ "behavior": "allow", "updatedInput": tool_input })
+                let result_text = if ui_resp.allow {
+                    // Use updatedInput from UI if provided (e.g. AskUserQuestion with answers),
+                    // otherwise use the original tool input.
+                    let updated = ui_resp.updated_input.unwrap_or(tool_input);
+                    serde_json::json!({ "behavior": "allow", "updatedInput": updated })
                 } else {
                     serde_json::json!({ "behavior": "deny", "message": "User denied permission" })
                 };
@@ -158,8 +161,15 @@ pub fn run(port: u16) -> ! {
     std::process::exit(0);
 }
 
+/// Response from the Nexus UI permission server.
+struct UiResponse {
+    allow: bool,
+    /// If present, the updated tool input (e.g. with AskUserQuestion answers injected).
+    updated_input: Option<serde_json::Value>,
+}
+
 /// Send a permission request to the Nexus UI over TCP and wait for the response.
-fn ask_ui(port: u16, args: &serde_json::Value) -> io::Result<bool> {
+fn ask_ui(port: u16, args: &serde_json::Value) -> io::Result<UiResponse> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))?;
 
     // Send request as JSON line
@@ -174,7 +184,9 @@ fn ask_ui(port: u16, args: &serde_json::Value) -> io::Result<bool> {
 
     let resp: serde_json::Value =
         serde_json::from_str(response.trim()).unwrap_or(serde_json::json!({"allow": false}));
-    Ok(resp.get("allow").and_then(|v| v.as_bool()).unwrap_or(false))
+    let allow = resp.get("allow").and_then(|v| v.as_bool()).unwrap_or(false);
+    let updated_input = resp.get("updatedInput").cloned();
+    Ok(UiResponse { allow, updated_input })
 }
 
 /// Write a JSON-RPC response as a single line to stdout.

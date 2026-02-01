@@ -15,6 +15,7 @@ use crate::agent_adapter::{AgentEvent, UserQuestion};
 use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
 use crate::nexus_widgets::AgentBlockWidget;
 use crate::systems::{agent_subscription, spawn_agent_task};
+use crate::systems::permission_server::PermissionDecision;
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::message::{AgentMsg, ContextMenuMsg, NexusMessage};
@@ -56,7 +57,7 @@ pub(crate) struct AgentWidget {
     pub active: Option<BlockId>,
     pub event_tx: mpsc::UnboundedSender<AgentEvent>,
     /// Channel to send permission responses back to the TCP permission server.
-    pub permission_response_tx: Option<mpsc::UnboundedSender<bool>>,
+    pub permission_response_tx: Option<mpsc::UnboundedSender<PermissionDecision>>,
     /// TCP port the permission server is listening on (for CLI spawns).
     pub permission_port: Option<u16>,
     pub cancel_flag: Arc<AtomicBool>,
@@ -456,7 +457,7 @@ impl AgentWidget {
             }
         }
         if let Some(ref tx) = self.permission_response_tx {
-            let _ = tx.send(true);
+            let _ = tx.send(PermissionDecision::Allow);
         }
     }
 
@@ -468,7 +469,7 @@ impl AgentWidget {
             }
         }
         if let Some(ref tx) = self.permission_response_tx {
-            let _ = tx.send(true);
+            let _ = tx.send(PermissionDecision::Allow);
         }
     }
 
@@ -481,7 +482,7 @@ impl AgentWidget {
             }
         }
         if let Some(ref tx) = self.permission_response_tx {
-            let _ = tx.send(false);
+            let _ = tx.send(PermissionDecision::Deny);
         }
         self.active = None;
     }
@@ -503,8 +504,8 @@ impl AgentWidget {
         self.block_index.clear();
     }
 
-    /// Answer a pending user question via JSONL surgery and resume the session.
-    pub fn answer_question(&mut self, block_id: BlockId, tool_use_id: String, answer_json: String) {
+    /// Answer a pending user question via MCP permission response.
+    pub fn answer_question(&mut self, block_id: BlockId, _tool_use_id: String, answer_json: String) {
         // Clear pending question from the block
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
@@ -514,66 +515,29 @@ impl AgentWidget {
             }
         }
 
-        // Perform JSONL surgery
-        if let Some(ref session_id) = self.session_id {
-            let path = crate::claude_cli::session_file_path(&self.cwd, session_id);
-            if let Err(e) = crate::claude_cli::patch_session_jsonl(&path, &tool_use_id, &answer_json) {
-                tracing::error!("JSONL surgery failed: {}", e);
-                if let Some(&idx) = self.block_index.get(&block_id) {
-                    if let Some(block) = self.blocks.get_mut(idx) {
-                        block.fail(format!("JSONL surgery failed: {}", e));
+        // Send the answer back through the permission channel.
+        // The permission server will inject it into updatedInput.answers.
+        if let Some(ref tx) = self.permission_response_tx {
+            // Parse the answer_json to extract the answers map.
+            // answer_json is like: {"questions":[{"question":"...","header":"...","answers":{"Header":"Selected"}}]}
+            // We need to extract all answers into a flat {"Header": "Selected"} map.
+            let answers = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&answer_json) {
+                let mut map = serde_json::Map::new();
+                if let Some(questions) = parsed.get("questions").and_then(|q| q.as_array()) {
+                    for q in questions {
+                        if let Some(answers_obj) = q.get("answers").and_then(|a| a.as_object()) {
+                            for (k, v) in answers_obj {
+                                map.insert(k.clone(), v.clone());
+                            }
+                        }
                     }
                 }
-                return;
-            }
+                serde_json::Value::Object(map)
+            } else {
+                serde_json::Value::Object(Default::default())
+            };
 
-            // Resume the session
-            self.resume(block_id);
-        }
-    }
-
-    /// Resume the agent session on an existing block (after JSONL surgery).
-    fn resume(&mut self, block_id: BlockId) {
-        self.active = Some(block_id);
-        self.dirty = true;
-
-        // Reset cancel flag
-        self.cancel_flag.store(false, Ordering::SeqCst);
-
-        let agent_tx = self.event_tx.clone();
-        let cancel_flag = self.cancel_flag.clone();
-        let cwd = PathBuf::from(&self.cwd);
-        let session_id = self.session_id.clone();
-        let permission_port = self.permission_port;
-
-        tokio::spawn(async move {
-            match spawn_agent_task(
-                agent_tx,
-                cancel_flag,
-                "continue".to_string(),
-                cwd,
-                vec![],
-                session_id,
-                permission_port,
-            )
-            .await
-            {
-                Ok(new_session_id) => {
-                    if let Some(sid) = new_session_id {
-                        tracing::info!("Agent resumed session: {}", sid);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Agent resume failed: {}", e);
-                }
-            }
-        });
-
-        // Mark block as streaming
-        if let Some(&idx) = self.block_index.get(&block_id) {
-            if let Some(block) = self.blocks.get_mut(idx) {
-                block.state = AgentBlockState::Streaming;
-            }
+            let _ = tx.send(PermissionDecision::Answer(answers));
         }
     }
 

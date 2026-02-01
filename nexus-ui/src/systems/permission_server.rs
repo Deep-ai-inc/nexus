@@ -3,18 +3,33 @@
 //!
 //! One TCP connection per permission request. The MCP proxy connects, sends a
 //! JSON line, we emit the event, wait for the user's decision, and respond.
+//!
+//! Special handling for AskUserQuestion: instead of a generic permission dialog,
+//! we show the question dialog and return the user's answer via `updatedInput`.
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use crate::agent_adapter::AgentEvent;
+use crate::claude_cli::parse_user_questions;
+
+/// Response from the UI to a permission/question request.
+#[derive(Debug, Clone)]
+pub enum PermissionDecision {
+    /// Allow the tool call (regular permission).
+    Allow,
+    /// Deny the tool call.
+    Deny,
+    /// Answer to an AskUserQuestion — contains `{"Header": "Selected"}` map.
+    Answer(serde_json::Value),
+}
 
 /// Run the permission server. Accepts connections until the listener is dropped.
 pub async fn run(
     listener: TcpListener,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
-    mut response_rx: mpsc::UnboundedReceiver<bool>,
+    mut response_rx: mpsc::UnboundedReceiver<PermissionDecision>,
 ) {
     tracing::info!("[perm-server] listening on {:?}", listener.local_addr());
     loop {
@@ -57,6 +72,41 @@ pub async fn run(
             .cloned()
             .unwrap_or(serde_json::Value::Object(Default::default()));
 
+        // AskUserQuestion: show question dialog instead of permission dialog.
+        if tool_name == "AskUserQuestion" {
+            if let Some(questions) = parse_user_questions(&tool_input) {
+                tracing::info!("[perm-server] AskUserQuestion with {} questions", questions.len());
+                let _ = event_tx.send(AgentEvent::UserQuestionRequested {
+                    tool_use_id: request
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    questions,
+                });
+
+                // Wait for the answer
+                let decision = response_rx.recv().await.unwrap_or(PermissionDecision::Deny);
+                tracing::info!("[perm-server] AskUserQuestion decision: {decision:?}");
+
+                let resp = match decision {
+                    PermissionDecision::Answer(answers) => {
+                        // Return allow + updatedInput with answers injected
+                        let mut updated = tool_input.clone();
+                        updated["answers"] = answers;
+                        serde_json::json!({ "allow": true, "updatedInput": updated })
+                    }
+                    _ => serde_json::json!({ "allow": false }),
+                };
+                let _ = writer
+                    .write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes())
+                    .await;
+                let _ = writer.flush().await;
+                continue;
+            }
+        }
+
+        // Regular permission request
         let description = format_description(&tool_name, &tool_input);
         let action = summarize_action(&tool_name, &tool_input);
 
@@ -73,9 +123,10 @@ pub async fn run(
 
         // Wait for the UI to respond
         tracing::info!("[perm-server] waiting for UI response...");
-        let allow = response_rx.recv().await.unwrap_or(false);
-        tracing::info!("[perm-server] UI responded: allow={allow}");
+        let decision = response_rx.recv().await.unwrap_or(PermissionDecision::Deny);
+        tracing::info!("[perm-server] UI responded: {decision:?}");
 
+        let allow = matches!(decision, PermissionDecision::Allow);
         let resp = serde_json::json!({ "allow": allow });
         let _ = writer
             .write_all(format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes())

@@ -610,7 +610,7 @@ impl Drop for ClaudeCli {
 use crate::agent_adapter::{UserQuestion, UserQuestionOption};
 
 /// Parse the AskUserQuestion tool input into our UserQuestion types.
-fn parse_user_questions(tool_input: &serde_json::Value) -> Option<Vec<UserQuestion>> {
+pub fn parse_user_questions(tool_input: &serde_json::Value) -> Option<Vec<UserQuestion>> {
     let questions = tool_input.get("questions")?.as_array()?;
     let mut result = Vec::new();
     for q in questions {
@@ -785,8 +785,9 @@ pub async fn spawn_claude_cli_task(
             "WebSearch".to_string(),
             "WebFetch".to_string(),
         ],
-        // Disallow tools that require interactive input (we're in -p mode).
-        // AskUserQuestion is allowed — we intercept the error via JSONL surgery.
+        // Disallow plan-mode tools (no interactive terminal).
+        // AskUserQuestion goes through MCP permission prompt — the permission
+        // server shows the question dialog and returns answers via updatedInput.
         disallowed_tools: vec![
             "EnterPlanMode".to_string(),
             "ExitPlanMode".to_string(),
