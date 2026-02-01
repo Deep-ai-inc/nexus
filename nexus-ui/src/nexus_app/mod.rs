@@ -276,6 +276,8 @@ impl RootComponent for NexusState {
         let kernel = Arc::new(Mutex::new(kernel));
 
         let mut input_widget = InputWidget::new(command_history, kernel.clone());
+        // Must match the initial `focus: Focus::Input` below — can't call
+        // set_focus() before the state is constructed.
         input_widget.text_input.focused = true;
 
         let state = NexusState {

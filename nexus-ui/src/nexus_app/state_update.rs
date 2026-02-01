@@ -106,6 +106,9 @@ impl NexusState {
                 Command::none()
             }
             NexusMessage::Agent(m) => {
+                if matches!(m, super::message::AgentMsg::QuestionInputMouse(_)) {
+                    self.set_focus(Focus::AgentInput);
+                }
                 let (_cmd, output) = self.agent.update(m, ctx);
                 self.apply_agent_output(output);
                 Command::none()
