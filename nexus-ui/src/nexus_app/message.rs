@@ -154,6 +154,8 @@ pub enum AgentMsg {
     PermissionGrant(BlockId, String),
     PermissionGrantSession(BlockId, String),
     PermissionDeny(BlockId, String),
+    /// User answered an AskUserQuestion dialog. (block_id, tool_use_id, answer_json)
+    UserQuestionAnswer(BlockId, String, String),
     Interrupt,
 }
 

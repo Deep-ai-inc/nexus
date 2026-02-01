@@ -28,6 +28,7 @@ const PERM_ALLOW: u64 = 12;
 const PERM_ALWAYS: u64 = 13;
 const ANCHOR: u64 = 14;
 const IMAGE_OUTPUT: u64 = 15;
+const QUESTION_OPTION: u64 = 16;
 
 // --- Shell block IDs ---
 
@@ -61,6 +62,11 @@ pub fn anchor(id: BlockId, index: usize) -> SourceId {
 
 pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId {
     block_space(id).child(THINKING_TOGGLE).id(i as u64)
+}
+
+/// Source ID for a question option button: block → QUESTION_OPTION → question_idx → option_idx.
+pub fn agent_question_option(id: BlockId, q: usize, opt: usize) -> SourceId {
+    block_space(id).child(QUESTION_OPTION).child(q as u64).id(opt as u64)
 }
 
 // --- Global UI IDs (no block) ---

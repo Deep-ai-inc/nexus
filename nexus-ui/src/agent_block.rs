@@ -95,6 +95,15 @@ pub struct PermissionRequest {
     pub working_dir: Option<String>,
 }
 
+/// A pending user question (from AskUserQuestion tool, awaiting JSONL surgery).
+#[derive(Debug, Clone)]
+pub struct PendingUserQuestion {
+    /// Tool use ID for the AskUserQuestion call.
+    pub tool_use_id: String,
+    /// The questions to present to the user.
+    pub questions: Vec<crate::agent_adapter::UserQuestion>,
+}
+
 /// An agent conversation turn (query + response).
 #[derive(Debug, Clone)]
 pub struct AgentBlock {
@@ -120,8 +129,16 @@ pub struct AgentBlock {
     pub duration_ms: Option<u64>,
     /// Pending permission request.
     pub pending_permission: Option<PermissionRequest>,
+    /// Pending user question (from AskUserQuestion tool via JSONL surgery).
+    pub pending_question: Option<PendingUserQuestion>,
     /// Whether thinking section is collapsed.
     pub thinking_collapsed: bool,
+    /// Cost in USD (from CLI result).
+    pub cost_usd: Option<f64>,
+    /// Input token count (from CLI result).
+    pub input_tokens: Option<u64>,
+    /// Output token count (from CLI result).
+    pub output_tokens: Option<u64>,
     /// Version counter for lazy invalidation.
     pub version: u64,
 }
@@ -150,7 +167,11 @@ impl AgentBlock {
             started_at: Instant::now(),
             duration_ms: None,
             pending_permission: None,
+            pending_question: None,
             thinking_collapsed: false,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
             version: 0,
         }
     }
@@ -200,6 +221,12 @@ impl AgentBlock {
         output: Option<String>,
     ) {
         if let Some(tool) = self.tools.iter_mut().find(|t| t.id == tool_id) {
+            // Auto-collapse on success, force-expand on error
+            match &status {
+                ToolStatus::Success => { tool.collapsed = true; }
+                ToolStatus::Error => { tool.collapsed = false; }
+                _ => {}
+            }
             tool.status = status;
             tool.message = message;
             if let Some(out) = output {

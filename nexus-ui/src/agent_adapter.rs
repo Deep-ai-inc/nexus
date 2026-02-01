@@ -53,8 +53,36 @@ pub enum AgentEvent {
         request_id: u64,
         messages: Vec<()>, // Placeholder - CLI manages its own history
     },
+    /// Usage/cost update (sent with result).
+    UsageUpdate {
+        cost_usd: Option<f64>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
     /// Agent encountered an error.
     Error(String),
+    /// Agent tried to ask the user a question (via AskUserQuestion tool).
+    /// Emitted after the CLI finishes, extracted from permission_denials in the result.
+    UserQuestionRequested {
+        tool_use_id: String,
+        questions: Vec<UserQuestion>,
+    },
+}
+
+/// A question from Claude's AskUserQuestion tool.
+#[derive(Debug, Clone)]
+pub struct UserQuestion {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<UserQuestionOption>,
+    pub multi_select: bool,
+}
+
+/// An option within a user question.
+#[derive(Debug, Clone)]
+pub struct UserQuestionOption {
+    pub label: String,
+    pub description: String,
 }
 
 /// Permission response from user.

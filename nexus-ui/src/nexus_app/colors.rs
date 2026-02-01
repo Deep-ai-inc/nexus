@@ -25,6 +25,19 @@ pub const TEXT_QUERY: Color = Color { r: 0.5, g: 0.7, b: 1.0, a: 1.0 };
 // Tool colors
 pub const TOOL_PENDING: Color = Color { r: 0.6, g: 0.6, b: 0.3, a: 1.0 };
 pub const TOOL_OUTPUT: Color = Color { r: 0.8, g: 0.8, b: 0.8, a: 1.0 };
+pub const TOOL_ACTION: Color = Color { r: 0.3, g: 0.7, b: 1.0, a: 1.0 };
+pub const TOOL_RESULT: Color = Color { r: 0.5, g: 0.5, b: 0.55, a: 1.0 };
+pub const TOOL_PATH: Color = Color { r: 0.7, g: 0.7, b: 0.9, a: 1.0 };
+pub const TOOL_COMMAND: Color = Color { r: 0.9, g: 0.8, b: 0.5, a: 1.0 };
+pub const TOOL_SUMMARY: Color = Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
+pub const TOOL_ARTIFACT_BG: Color = Color { r: 0.09, g: 0.09, b: 0.11, a: 1.0 };
+pub const TOOL_BORDER: Color = Color { r: 0.25, g: 0.25, b: 0.35, a: 1.0 };
+
+// Diff colors (subtle alpha-blended tints for native GUI feel)
+pub const DIFF_ADD: Color = Color { r: 0.4, g: 0.85, b: 0.5, a: 1.0 };
+pub const DIFF_REMOVE: Color = Color { r: 0.9, g: 0.45, b: 0.45, a: 1.0 };
+pub const DIFF_BG_ADD: Color = Color { r: 0.2, g: 0.8, b: 0.2, a: 0.08 };
+pub const DIFF_BG_REMOVE: Color = Color { r: 0.8, g: 0.2, b: 0.2, a: 0.08 };
 
 // Code blocks
 pub const CODE_BG: Color = Color { r: 0.06, g: 0.06, b: 0.08, a: 1.0 };

@@ -26,3 +26,4 @@ portable-pty = { workspace = true }
 arboard = { workspace = true }  # Clipboard support
 image = { workspace = true }  # Image processing for clipboard images
 nix = { workspace = true }  # Unix signal handling for CLI cancellation
+similar = "2"  # Myers diff algorithm for Edit tool rendering

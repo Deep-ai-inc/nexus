@@ -11,7 +11,7 @@ use nexus_api::{BlockId, Value};
 use strata::Subscription;
 use strata::content_address::SourceId;
 
-use crate::agent_adapter::{AgentEvent, PermissionResponse};
+use crate::agent_adapter::{AgentEvent, PermissionResponse, UserQuestion};
 use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
 use crate::nexus_widgets::AgentBlockWidget;
 use crate::systems::{agent_subscription, spawn_agent_task};
@@ -19,6 +19,23 @@ use crate::systems::{agent_subscription, spawn_agent_task};
 use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::message::{AgentMsg, ContextMenuMsg, NexusMessage};
 use super::source_ids;
+
+/// Build the answer JSON that Claude Code expects for an AskUserQuestion tool_result.
+/// Format: {"questions":[{"question":"...","header":"...","answers":{"Header":"Selected"}}]}
+fn build_question_answer(questions: &[UserQuestion], answered_idx: usize, selected_label: &str) -> String {
+    let mut q_array = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        let mut q_obj = serde_json::json!({
+            "question": q.question,
+            "header": q.header,
+        });
+        if i == answered_idx {
+            q_obj["answers"] = serde_json::json!({ &q.header: selected_label });
+        }
+        q_array.push(q_obj);
+    }
+    serde_json::json!({ "questions": q_array }).to_string()
+}
 
 /// Typed output from AgentWidget → orchestrator.
 pub(crate) enum AgentOutput {
@@ -42,6 +59,8 @@ pub(crate) struct AgentWidget {
     pub cancel_flag: Arc<AtomicBool>,
     pub dirty: bool,
     pub session_id: Option<String>,
+    /// Working directory (set during spawn, needed for JSONL surgery).
+    pub cwd: String,
 
     // --- Subscription channel (owned by this widget) ---
     event_rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
@@ -59,6 +78,7 @@ impl AgentWidget {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             dirty: false,
             session_id: None,
+            cwd: String::new(),
             event_rx: Arc::new(Mutex::new(event_rx)),
         }
     }
@@ -108,6 +128,22 @@ impl AgentWidget {
                 }
                 if id == source_ids::agent_perm_always(block.id) {
                     return Some(AgentMsg::PermissionGrantSession(block.id, perm.id.clone()));
+                }
+            }
+            // User question option buttons
+            if let Some(ref question) = block.pending_question {
+                for (q_idx, q) in question.questions.iter().enumerate() {
+                    for (o_idx, opt) in q.options.iter().enumerate() {
+                        if id == source_ids::agent_question_option(block.id, q_idx, o_idx) {
+                            // Build the answer JSON that the CLI expects
+                            let answer = build_question_answer(&question.questions, q_idx, &opt.label);
+                            return Some(AgentMsg::UserQuestionAnswer(
+                                block.id,
+                                question.tool_use_id.clone(),
+                                answer,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -179,6 +215,7 @@ impl AgentWidget {
         self.blocks.push(agent_block);
         self.active = Some(block_id);
         self.dirty = true;
+        self.cwd = cwd.to_string();
 
         // Reset cancel flag
         self.cancel_flag.store(false, Ordering::SeqCst);
@@ -230,6 +267,10 @@ impl AgentWidget {
             AgentMsg::PermissionGrant(block_id, perm_id) => { self.permission_grant(block_id, perm_id); AgentOutput::None }
             AgentMsg::PermissionGrantSession(block_id, perm_id) => { self.permission_grant_session(block_id, perm_id); AgentOutput::None }
             AgentMsg::PermissionDeny(block_id, perm_id) => { self.permission_deny(block_id, perm_id); AgentOutput::None }
+            AgentMsg::UserQuestionAnswer(block_id, tool_use_id, answer_json) => {
+                self.answer_question(block_id, tool_use_id, answer_json);
+                AgentOutput::ScrollToBottom
+            }
             AgentMsg::Interrupt => { self.interrupt(); AgentOutput::None }
         };
         (strata::Command::none(), output)
@@ -242,11 +283,29 @@ impl AgentWidget {
             self.session_id = Some(session_id.clone());
         }
 
+        // UserQuestionRequested arrives AFTER Finished (active is None).
+        // Handle it on the last block instead.
+        if let AgentEvent::UserQuestionRequested { tool_use_id, questions } = event {
+            if let Some(block) = self.blocks.last_mut() {
+                block.pending_question = Some(crate::agent_block::PendingUserQuestion {
+                    tool_use_id,
+                    questions,
+                });
+                block.state = AgentBlockState::AwaitingPermission;
+                // Clear the error-path response text that the CLI generated
+                // after AskUserQuestion failed. We'll get fresh output on resume.
+                block.response.clear();
+                block.version += 1;
+            }
+            return AgentOutput::ScrollToBottom;
+        }
+
         if let Some(block_id) = self.active {
             if let Some(&idx) = self.block_index.get(&block_id) {
                 if let Some(block) = self.blocks.get_mut(idx) {
                     match event {
                         AgentEvent::SessionStarted { .. } => {}
+                        AgentEvent::UserQuestionRequested { .. } => unreachable!(),
                         AgentEvent::Started { .. } => {
                             block.state = AgentBlockState::Streaming;
                         }
@@ -297,6 +356,16 @@ impl AgentWidget {
                                 action,
                                 working_dir,
                             });
+                        }
+                        AgentEvent::UsageUpdate {
+                            cost_usd,
+                            input_tokens,
+                            output_tokens,
+                        } => {
+                            block.cost_usd = cost_usd;
+                            block.input_tokens = input_tokens;
+                            block.output_tokens = output_tokens;
+                            block.version += 1;
                         }
                         AgentEvent::Finished { .. } => {
                             block.complete();
@@ -394,8 +463,85 @@ impl AgentWidget {
         self.block_index.clear();
     }
 
+    /// Answer a pending user question via JSONL surgery and resume the session.
+    pub fn answer_question(&mut self, block_id: BlockId, tool_use_id: String, answer_json: String) {
+        // Clear pending question from the block
+        if let Some(&idx) = self.block_index.get(&block_id) {
+            if let Some(block) = self.blocks.get_mut(idx) {
+                block.pending_question = None;
+                block.state = AgentBlockState::Streaming;
+                block.version += 1;
+            }
+        }
+
+        // Perform JSONL surgery
+        if let Some(ref session_id) = self.session_id {
+            let path = crate::claude_cli::session_file_path(&self.cwd, session_id);
+            if let Err(e) = crate::claude_cli::patch_session_jsonl(&path, &tool_use_id, &answer_json) {
+                tracing::error!("JSONL surgery failed: {}", e);
+                if let Some(&idx) = self.block_index.get(&block_id) {
+                    if let Some(block) = self.blocks.get_mut(idx) {
+                        block.fail(format!("JSONL surgery failed: {}", e));
+                    }
+                }
+                return;
+            }
+
+            // Resume the session
+            self.resume(block_id);
+        }
+    }
+
+    /// Resume the agent session on an existing block (after JSONL surgery).
+    fn resume(&mut self, block_id: BlockId) {
+        self.active = Some(block_id);
+        self.dirty = true;
+
+        // Reset cancel flag
+        self.cancel_flag.store(false, Ordering::SeqCst);
+
+        let agent_tx = self.event_tx.clone();
+        let cancel_flag = self.cancel_flag.clone();
+        let cwd = PathBuf::from(&self.cwd);
+        let session_id = self.session_id.clone();
+
+        tokio::spawn(async move {
+            match spawn_agent_task(
+                agent_tx,
+                cancel_flag,
+                "continue".to_string(),
+                cwd,
+                vec![],
+                session_id,
+            )
+            .await
+            {
+                Ok(new_session_id) => {
+                    if let Some(sid) = new_session_id {
+                        tracing::info!("Agent resumed session: {}", sid);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Agent resume failed: {}", e);
+                }
+            }
+        });
+
+        // Mark block as streaming
+        if let Some(&idx) = self.block_index.get(&block_id) {
+            if let Some(block) = self.blocks.get_mut(idx) {
+                block.state = AgentBlockState::Streaming;
+            }
+        }
+    }
+
     /// Check if an agent is currently active.
     pub fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// Check if any block has a pending user question.
+    pub fn has_pending_question(&self) -> bool {
+        self.blocks.iter().any(|b| b.pending_question.is_some())
     }
 }

@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use nexus_api::{BlockId, BlockState, FileType, Value, format_value_for_display};
 use nexus_kernel::{Completion, CompletionKind};
 
+use similar::{ChangeTag, TextDiff};
+
 use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus};
 use crate::blocks::Block;
 use strata::content_address::SourceId;
@@ -233,6 +235,11 @@ impl Widget for AgentBlockWidget<'_> {
             ));
         }
 
+        // User question dialog (AskUserQuestion via JSONL surgery)
+        if let Some(ref question) = block.pending_question {
+            content = content.push(build_question_dialog(question, block.id));
+        }
+
         // Response text
         if !block.response.is_empty() {
             let response_source = source_ids::agent_response(block.id);
@@ -273,7 +280,21 @@ impl Widget for AgentBlockWidget<'_> {
             } else {
                 format!("{:.1}s", ms as f64 / 1000.0)
             };
-            footer = footer.push(TextElement::new(duration).color(colors::TEXT_MUTED));
+            footer = footer.push(TextElement::new(&duration).color(colors::TEXT_MUTED));
+        }
+
+        if let Some(cost) = block.cost_usd {
+            footer = footer.push(
+                TextElement::new(&format!("${:.4}", cost)).color(colors::TEXT_MUTED),
+            );
+        }
+
+        let total_tokens = block.input_tokens.unwrap_or(0) + block.output_tokens.unwrap_or(0);
+        if total_tokens > 0 {
+            footer = footer.push(
+                TextElement::new(&format!("\u{2193} {}", format_tokens(total_tokens)))
+                    .color(colors::TEXT_MUTED),
+            );
         }
 
         content = content.fixed_spacer(4.0).push(footer);
@@ -282,63 +303,436 @@ impl Widget for AgentBlockWidget<'_> {
     }
 }
 
+/// Format a token count with K/M suffixes.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M tokens", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k tokens", n as f64 / 1_000.0)
+    } else {
+        format!("{} tokens", n)
+    }
+}
+
+/// Shorten a file path for display (keep last 2 components).
+fn shorten_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        path.to_string()
+    } else {
+        format!("\u{2026}/{}", parts[parts.len() - 2..].join("/"))
+    }
+}
+
+/// Truncate a string with ellipsis.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}\u{2026}", &s[..max])
+    }
+}
+
+/// Format a tool-specific header label based on tool name and parameters.
+fn tool_header_label(tool: &ToolInvocation) -> String {
+    match tool.name.as_str() {
+        "Read" => {
+            let path = tool.parameters.get("file_path")
+                .map(|p| shorten_path(p))
+                .unwrap_or_default();
+            format!("Read({})", path)
+        }
+        "Edit" => {
+            let path = tool.parameters.get("file_path")
+                .map(|p| shorten_path(p))
+                .unwrap_or_default();
+            format!("Update({})", path)
+        }
+        "Write" => {
+            let path = tool.parameters.get("file_path")
+                .map(|p| shorten_path(p))
+                .unwrap_or_default();
+            format!("Write({})", path)
+        }
+        "Bash" => {
+            let cmd = tool.parameters.get("command")
+                .map(|c| truncate_str(c.lines().next().unwrap_or(c), 80))
+                .unwrap_or_default();
+            format!("Bash({})", cmd)
+        }
+        "Grep" => {
+            let pattern = tool.parameters.get("pattern").cloned().unwrap_or_default();
+            let path = tool.parameters.get("path")
+                .map(|p| shorten_path(p))
+                .unwrap_or_else(|| ".".to_string());
+            format!("Search(\"{}\", {})", truncate_str(&pattern, 30), path)
+        }
+        "Glob" => {
+            let pattern = tool.parameters.get("pattern").cloned().unwrap_or_default();
+            format!("Glob({})", truncate_str(&pattern, 50))
+        }
+        "Task" => {
+            let desc = tool.parameters.get("description")
+                .map(|d| truncate_str(d, 60))
+                .unwrap_or_default();
+            format!("Task({})", desc)
+        }
+        "TodoWrite" => "TodoWrite".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Generate a smart summary for collapsed tool output.
+fn tool_collapsed_summary(tool: &ToolInvocation) -> Option<String> {
+    let output = tool.output.as_deref()?;
+
+    match tool.name.as_str() {
+        "Read" => {
+            let lines = output.lines().count();
+            Some(format!("Read {} lines", lines))
+        }
+        "Edit" => Some("Applied edits".to_string()),
+        "Write" => {
+            let lines = tool.parameters.get("content")
+                .map(|c| c.lines().count())
+                .unwrap_or(0);
+            Some(format!("Wrote {} lines", lines))
+        }
+        "Bash" => {
+            let lines = output.lines().count();
+            if lines == 0 {
+                Some("(no output)".to_string())
+            } else if lines == 1 {
+                Some(truncate_str(output.trim(), 80))
+            } else {
+                Some(format!("{} lines", lines))
+            }
+        }
+        "Grep" => {
+            let lines = output.lines().count();
+            Some(format!("Found {} results", lines))
+        }
+        "Glob" => {
+            let files = output.lines().count();
+            Some(format!("Found {} files", files))
+        }
+        "Task" => {
+            let desc = tool.parameters.get("description")
+                .map(|d| truncate_str(d, 40))
+                .unwrap_or_else(|| "Done".to_string());
+            let chars = output.len();
+            if chars >= 1000 {
+                Some(format!("{} ({:.1}k chars)", desc, chars as f64 / 1000.0))
+            } else {
+                Some(format!("{} ({} chars)", desc, chars))
+            }
+        }
+        _ => {
+            let lines = output.lines().count();
+            if lines > 0 {
+                Some(format!("{} lines", lines))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Tool-specific expanded body rendering
+// =========================================================================
+
+/// Dispatch to tool-specific body rendering.
+fn build_tool_body(tool: &ToolInvocation) -> Column {
+    match tool.name.as_str() {
+        "Edit" => build_edit_tool_body(tool),
+        "Read" => build_read_tool_body(tool),
+        "Bash" => build_bash_tool_body(tool),
+        "Grep" | "Glob" => build_search_tool_body(tool),
+        "Write" => build_write_tool_body(tool),
+        "Task" => build_task_tool_body(tool),
+        _ => build_generic_tool_body(tool),
+    }
+}
+
+/// Edit tool: show a unified diff with colored +/- lines.
+fn build_edit_tool_body(tool: &ToolInvocation) -> Column {
+    let old = tool.parameters.get("old_string").map(|s| s.as_str()).unwrap_or("");
+    let new = tool.parameters.get("new_string").map(|s| s.as_str()).unwrap_or("");
+
+    let mut col = Column::new().spacing(1.0);
+
+    if !old.is_empty() || !new.is_empty() {
+        let diff = TextDiff::from_lines(old, new);
+        let mut diff_col = Column::new()
+            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+            .background(colors::TOOL_ARTIFACT_BG)
+            .corner_radius(4.0)
+            .width(Length::Fill);
+
+        let mut line_count = 0;
+        for change in diff.iter_all_changes() {
+            if line_count >= 60 { break; }
+            let text = change.value().trim_end_matches('\n');
+            let (prefix, text_color, bg) = match change.tag() {
+                ChangeTag::Insert => ("+", colors::DIFF_ADD, Some(colors::DIFF_BG_ADD)),
+                ChangeTag::Delete => ("-", colors::DIFF_REMOVE, Some(colors::DIFF_BG_REMOVE)),
+                ChangeTag::Equal => (" ", colors::TEXT_MUTED, None),
+            };
+            let line_text = format!("{} {}", prefix, text);
+            let mut row = Row::new().width(Length::Fill);
+            if let Some(bg_color) = bg {
+                row = row.background(bg_color);
+            }
+            row = row.push(TextElement::new(&line_text).color(text_color));
+            diff_col = diff_col.push(row);
+            line_count += 1;
+        }
+
+        col = col.push(diff_col);
+    }
+
+    // Show tool output (e.g., confirmation message) if present
+    if let Some(ref output) = tool.output {
+        col = col.push(
+            Row::new()
+                .fixed_spacer(20.0)
+                .spacing(4.0)
+                .push(TextElement::new("\u{2514}").color(colors::TOOL_RESULT))
+                .push(TextElement::new(&truncate_str(output, 200)).color(colors::TOOL_OUTPUT)),
+        );
+    }
+
+    col
+}
+
+/// Read tool: code block with line numbers.
+fn build_read_tool_body(tool: &ToolInvocation) -> Column {
+    let mut col = Column::new().spacing(1.0);
+    if let Some(ref output) = tool.output {
+        let mut code_col = Column::new()
+            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+            .background(colors::TOOL_ARTIFACT_BG)
+            .corner_radius(4.0)
+            .width(Length::Fill);
+        for (i, line) in output.lines().take(50).enumerate() {
+            let numbered = format!("{:4} {}", i + 1, line);
+            code_col = code_col.push(TextElement::new(&numbered).color(colors::CODE_TEXT));
+        }
+        let total = output.lines().count();
+        if total > 50 {
+            code_col = code_col.push(
+                TextElement::new(&format!("  \u{2026} ({} more lines)", total - 50))
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+        col = col.push(code_col);
+    }
+    col
+}
+
+/// Bash tool: output in a code block with optional timeout display.
+fn build_bash_tool_body(tool: &ToolInvocation) -> Column {
+    let mut col = Column::new().spacing(1.0);
+
+    if let Some(timeout) = tool.parameters.get("timeout") {
+        col = col.push(
+            Row::new()
+                .fixed_spacer(16.0)
+                .push(TextElement::new(&format!("timeout: {}ms", timeout)).color(colors::TEXT_MUTED)),
+        );
+    }
+
+    if let Some(ref output) = tool.output {
+        let mut code_col = Column::new()
+            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+            .background(colors::TOOL_ARTIFACT_BG)
+            .corner_radius(4.0)
+            .width(Length::Fill);
+        for line in output.lines().take(30) {
+            code_col = code_col.push(TextElement::new(line).color(colors::TOOL_OUTPUT));
+        }
+        let total = output.lines().count();
+        if total > 30 {
+            code_col = code_col.push(
+                TextElement::new(&format!("  \u{2026} ({} more lines)", total - 30))
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+        col = col.push(code_col);
+    }
+    col
+}
+
+/// Grep/Glob tool: results list.
+fn build_search_tool_body(tool: &ToolInvocation) -> Column {
+    let mut col = Column::new().spacing(1.0);
+    if let Some(ref output) = tool.output {
+        for line in output.lines().take(30) {
+            col = col.push(
+                Row::new()
+                    .fixed_spacer(16.0)
+                    .push(TextElement::new(line).color(colors::TOOL_PATH)),
+            );
+        }
+        let total = output.lines().count();
+        if total > 30 {
+            col = col.push(
+                Row::new()
+                    .fixed_spacer(16.0)
+                    .push(
+                        TextElement::new(&format!("  \u{2026} ({} more results)", total - 30))
+                            .color(colors::TEXT_MUTED),
+                    ),
+            );
+        }
+    }
+    col
+}
+
+/// Write tool: show content being written in green.
+fn build_write_tool_body(tool: &ToolInvocation) -> Column {
+    let mut col = Column::new().spacing(1.0);
+    if let Some(content) = tool.parameters.get("content") {
+        let mut code_col = Column::new()
+            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+            .background(colors::TOOL_ARTIFACT_BG)
+            .corner_radius(4.0)
+            .width(Length::Fill);
+        for (i, line) in content.lines().take(30).enumerate() {
+            let numbered = format!("{:4} {}", i + 1, line);
+            code_col = code_col.push(TextElement::new(&numbered).color(colors::DIFF_ADD));
+        }
+        let total = content.lines().count();
+        if total > 30 {
+            code_col = code_col.push(
+                TextElement::new(&format!("  \u{2026} ({} more lines)", total - 30))
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+        col = col.push(code_col);
+    }
+    col
+}
+
+/// Task tool: sub-agent display with left-border threading.
+fn build_task_tool_body(tool: &ToolInvocation) -> Column {
+    let mut col = Column::new().spacing(1.0);
+    if let Some(ref output) = tool.output {
+        // Use a Row: thin left border column + indented content
+        let mut content_col = Column::new()
+            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
+            .background(colors::TOOL_ARTIFACT_BG)
+            .corner_radius(4.0)
+            .width(Length::Fill);
+        for line in output.lines().take(40) {
+            content_col = content_col.push(TextElement::new(line).color(colors::TOOL_OUTPUT));
+        }
+        let total = output.lines().count();
+        if total > 40 {
+            content_col = content_col.push(
+                TextElement::new(&format!("  \u{2026} ({} more lines)", total - 40))
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+
+        // Left border line + content
+        let border_line = Column::new()
+            .width(Length::Fixed(2.0))
+            .height(Length::Fill)
+            .background(colors::TOOL_BORDER);
+        col = col.push(
+            Row::new()
+                .fixed_spacer(16.0)
+                .push(border_line)
+                .fixed_spacer(8.0)
+                .push(content_col),
+        );
+    }
+    col
+}
+
+/// Generic tool: parameter dump + output (for MCP tools, TodoWrite, etc.)
+fn build_generic_tool_body(tool: &ToolInvocation) -> Column {
+    let mut col = Column::new().spacing(2.0);
+
+    // Parameters
+    if !tool.parameters.is_empty() {
+        for (name, value) in &tool.parameters {
+            let display_value = if value.len() > 100 {
+                format!("{}\u{2026}", &value[..100])
+            } else {
+                value.clone()
+            };
+            col = col.push(
+                Row::new()
+                    .fixed_spacer(16.0)
+                    .push(TextElement::new(&format!("{}: {}", name, display_value)).color(colors::TEXT_MUTED)),
+            );
+        }
+    }
+
+    // Output
+    if let Some(ref output) = tool.output {
+        let display_output = if output.len() > 500 {
+            format!("{}\u{2026}\n[{} more chars]", &output[..500], output.len() - 500)
+        } else {
+            output.clone()
+        };
+        for line in display_output.lines().take(20) {
+            col = col.push(
+                Row::new()
+                    .fixed_spacer(16.0)
+                    .push(TextElement::new(line).color(colors::TOOL_OUTPUT)),
+            );
+        }
+    }
+
+    col
+}
+
 /// Build a tool invocation widget.
 fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId) -> Column {
     let (status_icon, status_color) = match tool.status {
-        ToolStatus::Pending => ("\u{25CB}", colors::TOOL_PENDING),   // ◯
+        ToolStatus::Pending => ("\u{25CF}", colors::TOOL_PENDING),   // ●
         ToolStatus::Running => ("\u{25CF}", colors::RUNNING),        // ●
-        ToolStatus::Success => ("\u{2713}", colors::SUCCESS),        // ✓
-        ToolStatus::Error => ("\u{2717}", colors::ERROR),            // ✗
+        ToolStatus::Success => ("\u{25CF}", colors::TOOL_ACTION),    // ●
+        ToolStatus::Error   => ("\u{25CF}", colors::ERROR),          // ●
     };
 
-    let collapse_icon = if tool.collapsed { "\u{25B6}" } else { "\u{25BC}" };
-    let label = if let Some(ref msg) = tool.message {
-        format!("{} {} {} {}", collapse_icon, status_icon, tool.name, msg)
-    } else {
-        format!("{} {} {}", collapse_icon, status_icon, tool.name)
-    };
+    let collapse_icon = if tool.collapsed { "\u{25B6} " } else { "\u{25BC} " };
+    let header_label = tool_header_label(tool);
+
+    let mut header = Row::new()
+        .id(toggle_id)
+        .spacing(4.0)
+        .cross_align(CrossAxisAlignment::Center)
+        .push(TextElement::new(collapse_icon).color(colors::TEXT_MUTED))
+        .push(TextElement::new(status_icon).color(status_color))
+        .push(TextElement::new(&header_label).color(colors::TOOL_ACTION));
+
+    if let Some(ref msg) = tool.message {
+        header = header.push(TextElement::new(msg).color(colors::TEXT_MUTED));
+    }
 
     let mut col = Column::new().spacing(2.0);
+    col = col.push(header);
 
-    col = col.push(
-        ButtonElement::new(toggle_id, &label)
-            .background(Color::TRANSPARENT)
-            .text_color(status_color)
-            .corner_radius(2.0),
-    );
+    // Collapsed summary line
+    if tool.collapsed {
+        if let Some(summary) = tool_collapsed_summary(tool) {
+            col = col.push(
+                Row::new()
+                    .fixed_spacer(20.0)
+                    .spacing(4.0)
+                    .push(TextElement::new("\u{2514}").color(colors::TOOL_RESULT))
+                    .push(TextElement::new(&summary).color(colors::TOOL_SUMMARY)),
+            );
+        }
+    }
 
     if !tool.collapsed {
-        // Parameters
-        if !tool.parameters.is_empty() {
-            for (name, value) in &tool.parameters {
-                let display_value = if value.len() > 100 {
-                    format!("{}...", &value[..100])
-                } else {
-                    value.clone()
-                };
-                col = col.push(
-                    Row::new()
-                        .fixed_spacer(16.0)
-                        .push(TextElement::new(format!("{}: {}", name, display_value)).color(colors::TEXT_MUTED)),
-                );
-            }
-        }
-
-        // Output
-        if let Some(ref output) = tool.output {
-            let display_output = if output.len() > 500 {
-                format!("{}...\n[{} more chars]", &output[..500], output.len() - 500)
-            } else {
-                output.clone()
-            };
-            for line in display_output.lines().take(20) {
-                col = col.push(
-                    Row::new()
-                        .fixed_spacer(16.0)
-                        .push(TextElement::new(line).color(colors::TOOL_OUTPUT)),
-                );
-            }
-        }
+        col = col.push(build_tool_body(tool));
     }
 
     col
@@ -392,6 +786,40 @@ fn build_permission_dialog(
                     .corner_radius(4.0),
             ),
     );
+
+    dialog
+}
+
+/// Build a question dialog for AskUserQuestion (JSONL surgery flow).
+fn build_question_dialog(
+    question: &crate::agent_block::PendingUserQuestion,
+    block_id: BlockId,
+) -> Column {
+    let mut dialog = Column::new()
+        .padding(8.0)
+        .spacing(6.0)
+        .background(Color::rgb(0.05, 0.08, 0.15))
+        .corner_radius(8.0)
+        .border(Color::rgb(0.2, 0.5, 0.8), 1.0)
+        .width(Length::Fill)
+        .push(TextElement::new("\u{2753} Claude is asking:").color(colors::TOOL_ACTION));
+
+    for (q_idx, q) in question.questions.iter().enumerate() {
+        dialog = dialog.push(
+            TextElement::new(&q.question).color(colors::TEXT_PRIMARY)
+        );
+
+        let mut row = Row::new().spacing(8.0);
+        for (o_idx, opt) in q.options.iter().enumerate() {
+            let id = source_ids::agent_question_option(block_id, q_idx, o_idx);
+            row = row.push(
+                ButtonElement::new(id, &opt.label)
+                    .background(Color::rgb(0.12, 0.25, 0.45))
+                    .corner_radius(4.0),
+            );
+        }
+        dialog = dialog.push(row);
+    }
 
     dialog
 }

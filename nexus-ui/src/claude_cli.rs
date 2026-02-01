@@ -52,11 +52,19 @@ pub struct SystemMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantMessage {
+    /// The inner message object from the API.
+    pub message: AssistantMessageInner,
+    /// Session ID for this message.
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssistantMessageInner {
     /// Message content blocks.
     #[serde(default)]
     pub content: Vec<ContentBlock>,
     /// Unique message ID.
-    pub message_id: Option<String>,
+    pub id: Option<String>,
     /// Stop reason (end_turn, tool_use, etc).
     pub stop_reason: Option<String>,
 }
@@ -99,6 +107,12 @@ pub enum ContentBlock {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserMessage {
+    /// The inner message object from the API.
+    pub message: UserMessageInner,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserMessageInner {
     #[serde(default)]
     pub content: Vec<ContentBlock>,
 }
@@ -112,6 +126,7 @@ pub struct ResultMessage {
     /// Session ID for resumption.
     pub session_id: String,
     /// Cost in dollars.
+    #[serde(alias = "total_cost_usd")]
     pub cost_usd: Option<f64>,
     /// Whether the session is resumable.
     pub is_resumable: Option<bool>,
@@ -121,6 +136,17 @@ pub struct ResultMessage {
     pub num_turns: Option<u32>,
     /// Token usage.
     pub usage: Option<TokenUsage>,
+    /// Tools that were denied permission (includes AskUserQuestion in -p mode).
+    #[serde(default)]
+    pub permission_denials: Vec<PermissionDenial>,
+}
+
+/// A tool call that was denied permission by the CLI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PermissionDenial {
+    pub tool_name: String,
+    pub tool_use_id: String,
+    pub tool_input: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -335,7 +361,7 @@ impl ClaudeCli {
                 }
 
                 CliMessage::Assistant(asst) => {
-                    for block in asst.content {
+                    for block in asst.message.content {
                         match block {
                             ContentBlock::Text { text } => {
                                 let _ = event_tx.send(AgentEvent::ResponseText(text));
@@ -438,9 +464,8 @@ impl ClaudeCli {
                 }
 
                 CliMessage::User(user) => {
-                    // User messages contain tool results - we already handle these
-                    // in the assistant message flow, but we can process them here too
-                    for block in user.content {
+                    // User messages contain tool results
+                    for block in user.message.content {
                         if let ContentBlock::ToolResult {
                             tool_use_id,
                             content,
@@ -472,11 +497,21 @@ impl ClaudeCli {
                     // Query completed
                     session_id = Some(result.session_id.clone());
 
-                    // If there's a final result text, send it
-                    if let Some(text) = result.result {
-                        if !text.is_empty() {
-                            let _ = event_tx.send(AgentEvent::ResponseText(text));
-                        }
+                    // NOTE: We do NOT send result.result as ResponseText here because
+                    // the CLI already emits the final response as an Assistant message
+                    // before the Result message. Sending it again would double the text.
+
+                    // Send usage/cost data before finishing
+                    let (input_tokens, output_tokens) = result.usage
+                        .as_ref()
+                        .map(|u| (u.input_tokens, u.output_tokens))
+                        .unwrap_or((None, None));
+                    if result.cost_usd.is_some() || input_tokens.is_some() || output_tokens.is_some() {
+                        let _ = event_tx.send(AgentEvent::UsageUpdate {
+                            cost_usd: result.cost_usd,
+                            input_tokens,
+                            output_tokens,
+                        });
                     }
 
                     // Send finished event
@@ -484,6 +519,21 @@ impl ClaudeCli {
                         request_id,
                         messages: vec![], // CLI manages its own history via session
                     });
+
+                    // Check for AskUserQuestion in permission_denials.
+                    // The CLI can't handle interactive tools in -p mode, so it
+                    // errors them out. We intercept here and emit a UI event so
+                    // we can show the question, do JSONL surgery, and resume.
+                    for denial in &result.permission_denials {
+                        if denial.tool_name == "AskUserQuestion" {
+                            if let Some(questions) = parse_user_questions(&denial.tool_input) {
+                                let _ = event_tx.send(AgentEvent::UserQuestionRequested {
+                                    tool_use_id: denial.tool_use_id.clone(),
+                                    questions,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -509,6 +559,121 @@ impl Drop for ClaudeCli {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+// =============================================================================
+// AskUserQuestion Parsing
+// =============================================================================
+
+use crate::agent_adapter::{UserQuestion, UserQuestionOption};
+
+/// Parse the AskUserQuestion tool input into our UserQuestion types.
+fn parse_user_questions(tool_input: &serde_json::Value) -> Option<Vec<UserQuestion>> {
+    let questions = tool_input.get("questions")?.as_array()?;
+    let mut result = Vec::new();
+    for q in questions {
+        let question = q.get("question")?.as_str()?.to_string();
+        let header = q.get("header").and_then(|h| h.as_str()).unwrap_or("").to_string();
+        let multi_select = q.get("multiSelect").and_then(|m| m.as_bool()).unwrap_or(false);
+        let options = q.get("options")
+            .and_then(|o| o.as_array())
+            .map(|arr| {
+                arr.iter().filter_map(|opt| {
+                    Some(UserQuestionOption {
+                        label: opt.get("label")?.as_str()?.to_string(),
+                        description: opt.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+                    })
+                }).collect()
+            })
+            .unwrap_or_default();
+        result.push(UserQuestion { question, header, options, multi_select });
+    }
+    Some(result)
+}
+
+// =============================================================================
+// JSONL Surgery
+// =============================================================================
+
+/// Patch a Claude Code session JSONL file: replace the error tool_result for
+/// `tool_use_id` with a success result containing `answer_content`, and
+/// truncate everything after (the assistant's error-path response).
+pub fn patch_session_jsonl(
+    path: &std::path::Path,
+    tool_use_id: &str,
+    answer_content: &str,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines: Vec<serde_json::Value> = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() { continue; }
+        match serde_json::from_str(&line) {
+            Ok(v) => lines.push(v),
+            Err(_) => continue,
+        }
+    }
+
+    // Find the user message containing the error tool_result for this tool_use_id
+    let mut truncate_at = None;
+    for (i, line) in lines.iter_mut().enumerate() {
+        if line.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let content = match line.pointer_mut("/message/content") {
+            Some(serde_json::Value::Array(arr)) => arr,
+            _ => continue,
+        };
+        for block in content.iter_mut() {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            if block.get("tool_use_id").and_then(|t| t.as_str()) != Some(tool_use_id) {
+                continue;
+            }
+            // Found it — replace error with success
+            block["content"] = serde_json::Value::String(answer_content.to_string());
+            block["is_error"] = serde_json::Value::Bool(false);
+            // Also fix the top-level tool_use_result if present
+            if line.get("tool_use_result").is_some() {
+                line["tool_use_result"] = serde_json::json!({
+                    "type": "text",
+                    "text": answer_content,
+                });
+            }
+            truncate_at = Some(i + 1); // keep up to and including this line
+            break;
+        }
+        if truncate_at.is_some() { break; }
+    }
+
+    let truncate_at = truncate_at.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "tool_result not found in session")
+    })?;
+
+    // Truncate and write back
+    lines.truncate(truncate_at);
+    let mut file = std::fs::File::create(path)?;
+    for line in &lines {
+        writeln!(file, "{}", serde_json::to_string(line).unwrap())?;
+    }
+
+    Ok(())
+}
+
+/// Compute the Claude Code session file path for a given working directory and session ID.
+pub fn session_file_path(cwd: &str, session_id: &str) -> std::path::PathBuf {
+    let encoded = cwd.replace('/', "-");
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    home.join(".claude/projects")
+        .join(&encoded)
+        .join(format!("{}.jsonl", session_id))
 }
 
 // =============================================================================
@@ -539,6 +704,12 @@ pub async fn spawn_claude_cli_task(
             "Edit".to_string(),
             "Write".to_string(),
             "Task".to_string(),
+        ],
+        // Disallow tools that require interactive input (we're in -p mode).
+        // AskUserQuestion is allowed — we intercept the error via JSONL surgery.
+        disallowed_tools: vec![
+            "EnterPlanMode".to_string(),
+            "ExitPlanMode".to_string(),
         ],
         max_turns: Some(100),
         resume: session_id,
