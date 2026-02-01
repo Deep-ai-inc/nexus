@@ -32,8 +32,9 @@ pub async fn spawn_agent_task(
     working_dir: PathBuf,
     attachments: Vec<nexus_api::Value>,
     session_id: Option<String>,
+    permission_port: Option<u16>,
 ) -> anyhow::Result<Option<String>> {
-    spawn_claude_cli_task(event_tx, cancel_flag, query, working_dir, session_id, attachments).await
+    spawn_claude_cli_task(event_tx, cancel_flag, query, working_dir, session_id, attachments, permission_port).await
 }
 
 /// Async subscription that awaits agent events.

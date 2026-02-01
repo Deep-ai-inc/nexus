@@ -22,6 +22,7 @@ pub mod context;
 pub mod agent_adapter;
 pub mod agent_block;
 pub mod claude_cli;
+pub mod mcp_proxy;
 
 // Block types (depends on agent_block)
 pub mod blocks;

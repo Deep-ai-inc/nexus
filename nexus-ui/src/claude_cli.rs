@@ -47,7 +47,7 @@ pub struct SystemMessage {
     pub tools: Vec<String>,
     pub model: Option<String>,
     #[serde(default)]
-    pub mcp_servers: Vec<String>,
+    pub mcp_servers: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,6 +182,8 @@ pub struct CliOptions {
     pub append_system_prompt: Option<String>,
     /// Permission mode: default, acceptEdits, bypassPermissions
     pub permission_mode: Option<String>,
+    /// MCP tool name for interactive permission prompts.
+    pub permission_prompt_tool: Option<String>,
     /// Working directory.
     pub working_dir: Option<PathBuf>,
 }
@@ -245,6 +247,11 @@ impl ClaudeCli {
         // Permission mode
         if let Some(mode) = &options.permission_mode {
             cmd.args(["--permission-mode", mode]);
+        }
+
+        // MCP permission prompt tool
+        if let Some(tool) = &options.permission_prompt_tool {
+            cmd.args(["--permission-prompt-tool", tool]);
         }
 
         // Working directory
@@ -680,6 +687,24 @@ pub fn session_file_path(cwd: &str, session_id: &str) -> std::path::PathBuf {
 // Spawn Helper for UI Integration
 // =============================================================================
 
+/// Write a temporary MCP config file that points the Claude CLI at our
+/// permission proxy subcommand, which communicates with the UI over TCP.
+fn write_mcp_config(port: u16) -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("nexus"));
+    let config = serde_json::json!({
+        "mcpServers": {
+            "nexus_perm": {
+                "type": "stdio",
+                "command": exe.to_str().unwrap_or("nexus"),
+                "args": ["mcp-proxy", "--port", port.to_string()]
+            }
+        }
+    });
+    let path = std::env::temp_dir().join(format!("nexus-mcp-{}.json", std::process::id()));
+    std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
+    path
+}
+
 /// Spawn a Claude Code CLI query and stream events to the UI.
 ///
 /// This replaces the old `spawn_agent_task` function that used nexus-agent directly.
@@ -690,20 +715,40 @@ pub async fn spawn_claude_cli_task(
     working_dir: PathBuf,
     session_id: Option<String>,
     attachments: Vec<nexus_api::Value>,
+    permission_port: Option<u16>,
 ) -> anyhow::Result<Option<String>> {
     use tokio::task::spawn_blocking;
 
+    // When a permission port is provided, set up MCP config and use default
+    // permission mode so dangerous tools go through our permission proxy.
+    let (mcp_config, permission_prompt_tool, permission_mode) = if let Some(port) = permission_port
+    {
+        let config_path = write_mcp_config(port);
+        (
+            Some(config_path),
+            Some("mcp__nexus_perm__permission_prompt".to_string()),
+            None, // default mode — CLI will call permission tool for dangerous ops
+        )
+    } else {
+        (
+            None,
+            None,
+            Some("acceptEdits".to_string()), // legacy: accept everything
+        )
+    };
+
     // Build options
     let options = CliOptions {
-        // Allow common tools without prompting
+        // Safe read-only tools are always allowed without prompting.
+        // Dangerous tools (Bash, Edit, Write) go through the MCP permission prompt.
         allowed_tools: vec![
             "Read".to_string(),
             "Glob".to_string(),
             "Grep".to_string(),
-            "Bash".to_string(),
-            "Edit".to_string(),
-            "Write".to_string(),
             "Task".to_string(),
+            "TodoWrite".to_string(),
+            "WebSearch".to_string(),
+            "WebFetch".to_string(),
         ],
         // Disallow tools that require interactive input (we're in -p mode).
         // AskUserQuestion is allowed — we intercept the error via JSONL surgery.
@@ -714,8 +759,9 @@ pub async fn spawn_claude_cli_task(
         max_turns: Some(100),
         resume: session_id,
         working_dir: Some(working_dir),
-        // Accept edits by default (user can review in UI)
-        permission_mode: Some("acceptEdits".to_string()),
+        mcp_config,
+        permission_prompt_tool,
+        permission_mode,
         ..Default::default()
     };
 

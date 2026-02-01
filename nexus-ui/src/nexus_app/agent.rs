@@ -11,7 +11,7 @@ use nexus_api::{BlockId, Value};
 use strata::Subscription;
 use strata::content_address::SourceId;
 
-use crate::agent_adapter::{AgentEvent, PermissionResponse, UserQuestion};
+use crate::agent_adapter::{AgentEvent, UserQuestion};
 use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
 use crate::nexus_widgets::AgentBlockWidget;
 use crate::systems::{agent_subscription, spawn_agent_task};
@@ -55,7 +55,10 @@ pub(crate) struct AgentWidget {
     pub block_index: HashMap<BlockId, usize>,
     pub active: Option<BlockId>,
     pub event_tx: mpsc::UnboundedSender<AgentEvent>,
-    pub permission_tx: Option<mpsc::UnboundedSender<(String, PermissionResponse)>>,
+    /// Channel to send permission responses back to the TCP permission server.
+    pub permission_response_tx: Option<mpsc::UnboundedSender<bool>>,
+    /// TCP port the permission server is listening on (for CLI spawns).
+    pub permission_port: Option<u16>,
     pub cancel_flag: Arc<AtomicBool>,
     pub dirty: bool,
     pub session_id: Option<String>,
@@ -74,7 +77,8 @@ impl AgentWidget {
             block_index: HashMap::new(),
             active: None,
             event_tx,
-            permission_tx: None,
+            permission_response_tx: None,
+            permission_port: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             dirty: false,
             session_id: None,
@@ -200,6 +204,37 @@ impl AgentWidget {
         )
     }
 
+    /// Start the TCP permission server (once, reused across spawns).
+    fn ensure_permission_server(&mut self) {
+        if self.permission_port.is_some() {
+            return; // already running
+        }
+
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to bind permission server: {}", e);
+                return;
+            }
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        // Convert to async listener
+        listener.set_nonblocking(true).unwrap();
+        let async_listener = tokio::net::TcpListener::from_std(listener).unwrap();
+
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            crate::systems::permission_server::run(async_listener, event_tx, response_rx).await;
+        });
+
+        self.permission_response_tx = Some(response_tx);
+        self.permission_port = Some(port);
+        tracing::info!("Permission server listening on port {}", port);
+    }
+
     /// Spawn an agent task.
     pub fn spawn(
         &mut self,
@@ -220,10 +255,14 @@ impl AgentWidget {
         // Reset cancel flag
         self.cancel_flag.store(false, Ordering::SeqCst);
 
+        // Ensure permission server is running
+        self.ensure_permission_server();
+
         let agent_tx = self.event_tx.clone();
         let cancel_flag = self.cancel_flag.clone();
         let cwd = PathBuf::from(cwd);
         let session_id = self.session_id.clone();
+        let permission_port = self.permission_port;
 
         tokio::spawn(async move {
             match spawn_agent_task(
@@ -233,6 +272,7 @@ impl AgentWidget {
                 cwd,
                 attachments,
                 session_id,
+                permission_port,
             )
             .await
             {
@@ -409,39 +449,39 @@ impl AgentWidget {
     }
 
     /// Grant permission once.
-    pub fn permission_grant(&mut self, block_id: BlockId, perm_id: String) {
+    pub fn permission_grant(&mut self, block_id: BlockId, _perm_id: String) {
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.clear_permission();
             }
         }
-        if let Some(ref tx) = self.permission_tx {
-            let _ = tx.send((perm_id, PermissionResponse::GrantedOnce));
+        if let Some(ref tx) = self.permission_response_tx {
+            let _ = tx.send(true);
         }
     }
 
     /// Grant permission for session.
-    pub fn permission_grant_session(&mut self, block_id: BlockId, perm_id: String) {
+    pub fn permission_grant_session(&mut self, block_id: BlockId, _perm_id: String) {
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.clear_permission();
             }
         }
-        if let Some(ref tx) = self.permission_tx {
-            let _ = tx.send((perm_id, PermissionResponse::GrantedSession));
+        if let Some(ref tx) = self.permission_response_tx {
+            let _ = tx.send(true);
         }
     }
 
     /// Deny permission.
-    pub fn permission_deny(&mut self, block_id: BlockId, perm_id: String) {
+    pub fn permission_deny(&mut self, block_id: BlockId, _perm_id: String) {
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.clear_permission();
                 block.fail("Permission denied".to_string());
             }
         }
-        if let Some(ref tx) = self.permission_tx {
-            let _ = tx.send((perm_id, PermissionResponse::Denied));
+        if let Some(ref tx) = self.permission_response_tx {
+            let _ = tx.send(false);
         }
         self.active = None;
     }
@@ -504,6 +544,7 @@ impl AgentWidget {
         let cancel_flag = self.cancel_flag.clone();
         let cwd = PathBuf::from(&self.cwd);
         let session_id = self.session_id.clone();
+        let permission_port = self.permission_port;
 
         tokio::spawn(async move {
             match spawn_agent_task(
@@ -513,6 +554,7 @@ impl AgentWidget {
                 cwd,
                 vec![],
                 session_id,
+                permission_port,
             )
             .await
             {
