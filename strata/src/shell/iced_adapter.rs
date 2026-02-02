@@ -524,8 +524,6 @@ struct StrataPrimitive {
     pending_images: Arc<Mutex<Vec<PendingImage>>>,
     /// Pending image unloads (drained by prepare on first access).
     pending_image_unloads: Arc<Mutex<Vec<ImageHandle>>>,
-    /// Whether a selection drag is active (locks cursor to I-beam).
-    is_selecting: bool,
 }
 
 impl std::fmt::Debug for StrataPrimitive {
@@ -553,7 +551,6 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             frame: self.frame,
             pending_images: self.pending_images.clone(),
             pending_image_unloads: self.pending_image_unloads.clone(),
-            is_selecting: self.is_selecting,
         }
     }
 

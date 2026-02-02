@@ -193,10 +193,7 @@ impl NexusState {
                     super::message::SelectionMsg::Start(addr.clone(), mode),
                     ctx,
                 );
-                self.drag.status = DragStatus::Active(ActiveKind::Selecting {
-                    start_addr: addr,
-                    mode,
-                });
+                self.drag.status = DragStatus::Active(ActiveKind::Selecting);
             }
             DragMsg::Activate(_position) => {
                 if let DragStatus::Pending { intent, .. } =

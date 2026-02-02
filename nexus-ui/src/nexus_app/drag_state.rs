@@ -42,13 +42,6 @@ impl DragState {
         matches!(self.status, DragStatus::Active(_))
     }
 
-    pub fn is_pending(&self) -> bool {
-        matches!(self.status, DragStatus::Pending { .. })
-    }
-
-    pub fn is_idle(&self) -> bool {
-        matches!(self.status, DragStatus::Inactive)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,10 +119,7 @@ impl PendingIntent {
 #[derive(Debug, Clone)]
 pub enum ActiveKind {
     /// Text selection in progress. Drives SelectionMsg::Extend on move.
-    Selecting {
-        start_addr: ContentAddress,
-        mode: SelectMode,
-    },
+    Selecting,
 }
 
 /// Text selection granularity, determined by click count.

@@ -615,8 +615,4 @@ impl AgentWidget {
         self.active.is_some()
     }
 
-    /// Check if any block has a pending user question.
-    pub fn has_pending_question(&self) -> bool {
-        self.blocks.iter().any(|b| b.pending_question.is_some())
-    }
 }

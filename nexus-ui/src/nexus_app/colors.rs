@@ -28,7 +28,6 @@ pub const TOOL_OUTPUT: Color = Color { r: 0.8, g: 0.8, b: 0.8, a: 1.0 };
 pub const TOOL_ACTION: Color = Color { r: 0.3, g: 0.7, b: 1.0, a: 1.0 };
 pub const TOOL_RESULT: Color = Color { r: 0.5, g: 0.5, b: 0.55, a: 1.0 };
 pub const TOOL_PATH: Color = Color { r: 0.7, g: 0.7, b: 0.9, a: 1.0 };
-pub const TOOL_COMMAND: Color = Color { r: 0.9, g: 0.8, b: 0.5, a: 1.0 };
 pub const TOOL_SUMMARY: Color = Color { r: 0.5, g: 0.5, b: 0.5, a: 1.0 };
 pub const TOOL_ARTIFACT_BG: Color = Color { r: 0.09, g: 0.09, b: 0.11, a: 1.0 };
 pub const TOOL_BORDER: Color = Color { r: 0.25, g: 0.25, b: 0.35, a: 1.0 };
