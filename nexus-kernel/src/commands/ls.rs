@@ -206,13 +206,12 @@ fn entries_to_table(entries: Vec<FileEntry>, opts: &LsOptions) -> Value {
     let rows: Vec<Vec<Value>> = entries
         .into_iter()
         .map(|e| {
-            vec![
-                Value::String(format_permissions(e.permissions)),
-                // Always store raw bytes - formatting happens at render time!
-                Value::Int(e.size as i64),
-                Value::String(format_time(e.modified)),
-                Value::String(format_name(&e)),
-            ]
+            let permissions = Value::String(format_permissions(e.permissions));
+            let size = Value::Int(e.size as i64);
+            let modified = Value::String(format_time(e.modified));
+            // Keep as FileEntry so rendering can make it clickable
+            let name = Value::FileEntry(Box::new(e));
+            vec![permissions, size, modified, name]
         })
         .collect();
 
@@ -278,10 +277,3 @@ fn format_time(ts: Option<u64>) -> String {
     }
 }
 
-fn format_name(entry: &FileEntry) -> String {
-    if let Some(target) = &entry.symlink_target {
-        format!("{} -> {}", entry.name, target.display())
-    } else {
-        entry.name.clone()
-    }
-}

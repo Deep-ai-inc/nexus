@@ -68,6 +68,8 @@ pub enum PendingIntent {
     Anchor {
         source: SourceId,
         payload: DragPayload,
+        /// Widget bounds for Quick Look zoom animation (local coordinates).
+        source_rect: Option<Rect>,
     },
     /// Clicked inside an existing text selection. Click = place caret, drag = move text.
     SelectionDrag {

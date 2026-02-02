@@ -49,6 +49,8 @@ pub(crate) enum ShellOutput {
     },
     /// PTY input forwarding failed (block gone). Root should focus input.
     PtyInputFailed,
+    /// A directory was expanded — orchestrator should load its children.
+    LoadTreeChildren(BlockId, PathBuf),
 }
 
 impl Default for ShellOutput {
@@ -84,6 +86,9 @@ pub(crate) struct ShellWidget {
     /// Keyed by SourceId, provides O(1) lookup for both AnchorAction and DragPayload.
     pub(crate) anchor_registry: RefCell<HashMap<SourceId, AnchorEntry>>,
 
+    /// Tree expand registry — maps SourceId to (BlockId, PathBuf) for tree view chevrons.
+    pub(crate) tree_expand_registry: RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
+
     // --- Subscription channels (owned by this widget) ---
     pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
     kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
@@ -106,6 +111,7 @@ impl ShellWidget {
             image_handles: HashMap::new(),
             jobs: Vec::new(),
             anchor_registry: RefCell::new(HashMap::new()),
+            tree_expand_registry: RefCell::new(HashMap::new()),
             pty_rx: Arc::new(Mutex::new(pty_rx)),
             kernel_rx,
         }
@@ -120,6 +126,11 @@ impl ShellWidget {
     /// before blocks re-populate it.
     pub fn clear_anchor_registry(&self) {
         self.anchor_registry.borrow_mut().clear();
+    }
+
+    /// Clear the tree expand registry. Called at the start of each view() pass.
+    pub fn clear_tree_expand_registry(&self) {
+        self.tree_expand_registry.borrow_mut().clear();
     }
 
     // ---- View contributions ----
@@ -138,6 +149,7 @@ impl ShellWidget {
             image_info: self.image_handles.get(&block.id).copied(),
             is_focused,
             anchor_registry: &self.anchor_registry,
+            tree_expand_registry: &self.tree_expand_registry,
         })
     }
 
@@ -169,6 +181,10 @@ impl ShellWidget {
                     }
                 }
             }
+        }
+        // Tree expand chevrons
+        if let Some(msg) = self.on_click_tree_expand(id) {
+            return Some(msg);
         }
         None
     }
@@ -237,6 +253,13 @@ impl ShellWidget {
         let registry = self.anchor_registry.borrow();
         let entry = registry.get(&id)?;
         Some(ShellMsg::OpenAnchor(entry.block_id, entry.action.clone()))
+    }
+
+    /// Handle click on a tree expand chevron.
+    pub fn on_click_tree_expand(&self, id: SourceId) -> Option<ShellMsg> {
+        let registry = self.tree_expand_registry.borrow();
+        let (block_id, path) = registry.get(&id)?;
+        Some(ShellMsg::ToggleTreeExpand(*block_id, path.clone()))
     }
 
     /// Look up a drag payload by SourceId in the registry (O(1)).
@@ -347,6 +370,13 @@ impl ShellWidget {
             ShellMsg::SortTable(block_id, col_idx) => { self.sort_table(block_id, col_idx); ShellOutput::None }
             ShellMsg::OpenAnchor(_, _) => {
                 // Handled at the root level in state_update.rs
+                ShellOutput::None
+            }
+            ShellMsg::ToggleTreeExpand(block_id, path) => {
+                self.toggle_tree_expand(block_id, path)
+            }
+            ShellMsg::TreeChildrenLoaded(block_id, path, entries) => {
+                self.set_tree_children(block_id, path, entries);
                 ShellOutput::None
             }
         };
@@ -591,6 +621,31 @@ impl ShellWidget {
         }
     }
 
+    /// Toggle tree expansion for a directory.
+    /// Returns LoadTreeChildren if the directory was expanded and needs loading.
+    pub fn toggle_tree_expand(&mut self, block_id: BlockId, path: PathBuf) -> ShellOutput {
+        if let Some(&idx) = self.block_index.get(&block_id) {
+            if let Some(block) = self.blocks.get_mut(idx) {
+                let now_expanded = block.tree_state.toggle(path.clone());
+                block.version += 1; // Trigger re-render
+                if now_expanded && !block.tree_state.children.contains_key(&path) {
+                    return ShellOutput::LoadTreeChildren(block_id, path);
+                }
+            }
+        }
+        ShellOutput::None
+    }
+
+    /// Store loaded children for a tree node.
+    pub fn set_tree_children(&mut self, block_id: BlockId, path: PathBuf, entries: Vec<nexus_api::FileEntry>) {
+        if let Some(&idx) = self.block_index.get(&block_id) {
+            if let Some(block) = self.blocks.get_mut(idx) {
+                block.tree_state.set_children(path, entries);
+                block.version += 1; // Trigger re-render
+            }
+        }
+    }
+
     /// Clear all blocks, kill PTYs, clear jobs.
     pub fn clear(&mut self) {
         for handle in &self.pty_handles {
@@ -826,8 +881,8 @@ pub(crate) fn semantic_text_for_value(value: &Value, _column: Option<&nexus_api:
 
 pub(crate) fn value_to_anchor_action(value: &Value) -> AnchorAction {
     match value {
-        Value::Path(p) => AnchorAction::RevealPath(p.clone()),
-        Value::FileEntry(entry) => AnchorAction::RevealPath(entry.path.clone()),
+        Value::Path(p) => AnchorAction::QuickLook(p.clone()),
+        Value::FileEntry(entry) => AnchorAction::QuickLook(entry.path.clone()),
         Value::Process(info) => AnchorAction::CopyToClipboard(info.pid.to_string()),
         Value::GitCommit(info) => AnchorAction::CopyToClipboard(info.short_hash.clone()),
         _ => AnchorAction::CopyToClipboard(value.to_text()),

@@ -129,13 +129,21 @@ pub enum ShellMsg {
     KillBlock(BlockId),
     SortTable(BlockId, usize),
     OpenAnchor(BlockId, AnchorAction),
+    /// Toggle directory expansion in tree view.
+    ToggleTreeExpand(BlockId, PathBuf),
+    /// Load tree children for an expanded directory.
+    TreeChildrenLoaded(BlockId, PathBuf, Vec<nexus_api::FileEntry>),
 }
 
 /// Action to perform when a clickable anchor is activated.
 #[derive(Debug, Clone)]
 pub enum AnchorAction {
+    /// Preview a file with Quick Look (`qlmanage -p`).
+    QuickLook(PathBuf),
     /// Reveal a path in Finder (`open -R`).
     RevealPath(PathBuf),
+    /// Open a file/URL with the default application (`open`).
+    Open(PathBuf),
     /// Open a URL in the default browser.
     OpenUrl(String),
     /// Copy a string to the clipboard (PID, git hash, etc.).

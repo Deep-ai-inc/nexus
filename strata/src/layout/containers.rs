@@ -318,6 +318,10 @@ impl<W: Widget> From<W> for LayoutChild {
 pub struct TextElement {
     /// Source ID for hit-testing and selection.
     pub source_id: Option<SourceId>,
+    /// Widget ID for click detection (makes text clickable as a widget).
+    pub widget_id: Option<SourceId>,
+    /// Cursor hint shown when hovering (requires widget_id).
+    pub cursor_hint: Option<CursorIcon>,
     /// Text content.
     pub text: String,
     /// Text color.
@@ -549,6 +553,8 @@ impl TextElement {
         let cache_key = hash_text(&text);
         Self {
             source_id: None,
+            widget_id: None,
+            cursor_hint: None,
             text,
             color: Color::WHITE,
             size: None,
@@ -557,9 +563,22 @@ impl TextElement {
         }
     }
 
-    /// Set the source ID for hit-testing.
+    /// Set the source ID for hit-testing (makes text selectable content).
     pub fn source(mut self, source_id: SourceId) -> Self {
         self.source_id = Some(source_id);
+        self
+    }
+
+    /// Set widget ID for click detection (makes text clickable as a widget).
+    /// This is mutually exclusive with `source()` - use one or the other.
+    pub fn widget_id(mut self, id: SourceId) -> Self {
+        self.widget_id = Some(id);
+        self
+    }
+
+    /// Set cursor hint shown when hovering (requires widget_id).
+    pub fn cursor_hint(mut self, cursor: CursorIcon) -> Self {
+        self.cursor_hint = Some(cursor);
         self
     }
 
@@ -1082,6 +1101,7 @@ fn render_table(
                     let text = if cell.lines.len() == 1 { &cell.lines[0] } else { &cell.text };
                     let tx = col_x + cell_pad;
                     let ty = ry + 2.0;
+                    let text_width = text.chars().count() as f32 * char_width;
                     snapshot.primitives_mut().add_text_cached(
                         text.clone(),
                         Point::new(tx, ty),
@@ -1089,19 +1109,31 @@ fn render_table(
                         BASE_FONT_SIZE,
                         hash_text(text) ^ (row_idx as u64),
                     );
-                    // Register for selection
-                    use crate::layout_snapshot::{SourceLayout, TextLayout};
-                    let mut text_layout = TextLayout::simple(
-                        text.clone(), cell.color.pack(),
-                        tx, ty, char_width, table.line_height,
-                    );
-                    text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
-                    snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
+                    // Register clickable cell as widget (text-width only)
+                    // Widget takes priority over source, so register widget first for anchors
+                    if let Some(wid) = cell.widget_id {
+                        let text_rect = Rect::new(tx, ty, text_width, table.line_height);
+                        snapshot.register_widget(wid, text_rect);
+                        snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                    } else {
+                        // Only register for selection if not a clickable anchor
+                        use crate::layout_snapshot::{SourceLayout, TextLayout};
+                        let mut text_layout = TextLayout::simple(
+                            text.clone(), cell.color.pack(),
+                            tx, ty, char_width, table.line_height,
+                        );
+                        text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
+                        snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
+                    }
                 } else {
                     // Multi-line wrapped cell
+                    let is_anchor = cell.widget_id.is_some();
+                    let mut max_text_width: f32 = 0.0;
                     for (line_idx, line) in cell.lines.iter().enumerate() {
                         let tx = col_x + cell_pad;
                         let ly = ry + 2.0 + line_idx as f32 * table.line_height;
+                        let line_width = line.chars().count() as f32 * char_width;
+                        max_text_width = max_text_width.max(line_width);
                         snapshot.primitives_mut().add_text_cached(
                             line.clone(),
                             Point::new(tx, ly),
@@ -1109,21 +1141,25 @@ fn render_table(
                             BASE_FONT_SIZE,
                             hash_text(line) ^ (row_idx as u64) ^ ((line_idx as u64) << 32),
                         );
-                        // Register for selection
-                        use crate::layout_snapshot::{SourceLayout, TextLayout};
-                        let mut text_layout = TextLayout::simple(
-                            line.clone(), cell.color.pack(),
-                            tx, ly, char_width, table.line_height,
-                        );
-                        text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
-                        snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
+                        // Only register for selection if not a clickable anchor
+                        if !is_anchor {
+                            use crate::layout_snapshot::{SourceLayout, TextLayout};
+                            let mut text_layout = TextLayout::simple(
+                                line.clone(), cell.color.pack(),
+                                tx, ly, char_width, table.line_height,
+                            );
+                            text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
+                            snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
+                        }
                     }
-                }
-                // Register clickable cell as widget
-                if let Some(wid) = cell.widget_id {
-                    let cell_rect = Rect::new(col_x, ry, table.columns[col_idx].width, rh);
-                    snapshot.register_widget(wid, cell_rect);
-                    snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                    // Register clickable cell as widget covering all lines
+                    if let Some(wid) = cell.widget_id {
+                        let tx = col_x + cell_pad;
+                        let ty = ry + 2.0;
+                        let text_rect = Rect::new(tx, ty, max_text_width, cell.lines.len() as f32 * table.line_height);
+                        snapshot.register_widget(wid, text_rect);
+                        snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                    }
                 }
                 col_x += table.columns[col_idx].width;
             }
@@ -1605,6 +1641,15 @@ impl Column {
                         // owns the entire line so this is safe (no sibling conflicts).
                         text_layout.bounds.width = text_layout.bounds.width.max(content_width);
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
+                    }
+
+                    // Register widget if this text is clickable
+                    if let Some(widget_id) = t.widget_id {
+                        let text_rect = Rect::new(x, y, size.width, size.height);
+                        snapshot.register_widget(widget_id, text_rect);
+                        if let Some(cursor) = t.cursor_hint {
+                            snapshot.set_cursor_hint(widget_id, cursor);
+                        }
                     }
 
                     snapshot.primitives_mut().add_text_cached(
@@ -2258,6 +2303,15 @@ impl Row {
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
                     }
 
+                    // Register widget if this text is clickable
+                    if let Some(widget_id) = t.widget_id {
+                        let text_rect = Rect::new(x, y, size.width, size.height);
+                        snapshot.register_widget(widget_id, text_rect);
+                        if let Some(cursor) = t.cursor_hint {
+                            snapshot.set_cursor_hint(widget_id, cursor);
+                        }
+                    }
+
                     snapshot.primitives_mut().add_text_cached(
                         t.text,
                         crate::primitives::Point::new(x, y),
@@ -2717,6 +2771,7 @@ impl ScrollColumn {
                 match child {
                     LayoutChild::Text(t) => {
                         let fs = t.font_size();
+                        let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
                         use crate::layout_snapshot::{SourceLayout, TextLayout};
                         if let Some(source_id) = t.source_id {
                             let scale = fs / BASE_FONT_SIZE;
@@ -2730,6 +2785,15 @@ impl ScrollColumn {
                             // text owns the entire line so this is safe.
                             text_layout.bounds.width = text_layout.bounds.width.max(content_width);
                             snapshot.register_source(source_id, SourceLayout::text(text_layout));
+                        }
+
+                        // Register widget if this text is clickable
+                        if let Some(widget_id) = t.widget_id {
+                            let text_rect = Rect::new(content_x, screen_y, size.width, size.height);
+                            snapshot.register_widget(widget_id, text_rect);
+                            if let Some(cursor) = t.cursor_hint {
+                                snapshot.set_cursor_hint(widget_id, cursor);
+                            }
                         }
 
                         snapshot.primitives_mut().add_text_cached(

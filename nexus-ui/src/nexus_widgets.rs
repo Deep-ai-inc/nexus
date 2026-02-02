@@ -6,8 +6,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use nexus_api::{BlockId, BlockState, FileType, Value, format_value_for_display};
+use nexus_api::{BlockId, BlockState, FileEntry, FileType, Value, format_value_for_display};
 use nexus_kernel::{Completion, CompletionKind};
 
 use similar::{ChangeTag, TextDiff};
@@ -42,6 +43,8 @@ pub struct ShellBlockWidget<'a> {
     /// Shared anchor registry — populated during rendering so click/drag
     /// handling can do O(1) lookups without re-iterating the Value tree.
     pub(crate) anchor_registry: &'a RefCell<HashMap<SourceId, AnchorEntry>>,
+    /// Tree expand registry — maps SourceId to (BlockId, PathBuf) for chevron clicks.
+    pub(crate) tree_expand_registry: &'a RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
 }
 
 impl Widget for ShellBlockWidget<'_> {
@@ -108,7 +111,7 @@ impl Widget for ShellBlockWidget<'_> {
 
         // Render output: native structured data takes priority over terminal
         if let Some(value) = &block.native_output {
-            content = render_native_value(content, value, block, self.image_info, self.anchor_registry);
+            content = render_native_value(content, value, block, self.image_info, self.anchor_registry, self.tree_expand_registry);
         } else if content_rows > 0 {
             let source_id = source_ids::shell_term(block.id);
             let mut term = TerminalElement::new(source_id, cols, content_rows)
@@ -1378,6 +1381,7 @@ fn render_native_value(
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
     anchor_registry: &RefCell<HashMap<SourceId, AnchorEntry>>,
+    tree_expand_registry: &RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
 ) -> Column {
     let block_id = block.id;
     match value {
@@ -1490,7 +1494,7 @@ fn render_native_value(
 
         Value::List(items) => {
             // Check for file entries
-            let file_entries: Vec<&nexus_api::FileEntry> = items
+            let file_entries: Vec<&FileEntry> = items
                 .iter()
                 .filter_map(|v| match v {
                     Value::FileEntry(entry) => Some(entry.as_ref()),
@@ -1501,28 +1505,19 @@ fn render_native_value(
             let source_id = source_ids::native(block_id);
 
             if file_entries.len() == items.len() && !file_entries.is_empty() {
-                // Render as file list with colors — each entry is a clickable anchor
-                for (i, entry) in file_entries.iter().enumerate() {
-                    let color = file_entry_color(entry);
-                    let display = if let Some(target) = &entry.symlink_target {
-                        format!("{} -> {}", entry.name, target.display())
-                    } else {
-                        entry.name.clone()
-                    };
-                    let anchor_id = source_ids::anchor(block_id, i);
-                    let file_value = Value::FileEntry(Box::new((*entry).clone()));
-                    anchor_registry.borrow_mut().insert(anchor_id, AnchorEntry {
-                        block_id,
-                        action: value_to_anchor_action(&file_value),
-                        drag_payload: DragPayload::FilePath(entry.path.clone()),
-                    });
-                    parent = parent.push(
-                        Row::new()
-                            .id(anchor_id)
-                            .cursor_hint(CursorIcon::Pointer)
-                            .push(TextElement::new(display).color(color).source(source_id)),
-                    );
-                }
+                // Render as file list with tree expansion support
+                let mut anchor_idx = 0usize;
+                let mut expand_idx = 0usize;
+                render_file_entries(
+                    &mut parent,
+                    &file_entries,
+                    block,
+                    0, // depth
+                    &mut anchor_idx,
+                    &mut expand_idx,
+                    anchor_registry,
+                    tree_expand_registry,
+                );
                 parent
             } else {
                 // Generic list
@@ -1542,7 +1537,6 @@ fn render_native_value(
             } else {
                 entry.name.clone()
             };
-            let source_id = source_ids::native(block_id);
             let anchor_id = source_ids::anchor(block_id, 0);
             anchor_registry.borrow_mut().insert(anchor_id, AnchorEntry {
                 block_id,
@@ -1550,10 +1544,10 @@ fn render_native_value(
                 drag_payload: DragPayload::FilePath(entry.path.clone()),
             });
             parent.push(
-                Row::new()
-                    .id(anchor_id)
-                    .cursor_hint(CursorIcon::Pointer)
-                    .push(TextElement::new(display).color(color).source(source_id)),
+                TextElement::new(display)
+                    .color(color)
+                    .widget_id(anchor_id)
+                    .cursor_hint(CursorIcon::Pointer),
             )
         }
 
@@ -1586,6 +1580,108 @@ fn render_native_value(
                     parent = parent.push(TextElement::new(line).color(colors::TEXT_PRIMARY).source(source_id));
                 }
                 parent
+            }
+        }
+    }
+}
+
+/// Render file entries with tree expansion support.
+/// Recursively renders children for expanded directories.
+fn render_file_entries(
+    parent: &mut Column,
+    entries: &[&FileEntry],
+    block: &Block,
+    depth: usize,
+    anchor_idx: &mut usize,
+    expand_idx: &mut usize,
+    anchor_registry: &RefCell<HashMap<SourceId, AnchorEntry>>,
+    tree_expand_registry: &RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
+) {
+    let block_id = block.id;
+    let indent_px = depth as f32 * 20.0;
+
+    for entry in entries {
+        let is_dir = matches!(entry.file_type, FileType::Directory);
+        let is_expanded = is_dir && block.tree_state.is_expanded(&entry.path);
+        let color = file_entry_color(entry);
+
+        // Build the row: [chevron (if dir)] [name]
+        let mut row = Row::new()
+            .spacing(4.0)
+            .cross_align(CrossAxisAlignment::Center);
+
+        // Indentation
+        if depth > 0 {
+            row = row.push(TextElement::new(" ".repeat((indent_px / 8.0) as usize)));
+        }
+
+        // Expand/collapse chevron for directories
+        if is_dir {
+            let chevron = if is_expanded { "▼" } else { "▶" };
+            let expand_id = source_ids::tree_expand(block_id, *expand_idx);
+            tree_expand_registry.borrow_mut().insert(expand_id, (block_id, entry.path.clone()));
+            *expand_idx += 1;
+
+            row = row.push(
+                TextElement::new(chevron)
+                    .color(colors::TEXT_MUTED)
+                    .widget_id(expand_id)
+                    .cursor_hint(CursorIcon::Pointer),
+            );
+        } else {
+            // Placeholder to align with directories
+            row = row.push(TextElement::new("  ").color(colors::TEXT_MUTED));
+        }
+
+        // File/directory name (clickable anchor)
+        let display = if let Some(target) = &entry.symlink_target {
+            format!("{} -> {}", entry.name, target.display())
+        } else {
+            entry.name.clone()
+        };
+
+        let anchor_id = source_ids::anchor(block_id, *anchor_idx);
+        let file_value = Value::FileEntry(Box::new((*entry).clone()));
+        anchor_registry.borrow_mut().insert(anchor_id, AnchorEntry {
+            block_id,
+            action: value_to_anchor_action(&file_value),
+            drag_payload: DragPayload::FilePath(entry.path.clone()),
+        });
+        *anchor_idx += 1;
+
+        row = row.push(
+            TextElement::new(display)
+                .color(color)
+                .widget_id(anchor_id)
+                .cursor_hint(CursorIcon::Pointer),
+        );
+
+        *parent = std::mem::take(parent).push(row);
+
+        // Recursively render children if expanded
+        if is_expanded {
+            if let Some(children) = block.tree_state.get_children(&entry.path) {
+                let child_refs: Vec<&FileEntry> = children.iter().collect();
+                render_file_entries(
+                    parent,
+                    &child_refs,
+                    block,
+                    depth + 1,
+                    anchor_idx,
+                    expand_idx,
+                    anchor_registry,
+                    tree_expand_registry,
+                );
+            } else {
+                // Children not loaded yet — show loading indicator
+                let mut loading_row = Row::new().spacing(4.0);
+                if depth > 0 {
+                    loading_row = loading_row.push(TextElement::new(" ".repeat(((depth + 1) as f32 * 20.0 / 8.0) as usize)));
+                } else {
+                    loading_row = loading_row.push(TextElement::new("    ")); // indent for loading
+                }
+                loading_row = loading_row.push(TextElement::new("Loading...").color(colors::TEXT_MUTED));
+                *parent = std::mem::take(parent).push(loading_row);
             }
         }
     }

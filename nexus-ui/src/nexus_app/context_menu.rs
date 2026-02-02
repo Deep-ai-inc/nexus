@@ -18,6 +18,10 @@ pub enum ContextMenuItem {
     CopyAsJson,
     CopyAsTsv,
     Rerun,
+    // File-specific actions
+    QuickLook(PathBuf),
+    Open(PathBuf),
+    CopyPath(PathBuf),
     RevealInFinder(PathBuf),
 }
 
@@ -33,6 +37,9 @@ impl ContextMenuItem {
             Self::CopyAsJson => "Copy as JSON",
             Self::CopyAsTsv => "Copy as TSV",
             Self::Rerun => "Rerun",
+            Self::QuickLook(_) => "Quick Look",
+            Self::Open(_) => "Open",
+            Self::CopyPath(_) => "Copy Path",
             Self::RevealInFinder(_) => "Reveal in Finder",
         }
     }
@@ -42,6 +49,7 @@ impl ContextMenuItem {
             Self::Copy => "\u{2318}C",
             Self::Paste => "\u{2318}V",
             Self::SelectAll => "\u{2318}A",
+            Self::QuickLook(_) => "Space",
             _ => "",
         }
     }

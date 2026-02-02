@@ -34,6 +34,7 @@ const AGENT_TOOL: u64 = 18;
 const AGENT_PERM_TEXT: u64 = 19;
 const AGENT_QUESTION_TEXT: u64 = 20;
 const AGENT_FOOTER: u64 = 21;
+const TREE_EXPAND: u64 = 22;
 
 // --- Shell block IDs ---
 
@@ -63,6 +64,11 @@ pub fn table_sort(id: BlockId, col: usize) -> SourceId {
 
 pub fn anchor(id: BlockId, index: usize) -> SourceId {
     block_space(id).child(ANCHOR).id(index as u64)
+}
+
+/// Tree expand chevron for a directory entry.
+pub fn tree_expand(id: BlockId, index: usize) -> SourceId {
+    block_space(id).child(TREE_EXPAND).id(index as u64)
 }
 
 pub fn agent_tool_toggle(id: BlockId, i: usize) -> SourceId {
