@@ -1034,10 +1034,11 @@ fn render_table(
         // Register header text for selection
         {
             use crate::layout_snapshot::{SourceLayout, TextLayout};
-            let text_layout = TextLayout::simple(
+            let mut text_layout = TextLayout::simple(
                 col.name.clone(), table.header_text_color.pack(),
                 tx, ty, char_width, table.line_height,
             );
+            text_layout.bounds.width = text_layout.bounds.width.max(col.width - cell_pad);
             snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
         }
         if let Some(sort_id) = col.sort_id {
@@ -1090,10 +1091,11 @@ fn render_table(
                     );
                     // Register for selection
                     use crate::layout_snapshot::{SourceLayout, TextLayout};
-                    let text_layout = TextLayout::simple(
+                    let mut text_layout = TextLayout::simple(
                         text.clone(), cell.color.pack(),
                         tx, ty, char_width, table.line_height,
                     );
+                    text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
                     snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
                 } else {
                     // Multi-line wrapped cell
@@ -1109,10 +1111,11 @@ fn render_table(
                         );
                         // Register for selection
                         use crate::layout_snapshot::{SourceLayout, TextLayout};
-                        let text_layout = TextLayout::simple(
+                        let mut text_layout = TextLayout::simple(
                             line.clone(), cell.color.pack(),
                             tx, ly, char_width, table.line_height,
                         );
+                        text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
                         snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
                     }
                 }
@@ -1592,12 +1595,15 @@ impl Column {
                     use crate::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
                         let scale = fs / BASE_FONT_SIZE;
-                        let text_layout = TextLayout::simple(
+                        let mut text_layout = TextLayout::simple(
                             t.text.clone(),
                             t.color.pack(),
                             x, y,
                             CHAR_WIDTH * scale, LINE_HEIGHT * scale,
                         );
+                        // Expand hit-box to full content width — in Column, text
+                        // owns the entire line so this is safe (no sibling conflicts).
+                        text_layout.bounds.width = text_layout.bounds.width.max(content_width);
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
                     }
 
@@ -1620,7 +1626,7 @@ impl Column {
                         .map(|(text, color)| GridRow { text, color })
                         .collect();
                     let mut grid_layout = GridLayout::with_rows(
-                        Rect::new(x, y, size.width, size.height),
+                        Rect::new(x, y, size.width.max(content_width), size.height),
                         t.cell_width, t.cell_height,
                         t.cols, t.rows,
                         rows_content,
@@ -1710,11 +1716,11 @@ impl Column {
                     if nested.height.is_flex() && total_flex > 0.0 {
                         height = (nested.height.flex() / total_flex) * available_flex;
                     }
-                    // Resolve width
+                    // Give Rows the full content width so their children's
+                    // hit-boxes can expand to fill the line (same as Column text).
                     let w = match nested.width {
                         Length::Fixed(px) => px,
-                        Length::Fill | Length::FillPortion(_) => content_width,
-                        Length::Shrink => nested.measure().width.min(content_width),
+                        Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
                     };
                     let x = cross_x(w);
                     let nested_bounds = Rect::new(x, y, w, height);
@@ -2228,6 +2234,9 @@ impl Row {
                 }
             };
 
+            // Right edge of Row content area, for expanding hit-boxes.
+            let content_right = content_x + bounds.width - self.padding.horizontal();
+
             match child {
                 LayoutChild::Text(t) => {
                     let fs = t.font_size();
@@ -2237,12 +2246,15 @@ impl Row {
                     use crate::layout_snapshot::{SourceLayout, TextLayout};
                     if let Some(source_id) = t.source_id {
                         let scale = fs / BASE_FONT_SIZE;
-                        let text_layout = TextLayout::simple(
+                        let mut text_layout = TextLayout::simple(
                             t.text.clone(),
                             t.color.pack(),
                             x, y,
                             CHAR_WIDTH * scale, LINE_HEIGHT * scale,
                         );
+                        // Expand hit-box to fill remaining Row width so empty
+                        // space to the right of text is clickable.
+                        text_layout.bounds.width = text_layout.bounds.width.max(content_right - x);
                         snapshot.register_source(source_id, SourceLayout::text(text_layout));
                     }
 
@@ -2265,7 +2277,7 @@ impl Row {
                         .map(|(text, color)| GridRow { text, color })
                         .collect();
                     let mut grid_layout = GridLayout::with_rows(
-                        Rect::new(x, y, size.width, size.height),
+                        Rect::new(x, y, size.width.max(content_right - x), size.height),
                         t.cell_width, t.cell_height,
                         t.cols, t.rows,
                         rows_content,
@@ -2708,12 +2720,15 @@ impl ScrollColumn {
                         use crate::layout_snapshot::{SourceLayout, TextLayout};
                         if let Some(source_id) = t.source_id {
                             let scale = fs / BASE_FONT_SIZE;
-                            let text_layout = TextLayout::simple(
+                            let mut text_layout = TextLayout::simple(
                                 t.text.clone(),
                                 t.color.pack(),
                                 content_x, screen_y,
                                 CHAR_WIDTH * scale, LINE_HEIGHT * scale,
                             );
+                            // Expand hit-box to full content width — in ScrollColumn,
+                            // text owns the entire line so this is safe.
+                            text_layout.bounds.width = text_layout.bounds.width.max(content_width);
                             snapshot.register_source(source_id, SourceLayout::text(text_layout));
                         }
 
@@ -2733,7 +2748,7 @@ impl ScrollColumn {
                             .map(|(text, color)| GridRow { text, color })
                             .collect();
                         let mut grid_layout = GridLayout::with_rows(
-                            Rect::new(content_x, screen_y, size.width, size.height),
+                            Rect::new(content_x, screen_y, size.width.max(content_width), size.height),
                             t.cell_width, t.cell_height,
                             t.cols, t.rows,
                             rows_content,
@@ -2798,10 +2813,11 @@ impl ScrollColumn {
                         nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
                     }
                     LayoutChild::Row(nested) => {
+                        // Give Rows the full content width so their children's
+                        // hit-boxes can expand to fill the line.
                         let w = match nested.width {
                             Length::Fixed(px) => px,
-                            Length::Fill | Length::FillPortion(_) => content_width,
-                            Length::Shrink => nested.measure().width.min(content_width),
+                            Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
                         };
                         nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
                     }

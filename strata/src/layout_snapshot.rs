@@ -843,6 +843,45 @@ impl LayoutSnapshot {
         layout.grid_to_offset(col, row)
     }
 
+    /// Find the nearest content address to a screen point.
+    ///
+    /// Unlike `hit_test`, this returns a content address even when the point
+    /// is in a gap between elements. Used as a fallback during selection
+    /// drags to bridge dead zones.
+    pub fn nearest_content(&self, x: f32, y: f32) -> Option<HitResult> {
+        let mut best_source: Option<(SourceId, &SourceLayout, (f32, f32))> = None;
+
+        for source_id in self.source_ordering.sources_in_order() {
+            let Some(layout) = self.sources.get(source_id) else { continue };
+            if layout.items.is_empty() { continue; }
+
+            let dist = rect_distance(&layout.bounds, x, y);
+            if best_source.is_none() || dist < best_source.as_ref().unwrap().2 {
+                best_source = Some((*source_id, layout, dist));
+            }
+        }
+
+        let (source_id, source_layout, _) = best_source?;
+
+        // Find nearest item within the source
+        let mut best_item: Option<(usize, &ItemLayout, (f32, f32))> = None;
+        for (i, item) in source_layout.items.iter().enumerate() {
+            let dist = rect_distance(&item.bounds(), x, y);
+            if best_item.is_none() || dist < best_item.as_ref().unwrap().2 {
+                best_item = Some((i, item, dist));
+            }
+        }
+
+        let (item_index, item, _) = best_item?;
+
+        let content_offset = match item {
+            ItemLayout::Text(text) => nearest_text_offset(text, x, y),
+            ItemLayout::Grid(grid) => nearest_grid_offset(grid, x, y),
+        };
+
+        Some(HitResult::Content(ContentAddress::new(source_id, item_index, content_offset)))
+    }
+
     /// Get the screen bounds for a content address.
     ///
     /// Returns the rectangle of the character or cell at the address.
@@ -1091,6 +1130,83 @@ impl LayoutSnapshot {
 
         rects
     }
+}
+
+/// Axis-aligned distance from a point to a rect. Returns `(dy, dx)`, both >= 0.
+/// If the point is inside the rect on an axis, that component is 0.
+fn rect_distance(bounds: &Rect, x: f32, y: f32) -> (f32, f32) {
+    let dx = if x < bounds.x {
+        bounds.x - x
+    } else if x > bounds.x + bounds.width {
+        x - (bounds.x + bounds.width)
+    } else {
+        0.0
+    };
+    let dy = if y < bounds.y {
+        bounds.y - y
+    } else if y > bounds.y + bounds.height {
+        y - (bounds.y + bounds.height)
+    } else {
+        0.0
+    };
+    (dy, dx)
+}
+
+/// Resolve nearest content offset for a text item, clamping to edges.
+///
+/// Same logic as `hit_test_text` but with Y-clamping so positions above/below
+/// the text bounds snap to the first/last line respectively.
+fn nearest_text_offset(layout: &TextLayout, x: f32, y: f32) -> usize {
+    let rel_x = x - layout.bounds.x;
+    let rel_y = y - layout.bounds.y;
+
+    // Clamp line: above → first line, below → last line
+    let line = if rel_y < 0.0 {
+        0
+    } else {
+        let l = (rel_y / layout.line_height).floor() as usize;
+        l.min(layout.line_count().saturating_sub(1))
+    };
+
+    let (line_start, line_end) = layout.line_range(line);
+    if line_start >= line_end {
+        return line_start;
+    }
+
+    let line_chars = &layout.char_positions[line_start..line_end];
+    if line_chars.is_empty() {
+        return line_start;
+    }
+
+    // Same partition_point + midpoint-snap logic as hit_test_text
+    let idx = line_chars.partition_point(|&pos| pos < rel_x);
+
+    let final_idx = if idx == 0 {
+        0
+    } else if idx >= line_chars.len() {
+        line_chars.len()
+    } else {
+        let left_edge = line_chars[idx - 1];
+        let right_edge = line_chars[idx];
+        let midpoint = (left_edge + right_edge) / 2.0;
+        if rel_x <= midpoint { idx - 1 } else { idx }
+    };
+
+    line_start + final_idx
+}
+
+/// Resolve nearest content offset for a grid item, clamping to edges.
+fn nearest_grid_offset(layout: &GridLayout, x: f32, y: f32) -> usize {
+    let rel_x = (x - layout.bounds.x).clamp(0.0, layout.bounds.width - 0.01);
+    let rel_y = (y - layout.bounds.y).clamp(0.0, layout.bounds.height - 0.01);
+
+    let col = (rel_x / layout.cell_width).floor() as u16;
+    let row = (rel_y / layout.cell_height).floor() as u16;
+
+    let col = col.min(layout.cols.saturating_sub(1));
+    let row = row.min(layout.rows.saturating_sub(1));
+
+    layout.grid_to_offset(col, row)
 }
 
 #[cfg(test)]

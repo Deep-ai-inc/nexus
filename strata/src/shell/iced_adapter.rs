@@ -182,7 +182,20 @@ fn update<A: StrataApp>(
                         let cache = state.cached_snapshot.borrow();
                         match cache.as_ref() {
                             Some(snapshot) => {
-                                state.cursor_position.and_then(|pos| snapshot.hit_test(pos))
+                                let raw_hit = state.cursor_position
+                                    .and_then(|pos| snapshot.hit_test(pos));
+
+                                // During active capture (selection drag), bridge gaps by
+                                // falling back to nearest content when hit_test misses.
+                                if state.capture.is_captured()
+                                    && !matches!(&raw_hit, Some(HitResult::Content(_)))
+                                {
+                                    state.cursor_position
+                                        .and_then(|pos| snapshot.nearest_content(pos.x, pos.y))
+                                        .or(raw_hit)
+                                } else {
+                                    raw_hit
+                                }
                             }
                             None => {
                                 // First frame before any view() call — build once
@@ -324,6 +337,7 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
         frame: state.frame,
         pending_images,
         pending_image_unloads,
+        is_selecting: state.capture.is_captured(),
     };
 
     shader::Shader::new(program)
@@ -494,6 +508,8 @@ struct StrataShaderProgram {
     pending_images: Arc<Mutex<Vec<PendingImage>>>,
     /// Pending image unloads (drained by prepare on first access).
     pending_image_unloads: Arc<Mutex<Vec<ImageHandle>>>,
+    /// Whether a selection drag is active (locks cursor to I-beam).
+    is_selecting: bool,
 }
 
 /// Primitive passed to the GPU.
@@ -508,6 +524,8 @@ struct StrataPrimitive {
     pending_images: Arc<Mutex<Vec<PendingImage>>>,
     /// Pending image unloads (drained by prepare on first access).
     pending_image_unloads: Arc<Mutex<Vec<ImageHandle>>>,
+    /// Whether a selection drag is active (locks cursor to I-beam).
+    is_selecting: bool,
 }
 
 impl std::fmt::Debug for StrataPrimitive {
@@ -535,6 +553,7 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             frame: self.frame,
             pending_images: self.pending_images.clone(),
             pending_image_unloads: self.pending_image_unloads.clone(),
+            is_selecting: self.is_selecting,
         }
     }
 
@@ -544,6 +563,10 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
         _bounds: iced::Rectangle,
         cursor: iced::mouse::Cursor,
     ) -> iced::mouse::Interaction {
+        if self.is_selecting {
+            return iced::mouse::Interaction::Text;
+        }
+
         use crate::layout_snapshot::CursorIcon;
 
         let Some(pos) = cursor.position() else {
