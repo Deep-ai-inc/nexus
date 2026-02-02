@@ -11,8 +11,11 @@
 //! Supported subcommands: status, log, branch, diff, add, commit, remote, stash
 
 use super::{CommandContext, NexusCommand};
-use git2::{Repository, StatusOptions, DiffOptions, DiffFormat};
-use nexus_api::{GitChangeType, GitCommitInfo, GitFileStatus, GitStatusInfo, Value};
+use git2::{Repository, StatusOptions, DiffOptions};
+use nexus_api::{
+    DiffFileInfo, DiffHunk, DiffLine, DiffLineKind, GitChangeType, GitCommitInfo, GitFileStatus,
+    GitStatusInfo, Value,
+};
 use std::path::Path;
 
 /// Main git command dispatcher - handles `git <subcommand>` syntax.
@@ -385,7 +388,10 @@ impl NexusCommand for GitBranchCommand {
     }
 }
 
-/// git diff - show changes
+/// git diff - show changes with structured diff output.
+///
+/// Returns `Value::List(Vec<Value::DiffFile>)` with full hunk-level detail.
+/// `to_text()` produces valid unified diff format for pipe compatibility.
 pub struct GitDiffCommand;
 
 impl NexusCommand for GitDiffCommand {
@@ -401,65 +407,93 @@ impl NexusCommand for GitDiffCommand {
         let mut diff_opts = DiffOptions::new();
 
         let diff = if staged {
-            // Diff between HEAD and index (staged changes)
             let head = repo.head()?.peel_to_tree()?;
             repo.diff_tree_to_index(Some(&head), None, Some(&mut diff_opts))?
         } else {
-            // Diff between index and working directory (unstaged changes)
             repo.diff_index_to_workdir(None, Some(&mut diff_opts))?
         };
 
-        let stats = diff.stats()?;
+        // Build structured diff files using the Patch API (no RefCell needed)
+        let num_deltas = diff.deltas().count();
+        let mut values: Vec<Value> = Vec::new();
 
-        let mut files: Vec<Value> = Vec::new();
+        for idx in 0..num_deltas {
+            let patch = git2::Patch::from_diff(&diff, idx)?;
+            let Some(patch) = patch else { continue };
 
-        diff.foreach(
-            &mut |delta, _| {
-                let old_path = delta.old_file().path().map(|p| p.to_string_lossy().to_string());
-                let new_path = delta.new_file().path().map(|p| p.to_string_lossy().to_string());
-                let path = new_path.or(old_path).unwrap_or_default();
+            let delta = patch.delta();
+            let old_path = delta.old_file().path().map(|p| p.to_string_lossy().to_string());
+            let new_path = delta.new_file().path().map(|p| p.to_string_lossy().to_string());
+            let file_path = new_path.clone().or_else(|| old_path.clone()).unwrap_or_default();
 
-                let status = match delta.status() {
-                    git2::Delta::Added => "added",
-                    git2::Delta::Deleted => "deleted",
-                    git2::Delta::Modified => "modified",
-                    git2::Delta::Renamed => "renamed",
-                    git2::Delta::Copied => "copied",
-                    _ => "unknown",
-                };
+            let change_type = match delta.status() {
+                git2::Delta::Added => GitChangeType::Added,
+                git2::Delta::Deleted => GitChangeType::Deleted,
+                git2::Delta::Modified => GitChangeType::Modified,
+                git2::Delta::Renamed => GitChangeType::Renamed,
+                git2::Delta::Copied => GitChangeType::Copied,
+                _ => GitChangeType::Modified,
+            };
 
-                files.push(Value::Record(vec![
-                    ("path".to_string(), Value::String(path)),
-                    ("status".to_string(), Value::String(status.to_string())),
-                ]));
+            let old_path_opt = if delta.status() == git2::Delta::Renamed {
+                old_path
+            } else {
+                None
+            };
 
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
+            let mut hunks = Vec::new();
+            let mut additions = 0usize;
+            let mut deletions = 0usize;
 
-        // Capture the full diff text
-        let mut diff_text = String::new();
-        diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-            let origin = line.origin();
-            if origin == '+' || origin == '-' || origin == ' ' {
-                diff_text.push(origin);
+            for hunk_idx in 0..patch.num_hunks() {
+                let (hunk, _) = patch.hunk(hunk_idx)?;
+                let header = std::str::from_utf8(hunk.header())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+
+                let mut lines = Vec::new();
+                let num_lines = patch.num_lines_in_hunk(hunk_idx)?;
+                for line_idx in 0..num_lines {
+                    let line = patch.line_in_hunk(hunk_idx, line_idx)?;
+                    let kind = match line.origin() {
+                        '+' => { additions += 1; DiffLineKind::Addition }
+                        '-' => { deletions += 1; DiffLineKind::Deletion }
+                        _ => DiffLineKind::Context,
+                    };
+                    let content = std::str::from_utf8(line.content())
+                        .unwrap_or("")
+                        .trim_end_matches('\n')
+                        .to_string();
+                    lines.push(DiffLine {
+                        kind,
+                        content,
+                        old_lineno: line.old_lineno().map(|n| n as usize),
+                        new_lineno: line.new_lineno().map(|n| n as usize),
+                    });
+                }
+
+                hunks.push(DiffHunk {
+                    header,
+                    old_start: hunk.old_start() as usize,
+                    old_count: hunk.old_lines() as usize,
+                    new_start: hunk.new_start() as usize,
+                    new_count: hunk.new_lines() as usize,
+                    lines,
+                });
             }
-            if let Ok(content) = std::str::from_utf8(line.content()) {
-                diff_text.push_str(content);
-            }
-            true
-        })?;
 
-        Ok(Value::Record(vec![
-            ("files_changed".to_string(), Value::Int(stats.files_changed() as i64)),
-            ("insertions".to_string(), Value::Int(stats.insertions() as i64)),
-            ("deletions".to_string(), Value::Int(stats.deletions() as i64)),
-            ("files".to_string(), Value::List(files)),
-            ("patch".to_string(), Value::String(diff_text)),
-        ]))
+            values.push(Value::DiffFile(Box::new(DiffFileInfo {
+                file_path,
+                old_path: old_path_opt,
+                change_type,
+                hunks,
+                additions,
+                deletions,
+            })));
+        }
+
+        Ok(Value::List(values))
     }
 }
 
@@ -765,16 +799,85 @@ mod tests {
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
 
         match result {
-            Value::Record(fields) => {
-                let files_changed = fields.iter()
-                    .find(|(k, _)| k == "files_changed")
-                    .map(|(_, v)| v);
+            Value::List(files) => {
+                // Clean repo should have no diff files
+                assert!(files.is_empty(), "Expected empty diff list for clean repo");
+            }
+            _ => panic!("Expected List of DiffFile"),
+        }
+    }
 
-                if let Some(Value::Int(n)) = files_changed {
-                    assert_eq!(*n, 0);
+    #[test]
+    fn test_git_diff_with_changes() {
+        let (dir, repo) = setup_test_repo();
+
+        // Create a tracked file, commit it, then modify it
+        fs::write(dir.path().join("tracked.txt"), "original content").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("tracked.txt")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "Add tracked file", &tree, &[&head]).unwrap();
+        }
+
+        // Modify the tracked file (unstaged change)
+        fs::write(dir.path().join("tracked.txt"), "modified content").unwrap();
+
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+        let cmd = GitDiffCommand;
+        let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
+
+        match result {
+            Value::List(files) => {
+                assert!(!files.is_empty(), "Expected at least one diff file");
+                match &files[0] {
+                    Value::DiffFile(diff) => {
+                        assert!(diff.file_path.contains("tracked.txt"));
+                        assert!(diff.additions > 0 || diff.deletions > 0);
+                        assert!(!diff.hunks.is_empty());
+                        // Check that hunks have lines
+                        assert!(!diff.hunks[0].lines.is_empty());
+                    }
+                    _ => panic!("Expected DiffFile in list"),
                 }
             }
-            _ => panic!("Expected Record"),
+            _ => panic!("Expected List of DiffFile"),
+        }
+    }
+
+    #[test]
+    fn test_git_diff_staged() {
+        let (dir, repo) = setup_test_repo();
+
+        // Create and stage a new file
+        fs::write(dir.path().join("staged.txt"), "staged content").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("staged.txt")).unwrap();
+            index.write().unwrap();
+        }
+
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+        let cmd = GitDiffCommand;
+        let result = cmd
+            .execute(&["--staged".to_string()], &mut test_ctx.ctx())
+            .unwrap();
+
+        match result {
+            Value::List(files) => {
+                assert!(!files.is_empty(), "Expected staged diff");
+                match &files[0] {
+                    Value::DiffFile(diff) => {
+                        assert!(diff.file_path.contains("staged.txt"));
+                    }
+                    _ => panic!("Expected DiffFile"),
+                }
+            }
+            _ => panic!("Expected List of DiffFile"),
         }
     }
 

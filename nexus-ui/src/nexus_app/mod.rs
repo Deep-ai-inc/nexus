@@ -7,7 +7,7 @@
 pub(crate) mod colors;
 pub(crate) mod source_ids;
 pub(crate) mod context_menu;
-mod message;
+pub(crate) mod message;
 pub(crate) mod completion;
 pub(crate) mod history_search;
 pub(crate) mod input;

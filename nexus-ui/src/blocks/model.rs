@@ -1,5 +1,7 @@
 //! Block and related types for representing command execution in the UI.
 
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use nexus_api::{BlockId, BlockState, OutputFormat, Value};
@@ -86,6 +88,14 @@ pub struct Block {
     pub has_permission_denied: bool,
     /// Whether output contained "command not found".
     pub has_command_not_found: bool,
+    /// Append-only event log (ping replies, etc.). Capped at 1000 entries.
+    pub stream_log: VecDeque<Value>,
+    /// Latest coalesced state (progress bar, live table, etc.).
+    pub stream_latest: Option<Value>,
+    /// Sequence counter for ordering streaming updates.
+    pub stream_seq: u64,
+    /// Interactive viewer state (pager, process monitor, tree browser).
+    pub view_state: Option<ViewState>,
 }
 
 impl Block {
@@ -104,6 +114,10 @@ impl Block {
             table_sort: TableSort::new(),
             has_permission_denied: false,
             has_command_not_found: false,
+            stream_log: VecDeque::new(),
+            stream_latest: None,
+            stream_seq: 0,
+            view_state: None,
         }
     }
 
@@ -195,4 +209,77 @@ impl VisualJob {
             VisualJobState::Stopped => "⏸",
         }
     }
+}
+
+/// Interactive viewer state attached to a block.
+#[derive(Debug)]
+pub enum ViewState {
+    Pager {
+        scroll_line: usize,
+        search: Option<String>,
+        current_match: usize,
+    },
+    ProcessMonitor {
+        sort_by: ProcSort,
+        sort_desc: bool,
+        interval_ms: u64,
+    },
+    TreeBrowser {
+        collapsed: HashSet<usize>,
+        selected: Option<usize>,
+    },
+}
+
+impl ViewState {
+    /// Map a key press to a viewer message. Returns None if the key is not handled.
+    pub fn handle_key(
+        &self,
+        id: BlockId,
+        key: &strata::event_context::Key,
+    ) -> Option<crate::nexus_app::message::ViewerMsg> {
+        use strata::event_context::{Key, NamedKey};
+        use crate::nexus_app::message::ViewerMsg;
+
+        match self {
+            ViewState::Pager { .. } => match key {
+                Key::Character(c) if c == "j" => Some(ViewerMsg::ScrollDown(id)),
+                Key::Character(c) if c == "k" => Some(ViewerMsg::ScrollUp(id)),
+                Key::Named(NamedKey::Space) => Some(ViewerMsg::PageDown(id)),
+                Key::Character(c) if c == "b" => Some(ViewerMsg::PageUp(id)),
+                Key::Character(c) if c == "g" => Some(ViewerMsg::GoToTop(id)),
+                Key::Character(c) if c == "G" => Some(ViewerMsg::GoToBottom(id)),
+                Key::Character(c) if c == "/" => Some(ViewerMsg::SearchStart(id)),
+                Key::Character(c) if c == "n" => Some(ViewerMsg::SearchNext(id)),
+                Key::Character(c) if c == "q" => Some(ViewerMsg::Exit(id)),
+                _ => None,
+            },
+            ViewState::ProcessMonitor { .. } => match key {
+                Key::Character(c) if c == "c" => Some(ViewerMsg::SortBy(id, ProcSort::Cpu)),
+                Key::Character(c) if c == "m" => Some(ViewerMsg::SortBy(id, ProcSort::Mem)),
+                Key::Character(c) if c == "p" => Some(ViewerMsg::SortBy(id, ProcSort::Pid)),
+                Key::Character(c) if c == "q" => Some(ViewerMsg::Exit(id)),
+                _ => None,
+            },
+            ViewState::TreeBrowser { .. } => match key {
+                Key::Named(NamedKey::ArrowUp) => Some(ViewerMsg::TreeUp(id)),
+                Key::Character(c) if c == "k" => Some(ViewerMsg::TreeUp(id)),
+                Key::Named(NamedKey::ArrowDown) => Some(ViewerMsg::TreeDown(id)),
+                Key::Character(c) if c == "j" => Some(ViewerMsg::TreeDown(id)),
+                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
+                    Some(ViewerMsg::TreeToggle(id))
+                }
+                Key::Character(c) if c == "q" => Some(ViewerMsg::Exit(id)),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// Sort criteria for process monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcSort {
+    Cpu,
+    Mem,
+    Pid,
+    Command,
 }

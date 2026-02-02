@@ -60,6 +60,18 @@ pub enum ShellEvent {
         job_id: u32,
         state: JobState,
     },
+
+    /// Incremental streaming update from a long-running command.
+    StreamingUpdate {
+        block_id: BlockId,
+        /// Monotonic sequence number for ordering.
+        seq: u64,
+        /// The update payload.
+        update: Value,
+        /// If true, replaces previous coalesced state (e.g., progress bar).
+        /// If false, appends to the stream log (e.g., ping replies).
+        coalesce: bool,
+    },
 }
 
 /// State of a background job.

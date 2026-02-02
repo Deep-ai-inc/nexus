@@ -75,6 +75,14 @@ impl Widget for ShellBlockWidget<'_> {
                     .background(colors::BTN_KILL)
                     .corner_radius(4.0),
             );
+        } else if block.view_state.is_some() {
+            // Exit button for active viewers (top, less, man, tree)
+            let exit_id = source_ids::viewer_exit(block.id);
+            header = header.push(
+                ButtonElement::new(exit_id, "Exit")
+                    .background(colors::BTN_KILL)
+                    .corner_radius(4.0),
+            );
         } else if let Some(ms) = block.duration_ms {
             let duration = if ms < 1000 {
                 format!("{}ms", ms)
@@ -106,10 +114,44 @@ impl Widget for ShellBlockWidget<'_> {
 
         content = content.push(header);
 
-        // Render output: native structured data takes priority over terminal
-        if let Some(value) = &block.native_output {
+        // Render output: stream_latest replaces native_output when present (e.g. top),
+        // otherwise show native_output (e.g. ls, git status).
+        if let Some(ref latest) = block.stream_latest {
+            content = render_native_value(content, latest, block, self.image_info, self.anchor_registry);
+        } else if let Some(value) = &block.native_output {
             content = render_native_value(content, value, block, self.image_info, self.anchor_registry);
-        } else if content_rows > 0 {
+        }
+
+        // Render stream log: collapse history into a single text block for performance,
+        // only render the latest entry as a full widget.
+        if !block.stream_log.is_empty() {
+            let source_id = source_ids::native(block.id);
+            let visible_count = 50.min(block.stream_log.len());
+            let start = block.stream_log.len() - visible_count;
+
+            // History entries → single pre-rendered text element (cheap to layout)
+            if visible_count > 1 {
+                let mut history_text = String::new();
+                for entry in block.stream_log.iter().skip(start).take(visible_count - 1) {
+                    if !history_text.is_empty() {
+                        history_text.push('\n');
+                    }
+                    history_text.push_str(&entry.to_text());
+                }
+                content = content.push(
+                    TextElement::new(history_text)
+                        .color(colors::TEXT_MUTED)
+                        .source(source_id),
+                );
+            }
+
+            // Latest entry → full widget rendering (may have colors, structure)
+            if let Some(latest) = block.stream_log.back() {
+                content = render_native_value(content, latest, block, self.image_info, self.anchor_registry);
+            }
+        }
+
+        if block.native_output.is_none() && block.stream_latest.is_none() && block.stream_log.is_empty() && content_rows > 0 {
             let source_id = source_ids::shell_term(block.id);
             let mut term = TerminalElement::new(source_id, cols, content_rows)
                 .cell_size(8.4, 18.0);
@@ -1525,13 +1567,26 @@ fn render_native_value(
                 }
                 parent
             } else {
-                // Generic list
-                for item in items {
-                    parent = parent.push(
-                        TextElement::new(item.to_text()).color(colors::TEXT_PRIMARY).source(source_id),
-                    );
+                // Generic list — recurse for structured types, inline for simple ones
+                let has_structured = items.iter().any(|v| matches!(v,
+                    Value::DiffFile(_) | Value::FileOp(_) | Value::Tree(_) |
+                    Value::NetEvent(_) | Value::DnsAnswer(_) | Value::HttpResponse(_) |
+                    Value::GitStatus(_) | Value::GitCommit(_) | Value::Record(_) |
+                    Value::Table { .. }
+                ));
+                if has_structured {
+                    for item in items {
+                        parent = render_native_value(parent, item, block, None, anchor_registry);
+                    }
+                    parent
+                } else {
+                    for item in items {
+                        parent = parent.push(
+                            TextElement::new(item.to_text()).color(colors::TEXT_PRIMARY).source(source_id),
+                        );
+                    }
+                    parent
                 }
-                parent
             }
         }
 
@@ -1568,6 +1623,257 @@ fn render_native_value(
                 );
             }
             parent
+        }
+
+        Value::FileOp(info) => {
+            let source_id = source_ids::native(block_id);
+            // Phase indicator with icon and color
+            let (icon, phase_color) = match info.phase {
+                nexus_api::FileOpPhase::Planning => ("\u{1F50D}", colors::WARNING),  // 🔍
+                nexus_api::FileOpPhase::Executing => ("\u{25B6}", colors::RUNNING),  // ▶
+                nexus_api::FileOpPhase::Completed => ("\u{2714}", colors::SUCCESS),  // ✔
+                nexus_api::FileOpPhase::Failed => ("\u{2718}", colors::ERROR),       // ✘
+            };
+            let op_label = match info.op_type {
+                nexus_api::FileOpKind::Copy => "Copy",
+                nexus_api::FileOpKind::Move => "Move",
+                nexus_api::FileOpKind::Remove => "Remove",
+            };
+            parent = parent.push(
+                TextElement::new(format!("{} {} {:?}", icon, op_label, info.phase))
+                    .color(phase_color)
+                    .source(source_id),
+            );
+
+            // Progress bar
+            if let Some(total) = info.total_bytes {
+                if total > 0 {
+                    let pct = (info.bytes_processed as f64 / total as f64 * 100.0).min(100.0);
+                    let bar_len = 40;
+                    let filled = (pct / 100.0 * bar_len as f64) as usize;
+                    let bar: String = "\u{2588}".repeat(filled)
+                        + &"\u{2591}".repeat(bar_len - filled);
+                    parent = parent.push(
+                        TextElement::new(format!("[{}] {:.1}%", bar, pct))
+                            .color(colors::TEXT_PRIMARY)
+                            .source(source_id),
+                    );
+                }
+            } else if info.phase == nexus_api::FileOpPhase::Planning {
+                parent = parent.push(
+                    TextElement::new("[estimating...]".to_string())
+                        .color(colors::TEXT_MUTED)
+                        .source(source_id),
+                );
+            }
+
+            // Stats
+            let files_str = if let Some(total) = info.files_total {
+                format!("{}/{} files", info.files_processed, total)
+            } else {
+                format!("{} files processed", info.files_processed)
+            };
+            let bytes_str = if let Some(total) = info.total_bytes {
+                format!(", {}/{} bytes", info.bytes_processed, total)
+            } else {
+                String::new()
+            };
+            parent = parent.push(
+                TextElement::new(format!("{}{}", files_str, bytes_str))
+                    .color(colors::TEXT_SECONDARY)
+                    .source(source_id),
+            );
+
+            // Current file
+            if let Some(ref current) = info.current_file {
+                parent = parent.push(
+                    TextElement::new(format!("  {}", current.display()))
+                        .color(colors::TEXT_PATH)
+                        .source(source_id),
+                );
+            }
+
+            // Errors
+            for err in &info.errors {
+                parent = parent.push(
+                    TextElement::new(format!("  error: {}: {}", err.path.display(), err.message))
+                        .color(colors::ERROR)
+                        .source(source_id),
+                );
+            }
+            parent
+        }
+
+        Value::Tree(tree) => {
+            let source_id = source_ids::native(block_id);
+            for node in &tree.nodes {
+                let indent = if node.depth == 0 {
+                    String::new()
+                } else {
+                    let prefix = "    ".repeat(node.depth.saturating_sub(1));
+                    let is_last = tree.nodes.iter()
+                        .filter(|n| n.parent == node.parent && n.depth == node.depth)
+                        .last()
+                        .map(|n| n.id == node.id)
+                        .unwrap_or(true);
+                    if is_last {
+                        format!("{}\u{2514}\u{2500}\u{2500} ", prefix)
+                    } else {
+                        format!("{}\u{251C}\u{2500}\u{2500} ", prefix)
+                    }
+                };
+                let color = match node.node_type {
+                    nexus_api::FileType::Directory => colors::TEXT_PATH,
+                    _ => colors::TEXT_PRIMARY,
+                };
+                parent = parent.push(
+                    TextElement::new(format!("{}{}", indent, node.name))
+                        .color(color)
+                        .source(source_id),
+                );
+            }
+            parent
+        }
+
+        Value::DiffFile(diff) => {
+            let source_id = source_ids::native(block_id);
+            // File header
+            let stats_str = format!("+{} -{}", diff.additions, diff.deletions);
+            parent = parent.push(
+                Row::new()
+                    .spacing(8.0)
+                    .push(TextElement::new(&diff.file_path).color(colors::TEXT_PRIMARY).source(source_id))
+                    .push(TextElement::new(format!("  +{}", diff.additions)).color(colors::DIFF_ADD).source(source_id))
+                    .push(TextElement::new(format!("-{}", diff.deletions)).color(colors::DIFF_REMOVE).source(source_id)),
+            );
+            // Hunks
+            for hunk in &diff.hunks {
+                parent = parent.push(
+                    TextElement::new(format!("@@ -{},{} +{},{} @@ {}",
+                        hunk.old_start, hunk.old_count,
+                        hunk.new_start, hunk.new_count,
+                        hunk.header))
+                        .color(colors::TEXT_PATH)
+                        .source(source_id),
+                );
+                for line in &hunk.lines {
+                    let (prefix, color) = match line.kind {
+                        nexus_api::DiffLineKind::Context => (" ", colors::TEXT_MUTED),
+                        nexus_api::DiffLineKind::Addition => ("+", colors::DIFF_ADD),
+                        nexus_api::DiffLineKind::Deletion => ("-", colors::DIFF_REMOVE),
+                    };
+                    parent = parent.push(
+                        TextElement::new(format!("{}{}", prefix, line.content))
+                            .color(color)
+                            .source(source_id),
+                    );
+                }
+            }
+            let _ = stats_str;
+            parent
+        }
+
+        Value::NetEvent(evt) => {
+            let source_id = source_ids::native(block_id);
+            let (icon, color) = if evt.success {
+                ("\u{2714}", colors::SUCCESS)
+            } else {
+                ("\u{2718}", colors::ERROR)
+            };
+            let ip_str = evt.ip.as_ref().map(|ip| format!(" ({})", ip)).unwrap_or_default();
+            let rtt_str = evt.rtt_ms.map(|r| format!(" {:.1}ms", r)).unwrap_or_default();
+            parent.push(
+                TextElement::new(format!("{} {}{}{}", icon, evt.host, ip_str, rtt_str))
+                    .color(color)
+                    .source(source_id),
+            )
+        }
+
+        Value::DnsAnswer(dns) => {
+            let source_id = source_ids::native(block_id);
+            parent = parent.push(
+                TextElement::new(format!(";; {} {} query", dns.query, dns.record_type))
+                    .color(colors::TEXT_SECONDARY)
+                    .source(source_id),
+            );
+            for record in &dns.answers {
+                parent = parent.push(
+                    TextElement::new(format!("  {} {} IN {} {}",
+                        record.name, record.ttl, record.record_type, record.data))
+                        .color(colors::TEXT_PRIMARY)
+                        .source(source_id),
+                );
+            }
+            parent = parent.push(
+                TextElement::new(format!(";; Query time: {:.0} msec, Server: {}",
+                    dns.query_time_ms, dns.server))
+                    .color(colors::TEXT_MUTED)
+                    .source(source_id),
+            );
+            parent
+        }
+
+        Value::HttpResponse(resp) => {
+            let source_id = source_ids::native(block_id);
+            // Status line
+            let status_color = if resp.status_code < 300 {
+                colors::SUCCESS
+            } else if resp.status_code < 400 {
+                colors::WARNING
+            } else {
+                colors::ERROR
+            };
+            parent = parent.push(
+                TextElement::new(format!("{} {} {} ({:.0}ms)",
+                    resp.method, resp.status_code, resp.status_text, resp.timing.total_ms))
+                    .color(status_color)
+                    .source(source_id),
+            );
+            if let Some(ttfb) = resp.timing.ttfb_ms {
+                parent = parent.push(
+                    TextElement::new(format!("  TTFB: {:.0}ms", ttfb))
+                        .color(colors::TEXT_MUTED)
+                        .source(source_id),
+                );
+            }
+            // Headers (first 10)
+            for (name, value) in resp.headers.iter().take(10) {
+                parent = parent.push(
+                    TextElement::new(format!("  {}: {}", name, value))
+                        .color(colors::TEXT_SECONDARY)
+                        .source(source_id),
+                );
+            }
+            // Body preview
+            if let Some(ref preview) = resp.body_preview {
+                parent = parent.push(
+                    TextElement::new("").source(source_id),
+                );
+                for line in preview.lines().take(20) {
+                    parent = parent.push(
+                        TextElement::new(line).color(colors::TEXT_PRIMARY).source(source_id),
+                    );
+                }
+                if resp.body_truncated {
+                    parent = parent.push(
+                        TextElement::new(format!("[truncated, {} bytes total]", resp.body_len))
+                            .color(colors::TEXT_MUTED)
+                            .source(source_id),
+                    );
+                }
+            } else if resp.body_len > 0 {
+                parent = parent.push(
+                    TextElement::new(format!("[binary, {} bytes]", resp.body_len))
+                        .color(colors::TEXT_MUTED)
+                        .source(source_id),
+                );
+            }
+            parent
+        }
+
+        Value::Interactive(req) => {
+            // Render the content (viewer state is handled separately)
+            render_native_value(parent, &req.content, block, image_info, anchor_registry)
         }
 
         Value::Error { message, .. } => {

@@ -6,9 +6,11 @@
 mod basic;
 mod cat;
 mod cmp;
+mod curl;
 mod cut;
 mod date;
 mod df;
+pub(crate) mod dig;
 mod du;
 mod env;
 mod find;
@@ -21,15 +23,18 @@ mod history;
 mod iterators;
 mod jobs;
 mod json;
+mod less;
 mod links;
 mod ls;
+mod man;
 mod math;
 mod nl;
 mod path;
 mod perms;
+mod ping;
 mod prev;
 mod printf;
-mod ps;
+pub(crate) mod ps;
 mod registry;
 mod rev;
 mod select;
@@ -41,6 +46,8 @@ mod split;
 mod system;
 mod tail;
 mod times;
+mod top;
+mod tree;
 mod ulimit;
 mod tee;
 mod tr;
@@ -67,6 +74,37 @@ pub struct CommandContext<'a> {
     pub block_id: BlockId,
     /// Piped input from previous command (if any)
     pub stdin: Option<Value>,
+}
+
+// ---- Cancellation registry for long-running commands ----
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static CANCEL_REGISTRY: std::sync::LazyLock<Mutex<HashMap<BlockId, Arc<AtomicBool>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register a cancellation flag for a block. Returns the flag for the command to poll.
+pub fn register_cancel(block_id: BlockId) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    CANCEL_REGISTRY.lock().unwrap().insert(block_id, flag.clone());
+    flag
+}
+
+/// Signal a block to cancel. Returns true if the block was found.
+pub fn cancel_block(block_id: BlockId) -> bool {
+    if let Some(flag) = CANCEL_REGISTRY.lock().unwrap().get(&block_id) {
+        flag.store(true, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// Remove a block from the cancel registry (called when command exits).
+pub fn unregister_cancel(block_id: BlockId) {
+    CANCEL_REGISTRY.lock().unwrap().remove(&block_id);
 }
 
 /// Trait for commands that run in-process and return structured data.

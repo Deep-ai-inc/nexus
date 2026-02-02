@@ -260,6 +260,9 @@ pub fn serialize_value_for_llm(value: &nexus_api::Value) -> String {
                 .join("\n");
             format!("{}{}", prefix, fields)
         }
+
+        // New domain types: use their to_text() output for LLM serialization
+        _ => value.to_text(),
     }
 }
 

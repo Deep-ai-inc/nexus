@@ -1295,3 +1295,16 @@ mod tests {
         assert_eq!(opts.sort_keys, vec![("cpu".to_string(), true), ("pid".to_string(), false)]);
     }
 }
+
+/// Public helper: get all processes as a table Value (for top command).
+pub fn get_process_table() -> anyhow::Result<Value> {
+    let processes = list_processes()?;
+    let opts = PsOptions {
+        all_processes: true,
+        user_format: true,
+        no_tty_required: true,
+        ..PsOptions::default()
+    };
+    let (columns, rows) = build_table(&processes, &opts);
+    Ok(Value::Table { columns, rows })
+}

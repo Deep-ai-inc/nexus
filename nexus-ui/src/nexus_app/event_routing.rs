@@ -11,7 +11,7 @@ use crate::nexus_widgets::JobBar;
 
 use super::drag_state::PendingIntent;
 use super::message::{
-    AgentMsg, ContextMenuMsg, DragMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg,
+    AgentMsg, ContextMenuMsg, DragMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg, ViewerMsg,
 };
 use super::source_ids;
 use super::NexusState;
@@ -58,6 +58,16 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
     // Phase 4: Focus-based routing
     match state.focus {
         Focus::Block(id) => {
+            // If a viewer is active on this block, dispatch to viewer keybindings
+            if let Some(block) = state.shell.block_by_id(id) {
+                if let Some(ref view_state) = block.view_state {
+                    if let Some(viewer_msg) = view_state.handle_key(id, key) {
+                        return Some(NexusMessage::Viewer(viewer_msg));
+                    }
+                    // Viewer consumed the focus; don't pass to PTY
+                    return None;
+                }
+            }
             return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
         }
         Focus::AgentInput => {
@@ -101,6 +111,18 @@ fn route_global_shortcut(
                     if state.agent.is_active() {
                         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
                     }
+                    // Ctrl+C exits active viewers (top, less, man, tree)
+                    if let Focus::Block(id) = state.focus {
+                        if let Some(block) = state.shell.block_by_id(id) {
+                            if block.view_state.is_some() {
+                                return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
+                            }
+                        }
+                    }
+                    // Fallback: exit any active viewer even when focus is Input
+                    if let Some(id) = state.shell.active_viewer_block() {
+                        return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
+                    }
                     let focused = match state.focus {
                         Focus::Block(id) => Some(id),
                         _ => None,
@@ -125,8 +147,18 @@ fn route_escape(state: &NexusState) -> Option<NexusMessage> {
     if state.agent.is_active() {
         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
     }
-    if matches!(state.focus, Focus::Block(_)) {
+    // Escape exits active viewers (top, less, man, tree)
+    if let Focus::Block(id) = state.focus {
+        if let Some(block) = state.shell.block_by_id(id) {
+            if block.view_state.is_some() {
+                return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
+            }
+        }
         return Some(NexusMessage::BlurAll);
+    }
+    // Fallback: exit any active viewer even when focus is Input
+    if let Some(id) = state.shell.active_viewer_block() {
+        return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
     }
     if state.selection.selection.is_some() {
         return Some(NexusMessage::Selection(SelectionMsg::Clear));
@@ -233,6 +265,13 @@ pub(super) fn on_mouse(
         }
 
         if let Some(HitResult::Widget(id)) = &hit {
+            // Viewer exit buttons (cross-cutting: shell block → ViewerMsg)
+            for block in &state.shell.blocks {
+                if block.view_state.is_some() && *id == source_ids::viewer_exit(block.id) {
+                    return MouseResponse::message(NexusMessage::Viewer(ViewerMsg::Exit(block.id)));
+                }
+            }
+
             // Try each child in order
             if let Some(msg) = state.input.on_click(*id) {
                 return MouseResponse::message(NexusMessage::Input(msg));

@@ -100,6 +100,24 @@ pub enum Value {
     },
 
     // =========================================================================
+    // Extended Domain Types
+    // =========================================================================
+    /// File operation with progress tracking (cp, mv, rm).
+    FileOp(Box<FileOpInfo>),
+    /// Directory tree (flat arena representation).
+    Tree(Box<TreeInfo>),
+    /// Structured diff for a single file.
+    DiffFile(Box<DiffFileInfo>),
+    /// Network event (ping reply, timeout, error).
+    NetEvent(Box<NetEventInfo>),
+    /// DNS lookup answer.
+    DnsAnswer(Box<DnsAnswerInfo>),
+    /// HTTP response metadata + body preview.
+    HttpResponse(Box<HttpResponseInfo>),
+    /// Request to open an interactive viewer in the UI.
+    Interactive(Box<InteractiveRequest>),
+
+    // =========================================================================
     // Control Flow & Errors
     // =========================================================================
     /// An error value
@@ -478,6 +496,276 @@ impl MediaMetadata {
         self.size = Some(size);
         self
     }
+}
+
+// =============================================================================
+// File Operation (cp, mv, rm with progress)
+// =============================================================================
+
+/// Progress information for a file operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileOpInfo {
+    pub op_type: FileOpKind,
+    pub phase: FileOpPhase,
+    pub sources: Vec<PathBuf>,
+    pub dest: Option<PathBuf>,
+    /// Total bytes to process. `None` = still scanning.
+    pub total_bytes: Option<u64>,
+    pub bytes_processed: u64,
+    /// Total files to process. `None` = still scanning.
+    pub files_total: Option<usize>,
+    pub files_processed: usize,
+    pub current_file: Option<PathBuf>,
+    /// Milliseconds since Unix epoch when the operation started.
+    pub start_time_ms: u64,
+    pub errors: Vec<FileOpError>,
+}
+
+/// An error encountered during a file operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileOpError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// Kind of file operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileOpKind {
+    Copy,
+    Move,
+    Remove,
+}
+
+/// Phase of a file operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileOpPhase {
+    Planning,
+    Executing,
+    Completed,
+    Failed,
+}
+
+impl FileOpInfo {
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "op_type" => Some(Value::String(format!("{:?}", self.op_type))),
+            "phase" => Some(Value::String(format!("{:?}", self.phase))),
+            "total_bytes" => self.total_bytes.map(|b| Value::Int(b as i64)),
+            "bytes_processed" => Some(Value::Int(self.bytes_processed as i64)),
+            "files_total" => self.files_total.map(|n| Value::Int(n as i64)),
+            "files_processed" => Some(Value::Int(self.files_processed as i64)),
+            "errors" => Some(Value::Int(self.errors.len() as i64)),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// Directory Tree (flat arena)
+// =============================================================================
+
+/// Flat arena tree representation. Scales to large directories.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TreeInfo {
+    /// Index of the root node in `nodes`.
+    pub root: usize,
+    pub nodes: Vec<TreeNodeFlat>,
+}
+
+/// A single node in the flat tree arena.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TreeNodeFlat {
+    pub id: usize,
+    pub parent: Option<usize>,
+    pub name: String,
+    pub path: PathBuf,
+    pub node_type: FileType,
+    pub size: u64,
+    pub depth: usize,
+    pub child_count: usize,
+}
+
+// =============================================================================
+// Diff (structured)
+// =============================================================================
+
+/// Structured diff information for a single file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffFileInfo {
+    pub file_path: String,
+    pub old_path: Option<String>,
+    pub change_type: GitChangeType,
+    pub hunks: Vec<DiffHunk>,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// A single hunk in a diff.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub header: String,
+    pub old_start: usize,
+    pub old_count: usize,
+    pub new_start: usize,
+    pub new_count: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+/// A single line in a diff hunk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffLine {
+    pub kind: DiffLineKind,
+    pub content: String,
+    pub old_lineno: Option<usize>,
+    pub new_lineno: Option<usize>,
+}
+
+/// Kind of diff line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffLineKind {
+    Context,
+    Addition,
+    Deletion,
+}
+
+// =============================================================================
+// Network Event (ping)
+// =============================================================================
+
+/// A network event from ping or similar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetEventInfo {
+    pub event_type: NetEventType,
+    pub host: String,
+    pub ip: Option<String>,
+    pub rtt_ms: Option<f64>,
+    pub ttl: Option<u32>,
+    pub seq: Option<u32>,
+    pub success: bool,
+    pub message: Option<String>,
+}
+
+/// Type of network event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetEventType {
+    PingResponse,
+    Timeout,
+    Error,
+}
+
+impl NetEventInfo {
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "host" => Some(Value::String(self.host.clone())),
+            "ip" => self.ip.as_ref().map(|s| Value::String(s.clone())),
+            "rtt_ms" | "rtt" => self.rtt_ms.map(Value::Float),
+            "ttl" => self.ttl.map(|t| Value::Int(t as i64)),
+            "seq" => self.seq.map(|s| Value::Int(s as i64)),
+            "success" => Some(Value::Bool(self.success)),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// DNS Answer (dig)
+// =============================================================================
+
+/// DNS lookup result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DnsAnswerInfo {
+    pub query: String,
+    pub record_type: String,
+    pub answers: Vec<DnsRecord>,
+    pub query_time_ms: f64,
+    pub server: String,
+    pub from_cache: bool,
+}
+
+/// A single DNS record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DnsRecord {
+    pub name: String,
+    pub record_type: String,
+    pub ttl: u32,
+    pub data: String,
+}
+
+impl DnsAnswerInfo {
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "query" => Some(Value::String(self.query.clone())),
+            "record_type" => Some(Value::String(self.record_type.clone())),
+            "query_time_ms" => Some(Value::Float(self.query_time_ms)),
+            "server" => Some(Value::String(self.server.clone())),
+            "from_cache" => Some(Value::Bool(self.from_cache)),
+            "answer_count" => Some(Value::Int(self.answers.len() as i64)),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// HTTP Response (curl)
+// =============================================================================
+
+/// HTTP response metadata with optional body preview.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HttpResponseInfo {
+    pub url: String,
+    pub method: String,
+    pub status_code: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+    /// First 4KB of text bodies.
+    pub body_preview: Option<String>,
+    pub body_len: u64,
+    pub body_truncated: bool,
+    pub content_type: Option<String>,
+    pub timing: HttpTiming,
+}
+
+/// HTTP timing information.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HttpTiming {
+    pub total_ms: f64,
+    pub ttfb_ms: Option<f64>,
+}
+
+impl HttpResponseInfo {
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match name {
+            "url" => Some(Value::String(self.url.clone())),
+            "method" => Some(Value::String(self.method.clone())),
+            "status_code" | "status" => Some(Value::Int(self.status_code as i64)),
+            "status_text" => Some(Value::String(self.status_text.clone())),
+            "body_len" | "content_length" => Some(Value::Int(self.body_len as i64)),
+            "content_type" => self.content_type.as_ref().map(|s| Value::String(s.clone())),
+            "total_ms" => Some(Value::Float(self.timing.total_ms)),
+            "ttfb_ms" => self.timing.ttfb_ms.map(Value::Float),
+            _ => None,
+        }
+    }
+}
+
+// =============================================================================
+// Interactive Request (less, top, man, tree viewer)
+// =============================================================================
+
+/// A request to open an interactive viewer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InteractiveRequest {
+    pub viewer: ViewerKind,
+    pub content: Value,
+}
+
+/// The kind of interactive viewer to open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ViewerKind {
+    Pager,
+    ProcessMonitor { interval_ms: u64 },
+    TreeBrowser,
+    ManPage,
 }
 
 /// Detect MIME type from magic bytes.
@@ -1029,6 +1317,107 @@ impl Value {
                     commit.short_hash, commit.author, commit.author_email, commit.message
                 ));
             }
+            Value::FileOp(info) => {
+                let phase = format!("{:?}", info.phase);
+                let op = format!("{:?}", info.op_type);
+                buf.push_str(&format!("{} {}: ", op, phase));
+                if let Some(total) = info.files_total {
+                    buf.push_str(&format!("{}/{} files", info.files_processed, total));
+                } else {
+                    buf.push_str(&format!("{} files", info.files_processed));
+                }
+                if let Some(total_bytes) = info.total_bytes {
+                    buf.push_str(&format!(", {}/{} bytes", info.bytes_processed, total_bytes));
+                }
+                if !info.errors.is_empty() {
+                    buf.push_str(&format!(", {} errors", info.errors.len()));
+                }
+            }
+            Value::Tree(tree) => {
+                // Classic tree output with branch characters
+                for node in &tree.nodes {
+                    let indent: String = if node.depth == 0 {
+                        String::new()
+                    } else {
+                        let prefix = "    ".repeat(node.depth.saturating_sub(1));
+                        // Check if this is the last child of its parent
+                        let is_last = tree.nodes.iter()
+                            .filter(|n| n.parent == node.parent && n.depth == node.depth)
+                            .last()
+                            .map(|n| n.id == node.id)
+                            .unwrap_or(true);
+                        if is_last {
+                            format!("{}\u{2514}\u{2500}\u{2500} ", prefix)
+                        } else {
+                            format!("{}\u{251C}\u{2500}\u{2500} ", prefix)
+                        }
+                    };
+                    buf.push_str(&format!("{}{}\n", indent, node.name));
+                }
+            }
+            Value::DiffFile(diff) => {
+                // Unified diff format
+                if let Some(ref old) = diff.old_path {
+                    buf.push_str(&format!("--- {}\n", old));
+                } else {
+                    buf.push_str(&format!("--- a/{}\n", diff.file_path));
+                }
+                buf.push_str(&format!("+++ b/{}\n", diff.file_path));
+                for hunk in &diff.hunks {
+                    buf.push_str(&format!("@@ -{},{} +{},{} @@ {}\n",
+                        hunk.old_start, hunk.old_count,
+                        hunk.new_start, hunk.new_count,
+                        hunk.header));
+                    for line in &hunk.lines {
+                        let prefix = match line.kind {
+                            DiffLineKind::Context => " ",
+                            DiffLineKind::Addition => "+",
+                            DiffLineKind::Deletion => "-",
+                        };
+                        buf.push_str(&format!("{}{}\n", prefix, line.content));
+                    }
+                }
+            }
+            Value::NetEvent(evt) => {
+                match evt.event_type {
+                    NetEventType::PingResponse => {
+                        let ip = evt.ip.as_deref().unwrap_or(&evt.host);
+                        let rtt = evt.rtt_ms.map(|r| format!(" time={:.1} ms", r)).unwrap_or_default();
+                        let ttl = evt.ttl.map(|t| format!(" ttl={}", t)).unwrap_or_default();
+                        let seq = evt.seq.map(|s| format!(" seq={}", s)).unwrap_or_default();
+                        buf.push_str(&format!("64 bytes from {}:{}{}{}", ip, seq, ttl, rtt));
+                    }
+                    NetEventType::Timeout => {
+                        let seq = evt.seq.map(|s| format!(" seq={}", s)).unwrap_or_default();
+                        buf.push_str(&format!("Request timeout for {}{}", evt.host, seq));
+                    }
+                    NetEventType::Error => {
+                        let msg = evt.message.as_deref().unwrap_or("unknown error");
+                        buf.push_str(&format!("ping: {}: {}", evt.host, msg));
+                    }
+                }
+            }
+            Value::DnsAnswer(dns) => {
+                // dig-style output
+                buf.push_str(&format!(";; QUESTION SECTION:\n;{}\t\tIN\t{}\n\n", dns.query, dns.record_type));
+                buf.push_str(";; ANSWER SECTION:\n");
+                for record in &dns.answers {
+                    buf.push_str(&format!("{}\t{}\tIN\t{}\t{}\n",
+                        record.name, record.ttl, record.record_type, record.data));
+                }
+                buf.push_str(&format!("\n;; Query time: {:.0} msec\n", dns.query_time_ms));
+                buf.push_str(&format!(";; SERVER: {}\n", dns.server));
+            }
+            Value::HttpResponse(resp) => {
+                // For pipe compatibility, to_text() returns the body
+                if let Some(ref preview) = resp.body_preview {
+                    buf.push_str(preview);
+                }
+            }
+            Value::Interactive(req) => {
+                // Delegate to content's text representation
+                req.content.write_text(buf);
+            }
             Value::Structured { kind, data } => {
                 // JSON-like output with optional kind prefix
                 if let Some(k) = kind {
@@ -1073,6 +1462,10 @@ impl Value {
                 "is_symlink" | "symlink" => Some(Value::Bool(f.is_symlink)),
                 _ => None,
             },
+            Value::FileOp(info) => info.get_field(name),
+            Value::NetEvent(evt) => evt.get_field(name),
+            Value::DnsAnswer(dns) => dns.get_field(name),
+            Value::HttpResponse(resp) => resp.get_field(name),
             Value::Structured { data, .. } => data.get(name).cloned(),
             _ => None,
         }
@@ -1086,6 +1479,10 @@ impl Value {
                 | Value::GitStatus(_)
                 | Value::GitCommit(_)
                 | Value::FileEntry(_)
+                | Value::FileOp(_)
+                | Value::NetEvent(_)
+                | Value::DnsAnswer(_)
+                | Value::HttpResponse(_)
                 | Value::Structured { .. }
         )
     }
@@ -1108,6 +1505,13 @@ impl Value {
             Value::GitStatus(_) => "git-status",
             Value::GitCommit(_) => "git-commit",
             Value::Media { .. } => "media",
+            Value::FileOp(_) => "file-op",
+            Value::Tree(_) => "tree",
+            Value::DiffFile(_) => "diff-file",
+            Value::NetEvent(_) => "net-event",
+            Value::DnsAnswer(_) => "dns-answer",
+            Value::HttpResponse(_) => "http-response",
+            Value::Interactive(_) => "interactive",
             Value::Structured { .. } => "structured",
             Value::Error { .. } => "error",
         }

@@ -39,6 +39,7 @@ pub(crate) enum ShellOutput {
     CwdChanged(PathBuf),
     /// A kernel command finished. Orchestrator should update context.
     CommandFinished {
+        block_id: BlockId,
         exit_code: i32,
         command: String,
         output: String,
@@ -160,17 +161,42 @@ impl ShellWidget {
                 return Some(ShellMsg::KillBlock(block.id));
             }
         }
-        // Table sort headers
+        // Table sort headers (check both native_output and stream_latest)
         for block in &self.blocks {
-            if let Some(Value::Table { columns, .. }) = &block.native_output {
-                for col_idx in 0..columns.len() {
-                    if id == source_ids::table_sort(block.id, col_idx) {
-                        return Some(ShellMsg::SortTable(block.id, col_idx));
+            let tables = [&block.native_output, &block.stream_latest];
+            for table in &tables {
+                if let Some(Value::Table { columns, .. }) = table {
+                    for col_idx in 0..columns.len() {
+                        if id == source_ids::table_sort(block.id, col_idx) {
+                            return Some(ShellMsg::SortTable(block.id, col_idx));
+                        }
                     }
                 }
             }
         }
         None
+    }
+
+    /// Look up a block by ID (immutable).
+    pub fn block_by_id(&self, id: BlockId) -> Option<&Block> {
+        self.block_index.get(&id).and_then(|&idx| self.blocks.get(idx))
+    }
+
+    /// Look up a block by ID (mutable).
+    pub fn block_by_id_mut(&mut self, id: BlockId) -> Option<&mut Block> {
+        if let Some(&idx) = self.block_index.get(&id) {
+            self.blocks.get_mut(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Find the most recent block with an active viewer (e.g. top, less, tree).
+    /// Used as a fallback when focus is Input but a viewer is still running.
+    pub fn active_viewer_block(&self) -> Option<BlockId> {
+        self.blocks.iter().rev()
+            .find(|b| b.view_state.is_some())
+            .map(|b| b.id)
     }
 
     /// The block that should receive an interrupt (Ctrl+C).
@@ -439,6 +465,52 @@ impl ShellWidget {
                 ShellOutput::None
             }
             ShellEvent::CommandOutput { block_id, value } => {
+                // Handle Interactive values: set up viewer state
+                if let Value::Interactive(ref req) = value {
+                    let content = req.content.clone();
+                    let is_monitor = matches!(req.viewer, nexus_api::ViewerKind::ProcessMonitor { .. });
+                    let view_state = match &req.viewer {
+                        nexus_api::ViewerKind::Pager | nexus_api::ViewerKind::ManPage => {
+                            Some(crate::blocks::ViewState::Pager {
+                                scroll_line: 0,
+                                search: None,
+                                current_match: 0,
+                            })
+                        }
+                        nexus_api::ViewerKind::ProcessMonitor { interval_ms } => {
+                            Some(crate::blocks::ViewState::ProcessMonitor {
+                                sort_by: crate::blocks::ProcSort::Cpu,
+                                sort_desc: true,
+                                interval_ms: *interval_ms,
+                            })
+                        }
+                        nexus_api::ViewerKind::TreeBrowser => {
+                            Some(crate::blocks::ViewState::TreeBrowser {
+                                collapsed: std::collections::HashSet::new(),
+                                selected: Some(0),
+                            })
+                        }
+                    };
+                    if let Some(&idx) = self.block_index.get(&block_id) {
+                        if let Some(block) = self.blocks.get_mut(idx) {
+                            block.native_output = Some(content);
+                            block.view_state = view_state;
+                            // Default sort for ProcessMonitor: %CPU (index 2) descending
+                            if is_monitor {
+                                block.table_sort = crate::blocks::TableSort {
+                                    column: Some(2),
+                                    ascending: false,
+                                };
+                                // Sort initial data
+                                if let Some(Value::Table { ref mut rows, .. }) = block.native_output {
+                                    Self::sort_rows(rows, 2, false);
+                                }
+                            }
+                        }
+                    }
+                    return ShellOutput::FocusBlock(block_id);
+                }
+
                 if let Value::Media {
                     ref data,
                     ref content_type,
@@ -488,6 +560,7 @@ impl ShellWidget {
                 }
                 self.last_exit_code = Some(exit_code);
                 ShellOutput::CommandFinished {
+                    block_id,
                     exit_code,
                     command: cmd,
                     output,
@@ -526,6 +599,37 @@ impl ShellWidget {
                 }
                 ShellOutput::None
             }
+            ShellEvent::StreamingUpdate {
+                block_id,
+                seq,
+                update,
+                coalesce,
+            } => {
+                if let Some(&idx) = self.block_index.get(&block_id) {
+                    if let Some(block) = self.blocks.get_mut(idx) {
+                        if seq > block.stream_seq {
+                            block.stream_seq = seq;
+                            if coalesce {
+                                block.stream_latest = Some(update);
+                                // Re-apply current table sort to new data
+                                if let Some(col_idx) = block.table_sort.column {
+                                    let ascending = block.table_sort.ascending;
+                                    if let Some(Value::Table { ref mut rows, .. }) = block.stream_latest {
+                                        Self::sort_rows(rows, col_idx, ascending);
+                                    }
+                                }
+                            } else {
+                                block.stream_log.push_back(update);
+                                while block.stream_log.len() > 1000 {
+                                    block.stream_log.pop_front();
+                                }
+                            }
+                            block.version += 1;
+                        }
+                    }
+                }
+                ShellOutput::None
+            }
             ShellEvent::CwdChanged { new, .. } => ShellOutput::CwdChanged(new),
             _ => ShellOutput::None,
         }
@@ -558,37 +662,36 @@ impl ShellWidget {
         }
     }
 
-    /// Sort a table by column.
+    /// Sort a table by column (works on both native_output and stream_latest).
     pub fn sort_table(&mut self, block_id: BlockId, col_idx: usize) {
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.table_sort.toggle(col_idx);
+                let ascending = block.table_sort.ascending;
+                // Sort whichever table is present (native_output or stream_latest)
                 if let Some(Value::Table { ref mut rows, .. }) = block.native_output {
-                    let ascending = block.table_sort.ascending;
-                    rows.sort_by(|a, b| {
-                        let va = a.get(col_idx).map(|v| v.to_text()).unwrap_or_default();
-                        let vb = b.get(col_idx).map(|v| v.to_text()).unwrap_or_default();
-                        if let (Ok(na), Ok(nb)) = (va.parse::<f64>(), vb.parse::<f64>()) {
-                            let cmp = na
-                                .partial_cmp(&nb)
-                                .unwrap_or(std::cmp::Ordering::Equal);
-                            if ascending {
-                                cmp
-                            } else {
-                                cmp.reverse()
-                            }
-                        } else {
-                            let cmp = va.cmp(&vb);
-                            if ascending {
-                                cmp
-                            } else {
-                                cmp.reverse()
-                            }
-                        }
-                    });
+                    Self::sort_rows(rows, col_idx, ascending);
+                }
+                if let Some(Value::Table { ref mut rows, .. }) = block.stream_latest {
+                    Self::sort_rows(rows, col_idx, ascending);
                 }
             }
         }
+    }
+
+    /// Sort table rows by a column index.
+    pub(super) fn sort_rows(rows: &mut [Vec<Value>], col_idx: usize, ascending: bool) {
+        rows.sort_by(|a, b| {
+            let va = a.get(col_idx).map(|v| v.to_text()).unwrap_or_default();
+            let vb = b.get(col_idx).map(|v| v.to_text()).unwrap_or_default();
+            if let (Ok(na), Ok(nb)) = (va.parse::<f64>(), vb.parse::<f64>()) {
+                let cmp = na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal);
+                if ascending { cmp } else { cmp.reverse() }
+            } else {
+                let cmp = va.cmp(&vb);
+                if ascending { cmp } else { cmp.reverse() }
+            }
+        });
     }
 
     /// Clear all blocks, kill PTYs, clear jobs.
