@@ -1,10 +1,10 @@
 //! Message dispatch and domain handlers for NexusState.
 
-use nexus_api::{Value, TableColumn};
+use nexus_api::{DomainValue, Value, TableColumn};
 use strata::Command;
 
 
-use nexus_api::{ViewerKind};
+
 use crate::blocks::{Focus, ViewState, ProcSort};
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
@@ -608,69 +608,6 @@ impl NexusState {
 // =========================================================================
 // Streaming update handler
 // =========================================================================
-
-impl NexusState {
-    /// Handle a streaming update from a long-running command.
-    pub(super) fn handle_streaming_update(
-        &mut self,
-        block_id: nexus_api::BlockId,
-        seq: u64,
-        update: Value,
-        coalesce: bool,
-    ) {
-        if let Some(block) = self.shell.block_by_id_mut(block_id) {
-            // Ignore out-of-order updates
-            if seq <= block.stream_seq {
-                return;
-            }
-            block.stream_seq = seq;
-
-            if coalesce {
-                block.stream_latest = Some(update);
-            } else {
-                block.stream_log.push_back(update);
-                // Cap at 1000 entries
-                while block.stream_log.len() > 1000 {
-                    block.stream_log.pop_front();
-                }
-            }
-            block.version += 1;
-        }
-    }
-
-    /// Handle an Interactive value: set up the viewer on the block.
-    pub(super) fn handle_interactive_output(
-        &mut self,
-        block_id: nexus_api::BlockId,
-        viewer: ViewerKind,
-        content: Value,
-    ) {
-        if let Some(block) = self.shell.block_by_id_mut(block_id) {
-            block.native_output = Some(content);
-            block.view_state = Some(match viewer {
-                ViewerKind::Pager | ViewerKind::ManPage => ViewState::Pager {
-                    scroll_line: 0,
-                    search: None,
-                    current_match: 0,
-                },
-                ViewerKind::ProcessMonitor { interval_ms } => ViewState::ProcessMonitor {
-                    sort_by: ProcSort::Cpu,
-                    sort_desc: true,
-                    interval_ms,
-                },
-                ViewerKind::TreeBrowser => ViewState::TreeBrowser {
-                    collapsed: std::collections::HashSet::new(),
-                    selected: Some(0),
-                },
-            });
-            block.version += 1;
-        }
-        self.set_focus(Focus::Block(block_id));
-        self.scroll.force();
-    }
-}
-
-// =========================================================================
 // Viewer message handler
 // =========================================================================
 
@@ -788,7 +725,7 @@ impl NexusState {
             ViewerMsg::TreeDown(id) => {
                 if let Some(block) = self.shell.block_by_id_mut(id) {
                     let node_count = block.native_output.as_ref().map(|v| {
-                        if let Value::Tree(tree) = v { tree.nodes.len() } else { 0 }
+                        if let Some(DomainValue::Tree(tree)) = v.as_domain() { tree.nodes.len() } else { 0 }
                     }).unwrap_or(0);
                     if let Some(ViewState::TreeBrowser { selected, .. }) = &mut block.view_state {
                         if let Some(sel) = selected {

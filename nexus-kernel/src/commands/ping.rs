@@ -74,7 +74,7 @@ impl NexusCommand for PingCommand {
                     }
                 }
 
-                let event_value = Value::NetEvent(Box::new(evt));
+                let event_value = Value::net_event(evt);
                 events.push(event_value.clone());
 
                 // Throttle: emit at most every 100ms

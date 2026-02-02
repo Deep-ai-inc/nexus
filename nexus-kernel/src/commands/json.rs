@@ -102,6 +102,7 @@ impl NexusCommand for ToJsonCommand {
 }
 
 fn value_to_json(value: &Value) -> serde_json::Value {
+    #[allow(unreachable_patterns)]
     match value {
         Value::Unit => serde_json::Value::Null,
         Value::Bool(b) => serde_json::Value::Bool(*b),
@@ -274,9 +275,11 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             serde_json::Value::Object(map)
         }
 
-        // New domain types: serialize via serde
+        // Domain types: serialize via serde (structured JSON)
+        Value::Domain(d) => serde_json::to_value(d.as_ref()).unwrap_or(serde_json::Value::Null),
+
+        // Fallback for any remaining types
         _ => {
-            // Use to_text() as a string fallback for JSON
             serde_json::Value::String(value.to_text())
         }
     }

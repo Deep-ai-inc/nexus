@@ -102,14 +102,14 @@ impl NexusCommand for DigCommand {
             }
         }
 
-        Ok(Value::DnsAnswer(Box::new(DnsAnswerInfo {
+        Ok(Value::dns_answer(DnsAnswerInfo {
             query,
             record_type,
             answers,
             query_time_ms: dig_query_time.unwrap_or(query_time_ms),
             server: dig_server,
             from_cache: false,
-        })))
+        }))
     }
 }
 
@@ -134,8 +134,8 @@ mod tests {
             .execute(&["localhost".to_string()], &mut test_ctx.ctx())
             .unwrap();
 
-        match result {
-            Value::DnsAnswer(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::DnsAnswer(info)) => {
                 assert_eq!(info.query, "localhost");
                 assert_eq!(info.record_type, "A");
             }
@@ -154,8 +154,8 @@ mod tests {
             )
             .unwrap();
 
-        match result {
-            Value::DnsAnswer(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::DnsAnswer(info)) => {
                 assert_eq!(info.record_type, "AAAA");
             }
             _ => panic!("Expected DnsAnswer"),

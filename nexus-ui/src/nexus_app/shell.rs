@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use nexus_api::{BlockId, BlockState, ShellEvent, Value};
+use nexus_api::{BlockId, BlockState, DomainValue, ShellEvent, Value};
 use nexus_kernel::{CommandClassification, Kernel};
 use nexus_term::TerminalParser;
 
@@ -466,7 +466,7 @@ impl ShellWidget {
             }
             ShellEvent::CommandOutput { block_id, value } => {
                 // Handle Interactive values: set up viewer state
-                if let Value::Interactive(ref req) = value {
+                if let Some(DomainValue::Interactive(req)) = value.as_domain() {
                     let content = req.content.clone();
                     let is_monitor = matches!(req.viewer, nexus_api::ViewerKind::ProcessMonitor { .. });
                     let view_state = match &req.viewer {

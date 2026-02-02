@@ -32,10 +32,10 @@ impl NexusCommand for LessCommand {
             }
         };
 
-        Ok(Value::Interactive(Box::new(InteractiveRequest {
+        Ok(Value::interactive(InteractiveRequest {
             viewer: ViewerKind::Pager,
             content,
-        })))
+        }))
     }
 }
 
@@ -59,15 +59,13 @@ mod tests {
             .execute(&["test.txt".to_string()], &mut test_ctx.ctx())
             .unwrap();
 
-        match result {
-            Value::Interactive(req) => {
-                assert!(matches!(req.viewer, ViewerKind::Pager));
-                match req.content {
-                    Value::String(s) => assert!(s.contains("line1")),
-                    _ => panic!("Expected String content"),
-                }
-            }
-            _ => panic!("Expected Interactive value"),
+        let Some(nexus_api::DomainValue::Interactive(req)) = result.as_domain() else {
+            panic!("Expected Interactive value");
+        };
+        assert!(matches!(req.viewer, ViewerKind::Pager));
+        match &req.content {
+            Value::String(s) => assert!(s.contains("line1")),
+            _ => panic!("Expected String content"),
         }
     }
 
@@ -78,15 +76,13 @@ mod tests {
         let stdin = Value::String("piped content".to_string());
         let result = cmd.execute(&[], &mut test_ctx.ctx_with_stdin(stdin)).unwrap();
 
-        match result {
-            Value::Interactive(req) => {
-                assert!(matches!(req.viewer, ViewerKind::Pager));
-                match req.content {
-                    Value::String(s) => assert_eq!(s, "piped content"),
-                    _ => panic!("Expected String content"),
-                }
-            }
-            _ => panic!("Expected Interactive value"),
+        let Some(nexus_api::DomainValue::Interactive(req)) = result.as_domain() else {
+            panic!("Expected Interactive value");
+        };
+        assert!(matches!(req.viewer, ViewerKind::Pager));
+        match &req.content {
+            Value::String(s) => assert_eq!(s, "piped content"),
+            _ => panic!("Expected String content"),
         }
     }
 

@@ -43,10 +43,10 @@ impl NexusCommand for TopCommand {
         // Send the Interactive value so the UI sets up the viewer
         let _ = ctx.events.send(ShellEvent::CommandOutput {
             block_id: ctx.block_id,
-            value: Value::Interactive(Box::new(InteractiveRequest {
+            value: Value::interactive(InteractiveRequest {
                 viewer: ViewerKind::ProcessMonitor { interval_ms },
                 content: initial,
-            })),
+            }),
         });
 
         // Register for cancellation (UI sets this when user exits the viewer)

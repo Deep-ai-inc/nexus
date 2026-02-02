@@ -35,10 +35,10 @@ impl NexusCommand for ManCommand {
 
         let text = String::from_utf8_lossy(&output.stdout).to_string();
 
-        Ok(Value::Interactive(Box::new(InteractiveRequest {
+        Ok(Value::interactive(InteractiveRequest {
             viewer: ViewerKind::ManPage,
             content: Value::String(text),
-        })))
+        }))
     }
 }
 
@@ -53,20 +53,17 @@ mod tests {
         let cmd = ManCommand;
         let result = cmd.execute(&["ls".to_string()], &mut test_ctx.ctx()).unwrap();
 
-        match result {
-            Value::Interactive(req) => {
-                assert!(matches!(req.viewer, ViewerKind::ManPage));
-                match req.content {
-                    Value::String(text) => {
-                        assert!(!text.is_empty());
-                        // Man page for ls should mention "list"
-                        let lower = text.to_lowercase();
-                        assert!(lower.contains("list") || lower.contains("ls"));
-                    }
-                    _ => panic!("Expected String content"),
-                }
+        let Some(nexus_api::DomainValue::Interactive(req)) = result.as_domain() else {
+            panic!("Expected Interactive value");
+        };
+        assert!(matches!(req.viewer, ViewerKind::ManPage));
+        match &req.content {
+            Value::String(text) => {
+                assert!(!text.is_empty());
+                let lower = text.to_lowercase();
+                assert!(lower.contains("list") || lower.contains("ls"));
             }
-            _ => panic!("Expected Interactive value"),
+            _ => panic!("Expected String content"),
         }
     }
 

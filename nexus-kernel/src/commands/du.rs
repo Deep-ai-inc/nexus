@@ -95,10 +95,10 @@ impl NexusCommand for DuCommand {
                 build_du_tree(&resolved, None, 0, opts.max_depth.unwrap_or(usize::MAX), &mut all_nodes, &mut id_counter);
             }
 
-            return Ok(Value::Tree(Box::new(TreeInfo {
+            return Ok(Value::tree(TreeInfo {
                 root: 0,
                 nodes: all_nodes,
-            })));
+            }));
         }
 
         let columns = vec![
@@ -354,8 +354,8 @@ mod tests {
             .execute(&["--tree".to_string(), ".".to_string()], &mut test_ctx.ctx())
             .unwrap();
 
-        match result {
-            Value::Tree(tree) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::Tree(tree)) => {
                 assert!(!tree.nodes.is_empty());
                 assert_eq!(tree.root, 0);
                 // Root should be a directory

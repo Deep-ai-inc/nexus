@@ -235,7 +235,7 @@ impl NexusCommand for RmCommand {
             return Ok(Value::Unit);
         }
 
-        Ok(Value::FileOp(Box::new(info)))
+        Ok(Value::file_op(info))
     }
 }
 
@@ -371,7 +371,7 @@ impl NexusCommand for CpCommand {
 
         if !info.errors.is_empty() && sources.len() == info.errors.len() {
             info.phase = FileOpPhase::Failed;
-            return Ok(Value::FileOp(Box::new(info)));
+            return Ok(Value::file_op(info));
         }
 
         info.total_bytes = Some(total_bytes);
@@ -383,7 +383,7 @@ impl NexusCommand for CpCommand {
         let _ = ctx.events.send(ShellEvent::StreamingUpdate {
             block_id: ctx.block_id,
             seq: seq_counter,
-            update: Value::FileOp(Box::new(info.clone())),
+            update: Value::file_op(info.clone()),
             coalesce: true,
         });
 
@@ -437,7 +437,7 @@ impl NexusCommand for CpCommand {
                     let _ = ctx.events.send(ShellEvent::StreamingUpdate {
                         block_id: ctx.block_id,
                         seq: seq_counter,
-                        update: Value::FileOp(Box::new(info.clone())),
+                        update: Value::file_op(info.clone()),
                         coalesce: true,
                     });
                     last_emit = Instant::now();
@@ -452,7 +452,7 @@ impl NexusCommand for CpCommand {
         };
         info.current_file = None;
 
-        Ok(Value::FileOp(Box::new(info)))
+        Ok(Value::file_op(info))
     }
 }
 
@@ -523,7 +523,7 @@ fn copy_dir_with_progress(
                 let _ = ctx.events.send(ShellEvent::StreamingUpdate {
                     block_id: ctx.block_id,
                     seq: *seq_counter,
-                    update: Value::FileOp(Box::new(info.clone())),
+                    update: Value::file_op(info.clone()),
                     coalesce: true,
                 });
                 *last_emit = Instant::now();
@@ -669,7 +669,7 @@ impl NexusCommand for MvCommand {
         };
         info.current_file = None;
 
-        Ok(Value::FileOp(Box::new(info)))
+        Ok(Value::file_op(info))
     }
 }
 
@@ -705,8 +705,8 @@ mod tests {
             )
             .unwrap();
 
-        match result {
-            Value::FileOp(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::FileOp(info)) => {
                 assert!(matches!(info.op_type, FileOpKind::Copy));
                 assert!(matches!(info.phase, FileOpPhase::Completed));
                 assert!(info.errors.is_empty());
@@ -732,8 +732,8 @@ mod tests {
             )
             .unwrap();
 
-        match result {
-            Value::FileOp(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::FileOp(info)) => {
                 assert!(matches!(info.phase, FileOpPhase::Completed));
                 assert!(info.errors.is_empty());
             }
@@ -756,8 +756,8 @@ mod tests {
             )
             .unwrap();
 
-        match result {
-            Value::FileOp(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::FileOp(info)) => {
                 // Should have error about -r not specified
                 assert!(!info.errors.is_empty());
             }
@@ -778,8 +778,8 @@ mod tests {
             )
             .unwrap();
 
-        match result {
-            Value::FileOp(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::FileOp(info)) => {
                 assert!(matches!(info.phase, FileOpPhase::Failed));
                 assert!(!info.errors.is_empty());
             }
@@ -800,8 +800,8 @@ mod tests {
             )
             .unwrap();
 
-        match result {
-            Value::FileOp(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::FileOp(info)) => {
                 assert!(matches!(info.op_type, FileOpKind::Move));
                 assert!(matches!(info.phase, FileOpPhase::Completed));
                 assert!(info.errors.is_empty());
@@ -827,8 +827,8 @@ mod tests {
             )
             .unwrap();
 
-        match result {
-            Value::FileOp(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::FileOp(info)) => {
                 assert!(!info.errors.is_empty());
             }
             _ => panic!("Expected FileOp"),
@@ -878,8 +878,8 @@ mod tests {
             .unwrap();
 
         // Should have error about "Is a directory"
-        match result {
-            Value::FileOp(info) => {
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::FileOp(info)) => {
                 assert!(!info.errors.is_empty());
                 assert!(info.errors[0].message.contains("Is a directory"));
             }

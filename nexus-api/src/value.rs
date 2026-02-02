@@ -100,28 +100,174 @@ pub enum Value {
     },
 
     // =========================================================================
-    // Extended Domain Types
+    // Domain-Specific Types (grouped behind a single variant)
     // =========================================================================
-    /// File operation with progress tracking (cp, mv, rm).
-    FileOp(Box<FileOpInfo>),
-    /// Directory tree (flat arena representation).
-    Tree(Box<TreeInfo>),
-    /// Structured diff for a single file.
-    DiffFile(Box<DiffFileInfo>),
-    /// Network event (ping reply, timeout, error).
-    NetEvent(Box<NetEventInfo>),
-    /// DNS lookup answer.
-    DnsAnswer(Box<DnsAnswerInfo>),
-    /// HTTP response metadata + body preview.
-    HttpResponse(Box<HttpResponseInfo>),
-    /// Request to open an interactive viewer in the UI.
-    Interactive(Box<InteractiveRequest>),
+    /// Command-specific domain types: file operations, network events,
+    /// diffs, trees, interactive viewers, etc.
+    Domain(Box<DomainValue>),
 
     // =========================================================================
     // Control Flow & Errors
     // =========================================================================
     /// An error value
     Error { code: i32, message: String },
+}
+
+/// Command-specific domain types, grouped to keep the root `Value` enum lean.
+///
+/// Adding a new command output type (e.g. `Whois`, `Traceroute`) only requires
+/// adding a variant here and implementing it in `DomainValue`'s methods — no
+/// changes to `Value` itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DomainValue {
+    /// File operation with progress tracking (cp, mv, rm).
+    FileOp(FileOpInfo),
+    /// Directory tree (flat arena representation).
+    Tree(TreeInfo),
+    /// Structured diff for a single file.
+    DiffFile(DiffFileInfo),
+    /// Network event (ping reply, timeout, error).
+    NetEvent(NetEventInfo),
+    /// DNS lookup answer.
+    DnsAnswer(DnsAnswerInfo),
+    /// HTTP response metadata + body preview.
+    HttpResponse(HttpResponseInfo),
+    /// Request to open an interactive viewer in the UI.
+    Interactive(InteractiveRequest),
+}
+
+impl DomainValue {
+    pub fn write_text(&self, buf: &mut String) {
+        match self {
+            DomainValue::FileOp(info) => {
+                let phase = format!("{:?}", info.phase);
+                let op = format!("{:?}", info.op_type);
+                buf.push_str(&format!("{} {}: ", op, phase));
+                if let Some(total) = info.files_total {
+                    buf.push_str(&format!("{}/{} files", info.files_processed, total));
+                } else {
+                    buf.push_str(&format!("{} files", info.files_processed));
+                }
+                if let Some(total_bytes) = info.total_bytes {
+                    buf.push_str(&format!(", {}/{} bytes", info.bytes_processed, total_bytes));
+                }
+                if !info.errors.is_empty() {
+                    buf.push_str(&format!(", {} errors", info.errors.len()));
+                }
+            }
+            DomainValue::Tree(tree) => {
+                for node in &tree.nodes {
+                    let indent: String = if node.depth == 0 {
+                        String::new()
+                    } else {
+                        let prefix = "    ".repeat(node.depth.saturating_sub(1));
+                        let is_last = tree.nodes.iter()
+                            .filter(|n| n.parent == node.parent && n.depth == node.depth)
+                            .last()
+                            .map(|n| n.id == node.id)
+                            .unwrap_or(true);
+                        if is_last {
+                            format!("{}\u{2514}\u{2500}\u{2500} ", prefix)
+                        } else {
+                            format!("{}\u{251C}\u{2500}\u{2500} ", prefix)
+                        }
+                    };
+                    buf.push_str(&format!("{}{}\n", indent, node.name));
+                }
+            }
+            DomainValue::DiffFile(diff) => {
+                if let Some(ref old) = diff.old_path {
+                    buf.push_str(&format!("--- {}\n", old));
+                } else {
+                    buf.push_str(&format!("--- a/{}\n", diff.file_path));
+                }
+                buf.push_str(&format!("+++ b/{}\n", diff.file_path));
+                for hunk in &diff.hunks {
+                    buf.push_str(&format!("@@ -{},{} +{},{} @@ {}\n",
+                        hunk.old_start, hunk.old_count,
+                        hunk.new_start, hunk.new_count,
+                        hunk.header));
+                    for line in &hunk.lines {
+                        let prefix = match line.kind {
+                            DiffLineKind::Context => " ",
+                            DiffLineKind::Addition => "+",
+                            DiffLineKind::Deletion => "-",
+                        };
+                        buf.push_str(&format!("{}{}\n", prefix, line.content));
+                    }
+                }
+            }
+            DomainValue::NetEvent(evt) => {
+                match evt.event_type {
+                    NetEventType::PingResponse => {
+                        let ip = evt.ip.as_deref().unwrap_or(&evt.host);
+                        let rtt = evt.rtt_ms.map(|r| format!(" time={:.1} ms", r)).unwrap_or_default();
+                        let ttl = evt.ttl.map(|t| format!(" ttl={}", t)).unwrap_or_default();
+                        let seq = evt.seq.map(|s| format!(" seq={}", s)).unwrap_or_default();
+                        buf.push_str(&format!("64 bytes from {}:{}{}{}", ip, seq, ttl, rtt));
+                    }
+                    NetEventType::Timeout => {
+                        let seq = evt.seq.map(|s| format!(" seq={}", s)).unwrap_or_default();
+                        buf.push_str(&format!("Request timeout for {}{}", evt.host, seq));
+                    }
+                    NetEventType::Error => {
+                        let msg = evt.message.as_deref().unwrap_or("unknown error");
+                        buf.push_str(&format!("ping: {}: {}", evt.host, msg));
+                    }
+                }
+            }
+            DomainValue::DnsAnswer(dns) => {
+                buf.push_str(&format!(";; QUESTION SECTION:\n;{}\t\tIN\t{}\n\n", dns.query, dns.record_type));
+                buf.push_str(";; ANSWER SECTION:\n");
+                for record in &dns.answers {
+                    buf.push_str(&format!("{}\t{}\tIN\t{}\t{}\n",
+                        record.name, record.ttl, record.record_type, record.data));
+                }
+                buf.push_str(&format!("\n;; Query time: {:.0} msec\n", dns.query_time_ms));
+                buf.push_str(&format!(";; SERVER: {}\n", dns.server));
+            }
+            DomainValue::HttpResponse(resp) => {
+                if let Some(ref preview) = resp.body_preview {
+                    buf.push_str(preview);
+                }
+            }
+            DomainValue::Interactive(req) => {
+                req.content.write_text(buf);
+            }
+        }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            DomainValue::FileOp(_) => "file-op",
+            DomainValue::Tree(_) => "tree",
+            DomainValue::DiffFile(_) => "diff-file",
+            DomainValue::NetEvent(_) => "net-event",
+            DomainValue::DnsAnswer(_) => "dns-answer",
+            DomainValue::HttpResponse(_) => "http-response",
+            DomainValue::Interactive(_) => "interactive",
+        }
+    }
+
+    pub fn get_field(&self, name: &str) -> Option<Value> {
+        match self {
+            DomainValue::FileOp(info) => info.get_field(name),
+            DomainValue::NetEvent(evt) => evt.get_field(name),
+            DomainValue::DnsAnswer(dns) => dns.get_field(name),
+            DomainValue::HttpResponse(resp) => resp.get_field(name),
+            _ => None,
+        }
+    }
+
+    pub fn is_typed(&self) -> bool {
+        matches!(
+            self,
+            DomainValue::FileOp(_)
+                | DomainValue::NetEvent(_)
+                | DomainValue::DnsAnswer(_)
+                | DomainValue::HttpResponse(_)
+        )
+    }
 }
 
 /// Metadata about a file or directory.
@@ -1200,6 +1346,46 @@ impl Value {
         }
     }
 
+    // ── Domain value constructors ──────────────────────────────────────
+
+    pub fn file_op(info: FileOpInfo) -> Self {
+        Value::Domain(Box::new(DomainValue::FileOp(info)))
+    }
+    pub fn tree(info: TreeInfo) -> Self {
+        Value::Domain(Box::new(DomainValue::Tree(info)))
+    }
+    pub fn diff_file(info: DiffFileInfo) -> Self {
+        Value::Domain(Box::new(DomainValue::DiffFile(info)))
+    }
+    pub fn net_event(info: NetEventInfo) -> Self {
+        Value::Domain(Box::new(DomainValue::NetEvent(info)))
+    }
+    pub fn dns_answer(info: DnsAnswerInfo) -> Self {
+        Value::Domain(Box::new(DomainValue::DnsAnswer(info)))
+    }
+    pub fn http_response(info: HttpResponseInfo) -> Self {
+        Value::Domain(Box::new(DomainValue::HttpResponse(info)))
+    }
+    pub fn interactive(req: InteractiveRequest) -> Self {
+        Value::Domain(Box::new(DomainValue::Interactive(req)))
+    }
+
+    /// Access the inner `DomainValue` if this is a `Value::Domain`.
+    pub fn as_domain(&self) -> Option<&DomainValue> {
+        match self {
+            Value::Domain(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Mutably access the inner `DomainValue` if this is a `Value::Domain`.
+    pub fn as_domain_mut(&mut self) -> Option<&mut DomainValue> {
+        match self {
+            Value::Domain(d) => Some(d),
+            _ => None,
+        }
+    }
+
     /// Convert value to text for legacy interop (piping to external commands).
     pub fn to_text(&self) -> String {
         let mut buf = String::new();
@@ -1317,107 +1503,7 @@ impl Value {
                     commit.short_hash, commit.author, commit.author_email, commit.message
                 ));
             }
-            Value::FileOp(info) => {
-                let phase = format!("{:?}", info.phase);
-                let op = format!("{:?}", info.op_type);
-                buf.push_str(&format!("{} {}: ", op, phase));
-                if let Some(total) = info.files_total {
-                    buf.push_str(&format!("{}/{} files", info.files_processed, total));
-                } else {
-                    buf.push_str(&format!("{} files", info.files_processed));
-                }
-                if let Some(total_bytes) = info.total_bytes {
-                    buf.push_str(&format!(", {}/{} bytes", info.bytes_processed, total_bytes));
-                }
-                if !info.errors.is_empty() {
-                    buf.push_str(&format!(", {} errors", info.errors.len()));
-                }
-            }
-            Value::Tree(tree) => {
-                // Classic tree output with branch characters
-                for node in &tree.nodes {
-                    let indent: String = if node.depth == 0 {
-                        String::new()
-                    } else {
-                        let prefix = "    ".repeat(node.depth.saturating_sub(1));
-                        // Check if this is the last child of its parent
-                        let is_last = tree.nodes.iter()
-                            .filter(|n| n.parent == node.parent && n.depth == node.depth)
-                            .last()
-                            .map(|n| n.id == node.id)
-                            .unwrap_or(true);
-                        if is_last {
-                            format!("{}\u{2514}\u{2500}\u{2500} ", prefix)
-                        } else {
-                            format!("{}\u{251C}\u{2500}\u{2500} ", prefix)
-                        }
-                    };
-                    buf.push_str(&format!("{}{}\n", indent, node.name));
-                }
-            }
-            Value::DiffFile(diff) => {
-                // Unified diff format
-                if let Some(ref old) = diff.old_path {
-                    buf.push_str(&format!("--- {}\n", old));
-                } else {
-                    buf.push_str(&format!("--- a/{}\n", diff.file_path));
-                }
-                buf.push_str(&format!("+++ b/{}\n", diff.file_path));
-                for hunk in &diff.hunks {
-                    buf.push_str(&format!("@@ -{},{} +{},{} @@ {}\n",
-                        hunk.old_start, hunk.old_count,
-                        hunk.new_start, hunk.new_count,
-                        hunk.header));
-                    for line in &hunk.lines {
-                        let prefix = match line.kind {
-                            DiffLineKind::Context => " ",
-                            DiffLineKind::Addition => "+",
-                            DiffLineKind::Deletion => "-",
-                        };
-                        buf.push_str(&format!("{}{}\n", prefix, line.content));
-                    }
-                }
-            }
-            Value::NetEvent(evt) => {
-                match evt.event_type {
-                    NetEventType::PingResponse => {
-                        let ip = evt.ip.as_deref().unwrap_or(&evt.host);
-                        let rtt = evt.rtt_ms.map(|r| format!(" time={:.1} ms", r)).unwrap_or_default();
-                        let ttl = evt.ttl.map(|t| format!(" ttl={}", t)).unwrap_or_default();
-                        let seq = evt.seq.map(|s| format!(" seq={}", s)).unwrap_or_default();
-                        buf.push_str(&format!("64 bytes from {}:{}{}{}", ip, seq, ttl, rtt));
-                    }
-                    NetEventType::Timeout => {
-                        let seq = evt.seq.map(|s| format!(" seq={}", s)).unwrap_or_default();
-                        buf.push_str(&format!("Request timeout for {}{}", evt.host, seq));
-                    }
-                    NetEventType::Error => {
-                        let msg = evt.message.as_deref().unwrap_or("unknown error");
-                        buf.push_str(&format!("ping: {}: {}", evt.host, msg));
-                    }
-                }
-            }
-            Value::DnsAnswer(dns) => {
-                // dig-style output
-                buf.push_str(&format!(";; QUESTION SECTION:\n;{}\t\tIN\t{}\n\n", dns.query, dns.record_type));
-                buf.push_str(";; ANSWER SECTION:\n");
-                for record in &dns.answers {
-                    buf.push_str(&format!("{}\t{}\tIN\t{}\t{}\n",
-                        record.name, record.ttl, record.record_type, record.data));
-                }
-                buf.push_str(&format!("\n;; Query time: {:.0} msec\n", dns.query_time_ms));
-                buf.push_str(&format!(";; SERVER: {}\n", dns.server));
-            }
-            Value::HttpResponse(resp) => {
-                // For pipe compatibility, to_text() returns the body
-                if let Some(ref preview) = resp.body_preview {
-                    buf.push_str(preview);
-                }
-            }
-            Value::Interactive(req) => {
-                // Delegate to content's text representation
-                req.content.write_text(buf);
-            }
+            Value::Domain(d) => d.write_text(buf),
             Value::Structured { kind, data } => {
                 // JSON-like output with optional kind prefix
                 if let Some(k) = kind {
@@ -1462,10 +1548,7 @@ impl Value {
                 "is_symlink" | "symlink" => Some(Value::Bool(f.is_symlink)),
                 _ => None,
             },
-            Value::FileOp(info) => info.get_field(name),
-            Value::NetEvent(evt) => evt.get_field(name),
-            Value::DnsAnswer(dns) => dns.get_field(name),
-            Value::HttpResponse(resp) => resp.get_field(name),
+            Value::Domain(d) => d.get_field(name),
             Value::Structured { data, .. } => data.get(name).cloned(),
             _ => None,
         }
@@ -1473,18 +1556,15 @@ impl Value {
 
     /// Check if this value is a domain-specific type that has typed fields.
     pub fn is_typed(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Value::Process(_)
-                | Value::GitStatus(_)
-                | Value::GitCommit(_)
-                | Value::FileEntry(_)
-                | Value::FileOp(_)
-                | Value::NetEvent(_)
-                | Value::DnsAnswer(_)
-                | Value::HttpResponse(_)
-                | Value::Structured { .. }
-        )
+            | Value::GitStatus(_)
+            | Value::GitCommit(_)
+            | Value::FileEntry(_)
+            | Value::Structured { .. } => true,
+            Value::Domain(d) => d.is_typed(),
+            _ => false,
+        }
     }
 
     /// Get the type name of this value (useful for debugging/display).
@@ -1505,13 +1585,7 @@ impl Value {
             Value::GitStatus(_) => "git-status",
             Value::GitCommit(_) => "git-commit",
             Value::Media { .. } => "media",
-            Value::FileOp(_) => "file-op",
-            Value::Tree(_) => "tree",
-            Value::DiffFile(_) => "diff-file",
-            Value::NetEvent(_) => "net-event",
-            Value::DnsAnswer(_) => "dns-answer",
-            Value::HttpResponse(_) => "http-response",
-            Value::Interactive(_) => "interactive",
+            Value::Domain(d) => d.type_name(),
             Value::Structured { .. } => "structured",
             Value::Error { .. } => "error",
         }

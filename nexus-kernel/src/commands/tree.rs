@@ -73,10 +73,10 @@ impl NexusCommand for TreeCommand {
             nodes,
         };
 
-        Ok(Value::Interactive(Box::new(InteractiveRequest {
+        Ok(Value::interactive(InteractiveRequest {
             viewer: ViewerKind::TreeBrowser,
-            content: Value::Tree(Box::new(tree)),
-        })))
+            content: Value::tree(tree),
+        }))
     }
 }
 
@@ -202,22 +202,17 @@ mod tests {
         let cmd = TreeCommand;
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
 
-        match result {
-            Value::Interactive(req) => {
-                assert!(matches!(req.viewer, ViewerKind::TreeBrowser));
-                match req.content {
-                    Value::Tree(tree) => {
-                        assert!(!tree.nodes.is_empty());
-                        // Root node should be at index 0
-                        assert_eq!(tree.root, 0);
-                        assert_eq!(tree.nodes[0].depth, 0);
-                        assert!(matches!(tree.nodes[0].node_type, FileType::Directory));
-                    }
-                    _ => panic!("Expected Tree content"),
-                }
-            }
-            _ => panic!("Expected Interactive value"),
-        }
+        let Some(nexus_api::DomainValue::Interactive(req)) = result.as_domain() else {
+            panic!("Expected Interactive value");
+        };
+        assert!(matches!(req.viewer, ViewerKind::TreeBrowser));
+        let Some(nexus_api::DomainValue::Tree(tree)) = req.content.as_domain() else {
+            panic!("Expected Tree content");
+        };
+        assert!(!tree.nodes.is_empty());
+        assert_eq!(tree.root, 0);
+        assert_eq!(tree.nodes[0].depth, 0);
+        assert!(matches!(tree.nodes[0].node_type, FileType::Directory));
     }
 
     #[test]
@@ -230,19 +225,14 @@ mod tests {
             .execute(&["-L".to_string(), "1".to_string()], &mut test_ctx.ctx())
             .unwrap();
 
-        match result {
-            Value::Interactive(req) => {
-                match req.content {
-                    Value::Tree(tree) => {
-                        // With depth limit 1, no node should have depth > 1
-                        for node in &tree.nodes {
-                            assert!(node.depth <= 1, "Node {} has depth {} > 1", node.name, node.depth);
-                        }
-                    }
-                    _ => panic!("Expected Tree content"),
-                }
-            }
-            _ => panic!("Expected Interactive value"),
+        let Some(nexus_api::DomainValue::Interactive(req)) = result.as_domain() else {
+            panic!("Expected Interactive value");
+        };
+        let Some(nexus_api::DomainValue::Tree(tree)) = req.content.as_domain() else {
+            panic!("Expected Tree content");
+        };
+        for node in &tree.nodes {
+            assert!(node.depth <= 1, "Node {} has depth {} > 1", node.name, node.depth);
         }
     }
 
@@ -255,9 +245,9 @@ mod tests {
 
         // Without -a: should not include .hidden
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
-        let tree = match result {
-            Value::Interactive(req) => match req.content {
-                Value::Tree(t) => t,
+        let tree = match result.as_domain() {
+            Some(nexus_api::DomainValue::Interactive(req)) => match req.content.as_domain() {
+                Some(nexus_api::DomainValue::Tree(t)) => t,
                 _ => panic!("Expected Tree"),
             },
             _ => panic!("Expected Interactive"),
@@ -266,9 +256,9 @@ mod tests {
 
         // With -a: should include .hidden
         let result = cmd.execute(&["-a".to_string()], &mut test_ctx.ctx()).unwrap();
-        let tree = match result {
-            Value::Interactive(req) => match req.content {
-                Value::Tree(t) => t,
+        let tree = match result.as_domain() {
+            Some(nexus_api::DomainValue::Interactive(req)) => match req.content.as_domain() {
+                Some(nexus_api::DomainValue::Tree(t)) => t,
                 _ => panic!("Expected Tree"),
             },
             _ => panic!("Expected Interactive"),

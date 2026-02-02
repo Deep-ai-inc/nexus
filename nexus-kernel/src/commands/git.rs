@@ -483,14 +483,14 @@ impl NexusCommand for GitDiffCommand {
                 });
             }
 
-            values.push(Value::DiffFile(Box::new(DiffFileInfo {
+            values.push(Value::diff_file(DiffFileInfo {
                 file_path,
                 old_path: old_path_opt,
                 change_type,
                 hunks,
                 additions,
                 deletions,
-            })));
+            }));
         }
 
         Ok(Value::List(values))
@@ -834,8 +834,8 @@ mod tests {
         match result {
             Value::List(files) => {
                 assert!(!files.is_empty(), "Expected at least one diff file");
-                match &files[0] {
-                    Value::DiffFile(diff) => {
+                match files[0].as_domain() {
+                    Some(nexus_api::DomainValue::DiffFile(diff)) => {
                         assert!(diff.file_path.contains("tracked.txt"));
                         assert!(diff.additions > 0 || diff.deletions > 0);
                         assert!(!diff.hunks.is_empty());
@@ -870,8 +870,8 @@ mod tests {
         match result {
             Value::List(files) => {
                 assert!(!files.is_empty(), "Expected staged diff");
-                match &files[0] {
-                    Value::DiffFile(diff) => {
+                match files[0].as_domain() {
+                    Some(nexus_api::DomainValue::DiffFile(diff)) => {
                         assert!(diff.file_path.contains("staged.txt"));
                     }
                     _ => panic!("Expected DiffFile"),

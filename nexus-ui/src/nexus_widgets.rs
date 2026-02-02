@@ -1569,8 +1569,7 @@ fn render_native_value(
             } else {
                 // Generic list — recurse for structured types, inline for simple ones
                 let has_structured = items.iter().any(|v| matches!(v,
-                    Value::DiffFile(_) | Value::FileOp(_) | Value::Tree(_) |
-                    Value::NetEvent(_) | Value::DnsAnswer(_) | Value::HttpResponse(_) |
+                    Value::Domain(_) |
                     Value::GitStatus(_) | Value::GitCommit(_) | Value::Record(_) |
                     Value::Table { .. }
                 ));
@@ -1625,14 +1624,50 @@ fn render_native_value(
             parent
         }
 
-        Value::FileOp(info) => {
+        Value::Domain(domain) => {
+            render_domain_value(parent, domain, block, image_info, anchor_registry)
+        }
+
+        Value::Error { message, .. } => {
             let source_id = source_ids::native(block_id);
-            // Phase indicator with icon and color
+            parent.push(TextElement::new(message).color(colors::ERROR).source(source_id))
+        }
+
+        // All other types: render as text
+        _ => {
+            let text = value.to_text();
+            if text.is_empty() {
+                parent
+            } else {
+                let source_id = source_ids::native(block_id);
+                for line in text.lines() {
+                    parent = parent.push(TextElement::new(line).color(colors::TEXT_PRIMARY).source(source_id));
+                }
+                parent
+            }
+        }
+    }
+}
+
+/// Render a domain-specific value (FileOp, Tree, DiffFile, etc.).
+fn render_domain_value(
+    mut parent: Column,
+    domain: &nexus_api::DomainValue,
+    block: &Block,
+    image_info: Option<(ImageHandle, u32, u32)>,
+    anchor_registry: &RefCell<HashMap<SourceId, AnchorEntry>>,
+) -> Column {
+    use nexus_api::DomainValue;
+    let block_id = block.id;
+    let source_id = source_ids::native(block_id);
+
+    match domain {
+        DomainValue::FileOp(info) => {
             let (icon, phase_color) = match info.phase {
-                nexus_api::FileOpPhase::Planning => ("\u{1F50D}", colors::WARNING),  // 🔍
-                nexus_api::FileOpPhase::Executing => ("\u{25B6}", colors::RUNNING),  // ▶
-                nexus_api::FileOpPhase::Completed => ("\u{2714}", colors::SUCCESS),  // ✔
-                nexus_api::FileOpPhase::Failed => ("\u{2718}", colors::ERROR),       // ✘
+                nexus_api::FileOpPhase::Planning => ("\u{1F50D}", colors::WARNING),
+                nexus_api::FileOpPhase::Executing => ("\u{25B6}", colors::RUNNING),
+                nexus_api::FileOpPhase::Completed => ("\u{2714}", colors::SUCCESS),
+                nexus_api::FileOpPhase::Failed => ("\u{2718}", colors::ERROR),
             };
             let op_label = match info.op_type {
                 nexus_api::FileOpKind::Copy => "Copy",
@@ -1644,8 +1679,6 @@ fn render_native_value(
                     .color(phase_color)
                     .source(source_id),
             );
-
-            // Progress bar
             if let Some(total) = info.total_bytes {
                 if total > 0 {
                     let pct = (info.bytes_processed as f64 / total as f64 * 100.0).min(100.0);
@@ -1666,8 +1699,6 @@ fn render_native_value(
                         .source(source_id),
                 );
             }
-
-            // Stats
             let files_str = if let Some(total) = info.files_total {
                 format!("{}/{} files", info.files_processed, total)
             } else {
@@ -1683,8 +1714,6 @@ fn render_native_value(
                     .color(colors::TEXT_SECONDARY)
                     .source(source_id),
             );
-
-            // Current file
             if let Some(ref current) = info.current_file {
                 parent = parent.push(
                     TextElement::new(format!("  {}", current.display()))
@@ -1692,8 +1721,6 @@ fn render_native_value(
                         .source(source_id),
                 );
             }
-
-            // Errors
             for err in &info.errors {
                 parent = parent.push(
                     TextElement::new(format!("  error: {}: {}", err.path.display(), err.message))
@@ -1704,8 +1731,7 @@ fn render_native_value(
             parent
         }
 
-        Value::Tree(tree) => {
-            let source_id = source_ids::native(block_id);
+        DomainValue::Tree(tree) => {
             for node in &tree.nodes {
                 let indent = if node.depth == 0 {
                     String::new()
@@ -1735,9 +1761,7 @@ fn render_native_value(
             parent
         }
 
-        Value::DiffFile(diff) => {
-            let source_id = source_ids::native(block_id);
-            // File header
+        DomainValue::DiffFile(diff) => {
             let stats_str = format!("+{} -{}", diff.additions, diff.deletions);
             parent = parent.push(
                 Row::new()
@@ -1746,7 +1770,6 @@ fn render_native_value(
                     .push(TextElement::new(format!("  +{}", diff.additions)).color(colors::DIFF_ADD).source(source_id))
                     .push(TextElement::new(format!("-{}", diff.deletions)).color(colors::DIFF_REMOVE).source(source_id)),
             );
-            // Hunks
             for hunk in &diff.hunks {
                 parent = parent.push(
                     TextElement::new(format!("@@ -{},{} +{},{} @@ {}",
@@ -1773,8 +1796,7 @@ fn render_native_value(
             parent
         }
 
-        Value::NetEvent(evt) => {
-            let source_id = source_ids::native(block_id);
+        DomainValue::NetEvent(evt) => {
             let (icon, color) = if evt.success {
                 ("\u{2714}", colors::SUCCESS)
             } else {
@@ -1789,8 +1811,7 @@ fn render_native_value(
             )
         }
 
-        Value::DnsAnswer(dns) => {
-            let source_id = source_ids::native(block_id);
+        DomainValue::DnsAnswer(dns) => {
             parent = parent.push(
                 TextElement::new(format!(";; {} {} query", dns.query, dns.record_type))
                     .color(colors::TEXT_SECONDARY)
@@ -1813,9 +1834,7 @@ fn render_native_value(
             parent
         }
 
-        Value::HttpResponse(resp) => {
-            let source_id = source_ids::native(block_id);
-            // Status line
+        DomainValue::HttpResponse(resp) => {
             let status_color = if resp.status_code < 300 {
                 colors::SUCCESS
             } else if resp.status_code < 400 {
@@ -1836,7 +1855,6 @@ fn render_native_value(
                         .source(source_id),
                 );
             }
-            // Headers (first 10)
             for (name, value) in resp.headers.iter().take(10) {
                 parent = parent.push(
                     TextElement::new(format!("  {}: {}", name, value))
@@ -1844,7 +1862,6 @@ fn render_native_value(
                         .source(source_id),
                 );
             }
-            // Body preview
             if let Some(ref preview) = resp.body_preview {
                 parent = parent.push(
                     TextElement::new("").source(source_id),
@@ -1871,28 +1888,8 @@ fn render_native_value(
             parent
         }
 
-        Value::Interactive(req) => {
-            // Render the content (viewer state is handled separately)
+        DomainValue::Interactive(req) => {
             render_native_value(parent, &req.content, block, image_info, anchor_registry)
-        }
-
-        Value::Error { message, .. } => {
-            let source_id = source_ids::native(block_id);
-            parent.push(TextElement::new(message).color(colors::ERROR).source(source_id))
-        }
-
-        // All other types: render as text
-        _ => {
-            let text = value.to_text();
-            if text.is_empty() {
-                parent
-            } else {
-                let source_id = source_ids::native(block_id);
-                for line in text.lines() {
-                    parent = parent.push(TextElement::new(line).color(colors::TEXT_PRIMARY).source(source_id));
-                }
-                parent
-            }
         }
     }
 }

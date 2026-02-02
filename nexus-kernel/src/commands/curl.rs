@@ -140,7 +140,7 @@ impl NexusCommand for CurlCommand {
             (None, false)
         };
 
-        Ok(Value::HttpResponse(Box::new(HttpResponseInfo {
+        Ok(Value::http_response(HttpResponseInfo {
             url,
             method,
             status_code,
@@ -154,7 +154,7 @@ impl NexusCommand for CurlCommand {
                 total_ms,
                 ttfb_ms: None,
             },
-        })))
+        }))
     }
 }
 
