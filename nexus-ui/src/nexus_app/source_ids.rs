@@ -35,6 +35,7 @@ const AGENT_PERM_TEXT: u64 = 19;
 const AGENT_QUESTION_TEXT: u64 = 20;
 const AGENT_FOOTER: u64 = 21;
 const TREE_EXPAND: u64 = 22;
+const VIEWER_EXIT: u64 = 23;
 
 // --- Shell block IDs ---
 
@@ -44,6 +45,7 @@ pub fn native(id: BlockId) -> SourceId { block_space(id).id(NATIVE) }
 pub fn table(id: BlockId) -> SourceId { block_space(id).id(TABLE) }
 pub fn kill(id: BlockId) -> SourceId { block_space(id).id(KILL) }
 pub fn image_output(id: BlockId) -> SourceId { block_space(id).id(IMAGE_OUTPUT) }
+pub fn viewer_exit(id: BlockId) -> SourceId { block_space(id).id(VIEWER_EXIT) }
 
 // --- Agent block IDs ---
 

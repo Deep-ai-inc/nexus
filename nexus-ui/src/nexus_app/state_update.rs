@@ -3,13 +3,15 @@
 use nexus_api::{Value, TableColumn};
 use strata::Command;
 
-use crate::blocks::Focus;
+
+use nexus_api::{ViewerKind};
+use crate::blocks::{Focus, ViewState, ProcSort};
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::drag_state::{ActiveKind, DragStatus, PendingIntent};
 use super::file_drop;
 use super::input::InputOutput;
-use super::message::{AnchorAction, ContextMenuMsg, DragMsg, DropZone, FileDropMsg, NexusMessage, ShellMsg};
+use super::message::{AnchorAction, ContextMenuMsg, DragMsg, DropZone, FileDropMsg, NexusMessage, ShellMsg, ViewerMsg};
 use super::selection;
 use super::shell::ShellOutput;
 use super::agent::AgentOutput;
@@ -43,9 +45,15 @@ impl NexusState {
                 let _ = std::env::set_current_dir(&path);
                 Command::none()
             }
-            ShellOutput::CommandFinished { exit_code, command, output } => {
+            ShellOutput::CommandFinished { block_id, exit_code, command, output } => {
                 self.context.on_command_finished(command, output, exit_code);
-                self.set_focus(Focus::Input);
+                // Don't reset focus if the block has an active viewer (e.g. top, less)
+                let has_viewer = self.shell.block_by_id(block_id)
+                    .map(|b| b.view_state.is_some())
+                    .unwrap_or(false);
+                if !has_viewer {
+                    self.set_focus(Focus::Input);
+                }
                 self.scroll.force();
                 Command::none()
             }
@@ -139,6 +147,7 @@ impl NexusState {
                 let (_cmd, _) = self.selection.update(m, ctx);
                 Command::none()
             }
+            NexusMessage::Viewer(m) => { self.dispatch_viewer_msg(m); Command::none() }
             NexusMessage::ContextMenu(m) => self.dispatch_context_menu(m),
             NexusMessage::Scroll(action) => { self.scroll.apply_user_scroll(action); Command::none() }
             NexusMessage::ScrollToJob(_) => { self.scroll.force(); Command::none() }
@@ -650,6 +659,215 @@ impl NexusState {
                 self.shell.block_index.get(id).and_then(|&idx| self.shell.blocks.get(idx))
             }
             _ => None,
+        }
+    }
+}
+
+// =========================================================================
+// Streaming update handler
+// =========================================================================
+
+impl NexusState {
+    /// Handle a streaming update from a long-running command.
+    pub(super) fn handle_streaming_update(
+        &mut self,
+        block_id: nexus_api::BlockId,
+        seq: u64,
+        update: Value,
+        coalesce: bool,
+    ) {
+        if let Some(block) = self.shell.block_by_id_mut(block_id) {
+            // Ignore out-of-order updates
+            if seq <= block.stream_seq {
+                return;
+            }
+            block.stream_seq = seq;
+
+            if coalesce {
+                block.stream_latest = Some(update);
+            } else {
+                block.stream_log.push_back(update);
+                // Cap at 1000 entries
+                while block.stream_log.len() > 1000 {
+                    block.stream_log.pop_front();
+                }
+            }
+            block.version += 1;
+        }
+    }
+
+    /// Handle an Interactive value: set up the viewer on the block.
+    pub(super) fn handle_interactive_output(
+        &mut self,
+        block_id: nexus_api::BlockId,
+        viewer: ViewerKind,
+        content: Value,
+    ) {
+        if let Some(block) = self.shell.block_by_id_mut(block_id) {
+            block.native_output = Some(content);
+            block.view_state = Some(match viewer {
+                ViewerKind::Pager | ViewerKind::ManPage => ViewState::Pager {
+                    scroll_line: 0,
+                    search: None,
+                    current_match: 0,
+                },
+                ViewerKind::ProcessMonitor { interval_ms } => ViewState::ProcessMonitor {
+                    sort_by: ProcSort::Cpu,
+                    sort_desc: true,
+                    interval_ms,
+                },
+                ViewerKind::TreeBrowser => ViewState::TreeBrowser {
+                    collapsed: std::collections::HashSet::new(),
+                    selected: Some(0),
+                },
+            });
+            block.version += 1;
+        }
+        self.set_focus(Focus::Block(block_id));
+        self.scroll.force();
+    }
+}
+
+// =========================================================================
+// Viewer message handler
+// =========================================================================
+
+impl NexusState {
+    fn dispatch_viewer_msg(&mut self, msg: ViewerMsg) {
+        match msg {
+            ViewerMsg::ScrollUp(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
+                        *scroll_line = scroll_line.saturating_sub(1);
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::ScrollDown(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
+                        *scroll_line += 1;
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::PageUp(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
+                        *scroll_line = scroll_line.saturating_sub(30);
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::PageDown(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
+                        *scroll_line += 30;
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::GoToTop(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
+                        *scroll_line = 0;
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::GoToBottom(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
+                        // Set to a very large value; rendering will clamp
+                        *scroll_line = usize::MAX / 2;
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::SearchStart(_id) | ViewerMsg::SearchNext(_id) => {
+                // Search TBD — no-op for now
+            }
+            ViewerMsg::SortBy(id, sort) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::ProcessMonitor { ref mut sort_by, ref mut sort_desc, .. }) = block.view_state {
+                        if *sort_by == sort {
+                            *sort_desc = !*sort_desc;
+                        } else {
+                            *sort_by = sort;
+                            *sort_desc = true;
+                        }
+                        // Map ProcSort to column index (%CPU=2, %MEM=3, PID=1)
+                        let col_idx = match sort {
+                            ProcSort::Cpu => 2,
+                            ProcSort::Mem => 3,
+                            ProcSort::Pid => 1,
+                            ProcSort::Command => 10,
+                        };
+                        let ascending = !*sort_desc;
+                        block.table_sort = crate::blocks::TableSort {
+                            column: Some(col_idx),
+                            ascending,
+                        };
+                        // Re-sort current data
+                        if let Some(Value::Table { ref mut rows, .. }) = block.native_output {
+                            super::shell::ShellWidget::sort_rows(rows, col_idx, ascending);
+                        }
+                        if let Some(Value::Table { ref mut rows, .. }) = block.stream_latest {
+                            super::shell::ShellWidget::sort_rows(rows, col_idx, ascending);
+                        }
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::TreeToggle(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::TreeBrowser { ref mut collapsed, ref selected, .. }) = block.view_state {
+                        if let Some(sel) = selected {
+                            if collapsed.contains(sel) {
+                                collapsed.remove(sel);
+                            } else {
+                                collapsed.insert(*sel);
+                            }
+                            block.version += 1;
+                        }
+                    }
+                }
+            }
+            ViewerMsg::TreeUp(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::TreeBrowser { selected, .. }) = &mut block.view_state {
+                        if let Some(sel) = selected {
+                            *sel = sel.saturating_sub(1);
+                        }
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::TreeDown(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    let node_count = block.native_output.as_ref().map(|v| {
+                        if let Value::Tree(tree) = v { tree.nodes.len() } else { 0 }
+                    }).unwrap_or(0);
+                    if let Some(ViewState::TreeBrowser { selected, .. }) = &mut block.view_state {
+                        if let Some(sel) = selected {
+                            if *sel + 1 < node_count {
+                                *sel += 1;
+                            }
+                        }
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::Exit(id) => {
+                // Cancel directly via the free function — does NOT require the kernel
+                // mutex, which may be held by the command's blocking loop (e.g. top).
+                nexus_kernel::commands::cancel_block(id);
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    block.view_state = None;
+                    block.version += 1;
+                }
+                self.set_focus(Focus::Input);
+            }
         }
     }
 }

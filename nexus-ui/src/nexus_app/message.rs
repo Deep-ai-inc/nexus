@@ -10,6 +10,8 @@ use strata::content_address::ContentAddress;
 use strata::event_context::KeyEvent;
 use strata::{ScrollAction, TextInputMouseAction};
 
+use crate::blocks::ProcSort;
+
 use crate::agent_adapter::AgentEvent;
 use super::context_menu::{ContextMenuItem, ContextTarget};
 
@@ -23,6 +25,7 @@ pub enum NexusMessage {
     Shell(ShellMsg),
     Agent(AgentMsg),
     Selection(SelectionMsg),
+    Viewer(ViewerMsg),
 
     // Cross-cutting (root handles directly)
     Scroll(ScrollAction),
@@ -181,6 +184,27 @@ pub enum SelectionMsg {
     Extend(ContentAddress),
     End,
     Clear,
+}
+
+// =========================================================================
+// Viewer messages (interactive block viewers)
+// =========================================================================
+
+#[derive(Debug, Clone)]
+pub enum ViewerMsg {
+    ScrollUp(BlockId),
+    ScrollDown(BlockId),
+    PageUp(BlockId),
+    PageDown(BlockId),
+    GoToTop(BlockId),
+    GoToBottom(BlockId),
+    SearchStart(BlockId),
+    SearchNext(BlockId),
+    SortBy(BlockId, ProcSort),
+    TreeToggle(BlockId),
+    TreeUp(BlockId),
+    TreeDown(BlockId),
+    Exit(BlockId),
 }
 
 // =========================================================================

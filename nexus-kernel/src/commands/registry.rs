@@ -10,9 +10,11 @@ use super::basic::{
 };
 use super::cat::CatCommand;
 use super::cmp::CmpCommand;
+use super::curl::CurlCommand;
 use super::cut::CutCommand;
 use super::date::DateCommand;
 use super::df::DfCommand;
+use super::dig::DigCommand;
 use super::du::DuCommand;
 use super::env::{EnvCommand, ExportCommand, PrintenvCommand, UnsetCommand};
 use super::find::FindCommand;
@@ -22,6 +24,7 @@ use super::git::{
     GitLogCommand, GitRemoteCommand, GitStashCommand, GitStatusCommand,
 };
 use super::grep::GrepCommand;
+use super::less::LessCommand;
 use super::hash::HashCommand;
 use super::head::HeadCommand;
 use super::history::{FcCommand, HistoryCommand};
@@ -33,10 +36,12 @@ use super::jobs::{BgCommand, FgCommand, JobsCommand, WaitCommand};
 use super::json::{FromJsonCommand, GetCommand, ToJsonCommand};
 use super::links::{LinkCommand, LnCommand, UnlinkCommand};
 use super::ls::LsCommand;
+use super::man::ManCommand;
 use super::math::{AvgCommand, CountCommand, MaxCommand, MinCommand, SumCommand};
 use super::nl::NlCommand;
 use super::path::{BasenameCommand, DirnameCommand, ExtnameCommand, RealpathCommand, StemCommand};
 use super::perms::{ChgrpCommand, ChmodCommand, ChownCommand};
+use super::ping::PingCommand;
 use super::prev::{OutputsCommand, Prev1Command, Prev2Command, Prev3Command, PrevCommand};
 use super::printf::PrintfCommand;
 use super::rev::{RevCommand, TacCommand};
@@ -56,6 +61,8 @@ use super::split::{
 use super::tail::TailCommand;
 use super::tee::TeeCommand;
 use super::times::TimesCommand;
+use super::top::TopCommand;
+use super::tree::TreeCommand;
 use super::ulimit::UlimitCommand;
 use super::tr::TrCommand;
 use super::uniq::UniqCommand;
@@ -224,6 +231,17 @@ impl CommandRegistry {
         registry.register(Prev2Command);   // _2 - second most recent
         registry.register(Prev3Command);   // _3 - third most recent
         registry.register(OutputsCommand); // outputs - list recent outputs
+
+        // Network commands
+        registry.register(PingCommand);
+        registry.register(CurlCommand);
+        registry.register(DigCommand);
+
+        // Interactive viewers
+        registry.register(LessCommand);
+        registry.register(TopCommand);
+        registry.register(ManCommand);
+        registry.register(TreeCommand);
 
         // Git commands (native, structured output)
         registry.register(GitCommand);  // Main dispatcher: git <subcommand>

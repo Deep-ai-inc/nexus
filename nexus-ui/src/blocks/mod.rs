@@ -5,4 +5,4 @@
 
 pub mod model;
 
-pub use model::{Block, Focus, InputMode, PtyEvent, TableSort, TreeState, UnifiedBlock, UnifiedBlockRef, VisualJob, VisualJobState};
+pub use model::{Block, Focus, InputMode, ProcSort, PtyEvent, TableSort, TreeState, UnifiedBlock, UnifiedBlockRef, ViewState, VisualJob, VisualJobState};

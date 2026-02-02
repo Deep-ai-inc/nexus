@@ -1,9 +1,10 @@
 //! Filesystem commands - touch, mkdir, rm, rmdir, cp, mv.
 
 use super::{CommandContext, NexusCommand};
-use nexus_api::Value;
+use nexus_api::{FileOpError, FileOpInfo, FileOpKind, FileOpPhase, ShellEvent, Value};
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // touch - create files or update timestamps
@@ -151,32 +152,90 @@ impl NexusCommand for RmCommand {
             return Ok(Value::Unit);
         }
 
-        for target in targets {
-            let path = if PathBuf::from(&target).is_absolute() {
-                PathBuf::from(&target)
+        let start_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let sources: Vec<PathBuf> = targets.iter().map(|t| {
+            if PathBuf::from(t).is_absolute() { PathBuf::from(t) } else { ctx.state.cwd.join(t) }
+        }).collect();
+
+        let mut info = FileOpInfo {
+            op_type: FileOpKind::Remove,
+            phase: FileOpPhase::Executing,
+            sources: sources.clone(),
+            dest: None,
+            total_bytes: None,
+            bytes_processed: 0,
+            files_total: Some(targets.len()),
+            files_processed: 0,
+            current_file: None,
+            start_time_ms,
+            errors: Vec::new(),
+        };
+
+        for target in &targets {
+            let path = if PathBuf::from(target).is_absolute() {
+                PathBuf::from(target)
             } else {
-                ctx.state.cwd.join(&target)
+                ctx.state.cwd.join(target)
             };
 
             if !path.exists() {
                 if !force {
-                    return Err(anyhow::anyhow!("rm: cannot remove '{}': No such file or directory", target));
+                    info.errors.push(FileOpError {
+                        path: path.clone(),
+                        message: "No such file or directory".to_string(),
+                    });
                 }
                 continue;
             }
 
+            info.current_file = Some(path.clone());
+
             if path.is_dir() {
                 if recursive {
-                    fs::remove_dir_all(&path)?;
+                    match fs::remove_dir_all(&path) {
+                        Ok(()) => info.files_processed += 1,
+                        Err(e) => info.errors.push(FileOpError {
+                            path: path.clone(),
+                            message: e.to_string(),
+                        }),
+                    }
                 } else {
-                    return Err(anyhow::anyhow!("rm: cannot remove '{}': Is a directory", target));
+                    info.errors.push(FileOpError {
+                        path: path.clone(),
+                        message: "Is a directory".to_string(),
+                    });
                 }
             } else {
-                fs::remove_file(&path)?;
+                match fs::remove_file(&path) {
+                    Ok(()) => info.files_processed += 1,
+                    Err(e) => info.errors.push(FileOpError {
+                        path: path.clone(),
+                        message: e.to_string(),
+                    }),
+                }
             }
         }
 
-        Ok(Value::Unit)
+        info.phase = if info.errors.is_empty() {
+            FileOpPhase::Completed
+        } else if info.files_processed > 0 {
+            // Partial success
+            FileOpPhase::Completed
+        } else {
+            FileOpPhase::Failed
+        };
+        info.current_file = None;
+
+        // For backward compatibility: if no errors and simple rm, return Unit
+        if info.errors.is_empty() && targets.len() <= 2 {
+            return Ok(Value::Unit);
+        }
+
+        Ok(Value::FileOp(Box::new(info)))
     }
 }
 
@@ -270,16 +329,74 @@ impl NexusCommand for CpCommand {
         };
 
         let dest_is_dir = dest_path.is_dir();
+        let start_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
-        for src in paths {
-            let src_path = if PathBuf::from(&src).is_absolute() {
-                PathBuf::from(&src)
+        let sources: Vec<PathBuf> = paths.iter().map(|s| {
+            if PathBuf::from(s).is_absolute() { PathBuf::from(s) } else { ctx.state.cwd.join(s) }
+        }).collect();
+
+        let mut info = FileOpInfo {
+            op_type: FileOpKind::Copy,
+            phase: FileOpPhase::Planning,
+            sources: sources.clone(),
+            dest: Some(dest_path.clone()),
+            total_bytes: None,
+            bytes_processed: 0,
+            files_total: None,
+            files_processed: 0,
+            current_file: None,
+            start_time_ms,
+            errors: Vec::new(),
+        };
+
+        // Planning phase: scan sizes
+        let mut seq_counter: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut total_files: usize = 0;
+        let mut last_emit = Instant::now();
+
+        for src_path in &sources {
+            if !src_path.exists() {
+                info.errors.push(FileOpError {
+                    path: src_path.clone(),
+                    message: "No such file or directory".to_string(),
+                });
+                continue;
+            }
+            count_recursive(src_path, &mut total_bytes, &mut total_files);
+        }
+
+        if !info.errors.is_empty() && sources.len() == info.errors.len() {
+            info.phase = FileOpPhase::Failed;
+            return Ok(Value::FileOp(Box::new(info)));
+        }
+
+        info.total_bytes = Some(total_bytes);
+        info.files_total = Some(total_files);
+        info.phase = FileOpPhase::Executing;
+
+        // Emit planning complete
+        seq_counter += 1;
+        let _ = ctx.events.send(ShellEvent::StreamingUpdate {
+            block_id: ctx.block_id,
+            seq: seq_counter,
+            update: Value::FileOp(Box::new(info.clone())),
+            coalesce: true,
+        });
+
+        // Execution phase
+        for src in &paths {
+            let src_path = if PathBuf::from(src).is_absolute() {
+                PathBuf::from(src)
             } else {
-                ctx.state.cwd.join(&src)
+                ctx.state.cwd.join(src)
             };
 
             if !src_path.exists() {
-                return Err(anyhow::anyhow!("cp: cannot stat '{}': No such file or directory", src));
+                continue; // Already recorded error
             }
 
             let target = if dest_is_dir {
@@ -290,34 +407,129 @@ impl NexusCommand for CpCommand {
 
             if src_path.is_dir() {
                 if !recursive {
-                    return Err(anyhow::anyhow!("cp: -r not specified; omitting directory '{}'", src));
+                    info.errors.push(FileOpError {
+                        path: src_path.clone(),
+                        message: "-r not specified; omitting directory".to_string(),
+                    });
+                    continue;
                 }
-                copy_dir_recursive(&src_path, &target)?;
+                copy_dir_with_progress(
+                    &src_path, &target, &mut info, ctx, &mut seq_counter, &mut last_emit,
+                );
             } else {
-                fs::copy(&src_path, &target)?;
+                info.current_file = Some(src_path.clone());
+                match fs::copy(&src_path, &target) {
+                    Ok(bytes) => {
+                        info.bytes_processed += bytes;
+                        info.files_processed += 1;
+                    }
+                    Err(e) => {
+                        info.errors.push(FileOpError {
+                            path: src_path.clone(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+
+                // Throttled emit
+                if last_emit.elapsed().as_millis() >= 100 {
+                    seq_counter += 1;
+                    let _ = ctx.events.send(ShellEvent::StreamingUpdate {
+                        block_id: ctx.block_id,
+                        seq: seq_counter,
+                        update: Value::FileOp(Box::new(info.clone())),
+                        coalesce: true,
+                    });
+                    last_emit = Instant::now();
+                }
             }
         }
 
-        Ok(Value::Unit)
+        info.phase = if info.errors.is_empty() {
+            FileOpPhase::Completed
+        } else {
+            FileOpPhase::Failed
+        };
+        info.current_file = None;
+
+        Ok(Value::FileOp(Box::new(info)))
     }
 }
 
-fn copy_dir_recursive(src: &PathBuf, dest: &PathBuf) -> anyhow::Result<()> {
-    fs::create_dir_all(dest)?;
+fn count_recursive(path: &PathBuf, total_bytes: &mut u64, total_files: &mut usize) {
+    if path.is_file() {
+        *total_bytes += fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        *total_files += 1;
+    } else if path.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                count_recursive(&entry.path(), total_bytes, total_files);
+            }
+        }
+    }
+}
 
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
+fn copy_dir_with_progress(
+    src: &PathBuf,
+    dest: &PathBuf,
+    info: &mut FileOpInfo,
+    ctx: &mut CommandContext,
+    seq_counter: &mut u64,
+    last_emit: &mut Instant,
+) {
+    if let Err(e) = fs::create_dir_all(dest) {
+        info.errors.push(FileOpError {
+            path: dest.clone(),
+            message: e.to_string(),
+        });
+        return;
+    }
+
+    let entries = match fs::read_dir(src) {
+        Ok(e) => e,
+        Err(e) => {
+            info.errors.push(FileOpError {
+                path: src.clone(),
+                message: e.to_string(),
+            });
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
         let src_path = entry.path();
         let dest_path = dest.join(entry.file_name());
 
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
+            copy_dir_with_progress(&src_path, &dest_path, info, ctx, seq_counter, last_emit);
         } else {
-            fs::copy(&src_path, &dest_path)?;
+            info.current_file = Some(src_path.clone());
+            match fs::copy(&src_path, &dest_path) {
+                Ok(bytes) => {
+                    info.bytes_processed += bytes;
+                    info.files_processed += 1;
+                }
+                Err(e) => {
+                    info.errors.push(FileOpError {
+                        path: src_path.clone(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+
+            // Throttled emit
+            if last_emit.elapsed().as_millis() >= 100 {
+                *seq_counter += 1;
+                let _ = ctx.events.send(ShellEvent::StreamingUpdate {
+                    block_id: ctx.block_id,
+                    seq: *seq_counter,
+                    update: Value::FileOp(Box::new(info.clone())),
+                    coalesce: true,
+                });
+                *last_emit = Instant::now();
+            }
         }
     }
-
-    Ok(())
 }
 
 // ============================================================================
@@ -355,16 +567,42 @@ impl NexusCommand for MvCommand {
         };
 
         let dest_is_dir = dest_path.is_dir();
+        let start_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
-        for src in paths {
-            let src_path = if PathBuf::from(&src).is_absolute() {
-                PathBuf::from(&src)
+        let sources: Vec<PathBuf> = paths.iter().map(|s| {
+            if PathBuf::from(s).is_absolute() { PathBuf::from(s) } else { ctx.state.cwd.join(s) }
+        }).collect();
+
+        let mut info = FileOpInfo {
+            op_type: FileOpKind::Move,
+            phase: FileOpPhase::Executing,
+            sources: sources.clone(),
+            dest: Some(dest_path.clone()),
+            total_bytes: None,
+            bytes_processed: 0,
+            files_total: Some(sources.len()),
+            files_processed: 0,
+            current_file: None,
+            start_time_ms,
+            errors: Vec::new(),
+        };
+
+        for src in &paths {
+            let src_path = if PathBuf::from(src).is_absolute() {
+                PathBuf::from(src)
             } else {
-                ctx.state.cwd.join(&src)
+                ctx.state.cwd.join(src)
             };
 
             if !src_path.exists() {
-                return Err(anyhow::anyhow!("mv: cannot stat '{}': No such file or directory", src));
+                info.errors.push(FileOpError {
+                    path: src_path.clone(),
+                    message: "No such file or directory".to_string(),
+                });
+                continue;
             }
 
             let target = if dest_is_dir {
@@ -377,14 +615,283 @@ impl NexusCommand for MvCommand {
                 // In interactive mode we'd ask; here we just proceed
             }
 
-            fs::rename(&src_path, &target)?;
+            info.current_file = Some(src_path.clone());
+
+            // Try rename first (fast path, same filesystem)
+            match fs::rename(&src_path, &target) {
+                Ok(()) => {
+                    info.files_processed += 1;
+                }
+                Err(rename_err) => {
+                    // Only fallback to copy+delete on cross-device errors (EXDEV).
+                    // Other errors (EACCES, ENOENT, etc.) should be reported directly.
+                    // EXDEV = 18 on both macOS and Linux
+                    let is_cross_device = rename_err.raw_os_error() == Some(18);
+                    if !is_cross_device {
+                        info.errors.push(FileOpError {
+                            path: src_path.clone(),
+                            message: rename_err.to_string(),
+                        });
+                        continue;
+                    }
+                    // Fallback: copy + delete (cross-filesystem move)
+                    if src_path.is_dir() {
+                        let mut seq: u64 = 0;
+                        let mut last_emit = Instant::now();
+                        copy_dir_with_progress(
+                            &src_path, &target, &mut info, ctx, &mut seq, &mut last_emit,
+                        );
+                        if info.errors.is_empty() {
+                            let _ = fs::remove_dir_all(&src_path);
+                        }
+                    } else {
+                        match fs::copy(&src_path, &target) {
+                            Ok(_) => {
+                                let _ = fs::remove_file(&src_path);
+                                info.files_processed += 1;
+                            }
+                            Err(e) => {
+                                info.errors.push(FileOpError {
+                                    path: src_path.clone(),
+                                    message: e.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        Ok(Value::Unit)
+        info.phase = if info.errors.is_empty() {
+            FileOpPhase::Completed
+        } else {
+            FileOpPhase::Failed
+        };
+        info.current_file = None;
+
+        Ok(Value::FileOp(Box::new(info)))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Tests would require temp directories
+    use super::*;
+    use crate::commands::test_utils::test_helpers::TestContext;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn setup_test_dir() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let mut f = fs::File::create(dir.path().join("src.txt")).unwrap();
+        f.write_all(b"hello world").unwrap();
+
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+        let mut f2 = fs::File::create(dir.path().join("subdir/nested.txt")).unwrap();
+        f2.write_all(b"nested content").unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn test_cp_single_file() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = CpCommand;
+        let result = cmd
+            .execute(
+                &["src.txt".to_string(), "dst.txt".to_string()],
+                &mut test_ctx.ctx(),
+            )
+            .unwrap();
+
+        match result {
+            Value::FileOp(info) => {
+                assert!(matches!(info.op_type, FileOpKind::Copy));
+                assert!(matches!(info.phase, FileOpPhase::Completed));
+                assert!(info.errors.is_empty());
+                assert_eq!(info.files_processed, 1);
+            }
+            _ => panic!("Expected FileOp"),
+        }
+
+        assert!(dir.path().join("dst.txt").exists());
+        assert_eq!(fs::read_to_string(dir.path().join("dst.txt")).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_cp_recursive() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = CpCommand;
+        let result = cmd
+            .execute(
+                &["-r".to_string(), "subdir".to_string(), "subdir_copy".to_string()],
+                &mut test_ctx.ctx(),
+            )
+            .unwrap();
+
+        match result {
+            Value::FileOp(info) => {
+                assert!(matches!(info.phase, FileOpPhase::Completed));
+                assert!(info.errors.is_empty());
+            }
+            _ => panic!("Expected FileOp"),
+        }
+
+        assert!(dir.path().join("subdir_copy/nested.txt").exists());
+    }
+
+    #[test]
+    fn test_cp_dir_without_recursive() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = CpCommand;
+        let result = cmd
+            .execute(
+                &["subdir".to_string(), "subdir_copy".to_string()],
+                &mut test_ctx.ctx(),
+            )
+            .unwrap();
+
+        match result {
+            Value::FileOp(info) => {
+                // Should have error about -r not specified
+                assert!(!info.errors.is_empty());
+            }
+            _ => panic!("Expected FileOp"),
+        }
+    }
+
+    #[test]
+    fn test_cp_nonexistent_source() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = CpCommand;
+        let result = cmd
+            .execute(
+                &["nonexistent.txt".to_string(), "dst.txt".to_string()],
+                &mut test_ctx.ctx(),
+            )
+            .unwrap();
+
+        match result {
+            Value::FileOp(info) => {
+                assert!(matches!(info.phase, FileOpPhase::Failed));
+                assert!(!info.errors.is_empty());
+            }
+            _ => panic!("Expected FileOp"),
+        }
+    }
+
+    #[test]
+    fn test_mv_file() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = MvCommand;
+        let result = cmd
+            .execute(
+                &["src.txt".to_string(), "moved.txt".to_string()],
+                &mut test_ctx.ctx(),
+            )
+            .unwrap();
+
+        match result {
+            Value::FileOp(info) => {
+                assert!(matches!(info.op_type, FileOpKind::Move));
+                assert!(matches!(info.phase, FileOpPhase::Completed));
+                assert!(info.errors.is_empty());
+                assert_eq!(info.files_processed, 1);
+            }
+            _ => panic!("Expected FileOp"),
+        }
+
+        assert!(!dir.path().join("src.txt").exists());
+        assert!(dir.path().join("moved.txt").exists());
+    }
+
+    #[test]
+    fn test_mv_nonexistent() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = MvCommand;
+        let result = cmd
+            .execute(
+                &["nonexistent.txt".to_string(), "dst.txt".to_string()],
+                &mut test_ctx.ctx(),
+            )
+            .unwrap();
+
+        match result {
+            Value::FileOp(info) => {
+                assert!(!info.errors.is_empty());
+            }
+            _ => panic!("Expected FileOp"),
+        }
+    }
+
+    #[test]
+    fn test_rm_file() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = RmCommand;
+        let result = cmd
+            .execute(&["src.txt".to_string()], &mut test_ctx.ctx())
+            .unwrap();
+
+        // Simple rm returns Unit for backward compatibility
+        assert!(matches!(result, Value::Unit));
+        assert!(!dir.path().join("src.txt").exists());
+    }
+
+    #[test]
+    fn test_rm_recursive() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = RmCommand;
+        let result = cmd
+            .execute(
+                &["-rf".to_string(), "subdir".to_string()],
+                &mut test_ctx.ctx(),
+            )
+            .unwrap();
+
+        assert!(matches!(result, Value::Unit));
+        assert!(!dir.path().join("subdir").exists());
+    }
+
+    #[test]
+    fn test_rm_dir_without_recursive() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = RmCommand;
+        let result = cmd
+            .execute(&["subdir".to_string()], &mut test_ctx.ctx())
+            .unwrap();
+
+        // Should have error about "Is a directory"
+        match result {
+            Value::FileOp(info) => {
+                assert!(!info.errors.is_empty());
+                assert!(info.errors[0].message.contains("Is a directory"));
+            }
+            _ => panic!("Expected FileOp with error"),
+        }
+    }
+
+    #[test]
+    fn test_rm_missing_operand() {
+        let mut test_ctx = TestContext::new_default();
+        let cmd = RmCommand;
+        let result = cmd.execute(&[], &mut test_ctx.ctx());
+        assert!(result.is_err());
+    }
 }

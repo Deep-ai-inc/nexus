@@ -273,6 +273,12 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(map)
         }
+
+        // New domain types: serialize via serde
+        _ => {
+            // Use to_text() as a string fallback for JSON
+            serde_json::Value::String(value.to_text())
+        }
     }
 }
 

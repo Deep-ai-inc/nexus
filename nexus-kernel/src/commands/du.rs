@@ -1,7 +1,7 @@
 //! The `du` command - estimate file space usage.
 
 use super::{CommandContext, NexusCommand};
-use nexus_api::{DisplayFormat, TableColumn, Value};
+use nexus_api::{DisplayFormat, FileType, TableColumn, TreeInfo, TreeNodeFlat, Value};
 use std::fs;
 use std::path::PathBuf;
 
@@ -18,6 +18,8 @@ struct DuOptions {
     total: bool,
     /// Max depth to descend
     max_depth: Option<usize>,
+    /// Output as tree structure
+    tree: bool,
 }
 
 impl DuOptions {
@@ -28,6 +30,7 @@ impl DuOptions {
             summarize: false,
             total: false,
             max_depth: None,
+            tree: false,
         };
 
         let mut paths = Vec::new();
@@ -53,6 +56,8 @@ impl DuOptions {
                 opts.max_depth = arg.strip_prefix("--max-depth=").and_then(|s| s.parse().ok());
             } else if arg.starts_with("-d") {
                 opts.max_depth = arg.strip_prefix("-d").and_then(|s| s.parse().ok());
+            } else if arg == "--tree" || arg == "-t" {
+                opts.tree = true;
             } else if !arg.starts_with('-') {
                 paths.push(PathBuf::from(arg));
             }
@@ -75,6 +80,26 @@ impl NexusCommand for DuCommand {
 
     fn execute(&self, args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value> {
         let (opts, paths) = DuOptions::parse(args);
+
+        // Tree output mode
+        if opts.tree {
+            let mut all_nodes: Vec<TreeNodeFlat> = Vec::new();
+            let mut id_counter = 0;
+
+            for path in &paths {
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    ctx.state.cwd.join(path)
+                };
+                build_du_tree(&resolved, None, 0, opts.max_depth.unwrap_or(usize::MAX), &mut all_nodes, &mut id_counter);
+            }
+
+            return Ok(Value::Tree(Box::new(TreeInfo {
+                root: 0,
+                nodes: all_nodes,
+            })));
+        }
 
         let columns = vec![
             if opts.human_readable {
@@ -197,6 +222,62 @@ fn calculate_du(
     Ok((total_size, entries))
 }
 
+/// Build a flat tree arena with size annotations for `du --tree`.
+fn build_du_tree(
+    path: &PathBuf,
+    parent: Option<usize>,
+    depth: usize,
+    max_depth: usize,
+    nodes: &mut Vec<TreeNodeFlat>,
+    id_counter: &mut usize,
+) -> u64 {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+    let metadata = fs::metadata(path).ok();
+    let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+
+    let node_id = *id_counter;
+    *id_counter += 1;
+
+    let child_count = if is_dir && depth < max_depth {
+        fs::read_dir(path).map(|e| e.count()).unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Insert node (size will be updated after children are processed for dirs)
+    let node_idx = nodes.len();
+    nodes.push(TreeNodeFlat {
+        id: node_id,
+        parent,
+        name,
+        path: path.clone(),
+        node_type: if is_dir { FileType::Directory } else { FileType::File },
+        size: file_size,
+        depth,
+        child_count,
+    });
+
+    if is_dir && depth < max_depth {
+        let mut total: u64 = 0;
+        if let Ok(entries) = fs::read_dir(path) {
+            let mut children: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            children.sort();
+            for child in children {
+                total += build_du_tree(&child, Some(node_id), depth + 1, max_depth, nodes, id_counter);
+            }
+        }
+        nodes[node_idx].size = total;
+        total
+    } else {
+        file_size
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +341,30 @@ mod tests {
                 assert_eq!(size_col.format, Some(DisplayFormat::HumanBytes));
             }
             _ => panic!("Expected Table"),
+        }
+    }
+
+    #[test]
+    fn test_du_tree() {
+        let dir = setup_test_dir();
+        let mut test_ctx = TestContext::new(dir.path().to_path_buf());
+
+        let cmd = DuCommand;
+        let result = cmd
+            .execute(&["--tree".to_string(), ".".to_string()], &mut test_ctx.ctx())
+            .unwrap();
+
+        match result {
+            Value::Tree(tree) => {
+                assert!(!tree.nodes.is_empty());
+                assert_eq!(tree.root, 0);
+                // Root should be a directory
+                assert!(matches!(tree.nodes[0].node_type, FileType::Directory));
+                // Should contain subdirectory and files
+                let names: Vec<&str> = tree.nodes.iter().map(|n| n.name.as_str()).collect();
+                assert!(names.iter().any(|n| *n == "subdir"));
+            }
+            _ => panic!("Expected Tree value"),
         }
     }
 
