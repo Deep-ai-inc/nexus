@@ -237,7 +237,8 @@ fn entries_to_table(mut entries: Vec<FileEntry>, opts: &LsOptions) -> Value {
                 // Always store raw bytes - formatting happens at render time!
                 Value::Int(e.size as i64),
                 Value::String(format_time(e.modified)),
-                Value::String(format_name(&e)),
+                // Keep as FileEntry so rendering can make it clickable
+                Value::FileEntry(Box::new(e)),
             ]
         })
         .collect();
@@ -395,10 +396,3 @@ fn format_time(ts: Option<u64>) -> String {
     }
 }
 
-fn format_name(entry: &FileEntry) -> String {
-    if let Some(target) = &entry.symlink_target {
-        format!("{} -> {}", entry.name, target.display())
-    } else {
-        entry.name.clone()
-    }
-}

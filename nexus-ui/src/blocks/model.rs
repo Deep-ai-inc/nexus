@@ -1,10 +1,11 @@
 //! Block and related types for representing command execution in the UI.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Instant;
 
-use nexus_api::{BlockId, BlockState, OutputFormat, Value};
+use nexus_api::{BlockId, BlockState, FileEntry, OutputFormat, Value};
 use nexus_term::TerminalParser;
 
 use crate::agent_block::AgentBlock;
@@ -32,6 +33,48 @@ impl TableSort {
             self.column = Some(column_index);
             self.ascending = true;
         }
+    }
+}
+
+/// Tree state for directory expansion.
+#[derive(Debug, Clone, Default)]
+pub struct TreeState {
+    /// Which directory paths are currently expanded.
+    pub expanded: HashSet<PathBuf>,
+    /// Cached contents of expanded directories.
+    pub children: HashMap<PathBuf, Vec<FileEntry>>,
+}
+
+impl TreeState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if a path is expanded.
+    pub fn is_expanded(&self, path: &PathBuf) -> bool {
+        self.expanded.contains(path)
+    }
+
+    /// Toggle expansion of a directory.
+    /// Returns true if the directory is now expanded (needs content loading).
+    pub fn toggle(&mut self, path: PathBuf) -> bool {
+        if self.expanded.contains(&path) {
+            self.expanded.remove(&path);
+            false
+        } else {
+            self.expanded.insert(path);
+            true
+        }
+    }
+
+    /// Store children for an expanded directory.
+    pub fn set_children(&mut self, path: PathBuf, entries: Vec<FileEntry>) {
+        self.children.insert(path, entries);
+    }
+
+    /// Get children of an expanded directory.
+    pub fn get_children(&self, path: &PathBuf) -> Option<&Vec<FileEntry>> {
+        self.children.get(path)
     }
 }
 
@@ -96,6 +139,8 @@ pub struct Block {
     pub stream_seq: u64,
     /// Interactive viewer state (pager, process monitor, tree browser).
     pub view_state: Option<ViewState>,
+    /// Tree view: which directories are expanded.
+    pub tree_state: TreeState,
 }
 
 impl Block {
@@ -118,6 +163,7 @@ impl Block {
             stream_latest: None,
             stream_seq: 0,
             view_state: None,
+            tree_state: TreeState::new(),
         }
     }
 

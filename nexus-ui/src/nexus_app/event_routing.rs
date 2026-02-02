@@ -141,6 +141,9 @@ fn route_global_shortcut(
 }
 
 fn route_escape(state: &NexusState) -> Option<NexusMessage> {
+    // Close Quick Look on Esc (always, before other handlers)
+    strata::platform::close_quicklook();
+
     if state.transient.context_menu().is_some() {
         return Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss));
     }
@@ -189,6 +192,11 @@ pub(super) fn on_mouse(
     hit: Option<HitResult>,
     capture: &CaptureState,
 ) -> MouseResponse<NexusMessage> {
+    // Close Quick Look on any mouse click in the app window
+    if matches!(event, MouseEvent::ButtonPressed { .. }) {
+        strata::platform::close_quicklook();
+    }
+
     // ── Drag state machine intercept ──────────────────────────────
     if let Some(resp) = super::drag_state::route_drag_mouse(
         &state.drag.status,
@@ -285,7 +293,9 @@ pub(super) fn on_mouse(
 
             // Anchor clicks → start pending drag (click fires on release if <5px)
             if let Some(payload) = state.shell.drag_payload_for_anchor(*id) {
-                let intent = PendingIntent::Anchor { source: *id, payload };
+                // No source_rect - Quick Look will appear without zoom animation
+                // (zoom animation is designed for thumbnails, not text)
+                let intent = PendingIntent::Anchor { source: *id, payload, source_rect: None };
                 return MouseResponse::message_and_capture(
                     NexusMessage::Drag(DragMsg::Start(intent, *position)),
                     *id,
@@ -309,7 +319,7 @@ pub(super) fn on_mouse(
             };
             if let Some(src) = image_source {
                 if let Some(payload) = state.shell.image_drag_payload(src) {
-                    let intent = PendingIntent::Anchor { source: src, payload };
+                    let intent = PendingIntent::Anchor { source: src, payload, source_rect: None };
                     return MouseResponse::message_and_capture(
                         NexusMessage::Drag(DragMsg::Start(intent, *position)),
                         src,

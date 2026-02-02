@@ -23,23 +23,27 @@ use crate::shell_context::build_shell_context;
 // =========================================================================
 
 impl NexusState {
-    fn apply_shell_output(&mut self, output: ShellOutput) {
+    fn apply_shell_output(&mut self, output: ShellOutput) -> Command<NexusMessage> {
         match output {
-            ShellOutput::None => {}
+            ShellOutput::None => Command::none(),
             ShellOutput::FocusInput | ShellOutput::PtyInputFailed => {
                 self.set_focus(Focus::Input);
                 self.scroll.force();
+                Command::none()
             }
             ShellOutput::FocusBlock(id) => {
                 self.set_focus(Focus::Block(id));
                 self.scroll.force();
+                Command::none()
             }
             ShellOutput::ScrollToBottom => {
                 self.scroll.hint();
+                Command::none()
             }
             ShellOutput::CwdChanged(path) => {
                 self.cwd = path.display().to_string();
                 let _ = std::env::set_current_dir(&path);
+                Command::none()
             }
             ShellOutput::CommandFinished { block_id, exit_code, command, output } => {
                 self.context.on_command_finished(command, output, exit_code);
@@ -51,12 +55,31 @@ impl NexusState {
                     self.set_focus(Focus::Input);
                 }
                 self.scroll.force();
+                Command::none()
             }
             ShellOutput::BlockExited { id } => {
                 if self.focus == Focus::Block(id) {
                     self.set_focus(Focus::Input);
                     self.scroll.force();
                 }
+                Command::none()
+            }
+            ShellOutput::LoadTreeChildren(block_id, path) => {
+                // Spawn async directory listing
+                let path_clone = path.clone();
+                Command::perform(async move {
+                    let mut entries = Vec::new();
+                    if let Ok(read_dir) = std::fs::read_dir(&path_clone) {
+                        for entry in read_dir.flatten() {
+                            if let Ok(file_entry) = nexus_api::FileEntry::from_path(entry.path()) {
+                                entries.push(file_entry);
+                            }
+                        }
+                    }
+                    // Sort alphabetically
+                    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    NexusMessage::Shell(ShellMsg::TreeChildrenLoaded(block_id, path_clone, entries))
+                })
             }
         }
     }
@@ -110,8 +133,7 @@ impl NexusState {
                     return Command::none();
                 }
                 let (_cmd, output) = self.shell.update(m, ctx);
-                self.apply_shell_output(output);
-                Command::none()
+                self.apply_shell_output(output)
             }
             NexusMessage::Agent(m) => {
                 if matches!(m, super::message::AgentMsg::QuestionInputMouse(_)) {
@@ -238,11 +260,11 @@ impl NexusState {
                 match prev {
                     DragStatus::Pending { intent, .. } => {
                         match intent {
-                            PendingIntent::Anchor { source, .. } => {
+                            PendingIntent::Anchor { source, source_rect, .. } => {
                                 // Re-dispatch click to anchor handler
                                 if let Some(msg) = self.shell.on_click_anchor(source) {
                                     if let ShellMsg::OpenAnchor(_, ref action) = msg {
-                                        self.exec_anchor_action(action);
+                                        self.exec_anchor_action_with_rect(action, source_rect);
                                     }
                                 }
                             }
@@ -451,11 +473,34 @@ impl NexusState {
     }
 
     fn exec_anchor_action(&self, action: &AnchorAction) {
+        self.exec_anchor_action_with_rect(action, None);
+    }
+
+    fn exec_anchor_action_with_rect(&self, action: &AnchorAction, source_rect: Option<strata::primitives::Rect>) {
         match action {
+            AnchorAction::QuickLook(path) => {
+                // Preview with native Quick Look (macOS)
+                let result = if let Some(local_rect) = source_rect {
+                    // Use local rect for zoom animation
+                    strata::platform::preview_file_with_local_rect(path, local_rect)
+                } else {
+                    // No animation
+                    strata::platform::preview_file(path)
+                };
+                if let Err(e) = result {
+                    tracing::warn!("Quick Look failed: {}", e);
+                }
+            }
             AnchorAction::RevealPath(path) => {
                 // Reveal in Finder (macOS) — `open -R <path>`
                 let _ = std::process::Command::new("open")
                     .arg("-R")
+                    .arg(path)
+                    .spawn();
+            }
+            AnchorAction::Open(path) => {
+                // Open with default application (macOS) — `open <path>`
+                let _ = std::process::Command::new("open")
                     .arg(path)
                     .spawn();
             }
@@ -583,6 +628,19 @@ impl NexusState {
                     let cmd = block.command.clone();
                     return self.handle_submit(cmd, false, Vec::new());
                 }
+            }
+            ContextMenuItem::QuickLook(path) => {
+                if let Err(e) = strata::platform::preview_file(&path) {
+                    tracing::warn!("Quick Look failed: {}", e);
+                }
+            }
+            ContextMenuItem::Open(path) => {
+                let _ = std::process::Command::new("open")
+                    .arg(&path)
+                    .spawn();
+            }
+            ContextMenuItem::CopyPath(path) => {
+                Self::set_clipboard_text(&path.display().to_string());
             }
             ContextMenuItem::RevealInFinder(path) => {
                 let _ = std::process::Command::new("open")
