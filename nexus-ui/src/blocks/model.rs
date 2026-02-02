@@ -228,6 +228,11 @@ pub enum ViewState {
         collapsed: HashSet<usize>,
         selected: Option<usize>,
     },
+    DiffViewer {
+        scroll_line: usize,
+        current_file: usize,
+        collapsed_indices: HashSet<usize>,
+    },
 }
 
 impl ViewState {
@@ -268,6 +273,19 @@ impl ViewState {
                 Key::Named(NamedKey::Space) | Key::Named(NamedKey::Enter) => {
                     Some(ViewerMsg::TreeToggle(id))
                 }
+                Key::Character(c) if c == "q" => Some(ViewerMsg::Exit(id)),
+                _ => None,
+            },
+            ViewState::DiffViewer { .. } => match key {
+                Key::Character(c) if c == "j" => Some(ViewerMsg::ScrollDown(id)),
+                Key::Character(c) if c == "k" => Some(ViewerMsg::ScrollUp(id)),
+                Key::Character(c) if c == "n" => Some(ViewerMsg::DiffNextFile(id)),
+                Key::Character(c) if c == "p" => Some(ViewerMsg::DiffPrevFile(id)),
+                Key::Named(NamedKey::Space) => Some(ViewerMsg::DiffToggleFile(id)),
+                Key::Named(NamedKey::PageDown) => Some(ViewerMsg::PageDown(id)),
+                Key::Named(NamedKey::PageUp) => Some(ViewerMsg::PageUp(id)),
+                Key::Character(c) if c == "g" => Some(ViewerMsg::GoToTop(id)),
+                Key::Character(c) if c == "G" => Some(ViewerMsg::GoToBottom(id)),
                 Key::Character(c) if c == "q" => Some(ViewerMsg::Exit(id)),
                 _ => None,
             },

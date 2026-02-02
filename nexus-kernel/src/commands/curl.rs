@@ -77,17 +77,33 @@ impl NexusCommand for CurlCommand {
         }
 
         cmd.arg(&url);
+
+        // Write timing data to stderr via %{stderr} to avoid body collision
+        cmd.arg("-w")
+            .arg("%{stderr}__NEXUS_TIMING__%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}");
+
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd.spawn()?.wait_with_output()?;
         let total_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+        // Extract timing from stderr (appended by -w via %{stderr})
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let curl_timing = extract_timing_from_stderr(&stderr_str);
+
+        // Check for curl errors (timing marker removed from stderr for error check)
+        let stderr_clean = stderr_str
+            .find("__NEXUS_TIMING__")
+            .map(|pos| &stderr_str[..pos])
+            .unwrap_or(&stderr_str);
         if !output.status.success() && output.stdout.is_empty() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("curl: {}", stderr.trim());
+            let err = stderr_clean.trim();
+            if !err.is_empty() {
+                anyhow::bail!("curl: {}", err);
+            }
+            anyhow::bail!("curl: request failed");
         }
 
-        // Parse the response: headers are separated from body by \r\n\r\n
         let raw = output.stdout;
         let (header_bytes, body_bytes) = split_headers_body(&raw);
 
@@ -150,12 +166,55 @@ impl NexusCommand for CurlCommand {
             body_len,
             body_truncated,
             content_type,
-            timing: HttpTiming {
+            timing: curl_timing.unwrap_or(HttpTiming {
                 total_ms,
+                dns_ms: None,
+                connect_ms: None,
+                tls_ms: None,
                 ttfb_ms: None,
-            },
+                transfer_ms: None,
+            }),
         }))
     }
+}
+
+const TIMING_MARKER: &str = "__NEXUS_TIMING__";
+
+/// Extract timing data from curl's stderr output (written via `%{stderr}` in `-w`).
+fn extract_timing_from_stderr(stderr: &str) -> Option<HttpTiming> {
+    let timing_data = stderr.find(TIMING_MARKER)?;
+    let after_marker = &stderr[timing_data + TIMING_MARKER.len()..];
+    let parts: Vec<&str> = after_marker.trim().split('|').collect();
+
+    if parts.len() != 5 {
+        return None;
+    }
+
+    let t_dns: f64 = parts[0].parse().unwrap_or(0.0);
+    let t_conn: f64 = parts[1].parse().unwrap_or(0.0);
+    let t_tls: f64 = parts[2].parse().unwrap_or(0.0);
+    let t_ttfb: f64 = parts[3].parse().unwrap_or(0.0);
+    let t_total: f64 = parts[4].parse().unwrap_or(0.0);
+
+    let dns_ms = t_dns * 1000.0;
+    let connect_ms = (t_conn - t_dns).max(0.0) * 1000.0;
+    let tls_ms = if t_tls > t_conn {
+        Some((t_tls - t_conn) * 1000.0)
+    } else {
+        None
+    };
+    let tls_end = if t_tls > t_conn { t_tls } else { t_conn };
+    let ttfb_ms = (t_ttfb - tls_end).max(0.0) * 1000.0;
+    let transfer_ms = (t_total - t_ttfb).max(0.0) * 1000.0;
+
+    Some(HttpTiming {
+        total_ms: t_total * 1000.0,
+        dns_ms: Some(dns_ms),
+        connect_ms: Some(connect_ms),
+        tls_ms,
+        ttfb_ms: Some(ttfb_ms),
+        transfer_ms: Some(transfer_ms),
+    })
 }
 
 /// Split raw curl -i output into (headers, body) at the first \r\n\r\n boundary.
@@ -250,5 +309,38 @@ mod tests {
         let cmd = CurlCommand;
         let result = cmd.execute(&[], &mut test_ctx.ctx());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_timing_from_stderr_tls() {
+        let stderr = "__NEXUS_TIMING__0.012|0.045|0.120|0.200|0.350";
+        let timing = extract_timing_from_stderr(stderr).unwrap();
+        assert!((timing.total_ms - 350.0).abs() < 0.1);
+        assert!((timing.dns_ms.unwrap() - 12.0).abs() < 0.1);
+        assert!((timing.connect_ms.unwrap() - 33.0).abs() < 0.1);
+        assert!((timing.tls_ms.unwrap() - 75.0).abs() < 0.1);
+        assert!((timing.ttfb_ms.unwrap() - 80.0).abs() < 0.1);
+        assert!((timing.transfer_ms.unwrap() - 150.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_extract_timing_from_stderr_no_tls() {
+        let stderr = "__NEXUS_TIMING__0.005|0.020|0.020|0.100|0.250";
+        let timing = extract_timing_from_stderr(stderr).unwrap();
+        assert!(timing.tls_ms.is_none());
+        assert!((timing.ttfb_ms.unwrap() - 80.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_extract_timing_from_stderr_with_errors() {
+        let stderr = "curl: (6) Could not resolve host\n__NEXUS_TIMING__0.010|0.000|0.000|0.000|0.010";
+        let timing = extract_timing_from_stderr(stderr).unwrap();
+        assert!((timing.total_ms - 10.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_extract_timing_from_stderr_missing() {
+        let stderr = "curl: (6) Could not resolve host";
+        assert!(extract_timing_from_stderr(stderr).is_none());
     }
 }

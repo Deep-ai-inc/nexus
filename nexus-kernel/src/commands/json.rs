@@ -154,6 +154,21 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             if let Some(modified) = entry.modified {
                 map.insert("modified".to_string(), serde_json::Value::Number(modified.into()));
             }
+            if let Some(uid) = entry.uid {
+                map.insert("uid".to_string(), serde_json::Value::Number(uid.into()));
+            }
+            if let Some(gid) = entry.gid {
+                map.insert("gid".to_string(), serde_json::Value::Number(gid.into()));
+            }
+            if let Some(ref owner) = entry.owner {
+                map.insert("owner".to_string(), serde_json::Value::String(owner.clone()));
+            }
+            if let Some(ref group) = entry.group {
+                map.insert("group".to_string(), serde_json::Value::String(group.clone()));
+            }
+            if let Some(nlink) = entry.nlink {
+                map.insert("nlink".to_string(), serde_json::Value::Number(nlink.into()));
+            }
             serde_json::Value::Object(map)
         }
         Value::Error { code, message } => {

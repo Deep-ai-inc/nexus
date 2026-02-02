@@ -616,51 +616,81 @@ impl NexusState {
         match msg {
             ViewerMsg::ScrollUp(id) => {
                 if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
-                        *scroll_line = scroll_line.saturating_sub(1);
-                        block.version += 1;
-                    }
+                    let scrolled = match &mut block.view_state {
+                        Some(ViewState::Pager { scroll_line, .. })
+                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
+                            *scroll_line = scroll_line.saturating_sub(1);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if scrolled { block.version += 1; }
                 }
             }
             ViewerMsg::ScrollDown(id) => {
                 if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
-                        *scroll_line += 1;
-                        block.version += 1;
-                    }
+                    let scrolled = match &mut block.view_state {
+                        Some(ViewState::Pager { scroll_line, .. })
+                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
+                            *scroll_line += 1;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if scrolled { block.version += 1; }
                 }
             }
             ViewerMsg::PageUp(id) => {
                 if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
-                        *scroll_line = scroll_line.saturating_sub(30);
-                        block.version += 1;
-                    }
+                    let scrolled = match &mut block.view_state {
+                        Some(ViewState::Pager { scroll_line, .. })
+                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
+                            *scroll_line = scroll_line.saturating_sub(30);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if scrolled { block.version += 1; }
                 }
             }
             ViewerMsg::PageDown(id) => {
                 if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
-                        *scroll_line += 30;
-                        block.version += 1;
-                    }
+                    let scrolled = match &mut block.view_state {
+                        Some(ViewState::Pager { scroll_line, .. })
+                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
+                            *scroll_line += 30;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if scrolled { block.version += 1; }
                 }
             }
             ViewerMsg::GoToTop(id) => {
                 if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
-                        *scroll_line = 0;
-                        block.version += 1;
-                    }
+                    let scrolled = match &mut block.view_state {
+                        Some(ViewState::Pager { scroll_line, .. })
+                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
+                            *scroll_line = 0;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if scrolled { block.version += 1; }
                 }
             }
             ViewerMsg::GoToBottom(id) => {
                 if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::Pager { ref mut scroll_line, .. }) = block.view_state {
-                        // Set to a very large value; rendering will clamp
-                        *scroll_line = usize::MAX / 2;
-                        block.version += 1;
-                    }
+                    let scrolled = match &mut block.view_state {
+                        Some(ViewState::Pager { scroll_line, .. })
+                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
+                            // Set to a very large value; rendering will clamp
+                            *scroll_line = usize::MAX / 2;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if scrolled { block.version += 1; }
                 }
             }
             ViewerMsg::SearchStart(_id) | ViewerMsg::SearchNext(_id) => {
@@ -732,6 +762,41 @@ impl NexusState {
                             if *sel + 1 < node_count {
                                 *sel += 1;
                             }
+                        }
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::DiffNextFile(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::DiffViewer { current_file, .. }) = &mut block.view_state {
+                        // Count diff files in content
+                        let file_count = block.native_output.as_ref()
+                            .and_then(|v| if let Value::List(items) = v { Some(items.len()) } else { None })
+                            .unwrap_or(0);
+                        if *current_file + 1 < file_count {
+                            *current_file += 1;
+                        }
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::DiffPrevFile(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::DiffViewer { current_file, .. }) = &mut block.view_state {
+                        *current_file = current_file.saturating_sub(1);
+                        block.version += 1;
+                    }
+                }
+            }
+            ViewerMsg::DiffToggleFile(id) => {
+                if let Some(block) = self.shell.block_by_id_mut(id) {
+                    if let Some(ViewState::DiffViewer { current_file, collapsed_indices, .. }) =
+                        &mut block.view_state
+                    {
+                        let idx = *current_file;
+                        if !collapsed_indices.remove(&idx) {
+                            collapsed_indices.insert(idx);
                         }
                         block.version += 1;
                     }

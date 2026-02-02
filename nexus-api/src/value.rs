@@ -134,6 +134,8 @@ pub enum DomainValue {
     HttpResponse(HttpResponseInfo),
     /// Request to open an interactive viewer in the UI.
     Interactive(InteractiveRequest),
+    /// Binary data chunk with metadata (non-renderable binaries from cat).
+    BlobChunk(BlobChunk),
 }
 
 impl DomainValue {
@@ -234,6 +236,11 @@ impl DomainValue {
             DomainValue::Interactive(req) => {
                 req.content.write_text(buf);
             }
+            DomainValue::BlobChunk(chunk) => {
+                let size = chunk.total_size.unwrap_or(chunk.data.len() as u64);
+                let src = chunk.source.as_deref().unwrap_or("binary");
+                buf.push_str(&format!("[{}: {} {}]", src, chunk.content_type, format_size(size)));
+            }
         }
     }
 
@@ -246,6 +253,7 @@ impl DomainValue {
             DomainValue::DnsAnswer(_) => "dns-answer",
             DomainValue::HttpResponse(_) => "http-response",
             DomainValue::Interactive(_) => "interactive",
+            DomainValue::BlobChunk(_) => "blob-chunk",
         }
     }
 
@@ -255,6 +263,14 @@ impl DomainValue {
             DomainValue::NetEvent(evt) => evt.get_field(name),
             DomainValue::DnsAnswer(dns) => dns.get_field(name),
             DomainValue::HttpResponse(resp) => resp.get_field(name),
+            DomainValue::BlobChunk(chunk) => match name {
+                "content_type" => Some(Value::String(chunk.content_type.clone())),
+                "offset" => Some(Value::Int(chunk.offset as i64)),
+                "total_size" => chunk.total_size.map(|s| Value::Int(s as i64)),
+                "source" => chunk.source.as_ref().map(|s| Value::String(s.clone())),
+                "len" => Some(Value::Int(chunk.data.len() as i64)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -266,6 +282,7 @@ impl DomainValue {
                 | DomainValue::NetEvent(_)
                 | DomainValue::DnsAnswer(_)
                 | DomainValue::HttpResponse(_)
+                | DomainValue::BlobChunk(_)
         )
     }
 }
@@ -284,6 +301,11 @@ pub struct FileEntry {
     pub is_hidden: bool,
     pub is_symlink: bool,
     pub symlink_target: Option<PathBuf>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub owner: Option<String>,
+    pub group: Option<String>,
+    pub nlink: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -674,12 +696,26 @@ pub struct FileOpError {
     pub message: String,
 }
 
+/// A chunk of binary data with metadata. Used for non-renderable binaries (archives,
+/// executables, etc.) where only a prefix is kept in memory. `data` holds at most
+/// 64 KiB; `total_size` reflects the actual file size from metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobChunk {
+    pub data: Vec<u8>,
+    pub content_type: String,
+    pub offset: u64,
+    pub total_size: Option<u64>,
+    pub source: Option<String>,
+}
+
 /// Kind of file operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileOpKind {
     Copy,
     Move,
     Remove,
+    Chmod,
+    Chown,
 }
 
 /// Phase of a file operation.
@@ -875,7 +911,11 @@ pub struct HttpResponseInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpTiming {
     pub total_ms: f64,
+    pub dns_ms: Option<f64>,
+    pub connect_ms: Option<f64>,
+    pub tls_ms: Option<f64>,
     pub ttfb_ms: Option<f64>,
+    pub transfer_ms: Option<f64>,
 }
 
 impl HttpResponseInfo {
@@ -888,7 +928,11 @@ impl HttpResponseInfo {
             "body_len" | "content_length" => Some(Value::Int(self.body_len as i64)),
             "content_type" => self.content_type.as_ref().map(|s| Value::String(s.clone())),
             "total_ms" => Some(Value::Float(self.timing.total_ms)),
+            "dns_ms" => self.timing.dns_ms.map(Value::Float),
+            "connect_ms" => self.timing.connect_ms.map(Value::Float),
+            "tls_ms" => self.timing.tls_ms.map(Value::Float),
             "ttfb_ms" => self.timing.ttfb_ms.map(Value::Float),
+            "transfer_ms" => self.timing.transfer_ms.map(Value::Float),
             _ => None,
         }
     }
@@ -912,6 +956,7 @@ pub enum ViewerKind {
     ProcessMonitor { interval_ms: u64 },
     TreeBrowser,
     ManPage,
+    DiffViewer,
 }
 
 /// Detect MIME type from magic bytes.
@@ -1089,15 +1134,23 @@ impl FileEntry {
         }
 
         #[cfg(unix)]
-        let permissions = {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode()
+        let (permissions, uid, gid, nlink) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.mode(),
+                Some(metadata.uid()),
+                Some(metadata.gid()),
+                Some(metadata.nlink()),
+            )
         };
         #[cfg(not(unix))]
-        let permissions = if metadata.permissions().readonly() {
-            0o444
-        } else {
-            0o644
+        let (permissions, uid, gid, nlink) = {
+            let p = if metadata.permissions().readonly() {
+                0o444
+            } else {
+                0o644
+            };
+            (p, None, None, None)
         };
 
         Ok(FileEntry {
@@ -1112,12 +1165,17 @@ impl FileEntry {
             is_hidden,
             is_symlink: metadata.is_symlink(),
             symlink_target,
+            uid,
+            gid,
+            owner: None, // Resolved at kernel level with libc
+            group: None,
+            nlink,
         })
     }
 }
 
 /// Format a byte size into human-readable form.
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -1332,6 +1390,10 @@ impl Value {
         match self {
             Value::Bytes(b) => b.clone(),
             Value::Media { data, .. } => data.clone(),
+            Value::Domain(d) => match d.as_ref() {
+                DomainValue::BlobChunk(chunk) => chunk.data.clone(),
+                _ => self.to_text().into_bytes(),
+            },
             _ => self.to_text().into_bytes(),
         }
     }
@@ -1368,6 +1430,9 @@ impl Value {
     }
     pub fn interactive(req: InteractiveRequest) -> Self {
         Value::Domain(Box::new(DomainValue::Interactive(req)))
+    }
+    pub fn blob_chunk(chunk: BlobChunk) -> Self {
+        Value::Domain(Box::new(DomainValue::BlobChunk(chunk)))
     }
 
     /// Access the inner `DomainValue` if this is a `Value::Domain`.

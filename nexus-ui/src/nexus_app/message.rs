@@ -196,6 +196,9 @@ pub enum ViewerMsg {
     TreeToggle(BlockId),
     TreeUp(BlockId),
     TreeDown(BlockId),
+    DiffNextFile(BlockId),
+    DiffPrevFile(BlockId),
+    DiffToggleFile(BlockId),
     Exit(BlockId),
 }
 

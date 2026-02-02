@@ -113,12 +113,34 @@ impl NexusCommand for CatCommand {
                 return Ok(process_string(text, &opts));
             }
 
-            // For binary/media files, return as Media value
-            let metadata = MediaMetadata::new()
-                .with_filename(path.file_name().unwrap_or_default().to_string_lossy())
-                .with_size(data.len() as u64);
+            // Renderable media types (image, audio, video, pdf): return as Media
+            let is_renderable = content_type.starts_with("image/")
+                || content_type.starts_with("audio/")
+                || content_type.starts_with("video/")
+                || content_type == "application/pdf";
 
-            return Ok(Value::media_with_metadata(data, content_type, metadata));
+            if is_renderable {
+                let metadata = MediaMetadata::new()
+                    .with_filename(path.file_name().unwrap_or_default().to_string_lossy())
+                    .with_size(data.len() as u64);
+                return Ok(Value::media_with_metadata(data, content_type, metadata));
+            }
+
+            // Non-renderable binaries: return as BlobChunk with 64KiB data cap
+            let total_size = data.len() as u64;
+            const MAX_BLOB_PREVIEW: usize = 64 * 1024;
+            let chunk_data = if data.len() > MAX_BLOB_PREVIEW {
+                data[..MAX_BLOB_PREVIEW].to_vec()
+            } else {
+                data
+            };
+            return Ok(Value::blob_chunk(nexus_api::BlobChunk {
+                data: chunk_data,
+                content_type: content_type.to_string(),
+                offset: 0,
+                total_size: Some(total_size),
+                source: Some(path.to_string_lossy().to_string()),
+            }));
         }
 
         // Multiple files: concatenate as text

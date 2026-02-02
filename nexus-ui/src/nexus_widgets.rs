@@ -1673,6 +1673,8 @@ fn render_domain_value(
                 nexus_api::FileOpKind::Copy => "Copy",
                 nexus_api::FileOpKind::Move => "Move",
                 nexus_api::FileOpKind::Remove => "Remove",
+                nexus_api::FileOpKind::Chmod => "Chmod",
+                nexus_api::FileOpKind::Chown => "Chown",
             };
             parent = parent.push(
                 TextElement::new(format!("{} {} {:?}", icon, op_label, info.phase))
@@ -1714,6 +1716,44 @@ fn render_domain_value(
                     .color(colors::TEXT_SECONDARY)
                     .source(source_id),
             );
+            // Throughput + ETA based on cumulative rate
+            if info.phase == nexus_api::FileOpPhase::Executing && info.start_time_ms > 0 {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let elapsed_s = (now_ms.saturating_sub(info.start_time_ms)) as f64 / 1000.0;
+                if elapsed_s > 0.1 {
+                    let throughput_str = if let Some(total_bytes) = info.total_bytes {
+                        if total_bytes > 0 {
+                            let rate = info.bytes_processed as f64 / elapsed_s;
+                            let remaining_bytes = total_bytes.saturating_sub(info.bytes_processed);
+                            let eta_s = if rate > 0.0 { remaining_bytes as f64 / rate } else { 0.0 };
+                            format!("  {}/s ETA: {}", nexus_api::format_size(rate as u64), format_eta(eta_s))
+                        } else {
+                            String::new()
+                        }
+                    } else if let Some(files_total) = info.files_total {
+                        if files_total > 0 {
+                            let rate = info.files_processed as f64 / elapsed_s;
+                            let remaining = files_total.saturating_sub(info.files_processed);
+                            let eta_s = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
+                            format!("  {:.0} files/s ETA: {}", rate, format_eta(eta_s))
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        format!("  {:.1}s elapsed", elapsed_s)
+                    };
+                    if !throughput_str.is_empty() {
+                        parent = parent.push(
+                            TextElement::new(throughput_str)
+                                .color(colors::TEXT_MUTED)
+                                .source(source_id),
+                        );
+                    }
+                }
+            }
             if let Some(ref current) = info.current_file {
                 parent = parent.push(
                     TextElement::new(format!("  {}", current.display()))
@@ -1848,12 +1888,53 @@ fn render_domain_value(
                     .color(status_color)
                     .source(source_id),
             );
-            if let Some(ttfb) = resp.timing.ttfb_ms {
-                parent = parent.push(
-                    TextElement::new(format!("  TTFB: {:.0}ms", ttfb))
-                        .color(colors::TEXT_MUTED)
-                        .source(source_id),
-                );
+            // Timing waterfall
+            {
+                let t = &resp.timing;
+                let phases: Vec<(&str, Option<f64>, Color)> = vec![
+                    ("DNS",     t.dns_ms,      Color::rgb(0.4, 0.7, 1.0)),
+                    ("Connect", t.connect_ms,  Color::rgb(0.5, 0.8, 0.5)),
+                    ("TLS",     t.tls_ms,      Color::rgb(0.8, 0.6, 1.0)),
+                    ("TTFB",    t.ttfb_ms,     Color::rgb(1.0, 0.8, 0.3)),
+                    ("Transfer",t.transfer_ms, Color::rgb(0.3, 0.9, 0.9)),
+                ];
+                let has_phases = phases.iter().any(|(_, v, _)| v.is_some());
+                if has_phases {
+                    let total = t.total_ms.max(0.001);
+                    let bar_width = 40usize;
+                    let mut waterfall = String::with_capacity(bar_width);
+                    let mut legend_parts = Vec::new();
+                    for (label, ms_opt, _color) in &phases {
+                        if let Some(ms) = ms_opt {
+                            let fraction = ms / total;
+                            let chars = (fraction * bar_width as f64).round().max(0.0) as usize;
+                            let ch = match *label {
+                                "DNS" => 'D',
+                                "Connect" => 'C',
+                                "TLS" => 'S',
+                                "TTFB" => 'W',
+                                "Transfer" => 'T',
+                                _ => '?',
+                            };
+                            for _ in 0..chars { waterfall.push(ch); }
+                            legend_parts.push(format!("{}:{:.0}ms", label, ms));
+                        }
+                    }
+                    // Pad to bar_width
+                    while waterfall.len() < bar_width {
+                        waterfall.push('\u{2591}');
+                    }
+                    parent = parent.push(
+                        TextElement::new(format!("  [{}] {:.0}ms", waterfall, total))
+                            .color(colors::TEXT_MUTED)
+                            .source(source_id),
+                    );
+                    parent = parent.push(
+                        TextElement::new(format!("  {}", legend_parts.join(" | ")))
+                            .color(colors::TEXT_MUTED)
+                            .source(source_id),
+                    );
+                }
             }
             for (name, value) in resp.headers.iter().take(10) {
                 parent = parent.push(
@@ -1889,12 +1970,208 @@ fn render_domain_value(
         }
 
         DomainValue::Interactive(req) => {
+            // Check if this is a DiffViewer
+            if let Some(crate::blocks::ViewState::DiffViewer { scroll_line, current_file, collapsed_indices }) = &block.view_state {
+                if let Value::List(items) = &req.content {
+                    return render_diff_viewer(parent, items, *scroll_line, *current_file, collapsed_indices, source_id);
+                }
+            }
             render_native_value(parent, &req.content, block, image_info, anchor_registry)
+        }
+
+        DomainValue::BlobChunk(chunk) => {
+            let size = chunk.total_size.unwrap_or(chunk.data.len() as u64);
+            let src = chunk.source.as_deref().unwrap_or("binary");
+            parent = parent.push(
+                TextElement::new(format!("[{}: {} {}]", src, chunk.content_type, nexus_api::format_size(size)))
+                    .color(colors::TEXT_MUTED)
+                    .source(source_id),
+            );
+            parent
         }
     }
 }
 
 /// Get text color for a Value cell in a table.
+fn render_diff_viewer(
+    mut parent: Column,
+    items: &[Value],
+    scroll_line: usize,
+    current_file: usize,
+    collapsed_indices: &std::collections::HashSet<usize>,
+    source_id: strata::SourceId,
+) -> Column {
+    use nexus_api::DomainValue;
+
+    // Header with keybinding hints
+    parent = parent.push(
+        TextElement::new("j/k: scroll | n/p: next/prev file | space: toggle | q: quit")
+            .color(colors::TEXT_MUTED)
+            .source(source_id),
+    );
+
+    let viewport_height = 50;
+    let viewport_start = scroll_line;
+    let viewport_end = scroll_line + viewport_height;
+
+    // First pass: count total lines per file to find viewport boundaries.
+    // This avoids allocating strings for lines outside the viewport.
+    struct FileSpan {
+        file_idx: usize,
+        line_start: usize,
+        line_count: usize,
+    }
+    let mut spans: Vec<FileSpan> = Vec::new();
+    let mut total_lines = 0usize;
+
+    for (file_idx, item) in items.iter().enumerate() {
+        let diff = match item {
+            Value::Domain(d) => match d.as_ref() {
+                DomainValue::DiffFile(diff) => diff,
+                _ => continue,
+            },
+            _ => continue,
+        };
+
+        let is_collapsed = collapsed_indices.contains(&file_idx);
+        // 1 line for header + hunks + blank separator
+        let mut count = 1; // header
+        if !is_collapsed {
+            for hunk in &diff.hunks {
+                count += 1 + hunk.lines.len(); // hunk header + diff lines
+            }
+            count += 1; // blank separator
+        }
+        spans.push(FileSpan { file_idx, line_start: total_lines, line_count: count });
+        total_lines += count;
+    }
+
+    // Second pass: only generate text for lines within the viewport.
+    // Collect DiffFile references matching the order of spans.
+    let diffs: Vec<&nexus_api::DiffFileInfo> = items.iter().filter_map(|item| {
+        if let Value::Domain(d) = item {
+            if let DomainValue::DiffFile(diff) = d.as_ref() {
+                return Some(diff);
+            }
+        }
+        None
+    }).collect();
+
+    for (span_idx, span) in spans.iter().enumerate() {
+        let span_end = span.line_start + span.line_count;
+
+        // Skip files entirely before viewport
+        if span_end <= viewport_start {
+            continue;
+        }
+        // Stop once past viewport
+        if span.line_start >= viewport_end {
+            break;
+        }
+
+        let item = diffs[span_idx];
+        let mut line_num = span.line_start;
+
+        let is_collapsed = collapsed_indices.contains(&span.file_idx);
+
+        // Header line
+        if line_num >= viewport_start && line_num < viewport_end {
+            let cursor = if span.file_idx == current_file { "\u{25B6} " } else { "  " };
+            let collapse_marker = if is_collapsed { "\u{25B8}" } else { "\u{25BE}" };
+            let header_color = if span.file_idx == current_file {
+                Color::rgb(1.0, 1.0, 0.6)
+            } else {
+                colors::TEXT_PATH
+            };
+            let old_path_suffix = if let Some(ref old) = item.old_path {
+                format!(" (from {})", old)
+            } else {
+                String::new()
+            };
+            parent = parent.push(
+                TextElement::new(format!("{}{} {} (+{} -{}){}", cursor, collapse_marker,
+                    item.file_path, item.additions, item.deletions, old_path_suffix))
+                    .color(header_color)
+                    .source(source_id),
+            );
+        }
+        line_num += 1;
+
+        if is_collapsed {
+            continue;
+        }
+
+        for hunk in &item.hunks {
+            // Hunk header
+            if line_num >= viewport_start && line_num < viewport_end {
+                parent = parent.push(
+                    TextElement::new(format!("@@ -{},{} +{},{} @@ {}",
+                        hunk.old_start, hunk.old_count,
+                        hunk.new_start, hunk.new_count, hunk.header))
+                        .color(Color::rgb(0.5, 0.5, 1.0))
+                        .source(source_id),
+                );
+            }
+            line_num += 1;
+
+            for diff_line in &hunk.lines {
+                if line_num >= viewport_start && line_num < viewport_end {
+                    let (prefix, color) = match diff_line.kind {
+                        nexus_api::DiffLineKind::Addition => ("+", Color::rgb(0.4, 0.9, 0.4)),
+                        nexus_api::DiffLineKind::Deletion => ("-", Color::rgb(0.9, 0.4, 0.4)),
+                        nexus_api::DiffLineKind::Context => (" ", colors::TEXT_SECONDARY),
+                    };
+                    parent = parent.push(
+                        TextElement::new(format!("{}{}", prefix, diff_line.content))
+                            .color(color)
+                            .source(source_id),
+                    );
+                }
+                line_num += 1;
+                if line_num >= viewport_end { break; }
+            }
+            if line_num >= viewport_end { break; }
+        }
+
+        // Blank separator
+        if line_num >= viewport_start && line_num < viewport_end {
+            parent = parent.push(
+                TextElement::new("")
+                    .color(colors::TEXT_PRIMARY)
+                    .source(source_id),
+            );
+        }
+    }
+
+    // Footer with position info
+    let end = viewport_end.min(total_lines);
+    if total_lines > viewport_height {
+        parent = parent.push(
+            TextElement::new(format!("  [{}-{}/{}]", scroll_line + 1, end, total_lines))
+                .color(colors::TEXT_MUTED)
+                .source(source_id),
+        );
+    }
+
+    parent
+}
+
+fn format_eta(seconds: f64) -> String {
+    if seconds < 1.0 {
+        "<1s".to_string()
+    } else if seconds < 60.0 {
+        format!("{}s", seconds as u64)
+    } else if seconds < 3600.0 {
+        let m = (seconds / 60.0) as u64;
+        let s = (seconds % 60.0) as u64;
+        format!("{}m {}s", m, s)
+    } else {
+        let h = (seconds / 3600.0) as u64;
+        let m = ((seconds % 3600.0) / 60.0) as u64;
+        format!("{}h {}m", h, m)
+    }
+}
+
 fn value_text_color(value: &Value) -> Color {
     match value {
         Value::Int(_) | Value::Float(_) => Color::rgb(0.6, 0.8, 1.0),

@@ -490,6 +490,13 @@ impl ShellWidget {
                                 selected: Some(0),
                             })
                         }
+                        nexus_api::ViewerKind::DiffViewer => {
+                            Some(crate::blocks::ViewState::DiffViewer {
+                                scroll_line: 0,
+                                current_file: 0,
+                                collapsed_indices: std::collections::HashSet::new(),
+                            })
+                        }
                     };
                     if let Some(&idx) = self.block_index.get(&block_id) {
                         if let Some(block) = self.blocks.get_mut(idx) {

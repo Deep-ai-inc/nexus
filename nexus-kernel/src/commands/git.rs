@@ -14,7 +14,7 @@ use super::{CommandContext, NexusCommand};
 use git2::{Repository, StatusOptions, DiffOptions};
 use nexus_api::{
     DiffFileInfo, DiffHunk, DiffLine, DiffLineKind, GitChangeType, GitCommitInfo, GitFileStatus,
-    GitStatusInfo, Value,
+    GitStatusInfo, InteractiveRequest, Value, ViewerKind,
 };
 use std::path::Path;
 
@@ -493,7 +493,14 @@ impl NexusCommand for GitDiffCommand {
             }));
         }
 
-        Ok(Value::List(values))
+        if values.is_empty() {
+            Ok(Value::Unit)
+        } else {
+            Ok(Value::interactive(InteractiveRequest {
+                viewer: ViewerKind::DiffViewer,
+                content: Value::List(values),
+            }))
+        }
     }
 }
 
@@ -798,13 +805,8 @@ mod tests {
         let cmd = GitDiffCommand;
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
 
-        match result {
-            Value::List(files) => {
-                // Clean repo should have no diff files
-                assert!(files.is_empty(), "Expected empty diff list for clean repo");
-            }
-            _ => panic!("Expected List of DiffFile"),
-        }
+        // Clean repo should return Unit (no changes)
+        assert_eq!(result, Value::Unit, "Expected Unit for clean repo diff");
     }
 
     #[test]
@@ -831,21 +833,27 @@ mod tests {
         let cmd = GitDiffCommand;
         let result = cmd.execute(&[], &mut test_ctx.ctx()).unwrap();
 
-        match result {
-            Value::List(files) => {
-                assert!(!files.is_empty(), "Expected at least one diff file");
-                match files[0].as_domain() {
-                    Some(nexus_api::DomainValue::DiffFile(diff)) => {
-                        assert!(diff.file_path.contains("tracked.txt"));
-                        assert!(diff.additions > 0 || diff.deletions > 0);
-                        assert!(!diff.hunks.is_empty());
-                        // Check that hunks have lines
-                        assert!(!diff.hunks[0].lines.is_empty());
+        // Now returns Interactive(DiffViewer, List)
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::Interactive(req)) => {
+                assert_eq!(req.viewer, nexus_api::ViewerKind::DiffViewer);
+                match &req.content {
+                    Value::List(files) => {
+                        assert!(!files.is_empty(), "Expected at least one diff file");
+                        match files[0].as_domain() {
+                            Some(nexus_api::DomainValue::DiffFile(diff)) => {
+                                assert!(diff.file_path.contains("tracked.txt"));
+                                assert!(diff.additions > 0 || diff.deletions > 0);
+                                assert!(!diff.hunks.is_empty());
+                                assert!(!diff.hunks[0].lines.is_empty());
+                            }
+                            _ => panic!("Expected DiffFile in list"),
+                        }
                     }
-                    _ => panic!("Expected DiffFile in list"),
+                    _ => panic!("Expected List content"),
                 }
             }
-            _ => panic!("Expected List of DiffFile"),
+            _ => panic!("Expected Interactive DiffViewer"),
         }
     }
 
@@ -867,17 +875,24 @@ mod tests {
             .execute(&["--staged".to_string()], &mut test_ctx.ctx())
             .unwrap();
 
-        match result {
-            Value::List(files) => {
-                assert!(!files.is_empty(), "Expected staged diff");
-                match files[0].as_domain() {
-                    Some(nexus_api::DomainValue::DiffFile(diff)) => {
-                        assert!(diff.file_path.contains("staged.txt"));
+        // Now returns Interactive(DiffViewer, List)
+        match result.as_domain() {
+            Some(nexus_api::DomainValue::Interactive(req)) => {
+                assert_eq!(req.viewer, nexus_api::ViewerKind::DiffViewer);
+                match &req.content {
+                    Value::List(files) => {
+                        assert!(!files.is_empty(), "Expected staged diff");
+                        match files[0].as_domain() {
+                            Some(nexus_api::DomainValue::DiffFile(diff)) => {
+                                assert!(diff.file_path.contains("staged.txt"));
+                            }
+                            _ => panic!("Expected DiffFile"),
+                        }
                     }
-                    _ => panic!("Expected DiffFile"),
+                    _ => panic!("Expected List content"),
                 }
             }
-            _ => panic!("Expected List of DiffFile"),
+            _ => panic!("Expected Interactive DiffViewer"),
         }
     }
 

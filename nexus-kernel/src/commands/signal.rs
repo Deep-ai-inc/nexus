@@ -72,48 +72,53 @@ impl NexusCommand for KillCommand {
             anyhow::bail!("kill: no process or job specified");
         }
 
-        let mut errors = Vec::new();
+        let signal_name_str = format!("{:?}", signal);
+        let mut results = Vec::new();
 
         for target in targets {
-            if let Some(job_spec) = target.strip_prefix('%') {
-                // Job specification
-                let job = find_job(job_spec, ctx)?;
-                if let Err(e) = kill(job, signal) {
-                    errors.push(format!("kill: {}: {}", target, e));
+            let (pid_raw, result) = if let Some(job_spec) = target.strip_prefix('%') {
+                match find_job(job_spec, ctx) {
+                    Ok(job_pid) => {
+                        let raw = job_pid.as_raw();
+                        (raw, kill(job_pid, signal))
+                    }
+                    Err(e) => {
+                        results.push(Value::Record(vec![
+                            ("pid".to_string(), Value::Int(0)),
+                            ("signal".to_string(), Value::String(signal_name_str.clone())),
+                            ("success".to_string(), Value::Bool(false)),
+                            ("error".to_string(), Value::String(e.to_string())),
+                        ]));
+                        continue;
+                    }
                 }
             } else {
-                // PID
                 let pid: i32 = target
                     .parse()
                     .map_err(|_| anyhow::anyhow!("kill: {}: arguments must be process or job IDs", target))?;
+                (pid, kill(Pid::from_raw(pid), signal))
+            };
 
-                if pid == 0 {
-                    // Kill all processes in the current process group
-                    if let Err(e) = kill(Pid::from_raw(0), signal) {
-                        errors.push(format!("kill: 0: {}", e));
-                    }
-                } else if pid < 0 {
-                    // Kill process group
-                    if let Err(e) = kill(Pid::from_raw(pid), signal) {
-                        errors.push(format!("kill: {}: {}", pid, e));
-                    }
-                } else {
-                    // Kill specific process
-                    if let Err(e) = kill(Pid::from_raw(pid), signal) {
-                        errors.push(format!("kill: ({}): {}", pid, e));
-                    }
+            let (success, error) = match result {
+                Ok(()) => (true, Value::Unit),
+                Err(e) => {
+                    (false, Value::String(e.to_string()))
                 }
-            }
+            };
+
+            results.push(Value::Record(vec![
+                ("pid".to_string(), Value::Int(pid_raw as i64)),
+                ("signal".to_string(), Value::String(signal_name_str.clone())),
+                ("success".to_string(), Value::Bool(success)),
+                ("error".to_string(), error),
+            ]));
         }
 
-        if !errors.is_empty() {
-            for err in &errors {
-                eprintln!("{}", err);
-            }
-            anyhow::bail!("kill: some processes could not be signaled");
+        if results.len() == 1 {
+            Ok(results.into_iter().next().unwrap())
+        } else {
+            Ok(Value::List(results))
         }
-
-        Ok(Value::Unit)
     }
 }
 

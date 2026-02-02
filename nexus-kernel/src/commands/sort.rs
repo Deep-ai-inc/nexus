@@ -613,6 +613,11 @@ mod tests {
                 is_hidden: false,
                 is_symlink: false,
                 symlink_target: None,
+                uid: None,
+                gid: None,
+                owner: None,
+                group: None,
+                nlink: None,
             }
         }
 
