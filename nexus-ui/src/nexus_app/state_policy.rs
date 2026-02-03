@@ -112,8 +112,8 @@ impl NexusState {
 
     /// Pure computation of terminal grid dimensions from viewport size.
     pub(super) fn compute_terminal_size(vw: f32, vh: f32) -> (u16, u16) {
-        let char_width = 14.0 * 0.607;
-        let line_height = 14.0 * 1.4;
+        let char_width = 8.4;
+        let line_height = 18.0;
         let h_padding = 4.0 + 6.0 * 2.0;
         let v_padding = 44.0;
         let cols = ((vw - h_padding) / char_width) as u16;

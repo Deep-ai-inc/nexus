@@ -103,7 +103,7 @@ pub(crate) struct ShellWidget {
     pub pty_handles: Vec<PtyHandle>,
     pub pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
     pub terminal_size: Cell<(u16, u16)>,
-    pub last_terminal_size: (u16, u16),
+    pub last_terminal_size: Cell<(u16, u16)>,
     pub terminal_dirty: bool,
     pub last_exit_code: Option<i32>,
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
@@ -129,7 +129,7 @@ impl ShellWidget {
             pty_handles: Vec::new(),
             pty_tx,
             terminal_size: Cell::new((120, 24)),
-            last_terminal_size: (120, 24),
+            last_terminal_size: Cell::new((120, 24)),
             terminal_dirty: false,
             last_exit_code: None,
             image_handles: HashMap::new(),
@@ -795,11 +795,35 @@ impl ShellWidget {
         self.jobs.clear();
     }
 
-    /// Propagate terminal size changes to running PTY handles.
+    /// Propagate terminal size changes to running PTY handles and block parsers.
+    ///
+    /// Called from `update()` — has `&mut self` so it can resize block parsers.
     pub fn sync_terminal_size(&mut self) {
         let current_size = self.terminal_size.get();
-        if current_size != self.last_terminal_size {
-            self.last_terminal_size = current_size;
+        if current_size != self.last_terminal_size.get() {
+            self.last_terminal_size.set(current_size);
+            let (cols, rows) = current_size;
+            for handle in &self.pty_handles {
+                let _ = handle.resize(cols, rows);
+            }
+            for block in &mut self.blocks {
+                block.parser.resize(cols, rows);
+            }
+        }
+    }
+
+    /// Propagate terminal size changes to PTY handles immediately.
+    ///
+    /// Called from `view()` — only needs `&self` since PTY handles use
+    /// internal `Arc<Mutex<>>`. This ensures running child processes
+    /// receive SIGWINCH without waiting for the next `update()` cycle.
+    ///
+    /// Does NOT update `last_terminal_size` — that is left for
+    /// `sync_terminal_size()` in `update()` so it still detects the
+    /// change and resizes the block parsers too.
+    pub fn sync_pty_sizes(&self) {
+        let current_size = self.terminal_size.get();
+        if current_size != self.last_terminal_size.get() {
             let (cols, rows) = current_size;
             for handle in &self.pty_handles {
                 let _ = handle.resize(cols, rows);

@@ -134,6 +134,7 @@ impl Component for NexusState {
 
         let (cols, rows) = NexusState::compute_terminal_size(vw, vh);
         self.shell.terminal_size.set((cols, rows));
+        self.shell.sync_pty_sizes();
 
         let cursor_visible = self.cursor_visible();
 
