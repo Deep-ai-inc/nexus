@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use nexus_api::{BlockId, BlockState, FileEntry, OutputFormat, Value};
@@ -36,30 +36,28 @@ impl TableSort {
     }
 }
 
-/// Tree state for directory expansion.
+/// Lazy tree expansion state for file list output.
+/// Only allocated when a user expands a directory chevron.
 #[derive(Debug, Clone, Default)]
-pub struct TreeState {
+pub struct FileTreeState {
     /// Which directory paths are currently expanded.
     pub expanded: HashSet<PathBuf>,
     /// Cached contents of expanded directories.
     pub children: HashMap<PathBuf, Vec<FileEntry>>,
 }
 
-impl TreeState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
+impl FileTreeState {
     /// Check if a path is expanded.
-    pub fn is_expanded(&self, path: &PathBuf) -> bool {
+    pub fn is_expanded(&self, path: &Path) -> bool {
         self.expanded.contains(path)
     }
 
     /// Toggle expansion of a directory.
     /// Returns true if the directory is now expanded (needs content loading).
+    /// On collapse, clears expanded descendants and their cached children.
     pub fn toggle(&mut self, path: PathBuf) -> bool {
         if self.expanded.contains(&path) {
-            self.expanded.remove(&path);
+            self.collapse_subtree(&path);
             false
         } else {
             self.expanded.insert(path);
@@ -73,8 +71,14 @@ impl TreeState {
     }
 
     /// Get children of an expanded directory.
-    pub fn get_children(&self, path: &PathBuf) -> Option<&Vec<FileEntry>> {
+    pub fn get_children(&self, path: &Path) -> Option<&Vec<FileEntry>> {
         self.children.get(path)
+    }
+
+    /// Remove a directory and all its descendants from expanded + children.
+    fn collapse_subtree(&mut self, root: &Path) {
+        self.expanded.retain(|p| !p.starts_with(root));
+        self.children.retain(|p, _| !p.starts_with(root));
     }
 }
 
@@ -139,8 +143,8 @@ pub struct Block {
     pub stream_seq: u64,
     /// Interactive viewer state (pager, process monitor, tree browser).
     pub view_state: Option<ViewState>,
-    /// Tree view: which directories are expanded.
-    pub tree_state: TreeState,
+    /// Lazy tree expansion state (only allocated when a user clicks a chevron).
+    pub file_tree: Option<FileTreeState>,
 }
 
 impl Block {
@@ -163,12 +167,22 @@ impl Block {
             stream_latest: None,
             stream_seq: 0,
             view_state: None,
-            tree_state: TreeState::new(),
+            file_tree: None,
         }
     }
 
     pub fn is_running(&self) -> bool {
         matches!(self.state, BlockState::Running)
+    }
+
+    /// Get or create file tree expansion state.
+    pub fn ensure_file_tree(&mut self) -> &mut FileTreeState {
+        self.file_tree.get_or_insert_with(FileTreeState::default)
+    }
+
+    /// Get file tree expansion state (if any).
+    pub fn file_tree(&self) -> Option<&FileTreeState> {
+        self.file_tree.as_ref()
     }
 }
 

@@ -172,7 +172,13 @@ fn ensure_quicklook_loaded() {
 }
 
 fn show_quicklook_native(path: &Path, source_rect: Option<NSRect>) -> Result<(), String> {
-    // Update global state
+    // Snapshot previous path for same-file toggle detection
+    let previous_path = {
+        let state = QUICKLOOK_STATE.lock().unwrap();
+        state.path.clone()
+    };
+
+    // Update global state with new path
     {
         let mut state = QUICKLOOK_STATE.lock().unwrap();
         state.path = Some(path.to_path_buf());
@@ -196,23 +202,28 @@ fn show_quicklook_native(path: &Path, source_rect: Option<NSRect>) -> Result<(),
         let is_visible: Bool = msg_send![panel, isVisible];
 
         if is_visible.as_bool() {
-            // If already showing, toggle off
-            let _: () = msg_send![panel, orderOut: std::ptr::null::<AnyObject>()];
+            if previous_path.as_deref() == Some(path) {
+                // Same file — toggle off
+                let _: () = msg_send![panel, orderOut: std::ptr::null::<AnyObject>()];
+                // Clear stored path so data source reports 0 items while hidden
+                QUICKLOOK_STATE.lock().unwrap().path = None;
+            } else {
+                // Different file — switch preview in place
+                let _: () = msg_send![panel, reloadData];
+                let _: () = msg_send![panel, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+            }
         } else {
-            // Create a fresh data source (lightweight, just provides callbacks to global state)
+            // Not visible — set up data source and show
             let data_source: Retained<NexusPreviewDataSource> =
                 msg_send_id![NexusPreviewDataSource::class(), new];
 
-            // Set data source and delegate
             let _: () = msg_send![panel, setDataSource: &*data_source];
             let _: () = msg_send![panel, setDelegate: &*data_source];
 
-            // Refresh and show
             let _: () = msg_send![panel, reloadData];
             let _: () = msg_send![panel, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
 
-            // Note: data_source will be released when this function returns,
-            // but QLPreviewPanel retains its data source/delegate internally
+            // data_source released here, but QLPreviewPanel retains its delegate internally
         }
 
         Ok(())
@@ -230,6 +241,7 @@ pub fn close_quicklook() {
             let panel: *mut AnyObject = msg_send![ql_class, sharedPreviewPanel];
             if !panel.is_null() {
                 let _: () = msg_send![panel, orderOut: std::ptr::null::<AnyObject>()];
+                QUICKLOOK_STATE.lock().unwrap().path = None;
             }
         }
     }

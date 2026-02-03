@@ -570,7 +570,7 @@ impl TextElement {
     }
 
     /// Set widget ID for click detection (makes text clickable as a widget).
-    /// This is mutually exclusive with `source()` - use one or the other.
+    /// Can be combined with `source()` for text that is both selectable and clickable.
     pub fn widget_id(mut self, id: SourceId) -> Self {
         self.widget_id = Some(id);
         self

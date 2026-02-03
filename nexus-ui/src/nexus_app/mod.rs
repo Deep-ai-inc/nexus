@@ -137,8 +137,7 @@ impl Component for NexusState {
 
         let cursor_visible = self.cursor_visible();
 
-        self.shell.clear_anchor_registry();
-        self.shell.clear_tree_expand_registry();
+        self.shell.clear_click_registry();
 
         let scroll = ScrollColumn::from_state(&self.scroll.state)
             .spacing(4.0)

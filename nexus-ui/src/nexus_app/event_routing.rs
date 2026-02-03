@@ -192,11 +192,6 @@ pub(super) fn on_mouse(
     hit: Option<HitResult>,
     capture: &CaptureState,
 ) -> MouseResponse<NexusMessage> {
-    // Close Quick Look on any mouse click in the app window
-    if matches!(event, MouseEvent::ButtonPressed { .. }) {
-        strata::platform::close_quicklook();
-    }
-
     // ── Drag state machine intercept ──────────────────────────────
     if let Some(resp) = super::drag_state::route_drag_mouse(
         &state.drag.status,

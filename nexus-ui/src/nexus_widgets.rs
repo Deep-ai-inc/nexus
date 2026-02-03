@@ -6,7 +6,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use nexus_api::{BlockId, BlockState, FileEntry, FileType, Value, format_value_for_display};
 use nexus_kernel::{Completion, CompletionKind};
@@ -17,7 +16,7 @@ use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation, ToolStatus
 use crate::blocks::Block;
 use strata::content_address::SourceId;
 use crate::nexus_app::drag_state::DragPayload;
-use crate::nexus_app::shell::{AnchorEntry, value_to_anchor_action, semantic_text_for_value};
+use crate::nexus_app::shell::{AnchorEntry, ClickAction, register_anchor, register_tree_toggle, value_to_anchor_action, semantic_text_for_value};
 use crate::nexus_app::source_ids;
 use strata::gpu::ImageHandle;
 use strata::layout::containers::{
@@ -40,11 +39,9 @@ pub struct ShellBlockWidget<'a> {
     pub kill_id: SourceId,
     pub image_info: Option<(ImageHandle, u32, u32)>,
     pub is_focused: bool,
-    /// Shared anchor registry — populated during rendering so click/drag
+    /// Unified click registry — populated during rendering so click/drag
     /// handling can do O(1) lookups without re-iterating the Value tree.
-    pub(crate) anchor_registry: &'a RefCell<HashMap<SourceId, AnchorEntry>>,
-    /// Tree expand registry — maps SourceId to (BlockId, PathBuf) for chevron clicks.
-    pub(crate) tree_expand_registry: &'a RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
+    pub(crate) click_registry: &'a RefCell<HashMap<SourceId, ClickAction>>,
 }
 
 impl Widget for ShellBlockWidget<'_> {
@@ -120,9 +117,9 @@ impl Widget for ShellBlockWidget<'_> {
         // Render output: stream_latest replaces native_output when present (e.g. top),
         // otherwise show native_output (e.g. ls, git status).
         if let Some(ref latest) = block.stream_latest {
-            content = render_native_value(content, latest, block, self.image_info, self.anchor_registry, self.tree_expand_registry);
+            content = render_native_value(content, latest, block, self.image_info, self.click_registry);
         } else if let Some(value) = &block.native_output {
-            content = render_native_value(content, value, block, self.image_info, self.anchor_registry, self.tree_expand_registry);
+            content = render_native_value(content, value, block, self.image_info, self.click_registry);
         }
 
         // Render stream log: collapse history into a single text block for performance,
@@ -150,7 +147,7 @@ impl Widget for ShellBlockWidget<'_> {
 
             // Latest entry → full widget rendering (may have colors, structure)
             if let Some(latest) = block.stream_log.back() {
-                content = render_native_value(content, latest, block, self.image_info, self.anchor_registry, self.tree_expand_registry);
+                content = render_native_value(content, latest, block, self.image_info, self.click_registry);
             }
         }
 
@@ -1422,8 +1419,7 @@ fn render_native_value(
     value: &Value,
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
-    anchor_registry: &RefCell<HashMap<SourceId, AnchorEntry>>,
-    tree_expand_registry: &RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
+    click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
 ) -> Column {
     let block_id = block.id;
     match value {
@@ -1507,7 +1503,7 @@ fn render_native_value(
                     let lines = wrap_cell_text(&text, max_chars);
                     let widget_id = if is_anchor_value(cell) {
                         let id = source_ids::anchor(block_id, anchor_idx);
-                        anchor_registry.borrow_mut().insert(id, AnchorEntry {
+                        register_anchor(click_registry, id, AnchorEntry {
                             block_id,
                             action: value_to_anchor_action(cell),
                             drag_payload: DragPayload::TableRow {
@@ -1557,8 +1553,7 @@ fn render_native_value(
                     0, // depth
                     &mut anchor_idx,
                     &mut expand_idx,
-                    anchor_registry,
-                    tree_expand_registry,
+                    click_registry,
                 );
                 parent
             } else {
@@ -1570,7 +1565,7 @@ fn render_native_value(
                 ));
                 if has_structured {
                     for item in items {
-                        parent = render_native_value(parent, item, block, None, anchor_registry, tree_expand_registry);
+                        parent = render_native_value(parent, item, block, None, click_registry);
                     }
                     parent
                 } else {
@@ -1592,7 +1587,7 @@ fn render_native_value(
                 entry.name.clone()
             };
             let anchor_id = source_ids::anchor(block_id, 0);
-            anchor_registry.borrow_mut().insert(anchor_id, AnchorEntry {
+            register_anchor(click_registry, anchor_id, AnchorEntry {
                 block_id,
                 action: value_to_anchor_action(value),
                 drag_payload: DragPayload::FilePath(entry.path.clone()),
@@ -1621,7 +1616,7 @@ fn render_native_value(
         }
 
         Value::Domain(domain) => {
-            render_domain_value(parent, domain, block, image_info, anchor_registry, tree_expand_registry)
+            render_domain_value(parent, domain, block, image_info, click_registry)
         }
 
         Value::Error { message, .. } => {
@@ -1651,8 +1646,7 @@ fn render_domain_value(
     domain: &nexus_api::DomainValue,
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
-    anchor_registry: &RefCell<HashMap<SourceId, AnchorEntry>>,
-    tree_expand_registry: &RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
+    click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
 ) -> Column {
     use nexus_api::DomainValue;
     let block_id = block.id;
@@ -1973,7 +1967,7 @@ fn render_domain_value(
                     return render_diff_viewer(parent, items, *scroll_line, *current_file, collapsed_indices, source_id);
                 }
             }
-            render_native_value(parent, &req.content, block, image_info, anchor_registry, tree_expand_registry)
+            render_native_value(parent, &req.content, block, image_info, click_registry)
         }
 
         DomainValue::BlobChunk(chunk) => {
@@ -1998,15 +1992,14 @@ fn render_file_entries(
     depth: usize,
     anchor_idx: &mut usize,
     expand_idx: &mut usize,
-    anchor_registry: &RefCell<HashMap<SourceId, AnchorEntry>>,
-    tree_expand_registry: &RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
+    click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
 ) {
     let block_id = block.id;
     let indent_px = depth as f32 * 20.0;
 
     for entry in entries {
         let is_dir = matches!(entry.file_type, FileType::Directory);
-        let is_expanded = is_dir && block.tree_state.is_expanded(&entry.path);
+        let is_expanded = is_dir && block.file_tree().map_or(false, |t| t.is_expanded(&entry.path));
         let color = file_entry_color(entry);
 
         // Build the row: [chevron (if dir)] [name]
@@ -2023,7 +2016,7 @@ fn render_file_entries(
         if is_dir {
             let chevron = if is_expanded { "\u{25BC}" } else { "\u{25B6}" };
             let expand_id = source_ids::tree_expand(block_id, *expand_idx);
-            tree_expand_registry.borrow_mut().insert(expand_id, (block_id, entry.path.clone()));
+            register_tree_toggle(click_registry, expand_id, block_id, entry.path.clone());
             *expand_idx += 1;
 
             row = row.push(
@@ -2046,7 +2039,7 @@ fn render_file_entries(
 
         let anchor_id = source_ids::anchor(block_id, *anchor_idx);
         let file_value = Value::FileEntry(Box::new((*entry).clone()));
-        anchor_registry.borrow_mut().insert(anchor_id, AnchorEntry {
+        register_anchor(click_registry, anchor_id, AnchorEntry {
             block_id,
             action: value_to_anchor_action(&file_value),
             drag_payload: DragPayload::FilePath(entry.path.clone()),
@@ -2066,7 +2059,7 @@ fn render_file_entries(
 
         // Recursively render children if expanded
         if is_expanded {
-            if let Some(children) = block.tree_state.get_children(&entry.path) {
+            if let Some(children) = block.file_tree().and_then(|t| t.get_children(&entry.path)) {
                 let child_refs: Vec<&FileEntry> = children.iter().collect();
                 render_file_entries(
                     parent,
@@ -2075,8 +2068,7 @@ fn render_file_entries(
                     depth + 1,
                     anchor_idx,
                     expand_idx,
-                    anchor_registry,
-                    tree_expand_registry,
+                    click_registry,
                 );
             } else {
                 // Children not loaded yet — show loading indicator

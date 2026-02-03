@@ -62,12 +62,38 @@ impl Default for ShellOutput {
 /// and drag payload so click/drag handling is an O(1) HashMap lookup.
 ///
 /// Populated during `view()` (the single source of truth), read during
-/// `on_click_anchor()` and `drag_payload_for_anchor()`.
+/// click and drag handling.
 #[derive(Debug, Clone)]
 pub(crate) struct AnchorEntry {
     pub block_id: BlockId,
     pub action: AnchorAction,
     pub drag_payload: super::drag_state::DragPayload,
+}
+
+/// Unified click action — resolved during rendering, dispatched on click.
+#[derive(Debug, Clone)]
+pub(crate) enum ClickAction {
+    Anchor(AnchorEntry),
+    TreeToggle { block_id: BlockId, path: PathBuf },
+}
+
+/// Register an anchor click action in the click registry.
+pub(crate) fn register_anchor(
+    registry: &RefCell<HashMap<SourceId, ClickAction>>,
+    id: SourceId,
+    entry: AnchorEntry,
+) {
+    registry.borrow_mut().insert(id, ClickAction::Anchor(entry));
+}
+
+/// Register a tree-toggle click action in the click registry.
+pub(crate) fn register_tree_toggle(
+    registry: &RefCell<HashMap<SourceId, ClickAction>>,
+    id: SourceId,
+    block_id: BlockId,
+    path: PathBuf,
+) {
+    registry.borrow_mut().insert(id, ClickAction::TreeToggle { block_id, path });
 }
 
 /// Manages all shell-related state: terminal blocks, PTY handles, jobs, images.
@@ -83,12 +109,9 @@ pub(crate) struct ShellWidget {
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
     pub jobs: Vec<VisualJob>,
 
-    /// Anchor registry — populated during view(), read during click/drag handling.
-    /// Keyed by SourceId, provides O(1) lookup for both AnchorAction and DragPayload.
-    pub(crate) anchor_registry: RefCell<HashMap<SourceId, AnchorEntry>>,
-
-    /// Tree expand registry — maps SourceId to (BlockId, PathBuf) for tree view chevrons.
-    pub(crate) tree_expand_registry: RefCell<HashMap<SourceId, (BlockId, PathBuf)>>,
+    /// Unified click registry — populated during view(), read during click/drag handling.
+    /// Keyed by SourceId, provides O(1) lookup for anchors and tree toggles.
+    pub(crate) click_registry: RefCell<HashMap<SourceId, ClickAction>>,
 
     // --- Subscription channels (owned by this widget) ---
     pty_rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
@@ -111,8 +134,7 @@ impl ShellWidget {
             last_exit_code: None,
             image_handles: HashMap::new(),
             jobs: Vec::new(),
-            anchor_registry: RefCell::new(HashMap::new()),
-            tree_expand_registry: RefCell::new(HashMap::new()),
+            click_registry: RefCell::new(HashMap::new()),
             pty_rx: Arc::new(Mutex::new(pty_rx)),
             kernel_rx,
         }
@@ -123,15 +145,10 @@ impl ShellWidget {
         self.terminal_dirty
     }
 
-    /// Clear the anchor registry. Called at the start of each view() pass
+    /// Clear the click registry. Called at the start of each view() pass
     /// before blocks re-populate it.
-    pub fn clear_anchor_registry(&self) {
-        self.anchor_registry.borrow_mut().clear();
-    }
-
-    /// Clear the tree expand registry. Called at the start of each view() pass.
-    pub fn clear_tree_expand_registry(&self) {
-        self.tree_expand_registry.borrow_mut().clear();
+    pub fn clear_click_registry(&self) {
+        self.click_registry.borrow_mut().clear();
     }
 
     // ---- View contributions ----
@@ -149,8 +166,7 @@ impl ShellWidget {
             kill_id: source_ids::kill(block.id),
             image_info: self.image_handles.get(&block.id).copied(),
             is_focused,
-            anchor_registry: &self.anchor_registry,
-            tree_expand_registry: &self.tree_expand_registry,
+            click_registry: &self.click_registry,
         })
     }
 
@@ -186,11 +202,13 @@ impl ShellWidget {
                 }
             }
         }
-        // Tree expand chevrons
-        if let Some(msg) = self.on_click_tree_expand(id) {
-            return Some(msg);
+        // Unified click registry (anchors, tree toggles, etc.)
+        match self.click_registry.borrow().get(&id)? {
+            ClickAction::TreeToggle { block_id, path } => {
+                Some(ShellMsg::ToggleTreeExpand(*block_id, path.clone()))
+            }
+            _ => None, // Anchors handled via drag intent path
         }
-        None
     }
 
     /// Look up a block by ID (immutable).
@@ -273,25 +291,22 @@ impl ShellWidget {
     }
 
     /// Handle a click on an anchor widget. Returns None if not an anchor we own.
-    /// Look up an anchor by SourceId in the registry (O(1)).
-    /// The registry is populated during view() — the single source of truth.
+    /// Look up an anchor by SourceId in the unified click registry (O(1)).
     pub fn on_click_anchor(&self, id: SourceId) -> Option<ShellMsg> {
-        let registry = self.anchor_registry.borrow();
-        let entry = registry.get(&id)?;
-        Some(ShellMsg::OpenAnchor(entry.block_id, entry.action.clone()))
+        let registry = self.click_registry.borrow();
+        match registry.get(&id)? {
+            ClickAction::Anchor(entry) => Some(ShellMsg::OpenAnchor(entry.block_id, entry.action.clone())),
+            _ => None,
+        }
     }
 
-    /// Handle click on a tree expand chevron.
-    pub fn on_click_tree_expand(&self, id: SourceId) -> Option<ShellMsg> {
-        let registry = self.tree_expand_registry.borrow();
-        let (block_id, path) = registry.get(&id)?;
-        Some(ShellMsg::ToggleTreeExpand(*block_id, path.clone()))
-    }
-
-    /// Look up a drag payload by SourceId in the registry (O(1)).
+    /// Look up a drag payload by SourceId in the unified click registry (O(1)).
     pub fn drag_payload_for_anchor(&self, id: SourceId) -> Option<super::drag_state::DragPayload> {
-        let registry = self.anchor_registry.borrow();
-        registry.get(&id).map(|e| e.drag_payload.clone())
+        let registry = self.click_registry.borrow();
+        match registry.get(&id)? {
+            ClickAction::Anchor(entry) => Some(entry.drag_payload.clone()),
+            _ => None,
+        }
     }
 
     /// If a source belongs to a block with image output, return an Image drag payload.
@@ -736,9 +751,10 @@ impl ShellWidget {
     pub fn toggle_tree_expand(&mut self, block_id: BlockId, path: PathBuf) -> ShellOutput {
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
-                let now_expanded = block.tree_state.toggle(path.clone());
+                let tree = block.ensure_file_tree();
+                let now_expanded = tree.toggle(path.clone());
                 block.version += 1; // Trigger re-render
-                if now_expanded && !block.tree_state.children.contains_key(&path) {
+                if now_expanded && !block.ensure_file_tree().children.contains_key(&path) {
                     return ShellOutput::LoadTreeChildren(block_id, path);
                 }
             }
@@ -750,7 +766,7 @@ impl ShellWidget {
     pub fn set_tree_children(&mut self, block_id: BlockId, path: PathBuf, entries: Vec<nexus_api::FileEntry>) {
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
-                block.tree_state.set_children(path, entries);
+                block.ensure_file_tree().set_children(path, entries);
                 block.version += 1; // Trigger re-render
             }
         }
