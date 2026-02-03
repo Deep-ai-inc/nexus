@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping,
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight,
 };
 use iced::widget::shader::wgpu;
 use lru::LruCache;
@@ -292,6 +292,8 @@ pub struct StrataPipeline {
     pub cache_misses: u32,
     /// Cumulative shaping time for cache misses this frame.
     pub shaping_time: std::time::Duration,
+    /// Shape keys that caused cosmic-text panics — skip on future frames.
+    poisoned_texts: std::collections::HashSet<u64>,
 }
 
 impl StrataPipeline {
@@ -607,6 +609,7 @@ impl StrataPipeline {
             cache_hits: 0,
             cache_misses: 0,
             shaping_time: std::time::Duration::ZERO,
+            poisoned_texts: std::collections::HashSet::new(),
         }
     }
 
@@ -1090,17 +1093,24 @@ impl StrataPipeline {
     /// combining marks, ZWJ sequences). Results are cached in an LRU shape cache
     /// to avoid re-shaping unchanged text each frame.
     pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: Color, font_size: f32, font_system: &mut FontSystem) {
+        self.add_text_styled(text, x, y, color, font_size, false, false, font_system);
+    }
+
+    /// Add shaped text with optional bold/italic styling.
+    pub fn add_text_styled(&mut self, text: &str, x: f32, y: f32, color: Color, font_size: f32, bold: bool, italic: bool, font_system: &mut FontSystem) {
         if text.is_empty() {
             return;
         }
 
         let packed_color = color.pack();
 
-        // Compute shape cache key from text content + font size
+        // Compute shape cache key from text content + font size + style
         let shape_key = {
             let mut hasher = DefaultHasher::new();
             text.hash(&mut hasher);
             font_size.to_bits().hash(&mut hasher);
+            bold.hash(&mut hasher);
+            italic.hash(&mut hasher);
             hasher.finish()
         };
 
@@ -1133,69 +1143,95 @@ impl StrataPipeline {
 
         self.cache_misses += 1;
 
-        // Cache miss (or stale) — shape via cosmic-text
-        let shape_start = std::time::Instant::now();
-        let metrics = Metrics::new(font_size, font_size * 1.2);
-        let mut buffer = Buffer::new(font_system, metrics);
-        buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
-        let attrs = Attrs::new().family(Family::Monospace);
-        buffer.set_text(font_system, text, attrs, Shaping::Advanced);
-        buffer.shape_until_scroll(font_system, false);
-        self.shaping_time += shape_start.elapsed();
-
-        // Extract glyph data and emit instances
-        let mut shaped_glyphs = Vec::new();
-
-        for run in buffer.layout_runs() {
-            let line_y = run.line_y;
-            for glyph in run.glyphs.iter() {
-                let physical = glyph.physical((0., 0.), 1.0);
-                let cache_key = physical.cache_key;
-
-                let atlas_glyph = self.glyph_atlas.get_glyph(cache_key, font_system);
-
-                if atlas_glyph.width == 0 || atlas_glyph.height == 0 {
-                    continue;
-                }
-
-                // physical.x/y encode pixel position including per-glyph offsets
-                // (combining marks, y_offset, etc.) baked in by cosmic-text's physical().
-                // placement.left/top (offset_x/offset_y) give bitmap-to-origin offset.
-                let rel_x = physical.x as f32 + atlas_glyph.offset_x as f32;
-                let rel_y = physical.y as f32 + line_y - atlas_glyph.offset_y as f32;
-
-                let tl_u = Self::uv_to_f32(atlas_glyph.uv_x);
-                let tl_v = Self::uv_to_f32(atlas_glyph.uv_y);
-                let br_u = Self::uv_to_f32(atlas_glyph.uv_x + atlas_glyph.uv_w);
-                let br_v = Self::uv_to_f32(atlas_glyph.uv_y + atlas_glyph.uv_h);
-                let mode = if atlas_glyph.is_color { 5 } else { 0 };
-
-                self.instances.push(GpuInstance {
-                    pos: [(x + rel_x).round(), (y + rel_y).round()],
-                    size: [atlas_glyph.width as f32, atlas_glyph.height as f32],
-                    uv_tl: [tl_u, tl_v],
-                    uv_br: [br_u, br_v],
-                    color: packed_color,
-                    mode,
-                    corner_radius: 0.0,
-                    texture_layer: 0,
-                    clip_rect: NO_CLIP,
-                });
-
-                // Store pre-baked glyph data for future cache hits
-                shaped_glyphs.push(CachedShapedGlyph {
-                    x: rel_x,
-                    y: rel_y,
-                    width: atlas_glyph.width as f32,
-                    height: atlas_glyph.height as f32,
-                    uv_tl: [tl_u, tl_v],
-                    uv_br: [br_u, br_v],
-                    mode,
-                });
-            }
+        // Check if this text previously caused a panic (poisoned)
+        if self.poisoned_texts.contains(&shape_key) {
+            return;
         }
 
-        // Store in shape cache with current atlas generation
+        // Cache miss (or stale) — shape via cosmic-text
+        // Wrap shaping in catch_unwind because cosmic-text can panic on certain
+        // glyph cache operations (e.g. arithmetic overflow in glyph_cache.rs).
+        // Atlas insertion happens outside the unwind boundary.
+        let shape_start = std::time::Instant::now();
+
+        let shaping_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let metrics = Metrics::new(font_size, font_size * 1.2);
+            let mut buffer = Buffer::new(font_system, metrics);
+            buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+            let mut attrs = Attrs::new().family(Family::Monospace);
+            if bold {
+                attrs = attrs.weight(Weight::BOLD);
+            }
+            if italic {
+                attrs = attrs.style(Style::Italic);
+            }
+            buffer.set_text(font_system, text, attrs, Shaping::Advanced);
+            buffer.shape_until_scroll(font_system, false);
+
+            // Extract shaped glyph positions (cache keys + coordinates)
+            let mut glyph_data = Vec::new();
+            for run in buffer.layout_runs() {
+                let line_y = run.line_y;
+                for glyph in run.glyphs.iter() {
+                    let physical = glyph.physical((0., 0.), 1.0);
+                    glyph_data.push((physical.cache_key, physical.x, physical.y, line_y));
+                }
+            }
+            glyph_data
+        }));
+
+        self.shaping_time += shape_start.elapsed();
+
+        let glyph_data = match shaping_result {
+            Ok(data) => data,
+            Err(_) => {
+                eprintln!("[strata] cosmic-text panic for text len={}, poisoning", text.len());
+                self.poisoned_texts.insert(shape_key);
+                return;
+            }
+        };
+
+        // Atlas insertion and instance building (outside catch_unwind)
+        let mut shaped_glyphs = Vec::new();
+        for (cache_key, phys_x, phys_y, line_y) in glyph_data {
+            let atlas_glyph = self.glyph_atlas.get_glyph(cache_key, font_system);
+
+            if atlas_glyph.width == 0 || atlas_glyph.height == 0 {
+                continue;
+            }
+
+            let rel_x = phys_x as f32 + atlas_glyph.offset_x as f32;
+            let rel_y = phys_y as f32 + line_y - atlas_glyph.offset_y as f32;
+
+            let tl_u = Self::uv_to_f32(atlas_glyph.uv_x);
+            let tl_v = Self::uv_to_f32(atlas_glyph.uv_y);
+            let br_u = Self::uv_to_f32(atlas_glyph.uv_x + atlas_glyph.uv_w);
+            let br_v = Self::uv_to_f32(atlas_glyph.uv_y + atlas_glyph.uv_h);
+            let mode = if atlas_glyph.is_color { 5 } else { 0 };
+
+            self.instances.push(GpuInstance {
+                pos: [(x + rel_x).round(), (y + rel_y).round()],
+                size: [atlas_glyph.width as f32, atlas_glyph.height as f32],
+                uv_tl: [tl_u, tl_v],
+                uv_br: [br_u, br_v],
+                color: packed_color,
+                mode,
+                corner_radius: 0.0,
+                texture_layer: 0,
+                clip_rect: NO_CLIP,
+            });
+
+            shaped_glyphs.push(CachedShapedGlyph {
+                x: rel_x,
+                y: rel_y,
+                width: atlas_glyph.width as f32,
+                height: atlas_glyph.height as f32,
+                uv_tl: [tl_u, tl_v],
+                uv_br: [br_u, br_v],
+                mode,
+            });
+        }
+
         self.shape_cache.put(shape_key, (atlas_gen, Arc::new(shaped_glyphs)));
     }
 

@@ -23,7 +23,7 @@ use strata::layout::containers::{
     ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
     ScrollColumn, TerminalElement, TextElement, Widget,
 };
-use strata::layout_snapshot::CursorIcon;
+use strata::layout_snapshot::{CursorIcon, RunStyle, TextRun, UnderlineStyle};
 use strata::primitives::Color;
 use strata::scroll_state::ScrollState;
 use crate::blocks::{VisualJob, VisualJobState};
@@ -156,28 +156,112 @@ impl Widget for ShellBlockWidget<'_> {
             let mut term = TerminalElement::new(source_id, cols, content_rows)
                 .cell_size(8.4, 18.0);
 
-            // Extract text rows from the grid, preserving grapheme clusters
+            // Extract styled text runs from the grid
+            let default_fg_packed = Color::rgb(0.9, 0.9, 0.9).pack();
+            let default_bg_packed: u32 = 0;
             for row in grid.rows_iter() {
-                let mut text = String::with_capacity(row.len());
+                let mut runs: Vec<TextRun> = Vec::new();
+                let mut run_text = String::new();
+                let mut run_fg: u32 = default_fg_packed;
+                let mut run_bg: u32 = default_bg_packed;
+                let mut run_style = RunStyle::default();
+                let mut run_col: u16 = 0;
+                let mut run_cells: u16 = 0;
+                let mut col: u16 = 0;
+
+                // Flush helper: pushes current run if non-empty
+                macro_rules! flush_run {
+                    ($runs:expr, $text:expr, $fg:expr, $bg:expr, $col:expr, $cells:expr, $style:expr) => {
+                        if !$text.is_empty() {
+                            $runs.push(TextRun {
+                                text: std::mem::take(&mut $text),
+                                fg: $fg,
+                                bg: $bg,
+                                col_offset: $col,
+                                cell_len: $cells,
+                                style: $style,
+                            });
+                            $cells = 0;
+                        }
+                    };
+                }
+
                 for cell in row {
-                    // Skip the spacer half of wide characters
                     if cell.flags.wide_char_spacer {
                         continue;
                     }
-                    text.push(cell.c);
-                    // Append zero-width chars (combining marks, ZWJ, variation selectors)
-                    if let Some(ref zw) = cell.zerowidth {
-                        for &ch in zw.iter() {
-                            text.push(ch);
-                        }
+
+                    // Hidden cells: flush current run and skip (creates a gap)
+                    if cell.flags.hidden {
+                        flush_run!(runs, run_text, run_fg, run_bg, run_col, run_cells, run_style);
+                        col += if cell.flags.wide_char { 2 } else { 1 };
+                        run_col = col;
+                        continue;
                     }
+
+                    let cell_width: u16 = if cell.flags.wide_char { 2 } else { 1 };
+
+                    let (fg_packed, bg_packed) = if cell.flags.inverse {
+                        let resolved_fg = if matches!(cell.fg, nexus_term::Color::Default) {
+                            Color::rgb(0.9, 0.9, 0.9)
+                        } else {
+                            term_color_to_strata(cell.fg)
+                        };
+                        let resolved_bg = if matches!(cell.bg, nexus_term::Color::Default) {
+                            Color::rgb(0.12, 0.12, 0.12)
+                        } else {
+                            term_color_to_strata(cell.bg)
+                        };
+                        (resolved_bg.pack(), resolved_fg.pack())
+                    } else {
+                        let fg = term_color_to_strata(cell.fg).pack();
+                        let bg = if matches!(cell.bg, nexus_term::Color::Default) {
+                            0u32
+                        } else {
+                            term_color_to_strata(cell.bg).pack()
+                        };
+                        (fg, bg)
+                    };
+                    let style = RunStyle {
+                        bold: cell.flags.bold,
+                        italic: cell.flags.italic,
+                        underline: match cell.flags.underline {
+                            nexus_term::UnderlineStyle::None => UnderlineStyle::None,
+                            nexus_term::UnderlineStyle::Single => UnderlineStyle::Single,
+                            nexus_term::UnderlineStyle::Double => UnderlineStyle::Double,
+                            nexus_term::UnderlineStyle::Curly => UnderlineStyle::Curly,
+                            nexus_term::UnderlineStyle::Dotted => UnderlineStyle::Dotted,
+                            nexus_term::UnderlineStyle::Dashed => UnderlineStyle::Dashed,
+                        },
+                        strikethrough: cell.flags.strikethrough,
+                        dim: cell.flags.dim,
+                    };
+
+                    // Check if this cell continues the current run (packed u32 comparison)
+                    let same_attrs = fg_packed == run_fg && bg_packed == run_bg && style == run_style;
+
+                    if !same_attrs {
+                        flush_run!(runs, run_text, run_fg, run_bg, run_col, run_cells, run_style);
+                        run_col = col;
+                        run_fg = fg_packed;
+                        run_bg = bg_packed;
+                        run_style = style;
+                    } else if run_text.is_empty() {
+                        run_col = col;
+                        run_fg = fg_packed;
+                        run_bg = bg_packed;
+                        run_style = style;
+                    }
+
+                    cell.push_grapheme(&mut run_text);
+                    run_cells += cell_width;
+                    col += cell_width;
                 }
-                // Use cell foreground color from first non-default cell, or default
-                let fg = row.iter()
-                    .find(|c| !matches!(c.fg, nexus_term::Color::Default))
-                    .map(|c| term_color_to_strata(c.fg))
-                    .unwrap_or(Color::rgb(0.8, 0.8, 0.8));
-                term = term.row(&text, fg);
+
+                // Flush last run
+                flush_run!(runs, run_text, run_fg, run_bg, run_col, run_cells, run_style);
+
+                term = term.row(runs);
             }
 
             content = content.terminal(term);
@@ -1414,7 +1498,20 @@ fn term_color_to_strata(c: nexus_term::Color) -> Color {
             13 => Color::rgb(0.84, 0.44, 0.84),     // Bright Magenta
             14 => Color::rgb(0.16, 0.72, 0.86),     // Bright Cyan
             15 => Color::rgb(1.0, 1.0, 1.0),        // Bright White
-            _ => Color::rgb(0.9, 0.9, 0.9),
+            // 216-color cube (indices 16-231)
+            16..=231 => {
+                let idx = n - 16;
+                let r = (idx / 36) % 6;
+                let g = (idx / 6) % 6;
+                let b = idx % 6;
+                let to_val = |v: u8| if v == 0 { 0.0 } else { (55.0 + v as f32 * 40.0) / 255.0 };
+                Color::rgb(to_val(r), to_val(g), to_val(b))
+            }
+            // Grayscale (indices 232-255)
+            232..=255 => {
+                let gray = (8.0 + (n - 232) as f32 * 10.0) / 255.0;
+                Color::rgb(gray, gray, gray)
+            }
         }
     }
 
@@ -1424,6 +1521,12 @@ fn term_color_to_strata(c: nexus_term::Color) -> Color {
         nexus_term::Color::Rgb(r, g, b) => Color::rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
         nexus_term::Color::Indexed(n) => ansi_color(n),
     }
+}
+
+/// Convert nexus-term color to Strata color (background variant — uses 256-color palette).
+fn term_color_to_strata_bg(c: nexus_term::Color) -> Color {
+    // Reuse the same conversion — fg and bg use the same palette
+    term_color_to_strata(c)
 }
 
 /// Render a structured Value from a native (kernel) command into the layout.

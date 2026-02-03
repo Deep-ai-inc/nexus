@@ -900,17 +900,74 @@ impl PipelineWrapper {
             for item in &source_layout.items {
                 if let crate::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
                     let grid_clip = &grid_layout.clip_rect;
+                    let cell_w = grid_layout.cell_width * scale;
+                    let cell_h = grid_layout.cell_height * scale;
                     for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
-                        if row.text.trim().is_empty() {
+                        if row.runs.is_empty() {
                             continue;
                         }
                         grid_row_count += 1;
-                        let start = pipeline.instance_count();
-                        let x = grid_layout.bounds.x * scale;
-                        let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
-                        let color = crate::primitives::Color::unpack(row.color);
-                        pipeline.add_text(&row.text, x, y, color, BASE_FONT_SIZE * scale, &mut font_system);
-                        maybe_clip(pipeline, start, grid_clip, scale);
+                        let row_y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
+                        let base_x = grid_layout.bounds.x * scale;
+
+                        for run in &row.runs {
+                            let run_x = base_x + run.col_offset as f32 * cell_w;
+                            let run_w = run.cell_len as f32 * cell_w;
+                            let is_whitespace = run.text.trim().is_empty();
+
+                            // Background color rect
+                            if run.bg != 0 {
+                                let bg_color = crate::primitives::Color::unpack(run.bg);
+                                let bg_start = pipeline.instance_count();
+                                pipeline.add_solid_rect(run_x, row_y, run_w, cell_h, bg_color);
+                                maybe_clip(pipeline, bg_start, grid_clip, scale);
+                            }
+
+                            // Foreground color (used for text and decorations)
+                            let mut fg_color = crate::primitives::Color::unpack(run.fg);
+                            if run.style.dim {
+                                fg_color.a *= 0.5;
+                            }
+
+                            // Text shaping (skip for whitespace-only runs)
+                            if !is_whitespace {
+                                let start = pipeline.instance_count();
+                                pipeline.add_text_styled(&run.text, run_x, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
+                                maybe_clip(pipeline, start, grid_clip, scale);
+                            }
+
+                            // Underline variants (render on whitespace too)
+                            {
+                                use crate::layout_snapshot::UnderlineStyle;
+                                let ul_thickness = scale.max(1.0);
+                                match run.style.underline {
+                                    UnderlineStyle::None => {}
+                                    UnderlineStyle::Single | UnderlineStyle::Curly | UnderlineStyle::Dotted | UnderlineStyle::Dashed => {
+                                        let ul_y = row_y + cell_h * 0.85;
+                                        let ul_start = pipeline.instance_count();
+                                        pipeline.add_solid_rect(run_x, ul_y, run_w, ul_thickness, fg_color);
+                                        maybe_clip(pipeline, ul_start, grid_clip, scale);
+                                    }
+                                    UnderlineStyle::Double => {
+                                        let gap = (2.0 * scale).max(2.0);
+                                        let ul_y1 = row_y + cell_h * 0.82;
+                                        let ul_y2 = ul_y1 + gap;
+                                        let ul_start = pipeline.instance_count();
+                                        pipeline.add_solid_rect(run_x, ul_y1, run_w, ul_thickness, fg_color);
+                                        pipeline.add_solid_rect(run_x, ul_y2, run_w, ul_thickness, fg_color);
+                                        maybe_clip(pipeline, ul_start, grid_clip, scale);
+                                    }
+                                }
+                            }
+
+                            // Strikethrough (render on whitespace too)
+                            if run.style.strikethrough {
+                                let st_y = row_y + cell_h * 0.5;
+                                let st_start = pipeline.instance_count();
+                                pipeline.add_solid_rect(run_x, st_y, run_w, 1.0 * scale, fg_color);
+                                maybe_clip(pipeline, st_start, grid_clip, scale);
+                            }
+                        }
                     }
                 }
             }

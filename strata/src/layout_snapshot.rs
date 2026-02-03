@@ -445,13 +445,50 @@ impl TextLayout {
     }
 }
 
+/// Underline style for rendering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+/// Style flags for a text run in a grid row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: UnderlineStyle,
+    pub strikethrough: bool,
+    pub dim: bool,
+}
+
+/// A styled text run within a grid row.
+#[derive(Debug, Clone)]
+pub struct TextRun {
+    /// Text content for this run.
+    pub text: String,
+    /// Foreground color (packed RGBA).
+    pub fg: u32,
+    /// Background color (packed RGBA), 0 = default/transparent.
+    pub bg: u32,
+    /// Column offset from row start (in cell units).
+    pub col_offset: u16,
+    /// Width of this run in terminal cell units (accounts for wide chars, combining marks).
+    pub cell_len: u16,
+    /// Style flags.
+    pub style: RunStyle,
+}
+
 /// A row of text in a grid layout.
 #[derive(Debug, Clone)]
 pub struct GridRow {
-    /// The text content for this row.
-    pub text: String,
-    /// Foreground color (packed RGBA).
-    pub color: u32,
+    /// Styled text runs for this row.
+    pub runs: Vec<TextRun>,
 }
 
 /// Layout information for grid content (terminals).

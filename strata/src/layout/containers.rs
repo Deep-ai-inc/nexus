@@ -673,8 +673,8 @@ pub struct TerminalElement {
     /// Content buffer reference (zero-copy binding).
     /// The actual content is in the app state, we just point to it.
     content_hash: u64,
-    /// Row content for rendering.
-    row_content: Vec<(String, u32)>,
+    /// Row content for rendering — each row is a list of styled runs.
+    row_content: Vec<Vec<crate::layout_snapshot::TextRun>>,
 }
 
 impl TerminalElement {
@@ -691,9 +691,9 @@ impl TerminalElement {
         }
     }
 
-    /// Add a row of text content with a packed color.
-    pub fn row(mut self, text: impl Into<String>, color: Color) -> Self {
-        self.row_content.push((text.into(), color.pack()));
+    /// Add a row of styled text runs.
+    pub fn row(mut self, runs: Vec<crate::layout_snapshot::TextRun>) -> Self {
+        self.row_content.push(runs);
         self
     }
 
@@ -1917,7 +1917,7 @@ impl Column {
 
                     use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
                     let rows_content: Vec<GridRow> = t.row_content.into_iter()
-                        .map(|(text, color)| GridRow { text, color })
+                        .map(|runs| GridRow { runs })
                         .collect();
                     let mut grid_layout = GridLayout::with_rows(
                         Rect::new(x, y, size.width.max(content_width), size.height),
@@ -2594,7 +2594,7 @@ impl Row {
 
                     use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
                     let rows_content: Vec<GridRow> = t.row_content.into_iter()
-                        .map(|(text, color)| GridRow { text, color })
+                        .map(|runs| GridRow { runs })
                         .collect();
                     let mut grid_layout = GridLayout::with_rows(
                         Rect::new(x, y, size.width.max(content_right - x), size.height),
@@ -3086,7 +3086,7 @@ impl ScrollColumn {
 
                         use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
                         let rows_content: Vec<GridRow> = t.row_content.into_iter()
-                            .map(|(text, color)| GridRow { text, color })
+                            .map(|runs| GridRow { runs })
                             .collect();
                         let mut grid_layout = GridLayout::with_rows(
                             Rect::new(content_x, screen_y, size.width.max(content_width), size.height),

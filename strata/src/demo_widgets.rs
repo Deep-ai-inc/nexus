@@ -80,7 +80,14 @@ impl Widget for ShellBlock {
         let mut terminal = TerminalElement::new(self.terminal_source, self.cols, self.row_count)
             .cell_size(8.4, 18.0);
         for (text, color) in self.rows {
-            terminal = terminal.row(text, color);
+            terminal = terminal.row(vec![crate::layout_snapshot::TextRun {
+                text: text.to_string(),
+                fg: color.pack(),
+                bg: 0,
+                col_offset: 0,
+                cell_len: text.len() as u16,
+                style: crate::layout_snapshot::RunStyle::default(),
+            }]);
         }
 
         let header = Row::new()
@@ -168,7 +175,14 @@ impl Widget for AgentBlock {
                     let mut term = TerminalElement::new(source_id, tool.output_cols, rows)
                         .cell_size(8.4, 18.0);
                     for (text, color) in tool.output_rows {
-                        term = term.row(text, color);
+                        term = term.row(vec![crate::layout_snapshot::TextRun {
+                            text: text.to_string(),
+                            fg: color.pack(),
+                            bg: 0,
+                            col_offset: 0,
+                            cell_len: text.len() as u16,
+                            style: crate::layout_snapshot::RunStyle::default(),
+                        }]);
                     }
                     content = content.push(
                         Row::new()

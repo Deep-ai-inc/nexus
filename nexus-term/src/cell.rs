@@ -34,12 +34,24 @@ impl Cell {
     }
 }
 
+/// Underline style.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 /// Cell attribute flags.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CellFlags {
     pub bold: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub underline: UnderlineStyle,
     pub strikethrough: bool,
     pub dim: bool,
     pub inverse: bool,
@@ -56,7 +68,19 @@ impl From<AlacrittyFlags> for CellFlags {
         Self {
             bold: flags.contains(AlacrittyFlags::BOLD),
             italic: flags.contains(AlacrittyFlags::ITALIC),
-            underline: flags.contains(AlacrittyFlags::ALL_UNDERLINES),
+            underline: if flags.contains(AlacrittyFlags::DOUBLE_UNDERLINE) {
+                UnderlineStyle::Double
+            } else if flags.contains(AlacrittyFlags::UNDERCURL) {
+                UnderlineStyle::Curly
+            } else if flags.contains(AlacrittyFlags::DOTTED_UNDERLINE) {
+                UnderlineStyle::Dotted
+            } else if flags.contains(AlacrittyFlags::DASHED_UNDERLINE) {
+                UnderlineStyle::Dashed
+            } else if flags.contains(AlacrittyFlags::UNDERLINE) {
+                UnderlineStyle::Single
+            } else {
+                UnderlineStyle::None
+            },
             strikethrough: flags.contains(AlacrittyFlags::STRIKEOUT),
             dim: flags.contains(AlacrittyFlags::DIM),
             inverse: flags.contains(AlacrittyFlags::INVERSE),

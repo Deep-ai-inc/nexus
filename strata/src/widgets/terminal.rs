@@ -167,8 +167,14 @@ impl StrataWidget<TerminalMessage> for TerminalWidget {
             }
 
             rows_content.push(GridRow {
-                text: line,
-                color: row_color.pack(),
+                runs: vec![crate::layout_snapshot::TextRun {
+                    text: line.clone(),
+                    fg: row_color.pack(),
+                    bg: 0,
+                    col_offset: 0,
+                    cell_len: line.len() as u16,
+                    style: crate::layout_snapshot::RunStyle::default(),
+                }],
             });
         }
 

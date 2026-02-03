@@ -9,7 +9,7 @@ mod cell;
 
 pub use grid::TerminalGrid;
 pub use parser::TerminalParser;
-pub use cell::{Cell, CellFlags, Color};
+pub use cell::{Cell, CellFlags, Color, UnderlineStyle};
 
 /// Default terminal dimensions.
 pub const DEFAULT_COLS: u16 = 80;
