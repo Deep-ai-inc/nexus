@@ -1110,13 +1110,13 @@ fn render_table(
                         hash_text(text) ^ (row_idx as u64),
                     );
                     // Register clickable cell as widget (text-width only)
-                    // Widget takes priority over source, so register widget first for anchors
                     if let Some(wid) = cell.widget_id {
                         let text_rect = Rect::new(tx, ty, text_width, table.line_height);
                         snapshot.register_widget(wid, text_rect);
                         snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
-                    } else {
-                        // Only register for selection if not a clickable anchor
+                    }
+                    // Register for text selection (anchors are both clickable and selectable)
+                    {
                         use crate::layout_snapshot::{SourceLayout, TextLayout};
                         let mut text_layout = TextLayout::simple(
                             text.clone(), cell.color.pack(),
@@ -1127,7 +1127,6 @@ fn render_table(
                     }
                 } else {
                     // Multi-line wrapped cell
-                    let is_anchor = cell.widget_id.is_some();
                     let mut max_text_width: f32 = 0.0;
                     for (line_idx, line) in cell.lines.iter().enumerate() {
                         let tx = col_x + cell_pad;
@@ -1141,8 +1140,8 @@ fn render_table(
                             BASE_FONT_SIZE,
                             hash_text(line) ^ (row_idx as u64) ^ ((line_idx as u64) << 32),
                         );
-                        // Only register for selection if not a clickable anchor
-                        if !is_anchor {
+                        // Register for text selection (anchors are both clickable and selectable)
+                        {
                             use crate::layout_snapshot::{SourceLayout, TextLayout};
                             let mut text_layout = TextLayout::simple(
                                 line.clone(), cell.color.pack(),

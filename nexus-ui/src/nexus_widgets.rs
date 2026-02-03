@@ -1597,9 +1597,11 @@ fn render_native_value(
                 action: value_to_anchor_action(value),
                 drag_payload: DragPayload::FilePath(entry.path.clone()),
             });
+            let source_id = source_ids::native(block_id);
             parent.push(
                 TextElement::new(display)
                     .color(color)
+                    .source(source_id)
                     .widget_id(anchor_id)
                     .cursor_hint(CursorIcon::Pointer),
             )
@@ -2051,9 +2053,11 @@ fn render_file_entries(
         });
         *anchor_idx += 1;
 
+        let source_id = source_ids::native(block_id);
         row = row.push(
             TextElement::new(display)
                 .color(color)
+                .source(source_id)
                 .widget_id(anchor_id)
                 .cursor_hint(CursorIcon::Pointer),
         );
