@@ -18,7 +18,8 @@ struct SortOptions {
     by_time: bool,
     ignore_case: bool,
     unique: bool,
-    by_field: Option<String>,  // --by <field> for typed data
+    by_fields: Vec<String>,    // --by field1,field2 for multi-key typed data
+    by_key: Option<usize>,     // --key N for column-index sorting (1-based)
 }
 
 impl SortOptions {
@@ -30,22 +31,36 @@ impl SortOptions {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: Vec::new(),
+            by_key: None,
         };
 
         let mut i = 0;
         while i < args.len() {
             let arg = &args[i];
             if arg.starts_with('-') && !arg.starts_with("--") {
-                for c in arg[1..].chars() {
-                    match c {
-                        'r' => opts.reverse = true,
-                        'n' => opts.numeric = true,
-                        'S' => opts.by_size = true,
-                        't' => opts.by_time = true,
-                        'f' => opts.ignore_case = true,
-                        'u' => opts.unique = true,
-                        _ => {}
+                // Check for -k N (short flag with separate arg)
+                if arg == "-k" {
+                    if i + 1 < args.len() {
+                        if let Ok(n) = args[i + 1].parse::<usize>() {
+                            opts.by_key = Some(n);
+                        } else {
+                            // Not a number — treat as field name
+                            opts.by_fields = args[i + 1].split(',').map(|s| s.to_string()).collect();
+                        }
+                        i += 1;
+                    }
+                } else {
+                    for c in arg[1..].chars() {
+                        match c {
+                            'r' => opts.reverse = true,
+                            'n' => opts.numeric = true,
+                            'S' => opts.by_size = true,
+                            't' => opts.by_time = true,
+                            'f' => opts.ignore_case = true,
+                            'u' => opts.unique = true,
+                            _ => {}
+                        }
                     }
                 }
             } else {
@@ -56,16 +71,24 @@ impl SortOptions {
                     "--time" => opts.by_time = true,
                     "--ignore-case" => opts.ignore_case = true,
                     "--unique" => opts.unique = true,
-                    "--by" | "-k" => {
+                    "--key" => {
                         if i + 1 < args.len() {
-                            opts.by_field = Some(args[i + 1].clone());
+                            if let Ok(n) = args[i + 1].parse::<usize>() {
+                                opts.by_key = Some(n);
+                            }
+                            i += 1;
+                        }
+                    }
+                    "--by" => {
+                        if i + 1 < args.len() {
+                            opts.by_fields = args[i + 1].split(',').map(|s| s.to_string()).collect();
                             i += 1;
                         }
                     }
                     _ => {
                         // Treat bare argument as field name for --by
-                        if !arg.starts_with('-') && opts.by_field.is_none() {
-                            opts.by_field = Some(arg.clone());
+                        if !arg.starts_with('-') && opts.by_fields.is_empty() {
+                            opts.by_fields = arg.split(',').map(|s| s.to_string()).collect();
                         }
                     }
                 }
@@ -114,11 +137,24 @@ fn sort_value(value: Value, opts: &SortOptions) -> Value {
             Value::List(items)
         }
         Value::Table { columns, mut rows } => {
-            // Sort table rows by first column
+            // Determine which column(s) to sort by
+            let sort_col = if let Some(key) = opts.by_key {
+                // --key N is 1-based
+                key.saturating_sub(1)
+            } else if !opts.by_fields.is_empty() {
+                // --by field_name: find the column index by name
+                columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&opts.by_fields[0]))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
             rows.sort_by(|a, b| {
                 let cmp = compare_values(
-                    a.first().unwrap_or(&Value::Unit),
-                    b.first().unwrap_or(&Value::Unit),
+                    a.get(sort_col).unwrap_or(&Value::Unit),
+                    b.get(sort_col).unwrap_or(&Value::Unit),
                     opts,
                 );
                 if opts.reverse {
@@ -192,9 +228,16 @@ fn sort_file_entries(items: &mut [Value], opts: &SortOptions) {
 
 fn sort_generic(items: &mut [Value], opts: &SortOptions) {
     items.sort_by(|a, b| {
-        let cmp = if let Some(ref field) = opts.by_field {
-            // Sort by specific field for typed data
-            compare_by_field(a, b, field, opts)
+        let cmp = if !opts.by_fields.is_empty() {
+            // Multi-key sort: compare by each field in order, tiebreak with next field
+            let mut result = Ordering::Equal;
+            for field in &opts.by_fields {
+                result = compare_by_field(a, b, field, opts);
+                if result != Ordering::Equal {
+                    break;
+                }
+            }
+            result
         } else {
             compare_values(a, b, opts)
         };
@@ -387,7 +430,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: vec![],
+            by_key: None,
         };
         let result = sort_value(list, &opts);
         if let Value::List(items) = result {
@@ -407,7 +451,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: vec![],
+            by_key: None,
         };
         let result = sort_value(list, &opts);
         if let Value::List(items) = result {
@@ -431,7 +476,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: vec![],
+            by_key: None,
         };
         let result = sort_value(list, &opts);
         if let Value::List(items) = result {
@@ -472,7 +518,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: Some("cpu".to_string()),
+            by_fields: vec!["cpu".to_string()],
+            by_key: None,
         };
         let result = sort_value(processes.clone(), &opts);
 
@@ -498,7 +545,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: Some("cpu".to_string()),
+            by_fields: vec!["cpu".to_string()],
+            by_key: None,
         };
         let result = sort_value(processes, &opts);
 
@@ -530,7 +578,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: vec![],
+            by_key: None,
         };
         let result = sort_value(list, &opts);
         if let Value::List(items) = result {
@@ -557,7 +606,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: vec![],
+            by_key: None,
         };
         let result = sort_value(list, &opts);
         if let Value::List(items) = result {
@@ -584,7 +634,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: vec![],
+            by_key: None,
         };
         let result = sort_value(list, &opts);
         if let Value::List(items) = result {
@@ -592,6 +643,98 @@ mod tests {
             assert_eq!(items[1].to_text(), "v1.9");
             assert_eq!(items[2].to_text(), "v1.10");
             assert_eq!(items[3].to_text(), "v2.0");
+        }
+    }
+
+    #[test]
+    fn test_sort_table_by_key() {
+        use nexus_api::TableColumn;
+        let table = Value::Table {
+            columns: vec![TableColumn::new("name"), TableColumn::new("age"), TableColumn::new("city")],
+            rows: vec![
+                vec![Value::String("Charlie".into()), Value::Int(30), Value::String("NYC".into())],
+                vec![Value::String("Alice".into()), Value::Int(25), Value::String("LA".into())],
+                vec![Value::String("Bob".into()), Value::Int(35), Value::String("SF".into())],
+            ],
+        };
+        // Sort by column 2 (age, 1-based)
+        let opts = SortOptions {
+            reverse: false, numeric: false, by_size: false, by_time: false,
+            ignore_case: false, unique: false, by_fields: vec![], by_key: Some(2),
+        };
+        let result = sort_value(table, &opts);
+        if let Value::Table { rows, .. } = result {
+            assert_eq!(rows[0][1], Value::Int(25));  // Alice
+            assert_eq!(rows[1][1], Value::Int(30));  // Charlie
+            assert_eq!(rows[2][1], Value::Int(35));  // Bob
+        } else {
+            panic!("Expected Table");
+        }
+    }
+
+    #[test]
+    fn test_sort_table_by_column_name() {
+        use nexus_api::TableColumn;
+        let table = Value::Table {
+            columns: vec![TableColumn::new("name"), TableColumn::new("score")],
+            rows: vec![
+                vec![Value::String("B".into()), Value::Int(80)],
+                vec![Value::String("A".into()), Value::Int(90)],
+                vec![Value::String("C".into()), Value::Int(70)],
+            ],
+        };
+        // Sort by "score" column name
+        let opts = SortOptions {
+            reverse: false, numeric: false, by_size: false, by_time: false,
+            ignore_case: false, unique: false, by_fields: vec!["score".to_string()], by_key: None,
+        };
+        let result = sort_value(table, &opts);
+        if let Value::Table { rows, .. } = result {
+            assert_eq!(rows[0][1], Value::Int(70));
+            assert_eq!(rows[1][1], Value::Int(80));
+            assert_eq!(rows[2][1], Value::Int(90));
+        } else {
+            panic!("Expected Table");
+        }
+    }
+
+    #[test]
+    fn test_sort_multi_key() {
+        use nexus_api::{ProcessInfo, ProcessStatus};
+
+        fn test_proc(command: &str, cpu: f64, mem: u64) -> ProcessInfo {
+            ProcessInfo {
+                pid: 1, ppid: 0, user: "root".to_string(), group: None,
+                command: command.to_string(), args: vec![],
+                cpu_percent: cpu, mem_bytes: mem, mem_percent: 1.0, virtual_size: 0,
+                status: ProcessStatus::Running, started: None, cpu_time: 0,
+                tty: None, nice: None, priority: 0, pgid: None, sid: None,
+                tpgid: None, threads: None, wchan: None, flags: None,
+                is_session_leader: None, has_foreground: None,
+            }
+        }
+
+        let processes = Value::List(vec![
+            Value::Process(Box::new(test_proc("a", 50.0, 2000))),
+            Value::Process(Box::new(test_proc("b", 50.0, 1000))),
+            Value::Process(Box::new(test_proc("c", 10.0, 3000))),
+        ]);
+
+        // Multi-key: sort by cpu, then by mem as tiebreak
+        let opts = SortOptions {
+            reverse: false, numeric: false, by_size: false, by_time: false,
+            ignore_case: false, unique: false, by_fields: vec!["cpu".to_string(), "mem".to_string()], by_key: None,
+        };
+        let result = sort_value(processes, &opts);
+        if let Value::List(items) = result {
+            match (&items[0], &items[1], &items[2]) {
+                (Value::Process(a), Value::Process(b), Value::Process(c)) => {
+                    assert_eq!(a.command, "c");  // cpu=10
+                    assert_eq!(b.command, "b");  // cpu=50, mem=1000
+                    assert_eq!(c.command, "a");  // cpu=50, mem=2000
+                }
+                _ => panic!("Expected Process values"),
+            }
         }
     }
 
@@ -633,7 +776,8 @@ mod tests {
             by_time: false,
             ignore_case: false,
             unique: false,
-            by_field: None,
+            by_fields: vec![],
+            by_key: None,
         };
         let result = sort_value(list, &opts);
         if let Value::List(items) = result {

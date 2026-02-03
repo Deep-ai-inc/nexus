@@ -246,40 +246,177 @@ pub fn wait_with_events(
     }
 }
 
-/// Spawn a pipeline of commands.
+/// Spawn a pipeline of external commands connected by real pipes.
+///
+/// Creates pipe pairs between adjacent processes:
+///   process[0].stdout → pipe → process[1].stdin → pipe → process[2].stdin ...
+///
+/// The last process gets a PTY for terminal output. All processes share a
+/// process group (pgid = first child's PID) so Ctrl+C kills them all.
 pub fn spawn_pipeline(
     state: &ShellState,
     commands: &[Command],
 ) -> anyhow::Result<Vec<ProcessHandle>> {
-    // TODO: Implement proper pipeline with pipes between processes
-    // For now, this is a placeholder
+    use nix::unistd::{pipe, setpgid, Pid};
+    use std::os::fd::AsRawFd;
 
-    let mut handles = Vec::new();
-
-    for cmd in commands {
-        if let Command::Simple(simple) = cmd {
+    let n = commands.len();
+    if n == 0 {
+        return Ok(vec![]);
+    }
+    if n == 1 {
+        // Single command — use regular spawn with PTY
+        if let Command::Simple(simple) = &commands[0] {
             let argv: Vec<String> = std::iter::once(simple.name.clone())
                 .chain(simple.args.iter().filter_map(|w| w.as_literal().map(String::from)))
                 .collect();
-
             let handle = spawn(&argv, &state.cwd, &state.env, &[], &simple.redirects)?;
-            handles.push(handle);
+            return Ok(vec![handle]);
         }
+        return Ok(vec![]);
+    }
+
+    // Create pipes between adjacent processes, set CLOEXEC to prevent FD leaks
+    let mut pipes = Vec::with_capacity(n - 1);
+    for _ in 0..n - 1 {
+        let (read_fd, write_fd) = pipe()?;
+        set_cloexec(read_fd.as_raw_fd())?;
+        set_cloexec(write_fd.as_raw_fd())?;
+        pipes.push((read_fd, write_fd));
+    }
+
+    // PTY for the last process's output (so terminal escapes work and parent can read it)
+    let pty = pty::open_pty()?;
+    let pty_master_fd = pty.master.as_raw_fd();
+    let pty_slave_fd = pty.slave.as_raw_fd();
+
+    // Set CLOEXEC on PTY FDs so children that don't dup2 them won't leak them
+    set_cloexec(pty_master_fd)?;
+    set_cloexec(pty_slave_fd)?;
+
+    let mut handles = Vec::with_capacity(n);
+    let mut pgid = Pid::from_raw(0);
+
+    for (i, cmd) in commands.iter().enumerate() {
+        let Command::Simple(simple) = cmd else { continue };
+
+        let argv: Vec<String> = std::iter::once(simple.name.clone())
+            .chain(simple.args.iter().filter_map(|w| w.as_literal().map(String::from)))
+            .collect();
+
+        match unsafe { fork() }? {
+            ForkResult::Child => {
+                // Join the pipeline's process group (pgid=0 means "use my own PID" for the first child)
+                let _ = setpgid(Pid::from_raw(0), pgid);
+
+                // stdin: first process inherits parent's stdin; others read from previous pipe
+                if i > 0 {
+                    dup2(pipes[i - 1].0.as_raw_fd(), 0)?;
+                }
+
+                // stdout: last process writes to PTY; others write to next pipe
+                if i < n - 1 {
+                    dup2(pipes[i].1.as_raw_fd(), 1)?;
+                } else {
+                    dup2(pty_slave_fd, 1)?;
+                }
+
+                // stderr: always to PTY (visible in terminal)
+                dup2(pty_slave_fd, 2)?;
+
+                // All other FDs (pipes, PTY master/slave originals) have CLOEXEC
+                // and will be closed on exec. Set cwd and env.
+                let _ = std::env::set_current_dir(&state.cwd);
+                unsafe {
+                    for (key, value) in &state.env {
+                        std::env::set_var(key, value);
+                    }
+                }
+
+                if let Err(e) = apply_redirects(&simple.redirects) {
+                    eprintln!("redirect error: {}", e);
+                    std::process::exit(1);
+                }
+
+                let argv_cstr: Vec<CString> = argv
+                    .iter()
+                    .map(|s| CString::new(s.as_str()).unwrap())
+                    .collect();
+                let _ = execvp(&argv_cstr[0], &argv_cstr);
+                // exec failed
+                eprintln!("{}: command not found", argv[0]);
+                std::process::exit(127);
+            }
+            ForkResult::Parent { child } => {
+                if i == 0 {
+                    pgid = child;
+                }
+                // Also set pgid in parent (prevents race where child execs before setpgid)
+                let _ = setpgid(child, pgid);
+
+                handles.push(ProcessHandle { pid: child, pty: None });
+            }
+        }
+    }
+
+    // Parent: close all pipe FDs (children own them via dup2; CLOEXEC closed the originals on exec)
+    drop(pipes);
+    // Close PTY slave — children have it via dup2
+    drop(pty.slave);
+
+    // Give the last handle the PTY master so wait_pipeline can read output
+    if let Some(last) = handles.last_mut() {
+        last.pty = Some(PtyHandle {
+            master: pty.master,
+            pid: last.pid,
+        });
+    } else {
+        drop(pty.master);
     }
 
     Ok(handles)
 }
 
+/// Set FD_CLOEXEC on a file descriptor.
+fn set_cloexec(fd: i32) -> anyhow::Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+    let flags = fcntl(fd, FcntlArg::F_GETFD)?;
+    let mut flags = FdFlag::from_bits_truncate(flags);
+    flags.insert(FdFlag::FD_CLOEXEC);
+    fcntl(fd, FcntlArg::F_SETFD(flags))?;
+    Ok(())
+}
+
 /// Wait for all processes in a pipeline.
+///
+/// Waits for the LAST process first (the one with the PTY, producing output).
+/// This prevents deadlocks: if we waited for process[0] first, it might block
+/// writing to a full pipe because process[1] hasn't started reading yet.
+/// By waiting for the last process, data flows through the pipeline naturally.
+/// After the last process exits, upstream processes get SIGPIPE and die.
 pub fn wait_pipeline(
-    handles: Vec<ProcessHandle>,
+    mut handles: Vec<ProcessHandle>,
     block_id: BlockId,
     events: &Sender<ShellEvent>,
 ) -> anyhow::Result<i32> {
-    let mut last_exit = 0;
+    if handles.is_empty() {
+        return Ok(0);
+    }
 
+    // Pop the last handle (has the PTY) and wait for it while streaming output
+    let last = handles.pop().unwrap();
+    let last_exit = wait_with_events(last, block_id, events)?;
+
+    // Reap remaining processes (they should be done or dying from SIGPIPE)
     for handle in handles {
-        last_exit = wait_with_events(handle, block_id, events)?;
+        match waitpid(handle.pid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                // Still running — give it a moment then block-wait
+                let _ = waitpid(handle.pid, None);
+            }
+            Ok(_) => {} // Already exited
+            Err(_) => {} // Already reaped
+        }
     }
 
     Ok(last_exit)
