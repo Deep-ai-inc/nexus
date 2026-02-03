@@ -181,7 +181,8 @@ impl Widget for ShellBlockWidget<'_> {
                                 cell_len: $cells,
                                 style: $style,
                             });
-                            $cells = 0;
+                            #[allow(unused_assignments)]
+                            { $cells = 0; }
                         }
                     };
                 }
@@ -1521,12 +1522,6 @@ fn term_color_to_strata(c: nexus_term::Color) -> Color {
         nexus_term::Color::Rgb(r, g, b) => Color::rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
         nexus_term::Color::Indexed(n) => ansi_color(n),
     }
-}
-
-/// Convert nexus-term color to Strata color (background variant — uses 256-color palette).
-fn term_color_to_strata_bg(c: nexus_term::Color) -> Color {
-    // Reuse the same conversion — fg and bg use the same palette
-    term_color_to_strata(c)
 }
 
 /// Render a structured Value from a native (kernel) command into the layout.
