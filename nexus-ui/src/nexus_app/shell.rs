@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 
@@ -104,9 +104,14 @@ pub(crate) struct ShellWidget {
     pub pty_handles: Vec<PtyHandle>,
     pub pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
     pub terminal_size: Cell<(u16, u16)>,
-    pub last_terminal_size: Cell<(u16, u16)>,
-    /// Timestamp of the last PTY resize signal (for downsize debounce).
-    last_resize_at: Cell<Instant>,
+    /// Last size committed to all block parsers.
+    last_parser_size: Cell<(u16, u16)>,
+    /// Last size sent to PTY handles (avoids redundant SIGWINCH).
+    last_pty_size: Cell<(u16, u16)>,
+    /// Pending column downsize: `(target_size, first_seen)`. The timer
+    /// restarts whenever the target changes, so the reflow only commits
+    /// once the size has been stable for the debounce window.
+    pending_downsize: Cell<Option<((u16, u16), Instant)>>,
     pub terminal_dirty: bool,
     pub last_exit_code: Option<i32>,
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
@@ -132,8 +137,9 @@ impl ShellWidget {
             pty_handles: Vec::new(),
             pty_tx,
             terminal_size: Cell::new((120, 24)),
-            last_terminal_size: Cell::new((120, 24)),
-            last_resize_at: Cell::new(Instant::now()),
+            last_parser_size: Cell::new((120, 24)),
+            last_pty_size: Cell::new((120, 24)),
+            pending_downsize: Cell::new(None),
             terminal_dirty: false,
             last_exit_code: None,
             image_handles: HashMap::new(),
@@ -802,50 +808,66 @@ impl ShellWidget {
     /// Propagate terminal size changes to PTY handles and block parsers.
     ///
     /// Uses an asymmetric strategy:
-    ///   - **Upsizing** (cols growing): resize parser immediately — adds
-    ///     padding which is visually stable.
-    ///   - **Downsizing** (cols shrinking): delay the parser resize for
-    ///     ~32ms so the window frame crops the old wide grid instead of
-    ///     reflowing text chaotically during a drag. The reflow happens
-    ///     once when the user pauses.
+    ///   - **Upsizing / height-only**: resize parser immediately — padding
+    ///     appears instantly and is visually stable.
+    ///   - **Column downsize**: delay the parser column reflow until the
+    ///     target size has been **stable** for ~32ms. During the drag the
+    ///     parser stays wide and the window frame just crops the right
+    ///     edge. Row changes are still applied immediately to keep scroll
+    ///     regions correct.
     ///
-    /// PTY handles are always resized immediately so the child process
-    /// can start computing the new layout in the background.
+    /// PTY handles are resized via `sync_pty_sizes()` in `view()`.
     pub fn sync_terminal_size(&mut self) {
         let current_size = self.terminal_size.get();
         let (target_cols, target_rows) = current_size;
-        let (last_cols, last_rows) = self.last_terminal_size.get();
+        let (parser_cols, parser_rows) = self.last_parser_size.get();
 
-        if current_size == (last_cols, last_rows) {
+        if (target_cols, target_rows) == (parser_cols, parser_rows) {
+            self.pending_downsize.set(None);
             return;
         }
 
-        // Always resize PTY handles immediately.
-        for handle in &self.pty_handles {
-            let _ = handle.resize(target_cols, target_rows);
-        }
-
-        // Upsizing or height-only change: resize parser immediately.
-        if target_cols >= last_cols {
-            self.last_terminal_size.set(current_size);
-            self.last_resize_at.set(Instant::now());
+        // Upsizing or width unchanged: resize parser immediately.
+        if target_cols >= parser_cols {
+            self.last_parser_size.set(current_size);
+            self.pending_downsize.set(None);
             for block in &mut self.blocks {
                 block.parser.resize(target_cols, target_rows);
             }
             return;
         }
 
-        // Downsizing: only commit the parser resize after the debounce
-        // window (~32ms). During the drag the parser stays wide and the
-        // window frame just crops the right edge.
-        let elapsed = Instant::now()
-            .duration_since(self.last_resize_at.get())
-            .as_millis();
-        if elapsed >= 32 {
-            self.last_terminal_size.set(current_size);
-            self.last_resize_at.set(Instant::now());
+        // Column downsize: apply row changes immediately (keeps scroll
+        // regions correct while child is using new row count), but delay
+        // the column reflow until the target has been stable.
+        if target_rows != parser_rows {
+            self.last_parser_size.set((parser_cols, target_rows));
             for block in &mut self.blocks {
-                block.parser.resize(target_cols, target_rows);
+                block.parser.resize(parser_cols, target_rows);
+            }
+        }
+
+        // If the target size changed since the last pending observation,
+        // (re)start the debounce timer. The reflow only commits once the
+        // size stops changing.
+        const DEBOUNCE: Duration = Duration::from_millis(32);
+        match self.pending_downsize.get() {
+            Some((pending_size, started))
+                if pending_size == current_size && started.elapsed() >= DEBOUNCE =>
+            {
+                // Size has been stable for long enough — commit the reflow.
+                self.last_parser_size.set(current_size);
+                self.pending_downsize.set(None);
+                for block in &mut self.blocks {
+                    block.parser.resize(target_cols, target_rows);
+                }
+            }
+            Some((pending_size, _)) if pending_size == current_size => {
+                // Still waiting for debounce to expire.
+            }
+            _ => {
+                // First observation or size changed again — (re)start timer.
+                self.pending_downsize.set(Some((current_size, Instant::now())));
             }
         }
     }
@@ -853,14 +875,13 @@ impl ShellWidget {
     /// Send PTY resize immediately from `view()`.
     ///
     /// Only needs `&self` since PTY handles use `Arc<Mutex<>>`.
-    /// Stamps the debounce timer so the downsize delay in
-    /// `sync_terminal_size()` can measure from the latest resize event.
-    /// Does NOT update `last_terminal_size` so `sync_terminal_size()`
-    /// in `update()` still fires and resizes parsers too.
+    /// Sends SIGWINCH only when the size actually changes (avoids
+    /// redundant signals every frame). Does NOT touch `last_parser_size`
+    /// so `sync_terminal_size()` in `update()` still detects the change.
     pub fn sync_pty_sizes(&self) {
         let current_size = self.terminal_size.get();
-        if current_size != self.last_terminal_size.get() {
-            self.last_resize_at.set(Instant::now());
+        if current_size != self.last_pty_size.get() {
+            self.last_pty_size.set(current_size);
             let (cols, rows) = current_size;
             for handle in &self.pty_handles {
                 let _ = handle.resize(cols, rows);
