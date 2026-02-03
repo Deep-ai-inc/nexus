@@ -4,6 +4,8 @@
 //! The layout computation happens ONCE when `layout()` is called,
 //! not during widget construction.
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::content_address::SourceId;
 use crate::gpu::ImageHandle;
 use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
@@ -11,7 +13,23 @@ use crate::primitives::{Color, Rect, Size};
 use crate::scroll_state::ScrollState;
 use crate::text_input_state::TextInputState;
 
-// Layout metrics derived from fontdue for JetBrains Mono at 14px base size.
+/// Estimate display width in cell units (1 for Latin, 2 for CJK, 0 for combining marks).
+fn unicode_display_width(text: &str) -> f32 {
+    text.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as f32)
+        .sum()
+}
+
+/// Get the X offset in cell-width units for a given column index in a string.
+/// Accounts for CJK (2-wide), combining marks (0-wide), etc.
+fn unicode_col_x(text: &str, col: usize) -> f32 {
+    text.chars()
+        .take(col)
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0) as f32)
+        .sum()
+}
+
+// Layout metrics derived from cosmic-text for JetBrains Mono at 14px base size.
 const CHAR_WIDTH: f32 = 8.4;
 const LINE_HEIGHT: f32 = 18.0;
 const BASE_FONT_SIZE: f32 = 14.0;
@@ -358,12 +376,15 @@ fn render_text_input(
     let text_x = x + input.padding.left;
     let text_y = y + input.padding.top;
 
+    // Pre-compute cursor X position before text is moved
+    let cursor_x_offset = unicode_col_x(&input.text, input.cursor) * CHAR_WIDTH;
+
     // Selection highlight
     if let Some((sel_start, sel_end)) = input.selection {
         let s = sel_start.min(sel_end);
         let e = sel_start.max(sel_end);
-        let sel_x = text_x + s as f32 * CHAR_WIDTH;
-        let sel_w = (e - s) as f32 * CHAR_WIDTH;
+        let sel_x = text_x + unicode_col_x(&input.text, s) * CHAR_WIDTH;
+        let sel_w = (unicode_col_x(&input.text, e) - unicode_col_x(&input.text, s)) * CHAR_WIDTH;
         snapshot.primitives_mut().add_solid_rect(
             Rect::new(sel_x, text_y, sel_w, LINE_HEIGHT),
             Color::rgba(0.3, 0.5, 0.8, 0.4),
@@ -391,7 +412,7 @@ fn render_text_input(
 
     // Cursor (blinking)
     if input.focused && input.cursor_visible {
-        let cursor_x = text_x + input.cursor as f32 * CHAR_WIDTH;
+        let cursor_x = text_x + cursor_x_offset;
         snapshot.primitives_mut().add_solid_rect(
             Rect::new(cursor_x, text_y, 2.0, LINE_HEIGHT),
             Color::rgba(0.85, 0.85, 0.88, 0.8),
@@ -463,8 +484,9 @@ fn render_text_input_multiline(
             if col_start == col_end && s_line != e_line && line_idx != e_line {
                 // Full-line selection indicator for empty-col lines in middle
             }
-            let sel_x = text_x + col_start as f32 * CHAR_WIDTH;
-            let sel_w = ((col_end - col_start).max(1)) as f32 * CHAR_WIDTH;
+            let line_text = lines.get(line_idx).map(|l| *l).unwrap_or("");
+            let sel_x = text_x + unicode_col_x(line_text, col_start) * CHAR_WIDTH;
+            let sel_w = (unicode_col_x(line_text, col_end) - unicode_col_x(line_text, col_start)).max(1.0) * CHAR_WIDTH;
             let sel_y = text_y + line_idx as f32 * LINE_HEIGHT - input.scroll_offset;
             snapshot.primitives_mut().add_solid_rect(
                 Rect::new(sel_x, sel_y, sel_w, LINE_HEIGHT),
@@ -500,7 +522,8 @@ fn render_text_input_multiline(
 
     // Cursor (blinking)
     if input.focused && input.cursor_visible {
-        let cursor_x = text_x + cursor_col as f32 * CHAR_WIDTH;
+        let cursor_line_text = lines.get(cursor_line).map(|l| *l).unwrap_or("");
+        let cursor_x = text_x + unicode_col_x(cursor_line_text, cursor_col) * CHAR_WIDTH;
         let cursor_y = text_y + cursor_line as f32 * LINE_HEIGHT - input.scroll_offset;
         snapshot.primitives_mut().add_solid_rect(
             Rect::new(cursor_x, cursor_y, 2.0, LINE_HEIGHT),
@@ -618,7 +641,7 @@ impl TextElement {
         } else {
             (default_char_width, default_line_height)
         };
-        let char_count = self.text.chars().count() as f32;
+        let char_count = unicode_display_width(&self.text);
         Size::new(char_count * cw, lh)
     }
 
@@ -903,7 +926,7 @@ impl TextInputElement {
     pub fn cursor_visible(mut self, visible: bool) -> Self { self.cursor_visible = visible; self }
 
     fn estimate_size(&self) -> Size {
-        let text_w = self.text.chars().count().max(20) as f32 * CHAR_WIDTH;
+        let text_w = unicode_display_width(&self.text).max(20.0) * CHAR_WIDTH;
         if self.multiline {
             let line_count = self.text.lines().count().max(1) as f32;
             let content_h = line_count * LINE_HEIGHT + self.padding.vertical();
@@ -1101,7 +1124,7 @@ fn render_table(
                     let text = if cell.lines.len() == 1 { &cell.lines[0] } else { &cell.text };
                     let tx = col_x + cell_pad;
                     let ty = ry + 2.0;
-                    let text_width = text.chars().count() as f32 * char_width;
+                    let text_width = unicode_display_width(text) * char_width;
                     snapshot.primitives_mut().add_text_cached(
                         text.clone(),
                         Point::new(tx, ty),
@@ -1131,7 +1154,7 @@ fn render_table(
                     for (line_idx, line) in cell.lines.iter().enumerate() {
                         let tx = col_x + cell_pad;
                         let ly = ry + 2.0 + line_idx as f32 * table.line_height;
-                        let line_width = line.chars().count() as f32 * char_width;
+                        let line_width = unicode_display_width(line) * char_width;
                         max_text_width = max_text_width.max(line_width);
                         snapshot.primitives_mut().add_text_cached(
                             line.clone(),

@@ -21,10 +21,17 @@
 //!
 //! Uses `StagingBelt` for buffer uploads to exploit unified memory on M1/M2/M3.
 
-use std::num::NonZeroU64;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
+use std::sync::Arc;
 
+use cosmic_text::{
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping,
+};
 use iced::widget::shader::wgpu;
+use lru::LruCache;
 use wgpu::util::StagingBelt;
 
 use super::glyph_atlas::GlyphAtlas;
@@ -232,6 +239,25 @@ pub const SELECTION_COLOR: Color = Color {
 /// No-clip sentinel value.
 const NO_CLIP: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 
+/// A pre-computed shaped glyph with position, atlas UVs, and rendering data.
+///
+/// Stores everything needed to emit a `GpuInstance` on a cache hit, so the
+/// hot path avoids both Vec cloning and per-glyph HashMap lookups.
+#[derive(Clone, Copy)]
+struct CachedShapedGlyph {
+    /// Relative position from text origin.
+    x: f32,
+    y: f32,
+    /// Glyph bitmap size (pixels).
+    width: f32,
+    height: f32,
+    /// Pre-computed atlas UVs (already converted to f32).
+    uv_tl: [f32; 2],
+    uv_br: [f32; 2],
+    /// Rendering mode (0 = mask glyph, 5 = color emoji).
+    mode: u32,
+}
+
 /// GPU pipeline for Strata rendering.
 ///
 /// Uses a unified ubershader that renders all 2D primitives in one draw call.
@@ -257,13 +283,17 @@ pub struct StrataPipeline {
     background: Color,
     /// Staging belt for unified memory uploads (Apple Silicon optimization).
     staging_belt: StagingBelt,
+    /// LRU shape cache: avoids re-shaping unchanged text each frame.
+    /// Key is hash(text, font_size_bits), value is (atlas_generation, glyphs).
+    /// When atlas generation mismatches, the entry is stale and must be rebuilt.
+    shape_cache: LruCache<u64, (u32, Arc<Vec<CachedShapedGlyph>>)>,
 }
 
 impl StrataPipeline {
     /// Create a new pipeline.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, font_size: f32) -> Self {
-        let mut glyph_atlas = GlyphAtlas::new(font_size);
-        glyph_atlas.precache_ascii();
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, font_size: f32, font_system: &mut FontSystem) -> Self {
+        let mut glyph_atlas = GlyphAtlas::new(font_size, font_system);
+        glyph_atlas.precache_ascii(font_system);
 
         // Create shader module
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -568,6 +598,7 @@ impl StrataPipeline {
             instances: Vec::new(),
             background: Color::BLACK,
             staging_belt,
+            shape_cache: LruCache::new(NonZeroUsize::new(2048).unwrap()),
         }
     }
 
@@ -1043,54 +1074,113 @@ impl StrataPipeline {
     // =========================================================================
 
     /// Add a text string to render at a specific font size.
-    pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: Color, font_size: f32) {
-        let packed_color = color.pack();
-        let metrics = self.glyph_atlas.metrics_for_size(font_size);
-        let ascent = metrics.ascent;
-        let cell_width = metrics.cell_width;
-        let line_height = metrics.cell_height;
-        let mut cursor_x = x;
-        let mut cursor_y = y;
-
-        for ch in text.chars() {
-            if ch == '\n' {
-                cursor_x = x;
-                cursor_y += line_height;
-                continue;
-            }
-
-            let glyph = self.glyph_atlas.get_glyph(ch, font_size);
-
-            // Skip zero-size glyphs (spaces, etc.) but advance cursor
-            if glyph.width == 0 || glyph.height == 0 {
-                cursor_x += cell_width;
-                continue;
-            }
-
-            // Pixel-align glyph positions to avoid subpixel blur
-            let glyph_x = (cursor_x + glyph.offset_x as f32).round();
-            let glyph_y = (cursor_y + ascent - glyph.offset_y as f32 - glyph.height as f32).round();
-
-            // Convert u16 atlas UVs to f32 tl/br
-            let tl_u = Self::uv_to_f32(glyph.uv_x);
-            let tl_v = Self::uv_to_f32(glyph.uv_y);
-            let br_u = Self::uv_to_f32(glyph.uv_x + glyph.uv_w);
-            let br_v = Self::uv_to_f32(glyph.uv_y + glyph.uv_h);
-
-            self.instances.push(GpuInstance {
-                pos: [glyph_x, glyph_y],
-                size: [glyph.width as f32, glyph.height as f32],
-                uv_tl: [tl_u, tl_v],
-                uv_br: [br_u, br_v],
-                color: packed_color,
-                mode: 0,
-                corner_radius: 0.0,
-                texture_layer: 0,
-                clip_rect: NO_CLIP,
-            });
-
-            cursor_x += cell_width;
+    ///
+    /// Uses cosmic-text for shaping (proper Unicode support: CJK, emoji, Arabic,
+    /// combining marks, ZWJ sequences). Results are cached in an LRU shape cache
+    /// to avoid re-shaping unchanged text each frame.
+    pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: Color, font_size: f32, font_system: &mut FontSystem) {
+        if text.is_empty() {
+            return;
         }
+
+        let packed_color = color.pack();
+
+        // Compute shape cache key from text content + font size
+        let shape_key = {
+            let mut hasher = DefaultHasher::new();
+            text.hash(&mut hasher);
+            font_size.to_bits().hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let atlas_gen = self.glyph_atlas.generation();
+
+        // Check shape cache — hit only if atlas generation matches
+        if let Some((cached_gen, cached)) = self.shape_cache.get(&shape_key) {
+            if *cached_gen == atlas_gen {
+                // Fast path: Rc::clone is a pointer bump, no Vec allocation.
+                // All UV/size/mode data is pre-baked, no HashMap lookups needed.
+                let glyphs = Arc::clone(cached);
+                for sg in glyphs.iter() {
+                    self.instances.push(GpuInstance {
+                        pos: [(x + sg.x).round(), (y + sg.y).round()],
+                        size: [sg.width, sg.height],
+                        uv_tl: sg.uv_tl,
+                        uv_br: sg.uv_br,
+                        color: packed_color,
+                        mode: sg.mode,
+                        corner_radius: 0.0,
+                        texture_layer: 0,
+                        clip_rect: NO_CLIP,
+                    });
+                }
+                return;
+            }
+            // Atlas generation mismatch — fall through to rebuild
+        }
+
+        // Cache miss (or stale) — shape via cosmic-text
+        let metrics = Metrics::new(font_size, font_size * 1.2);
+        let mut buffer = Buffer::new(font_system, metrics);
+        buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+        let attrs = Attrs::new().family(Family::Monospace);
+        buffer.set_text(font_system, text, attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(font_system, false);
+
+        // Extract glyph data and emit instances
+        let mut shaped_glyphs = Vec::new();
+
+        for run in buffer.layout_runs() {
+            let line_y = run.line_y;
+            for glyph in run.glyphs.iter() {
+                let physical = glyph.physical((0., 0.), 1.0);
+                let cache_key = physical.cache_key;
+
+                let atlas_glyph = self.glyph_atlas.get_glyph(cache_key, font_system);
+
+                if atlas_glyph.width == 0 || atlas_glyph.height == 0 {
+                    continue;
+                }
+
+                // physical.x/y encode pixel position including per-glyph offsets
+                // (combining marks, y_offset, etc.) baked in by cosmic-text's physical().
+                // placement.left/top (offset_x/offset_y) give bitmap-to-origin offset.
+                let rel_x = physical.x as f32 + atlas_glyph.offset_x as f32;
+                let rel_y = physical.y as f32 + line_y - atlas_glyph.offset_y as f32;
+
+                let tl_u = Self::uv_to_f32(atlas_glyph.uv_x);
+                let tl_v = Self::uv_to_f32(atlas_glyph.uv_y);
+                let br_u = Self::uv_to_f32(atlas_glyph.uv_x + atlas_glyph.uv_w);
+                let br_v = Self::uv_to_f32(atlas_glyph.uv_y + atlas_glyph.uv_h);
+                let mode = if atlas_glyph.is_color { 5 } else { 0 };
+
+                self.instances.push(GpuInstance {
+                    pos: [(x + rel_x).round(), (y + rel_y).round()],
+                    size: [atlas_glyph.width as f32, atlas_glyph.height as f32],
+                    uv_tl: [tl_u, tl_v],
+                    uv_br: [br_u, br_v],
+                    color: packed_color,
+                    mode,
+                    corner_radius: 0.0,
+                    texture_layer: 0,
+                    clip_rect: NO_CLIP,
+                });
+
+                // Store pre-baked glyph data for future cache hits
+                shaped_glyphs.push(CachedShapedGlyph {
+                    x: rel_x,
+                    y: rel_y,
+                    width: atlas_glyph.width as f32,
+                    height: atlas_glyph.height as f32,
+                    uv_tl: [tl_u, tl_v],
+                    uv_br: [br_u, br_v],
+                    mode,
+                });
+            }
+        }
+
+        // Store in shape cache with current atlas generation
+        self.shape_cache.put(shape_key, (atlas_gen, Arc::new(shaped_glyphs)));
     }
 
     // =========================================================================

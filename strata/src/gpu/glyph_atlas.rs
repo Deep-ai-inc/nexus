@@ -1,48 +1,54 @@
 //! Glyph Atlas for GPU text rendering.
 //!
-//! Lazily rasterizes glyphs using fontdue and packs them into a texture atlas.
-//! Supports multiple font sizes in a single shared atlas. Base-size ASCII glyphs
-//! use an O(1) lookup; other sizes use a HashMap keyed by `(char, size_key)`.
+//! Lazily rasterizes glyphs using cosmic-text's SwashCache (font-fallback-aware)
+//! and packs them into a texture atlas. Supports multiple font sizes in a single
+//! shared atlas. Uses CacheKey from cosmic-text for glyph lookup.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
-use fontdue::{Font, FontSettings};
+use cosmic_text::{
+    Attrs, Buffer, CacheKey, Family, FontSystem, Metrics,
+    Shaping, SwashCache, SwashContent,
+};
 
 /// Maximum atlas size (8K is safe for most GPUs).
 const MAX_ATLAS_SIZE: u32 = 8192;
 
-/// Embedded font data - loaded once.
-static FONT: OnceLock<Font> = OnceLock::new();
-
-/// Get the shared font instance.
-fn get_font() -> &'static Font {
-    FONT.get_or_init(|| {
-        let font_bytes = include_bytes!("../../fonts/JetBrainsMono-Regular.ttf");
-        Font::from_bytes(font_bytes as &[u8], FontSettings::default())
-            .expect("Failed to load embedded font")
-    })
-}
-
-/// Quantize a font size to 0.5px granularity to bound cache entries.
-#[inline]
-fn size_key(font_size: f32) -> u16 {
-    (font_size * 2.0).round() as u16
-}
-
 /// Get font metrics for a given size without needing a GlyphAtlas instance.
 ///
-/// Uses the same embedded font as the GPU pipeline. Suitable for layout
+/// Uses cosmic-text shaping for measurement. Suitable for layout
 /// calculations outside the render path (ghost previews, text measurement).
 pub fn metrics_for_size(font_size: f32) -> SizeMetrics {
-    let font = get_font();
-    let effective_size = size_key(font_size) as f32 / 2.0;
-    let char_metrics = font.metrics('M', effective_size);
-    let line_metrics = font.horizontal_line_metrics(effective_size).unwrap();
+    let fs_mutex = crate::text_engine::get_font_system();
+    let mut font_system = fs_mutex.lock().unwrap();
+    metrics_for_size_with_fs(font_size, &mut font_system)
+}
+
+/// Get font metrics for a given size using an already-locked FontSystem.
+pub fn metrics_for_size_with_fs(font_size: f32, font_system: &mut FontSystem) -> SizeMetrics {
+    let metrics = Metrics::new(font_size, font_size * 1.2);
+    let mut buffer = Buffer::new(font_system, metrics);
+    buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+    let attrs = Attrs::new().family(Family::Monospace);
+    buffer.set_text(font_system, "M", attrs, Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+
+    let mut cell_width = font_size * 0.6; // fallback
+    let mut ascent = font_size * 0.8;
+    let mut cell_height = font_size * 1.2;
+
+    for run in buffer.layout_runs() {
+        if let Some(g) = run.glyphs.first() {
+            cell_width = g.w;
+        }
+        cell_height = run.line_height;
+        ascent = run.line_y; // line_y is the baseline offset from top
+    }
+
     SizeMetrics {
-        cell_width: char_metrics.advance_width,
-        cell_height: line_metrics.new_line_size,
-        ascent: line_metrics.ascent,
+        cell_width,
+        cell_height,
+        ascent,
     }
 }
 
@@ -66,23 +72,23 @@ pub struct CachedGlyph {
     pub uv_y: u16,
     pub uv_w: u16,
     pub uv_h: u16,
+    /// Whether this glyph contains color data (e.g. emoji bitmaps).
+    pub is_color: bool,
 }
 
 /// Glyph atlas that lazily rasterizes and packs glyphs at multiple sizes.
 ///
-/// All sizes share a single atlas texture. Base-size ASCII uses a fast array
-/// lookup; other (char, size) pairs use a HashMap.
+/// Uses cosmic-text's SwashCache for font-fallback-aware rasterization.
+/// All sizes share a single atlas texture.
 pub struct GlyphAtlas {
-    /// Base font size (used for the fast ASCII cache path).
+    /// Base font size.
     font_size: f32,
-    /// Pre-computed size_key for the base font size.
-    base_size_key: u16,
-    /// Cache for non-base-size glyphs (and non-ASCII base-size glyphs).
-    glyphs: HashMap<(char, u16), CachedGlyph>,
-    /// Fast O(1) lookup for ASCII characters at the base font size.
-    ascii_cache: [Option<CachedGlyph>; 128],
+    /// Cache for glyphs keyed by cosmic-text CacheKey.
+    glyphs: HashMap<CacheKey, CachedGlyph>,
     /// Per-size font metrics, lazily computed.
     size_metrics: HashMap<u16, SizeMetrics>,
+    /// SwashCache for rasterization.
+    swash_cache: SwashCache,
     /// Atlas texture data (RGBA).
     atlas_data: Vec<u8>,
     /// Atlas dimensions.
@@ -97,6 +103,9 @@ pub struct GlyphAtlas {
     /// of all glyph writes since last upload.
     dirty_region: Option<(u32, u32, u32, u32)>,
     resized: bool,
+    /// Generation counter — incremented on every atlas clear/grow.
+    /// Used to invalidate shape cache entries that store atlas-dependent UV data.
+    generation: u32,
     /// Base font metrics (convenience accessors for the common case).
     pub cell_width: f32,
     pub cell_height: f32,
@@ -105,22 +114,16 @@ pub struct GlyphAtlas {
 
 impl GlyphAtlas {
     /// Create a new glyph atlas with the given base font size.
-    pub fn new(font_size: f32) -> Self {
-        let font = get_font();
-
-        let metrics = font.metrics('M', font_size);
-        let line_metrics = font.horizontal_line_metrics(font_size).unwrap();
-
-        let cell_width = metrics.advance_width;
-        let cell_height = line_metrics.new_line_size;
-        let ascent = line_metrics.ascent;
+    pub fn new(font_size: f32, font_system: &mut FontSystem) -> Self {
+        let base_metrics = metrics_for_size_with_fs(font_size, font_system);
 
         let base_key = size_key(font_size);
         let mut size_metrics = HashMap::new();
-        size_metrics.insert(base_key, SizeMetrics { cell_width, cell_height, ascent });
+        size_metrics.insert(base_key, base_metrics);
 
-        let atlas_width = 512;
-        let atlas_height = 512;
+        // Start at 1024x1024 to accommodate color emoji bitmaps.
+        let atlas_width = 1024;
+        let atlas_height = 1024;
         let mut atlas_data = vec![0u8; (atlas_width * atlas_height * 4) as usize];
 
         // Reserve a 1x1 white pixel at (0,0) for solid quads (selection, backgrounds).
@@ -131,9 +134,8 @@ impl GlyphAtlas {
 
         Self {
             font_size,
-            base_size_key: base_key,
             glyphs: HashMap::new(),
-            ascii_cache: [None; 128],
+            swash_cache: SwashCache::new(),
             size_metrics,
             atlas_data,
             atlas_width,
@@ -143,10 +145,16 @@ impl GlyphAtlas {
             row_height: 0,
             dirty_region: Some((0, 0, 1, 1)), // Mark white pixel dirty for initial upload
             resized: false,
-            cell_width,
-            cell_height,
-            ascent,
+            generation: 0,
+            cell_width: base_metrics.cell_width,
+            cell_height: base_metrics.cell_height,
+            ascent: base_metrics.ascent,
         }
+    }
+
+    /// Get the current atlas generation. Incremented on every clear/grow.
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     /// Get the UV coordinates for the white pixel (used for solid quads).
@@ -170,57 +178,77 @@ impl GlyphAtlas {
     }
 
     /// Get font metrics for a specific size. Lazily computed and cached.
-    pub fn metrics_for_size(&mut self, font_size: f32) -> SizeMetrics {
+    pub fn metrics_for_size(&mut self, font_size: f32, font_system: &mut FontSystem) -> SizeMetrics {
         let key = size_key(font_size);
         if let Some(&m) = self.size_metrics.get(&key) {
             return m;
         }
-        let font = get_font();
-        let effective_size = key as f32 / 2.0;
-        let char_metrics = font.metrics('M', effective_size);
-        let line_metrics = font.horizontal_line_metrics(effective_size).unwrap();
-        let m = SizeMetrics {
-            cell_width: char_metrics.advance_width,
-            cell_height: line_metrics.new_line_size,
-            ascent: line_metrics.ascent,
-        };
+        let m = metrics_for_size_with_fs(font_size, font_system);
         self.size_metrics.insert(key, m);
         m
     }
 
-    /// Get or create a cached glyph for the given character at a specific font size.
+    /// Get or create a cached glyph for the given CacheKey.
     #[inline]
-    pub fn get_glyph(&mut self, ch: char, font_size: f32) -> CachedGlyph {
-        let key = size_key(font_size);
-
-        // Fast path: base-size ASCII
-        if key == self.base_size_key && ch < '\u{80}' {
-            let idx = ch as usize;
-            if let Some(g) = self.ascii_cache[idx] {
-                return g;
-            }
-        }
-
-        // Slow path: HashMap lookup or rasterize
-        let glyph_key = (ch, key);
-        if let Some(&g) = self.glyphs.get(&glyph_key) {
+    pub fn get_glyph(&mut self, cache_key: CacheKey, font_system: &mut FontSystem) -> CachedGlyph {
+        if let Some(&g) = self.glyphs.get(&cache_key) {
             return g;
         }
 
-        self.rasterize_and_cache(ch, font_size);
-        *self.glyphs.get(&glyph_key).unwrap()
+        self.rasterize_and_cache(cache_key, font_system);
+        // If rasterization failed (no image), return a zero-size glyph
+        self.glyphs.get(&cache_key).copied().unwrap_or(CachedGlyph {
+            width: 0,
+            height: 0,
+            offset_x: 0,
+            offset_y: 0,
+            uv_x: 0,
+            uv_y: 0,
+            uv_w: 0,
+            uv_h: 0,
+            is_color: false,
+        })
     }
 
-    /// Rasterize a glyph at a specific font size and add it to the atlas.
-    fn rasterize_and_cache(&mut self, ch: char, font_size: f32) {
-        let key = size_key(font_size);
-        let effective_size = key as f32 / 2.0;
+    /// Rasterize a glyph via SwashCache and add it to the atlas.
+    fn rasterize_and_cache(&mut self, cache_key: CacheKey, font_system: &mut FontSystem) {
+        let image = match self.swash_cache.get_image_uncached(font_system, cache_key) {
+            Some(img) => img,
+            None => {
+                // No image available (e.g., space character) — cache a zero-size glyph
+                self.glyphs.insert(cache_key, CachedGlyph {
+                    width: 0,
+                    height: 0,
+                    offset_x: 0,
+                    offset_y: 0,
+                    uv_x: 0,
+                    uv_y: 0,
+                    uv_w: 0,
+                    uv_h: 0,
+                    is_color: false,
+                });
+                return;
+            }
+        };
 
-        let font = get_font();
-        let (metrics, bitmap) = font.rasterize(ch, effective_size);
+        let width = image.placement.width;
+        let height = image.placement.height;
+        let is_color = matches!(image.content, SwashContent::Color);
 
-        let width = metrics.width as u32;
-        let height = metrics.height as u32;
+        if width == 0 || height == 0 {
+            self.glyphs.insert(cache_key, CachedGlyph {
+                width: 0,
+                height: 0,
+                offset_x: image.placement.left,
+                offset_y: image.placement.top,
+                uv_x: 0,
+                uv_y: 0,
+                uv_w: 0,
+                uv_h: 0,
+                is_color,
+            });
+            return;
+        }
 
         // Find position in atlas
         let (atlas_x, atlas_y) = match self.pack_glyph(width, height) {
@@ -237,17 +265,54 @@ impl GlyphAtlas {
             }
         };
 
-        // Copy bitmap to atlas (grayscale to RGBA white)
-        for y in 0..height {
-            for x in 0..width {
-                let src_idx = (y * width + x) as usize;
-                let dst_idx = ((atlas_y + y) * self.atlas_width + atlas_x + x) as usize * 4;
+        // Copy bitmap to atlas based on content type
+        match image.content {
+            SwashContent::Mask => {
+                // Alpha mask → white + alpha RGBA
+                for y in 0..height {
+                    for x in 0..width {
+                        let src_idx = (y * width + x) as usize;
+                        let dst_idx = ((atlas_y + y) * self.atlas_width + atlas_x + x) as usize * 4;
 
-                let alpha = bitmap.get(src_idx).copied().unwrap_or(0);
-                self.atlas_data[dst_idx] = 255;     // R
-                self.atlas_data[dst_idx + 1] = 255; // G
-                self.atlas_data[dst_idx + 2] = 255; // B
-                self.atlas_data[dst_idx + 3] = alpha; // A
+                        let alpha = image.data.get(src_idx).copied().unwrap_or(0);
+                        self.atlas_data[dst_idx] = 255;     // R
+                        self.atlas_data[dst_idx + 1] = 255; // G
+                        self.atlas_data[dst_idx + 2] = 255; // B
+                        self.atlas_data[dst_idx + 3] = alpha; // A
+                    }
+                }
+            }
+            SwashContent::Color => {
+                // Color bitmap (emoji) — copy RGBA directly
+                for y in 0..height {
+                    for x in 0..width {
+                        let src_idx = ((y * width + x) * 4) as usize;
+                        let dst_idx = ((atlas_y + y) * self.atlas_width + atlas_x + x) as usize * 4;
+
+                        self.atlas_data[dst_idx] = image.data.get(src_idx).copied().unwrap_or(0);
+                        self.atlas_data[dst_idx + 1] = image.data.get(src_idx + 1).copied().unwrap_or(0);
+                        self.atlas_data[dst_idx + 2] = image.data.get(src_idx + 2).copied().unwrap_or(0);
+                        self.atlas_data[dst_idx + 3] = image.data.get(src_idx + 3).copied().unwrap_or(0);
+                    }
+                }
+            }
+            SwashContent::SubpixelMask => {
+                // Subpixel mask — average RGB channels to produce alpha, render as white
+                for y in 0..height {
+                    for x in 0..width {
+                        let src_idx = ((y * width + x) * 3) as usize;
+                        let dst_idx = ((atlas_y + y) * self.atlas_width + atlas_x + x) as usize * 4;
+
+                        let r = image.data.get(src_idx).copied().unwrap_or(0) as u16;
+                        let g = image.data.get(src_idx + 1).copied().unwrap_or(0) as u16;
+                        let b = image.data.get(src_idx + 2).copied().unwrap_or(0) as u16;
+                        let alpha = ((r + g + b) / 3) as u8;
+                        self.atlas_data[dst_idx] = 255;
+                        self.atlas_data[dst_idx + 1] = 255;
+                        self.atlas_data[dst_idx + 2] = 255;
+                        self.atlas_data[dst_idx + 3] = alpha;
+                    }
+                }
             }
         }
 
@@ -260,19 +325,16 @@ impl GlyphAtlas {
         let glyph = CachedGlyph {
             width: width as u16,
             height: height as u16,
-            offset_x: metrics.xmin,
-            offset_y: metrics.ymin,
+            offset_x: image.placement.left,
+            offset_y: image.placement.top,
             uv_x: (atlas_x as f32 * inv_w) as u16,
             uv_y: (atlas_y as f32 * inv_h) as u16,
             uv_w: (width as f32 * inv_w) as u16,
             uv_h: (height as f32 * inv_h) as u16,
+            is_color,
         };
 
-        // Store in base-size ASCII cache if applicable
-        if key == self.base_size_key && ch < '\u{80}' {
-            self.ascii_cache[ch as usize] = Some(glyph);
-        }
-        self.glyphs.insert((ch, key), glyph);
+        self.glyphs.insert(cache_key, glyph);
     }
 
     /// Find space in atlas for a glyph.
@@ -323,7 +385,7 @@ impl GlyphAtlas {
     /// Clear glyph cache state (preserves the white pixel at 0,0).
     fn clear_atlas(&mut self) {
         self.glyphs.clear();
-        self.ascii_cache = [None; 128];
+        self.generation = self.generation.wrapping_add(1);
         // Keep size_metrics — they don't depend on atlas state
         self.atlas_data.fill(0);
         // Re-write the white pixel at (0,0)
@@ -367,12 +429,31 @@ impl GlyphAtlas {
     }
 
     /// Pre-cache common ASCII characters at the base font size.
-    pub fn precache_ascii(&mut self) {
-        let base_size = self.font_size;
-        for ch in (32u8..=126u8).map(|b| b as char) {
-            if self.ascii_cache[ch as usize].is_none() {
-                self.rasterize_and_cache(ch, base_size);
-            }
+    pub fn precache_ascii(&mut self, font_system: &mut FontSystem) {
+        let font_size = self.font_size;
+        let metrics = Metrics::new(font_size, font_size * 1.2);
+        let mut buffer = Buffer::new(font_system, metrics);
+        buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+        let attrs = Attrs::new().family(Family::Monospace);
+
+        // Shape all printable ASCII as one string
+        let ascii_str: String = (32u8..=126u8).map(|b| b as char).collect();
+        buffer.set_text(font_system, &ascii_str, attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(font_system, false);
+
+        // Iterate layout glyphs and cache each one
+        let cache_keys: Vec<CacheKey> = buffer.layout_runs()
+            .flat_map(|run| run.glyphs.iter().map(|g| g.physical((0., 0.), 1.0).cache_key))
+            .collect();
+
+        for cache_key in cache_keys {
+            self.get_glyph(cache_key, font_system);
         }
     }
+}
+
+/// Quantize a font size to 0.5px granularity to bound cache entries.
+#[inline]
+fn size_key(font_size: f32) -> u16 {
+    (font_size * 2.0).round() as u16
 }

@@ -17,7 +17,7 @@ use crate::primitives::Color;
 /// Global font system (expensive to create, shared across engine instances).
 static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
 
-fn get_font_system() -> &'static Mutex<FontSystem> {
+pub(crate) fn get_font_system() -> &'static Mutex<FontSystem> {
     FONT_SYSTEM.get_or_init(|| {
         Mutex::new(FontSystem::new())
     })

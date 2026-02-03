@@ -229,6 +229,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let tex = textureSample(image_texture, image_sampler, in.uv);
         final_color *= tex.rgb;
         final_alpha *= tex.a;
+    } else if (base_mode == 5u) {
+        // Color glyph mode (emoji bitmaps)
+        let tex = textureSample(atlas_texture, atlas_sampler, in.uv);
+        final_color = tex.rgb;
+        final_alpha = tex.a;
     } else if (base_mode == 0u) {
         // Glyph/Quad Mode
         let atlas_a = textureSample(atlas_texture, atlas_sampler, in.uv).a;

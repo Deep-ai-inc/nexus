@@ -124,7 +124,7 @@ pub trait StrataWidget<M> {
     ///
     /// - `pipeline`: The GPU pipeline to render to.
     /// - `bounds`: The screen-space bounds for rendering.
-    fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect);
+    fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect, font_system: &mut cosmic_text::FontSystem);
 }
 
 /// A boxed widget for dynamic dispatch.
@@ -184,8 +184,8 @@ mod tests {
             EventResult::Ignored
         }
 
-        fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect) {
-            pipeline.add_text(&self.text, bounds.x, bounds.y, Color::WHITE, 14.0);
+        fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect, font_system: &mut cosmic_text::FontSystem) {
+            pipeline.add_text(&self.text, bounds.x, bounds.y, Color::WHITE, 14.0, font_system);
         }
     }
 

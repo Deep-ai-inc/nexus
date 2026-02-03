@@ -150,8 +150,8 @@ impl StrataWidget<TextMessage> for TextWidget {
         }
     }
 
-    fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect) {
-        pipeline.add_text(&self.text, bounds.x, bounds.y, self.attrs.color, self.attrs.font_size);
+    fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect, font_system: &mut cosmic_text::FontSystem) {
+        pipeline.add_text(&self.text, bounds.x, bounds.y, self.attrs.color, self.attrs.font_size, font_system);
     }
 }
 

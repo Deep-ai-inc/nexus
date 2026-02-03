@@ -670,10 +670,14 @@ impl PipelineWrapper {
     ) {
         let scale = viewport.scale_factor() as f32;
 
+        // Lock FontSystem once for the entire frame
+        let fs_mutex = crate::text_engine::get_font_system();
+        let mut font_system = fs_mutex.lock().unwrap();
+
         // Create or recreate pipeline if scale factor changed
         if self.pipeline.is_none() || (self.current_scale - scale).abs() > 0.01 {
             let font_size = BASE_FONT_SIZE * scale;
-            self.pipeline = Some(StrataPipeline::new(device, queue, self.format, font_size));
+            self.pipeline = Some(StrataPipeline::new(device, queue, self.format, font_size, &mut font_system));
             self.current_scale = scale;
         }
 
@@ -881,7 +885,7 @@ impl PipelineWrapper {
                         let x = grid_layout.bounds.x * scale;
                         let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
                         let color = crate::primitives::Color::unpack(row.color);
-                        pipeline.add_text(&row.text, x, y, color, BASE_FONT_SIZE * scale);
+                        pipeline.add_text(&row.text, x, y, color, BASE_FONT_SIZE * scale, &mut font_system);
                         maybe_clip(pipeline, start, grid_clip, scale);
                     }
                 }
@@ -897,6 +901,7 @@ impl PipelineWrapper {
                 prim.position.y * scale,
                 prim.color,
                 prim.font_size * scale,
+                &mut font_system,
             );
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }
@@ -949,7 +954,7 @@ impl PipelineWrapper {
             let start = pipeline.instance_count();
             pipeline.add_text(
                 &prim.text, prim.position.x * scale, prim.position.y * scale, prim.color,
-                prim.font_size * scale,
+                prim.font_size * scale, &mut font_system,
             );
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }

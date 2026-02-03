@@ -160,6 +160,10 @@ pub struct TextLayout {
 
     /// Total character count.
     pub char_count: usize,
+
+    /// Fallback advance width for characters without shaped width data.
+    /// Set to the monospace cell width the layout was built with.
+    pub fallback_advance: f32,
 }
 
 impl TextLayout {
@@ -183,13 +187,17 @@ impl TextLayout {
             line_breaks,
             line_height,
             char_count,
+            fallback_advance: 8.0, // Sensible default for tests/manual construction
         }
     }
 
-    /// Create a simple single-line text layout with uniform character spacing.
+    /// Create a simple single-line text layout with accurate character positions.
     ///
-    /// This is a convenience method for simple text where each character
-    /// has the same width. For proper text shaping, use the full constructor.
+    /// For ASCII-only text in a monospace font, uses a fast path with fixed
+    /// `char_width` spacing. For text containing non-ASCII characters, shapes
+    /// with cosmic-text for accurate positions (ligatures, CJK, emoji, etc.).
+    ///
+    /// Results are cached in a thread-local LRU to avoid re-shaping per frame.
     pub fn simple(
         text: impl Into<Cow<'static, str>>,
         color: u32,
@@ -200,21 +208,189 @@ impl TextLayout {
     ) -> Self {
         let text = text.into();
         let char_count = text.chars().count();
-        let char_positions: Vec<f32> = (0..char_count)
-            .map(|i| i as f32 * char_width)
-            .collect();
-        let width = char_count as f32 * char_width;
+
+        if char_count == 0 {
+            return Self {
+                text,
+                color,
+                bounds: Rect::new(x, y, 0.0, line_height),
+                char_positions: Vec::new(),
+                char_widths: Vec::new(),
+                line_breaks: Vec::new(),
+                line_height,
+                char_count: 0,
+                fallback_advance: char_width,
+            };
+        }
+
+        // Fast path: pure ASCII in monospace — fixed-width positions
+        if text.is_ascii() {
+            let mut char_positions = Vec::with_capacity(char_count);
+            let mut char_widths_vec = Vec::with_capacity(char_count);
+            for i in 0..char_count {
+                char_positions.push(i as f32 * char_width);
+                char_widths_vec.push(char_width);
+            }
+            let total_width = char_count as f32 * char_width;
+            return Self {
+                text,
+                color,
+                bounds: Rect::new(x, y, total_width, line_height),
+                char_positions,
+                char_widths: char_widths_vec,
+                line_breaks: Vec::new(),
+                line_height,
+                char_count,
+                fallback_advance: char_width,
+            };
+        }
+
+        // Slow path: shape with cosmic-text for non-ASCII text.
+        // Use a thread-local cache to avoid reshaping identical text each frame.
+        use std::cell::RefCell;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::num::NonZeroUsize;
+
+        thread_local! {
+            static SHAPE_CACHE: RefCell<lru::LruCache<u64, (Vec<f32>, Vec<f32>)>> =
+                RefCell::new(lru::LruCache::new(NonZeroUsize::new(512).unwrap()));
+        }
+
+        let cache_key = {
+            let mut hasher = DefaultHasher::new();
+            text.hash(&mut hasher);
+            char_width.to_bits().hash(&mut hasher);
+            hasher.finish()
+        };
+
+        // Check cache
+        let cached = SHAPE_CACHE.with(|cache| {
+            cache.borrow_mut().get(&cache_key).cloned()
+        });
+
+        if let Some((char_positions, char_widths_vec)) = cached {
+            let total_width = max_extent(&char_positions, &char_widths_vec);
+            return Self {
+                text,
+                color,
+                bounds: Rect::new(x, y, total_width, line_height),
+                char_positions,
+                char_widths: char_widths_vec,
+                line_breaks: Vec::new(),
+                line_height,
+                char_count,
+                fallback_advance: char_width,
+            };
+        }
+
+        // Cache miss — shape with cosmic-text
+        let (char_positions, char_widths_vec) = Self::shape_for_layout(&text, char_count, char_width);
+
+        // Store in cache
+        SHAPE_CACHE.with(|cache| {
+            cache.borrow_mut().put(cache_key, (char_positions.clone(), char_widths_vec.clone()));
+        });
+
+        let total_width = max_extent(&char_positions, &char_widths_vec);
 
         Self {
             text,
             color,
-            bounds: Rect::new(x, y, width, line_height),
+            bounds: Rect::new(x, y, total_width, line_height),
             char_positions,
-            char_widths: Vec::new(),
+            char_widths: char_widths_vec,
             line_breaks: Vec::new(),
             line_height,
             char_count,
+            fallback_advance: char_width,
         }
+    }
+
+    /// Shape text with cosmic-text and extract per-character positions/widths.
+    fn shape_for_layout(text: &str, char_count: usize, char_width: f32) -> (Vec<f32>, Vec<f32>) {
+        use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping};
+
+        // Derive font_size from char_width using the known ratio:
+        // CHAR_WIDTH (8.4) corresponds to BASE_FONT_SIZE (14.0)
+        let font_size = char_width / 8.4 * 14.0;
+
+        let fs_mutex = crate::text_engine::get_font_system();
+        let mut font_system = fs_mutex.lock().unwrap();
+
+        let metrics = Metrics::new(font_size, font_size * 1.2);
+        let mut buffer = Buffer::new(&mut font_system, metrics);
+        buffer.set_size(&mut font_system, Some(f32::MAX), Some(f32::MAX));
+        let attrs = Attrs::new().family(Family::Monospace);
+        buffer.set_text(&mut font_system, text, attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut font_system, false);
+
+        // Build byte_offset → char_index mapping.
+        // Each byte maps to the char index whose byte range contains it.
+        let byte_len = text.len();
+        let mut byte_to_char = vec![0usize; byte_len + 1];
+        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
+            let end = byte_idx + ch.len_utf8();
+            for b in byte_idx..end {
+                byte_to_char[b] = char_idx;
+            }
+        }
+        // The entry at byte_len maps past the last char
+        byte_to_char[byte_len] = char_count;
+
+        // Extract per-character positions from shaped glyphs.
+        // Track which chars were covered by a glyph cluster so we can
+        // assign fallback widths to uncovered chars (e.g. trailing whitespace).
+        let mut char_positions = vec![f32::NAN; char_count];
+        let mut char_widths_vec = vec![0.0_f32; char_count];
+        let mut covered = vec![false; char_count];
+
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs.iter() {
+                let ci_start = if glyph.start < byte_to_char.len() {
+                    byte_to_char[glyph.start]
+                } else {
+                    continue;
+                };
+                let ci_end = if glyph.end <= byte_len {
+                    byte_to_char[glyph.end.min(byte_len)]
+                } else {
+                    char_count
+                };
+
+                // First char of this glyph cluster gets the position and width
+                if ci_start < char_count && char_positions[ci_start].is_nan() {
+                    char_positions[ci_start] = glyph.x;
+                    char_widths_vec[ci_start] = glyph.w;
+                    covered[ci_start] = true;
+                }
+
+                // Interior chars of multi-codepoint clusters get same position, 0 width.
+                // Mark them as covered (they're part of a cluster, not orphaned).
+                for interior in (ci_start + 1)..ci_end.min(char_count) {
+                    if char_positions[interior].is_nan() {
+                        char_positions[interior] = glyph.x;
+                        covered[interior] = true;
+                        // width stays 0 — they're interior to a cluster
+                    }
+                }
+            }
+        }
+
+        // Fill uncovered chars (not part of any glyph cluster):
+        // assign fallback advance width so they're selectable/hittable.
+        let mut prev_end = 0.0_f32;
+        for i in 0..char_count {
+            if char_positions[i].is_nan() {
+                char_positions[i] = prev_end;
+            }
+            if !covered[i] {
+                char_widths_vec[i] = char_width;
+            }
+            prev_end = char_positions[i] + char_widths_vec[i];
+        }
+
+        (char_positions, char_widths_vec)
     }
 
     /// Create a text layout from shaped text.
@@ -231,6 +407,7 @@ impl TextLayout {
             line_breaks: shaped.line_breaks.clone(),
             line_height: shaped.line_height,
             char_count: shaped.char_positions.len(),
+            fallback_advance: 8.0, // Default; shaped text should have accurate widths
         }
     }
 
@@ -781,7 +958,7 @@ impl LayoutSnapshot {
     ///
     /// Returns a cursor position (0 to char_count) suitable for text selection.
     /// Position N means "between character N-1 and character N" (or before first/after last).
-    /// This snaps to the nearest character boundary based on click position.
+    /// Uses a linear scan to handle both LTR and RTL text (positions may not be monotonic).
     fn hit_test_text(&self, layout: &TextLayout, x: f32, y: f32) -> usize {
         let rel_x = x - layout.bounds.x;
         let rel_y = y - layout.bounds.y;
@@ -796,36 +973,7 @@ impl LayoutSnapshot {
             return line_start;
         }
 
-        // Get character positions for this line (left edge of each character)
-        let line_chars = &layout.char_positions[line_start..line_end];
-        if line_chars.is_empty() {
-            return line_start;
-        }
-
-        // Find cursor position by snapping to nearest character boundary.
-        // char_positions[i] = left edge of character i = cursor position i.
-        // We also need the right edge of the last character for cursor position N.
-        let idx = line_chars.partition_point(|&pos| pos < rel_x);
-
-        let final_idx = if idx == 0 {
-            // Before first character
-            0
-        } else if idx >= line_chars.len() {
-            // Past last character - cursor goes at the end
-            line_chars.len()
-        } else {
-            // Between two characters - snap to nearest boundary
-            let left_edge = line_chars[idx - 1];
-            let right_edge = line_chars[idx];
-            let midpoint = (left_edge + right_edge) / 2.0;
-            if rel_x <= midpoint {
-                idx - 1
-            } else {
-                idx
-            }
-        };
-
-        line_start + final_idx
+        line_start + nearest_char_in_range(layout, line_start, line_end, rel_x)
     }
 
     /// Hit test within a grid layout.
@@ -909,13 +1057,13 @@ impl LayoutSnapshot {
 
         // Get width (from char_widths or compute from next position)
         let width = if !layout.char_widths.is_empty() {
-            layout.char_widths.get(offset).copied().unwrap_or(8.0)
+            layout.char_widths.get(offset).copied().unwrap_or(layout.fallback_advance)
         } else {
             layout
                 .char_positions
                 .get(offset + 1)
                 .map(|next| next - x)
-                .unwrap_or(8.0) // Default char width for last char
+                .unwrap_or(layout.fallback_advance)
         };
 
         // Find which line this character is on
@@ -1073,28 +1221,37 @@ impl LayoutSnapshot {
                         continue;
                     }
 
-                    let x_start = text_layout
-                        .char_positions
-                        .get(range_start)
-                        .copied()
-                        .unwrap_or(0.0);
-                    let x_end = text_layout
-                        .char_positions
-                        .get(range_end)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            text_layout
-                                .char_positions
-                                .last()
-                                .copied()
-                                .unwrap_or(0.0)
-                                + 8.0
-                        });
+                    // Compute the visual extent of selected chars.
+                    // Use min/max instead of assuming monotonic positions,
+                    // so RTL and bidi text get correct highlight bounds.
+                    let has_widths = !text_layout.char_widths.is_empty();
+                    let mut min_x = f32::MAX;
+                    let mut max_x = f32::MIN;
+
+                    let fa = text_layout.fallback_advance;
+                    for i in range_start..range_end {
+                        let pos = text_layout.char_positions.get(i).copied().unwrap_or(0.0);
+                        let w = if has_widths {
+                            text_layout.char_widths.get(i).copied().unwrap_or(fa)
+                        } else {
+                            text_layout.char_positions.get(i + 1)
+                                .map(|&next| (next - pos).abs())
+                                .unwrap_or(fa)
+                        };
+                        let left = pos.min(pos + w);
+                        let right = pos.max(pos + w);
+                        min_x = min_x.min(left);
+                        max_x = max_x.max(right);
+                    }
+
+                    if min_x >= max_x {
+                        continue;
+                    }
 
                     rects.push(Rect {
-                        x: text_layout.bounds.x + x_start,
+                        x: text_layout.bounds.x + min_x,
                         y: text_layout.bounds.y + text_layout.line_y(line),
-                        width: x_end - x_start,
+                        width: max_x - min_x,
                         height: text_layout.line_height,
                     });
                 }
@@ -1173,26 +1330,81 @@ fn nearest_text_offset(layout: &TextLayout, x: f32, y: f32) -> usize {
         return line_start;
     }
 
-    let line_chars = &layout.char_positions[line_start..line_end];
-    if line_chars.is_empty() {
-        return line_start;
+    line_start + nearest_char_in_range(layout, line_start, line_end, rel_x)
+}
+
+/// Find the nearest character boundary in a range, handling both LTR and RTL.
+///
+/// Returns a local index (0..=range_len) where 0 = before first char in range,
+/// range_len = after last char in range. Works by linear scan over character
+/// midpoints, so it handles non-monotonic positions from RTL/bidi text.
+fn nearest_char_in_range(layout: &TextLayout, line_start: usize, line_end: usize, rel_x: f32) -> usize {
+    let count = line_end - line_start;
+    if count == 0 {
+        return 0;
     }
 
-    // Same partition_point + midpoint-snap logic as hit_test_text
-    let idx = line_chars.partition_point(|&pos| pos < rel_x);
+    let positions = &layout.char_positions[line_start..line_end];
+    let widths = &layout.char_widths;
+    let has_widths = !widths.is_empty();
+    let fa = layout.fallback_advance;
 
-    let final_idx = if idx == 0 {
-        0
-    } else if idx >= line_chars.len() {
-        line_chars.len()
-    } else {
-        let left_edge = line_chars[idx - 1];
-        let right_edge = line_chars[idx];
-        let midpoint = (left_edge + right_edge) / 2.0;
-        if rel_x <= midpoint { idx - 1 } else { idx }
-    };
+    // Find which character the click is inside, by checking if rel_x falls
+    // within [pos, pos + width) for each character.
+    let mut best_idx = 0;
+    let mut best_dist = f32::MAX;
 
-    line_start + final_idx
+    for i in 0..count {
+        let pos = positions[i];
+        let stored_w = if has_widths {
+            widths.get(line_start + i).copied().unwrap_or(fa)
+        } else {
+            positions.get(i + 1).map(|&next| (next - pos).abs()).unwrap_or(fa)
+        };
+
+        // For zero-width chars (combining marks, ZWJ interior), derive
+        // a width from neighbor positions so they're still hittable.
+        let w = if stored_w < 0.01 {
+            // Try to derive width from the next non-zero-width char's position
+            let mut derived = fa;
+            for j in (i + 1)..count {
+                let next_pos = positions[j];
+                let d = (next_pos - pos).abs();
+                if d > 0.01 {
+                    derived = d;
+                    break;
+                }
+            }
+            derived
+        } else {
+            stored_w
+        };
+
+        let left = pos.min(pos + w);
+        let right = pos.max(pos + w);
+        let mid = (left + right) / 2.0;
+
+        // Distance from click to midpoint of this character
+        let dist = (rel_x - mid).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = i;
+            // Snap to left or right side of this character
+            if rel_x > mid {
+                best_idx = i + 1; // cursor after this char
+            }
+        }
+    }
+
+    best_idx.min(count)
+}
+
+/// Compute total visual extent as max(pos + width) across all characters.
+fn max_extent(positions: &[f32], widths: &[f32]) -> f32 {
+    positions.iter()
+        .zip(widths)
+        .map(|(p, w)| p + w)
+        .fold(0.0_f32, f32::max)
 }
 
 /// Resolve nearest content offset for a grid item, clamping to edges.

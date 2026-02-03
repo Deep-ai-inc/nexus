@@ -205,7 +205,7 @@ impl StrataWidget<TerminalMessage> for TerminalWidget {
         }
     }
 
-    fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect) {
+    fn render(&self, pipeline: &mut StrataPipeline, bounds: Rect, font_system: &mut cosmic_text::FontSystem) {
         // Render each row
         for row in 0..self.rows {
             let y = bounds.y + row as f32 * self.cell_height;
@@ -226,7 +226,7 @@ impl StrataWidget<TerminalMessage> for TerminalWidget {
             }
 
             if !line.trim().is_empty() {
-                pipeline.add_text(&line, bounds.x, y, current_fg, 14.0);
+                pipeline.add_text(&line, bounds.x, y, current_fg, 14.0, font_system);
             }
         }
     }
