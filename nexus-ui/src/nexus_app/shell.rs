@@ -772,8 +772,13 @@ impl ShellWidget {
         }
     }
 
-    /// Clear all blocks, kill PTYs, clear jobs.
+    /// Clear all blocks, kill PTYs, cancel kernel commands, clear jobs.
     pub fn clear(&mut self) {
+        // Cancel any running kernel commands (e.g. `top`) so they release
+        // the kernel mutex.  Must happen before clearing blocks.
+        for block in &self.blocks {
+            nexus_kernel::commands::cancel_block(block.id);
+        }
         for handle in &self.pty_handles {
             let _ = handle.send_interrupt();
             handle.kill();
