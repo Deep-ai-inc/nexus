@@ -64,6 +64,7 @@ use super::times::TimesCommand;
 use super::top::TopCommand;
 use super::tree::TreeCommand;
 use super::ulimit::UlimitCommand;
+use super::unicode_stress::UnicodeStressCommand;
 use super::tr::TrCommand;
 use super::uniq::UniqCommand;
 use super::wc::WcCommand;
@@ -242,6 +243,9 @@ impl CommandRegistry {
         registry.register(TopCommand);
         registry.register(ManCommand);
         registry.register(TreeCommand);
+
+        // Testing
+        registry.register(UnicodeStressCommand);
 
         // Git commands (native, structured output)
         registry.register(GitCommand);  // Main dispatcher: git <subcommand>

@@ -49,6 +49,7 @@ mod times;
 mod top;
 mod tree;
 mod ulimit;
+mod unicode_stress;
 mod tee;
 mod tr;
 mod uniq;
