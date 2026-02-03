@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, Mutex};
 
@@ -104,6 +105,8 @@ pub(crate) struct ShellWidget {
     pub pty_tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
     pub terminal_size: Cell<(u16, u16)>,
     pub last_terminal_size: Cell<(u16, u16)>,
+    /// Timestamp of the last PTY resize signal (for downsize debounce).
+    last_resize_at: Cell<Instant>,
     pub terminal_dirty: bool,
     pub last_exit_code: Option<i32>,
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
@@ -130,6 +133,7 @@ impl ShellWidget {
             pty_tx,
             terminal_size: Cell::new((120, 24)),
             last_terminal_size: Cell::new((120, 24)),
+            last_resize_at: Cell::new(Instant::now()),
             terminal_dirty: false,
             last_exit_code: None,
             image_handles: HashMap::new(),
@@ -795,35 +799,68 @@ impl ShellWidget {
         self.jobs.clear();
     }
 
-    /// Propagate terminal size changes to running PTY handles and block parsers.
+    /// Propagate terminal size changes to PTY handles and block parsers.
     ///
-    /// Called from `update()` — has `&mut self` so it can resize block parsers.
+    /// Uses an asymmetric strategy:
+    ///   - **Upsizing** (cols growing): resize parser immediately — adds
+    ///     padding which is visually stable.
+    ///   - **Downsizing** (cols shrinking): delay the parser resize for
+    ///     ~32ms so the window frame crops the old wide grid instead of
+    ///     reflowing text chaotically during a drag. The reflow happens
+    ///     once when the user pauses.
+    ///
+    /// PTY handles are always resized immediately so the child process
+    /// can start computing the new layout in the background.
     pub fn sync_terminal_size(&mut self) {
         let current_size = self.terminal_size.get();
-        if current_size != self.last_terminal_size.get() {
+        let (target_cols, target_rows) = current_size;
+        let (last_cols, last_rows) = self.last_terminal_size.get();
+
+        if current_size == (last_cols, last_rows) {
+            return;
+        }
+
+        // Always resize PTY handles immediately.
+        for handle in &self.pty_handles {
+            let _ = handle.resize(target_cols, target_rows);
+        }
+
+        // Upsizing or height-only change: resize parser immediately.
+        if target_cols >= last_cols {
             self.last_terminal_size.set(current_size);
-            let (cols, rows) = current_size;
-            for handle in &self.pty_handles {
-                let _ = handle.resize(cols, rows);
-            }
+            self.last_resize_at.set(Instant::now());
             for block in &mut self.blocks {
-                block.parser.resize(cols, rows);
+                block.parser.resize(target_cols, target_rows);
+            }
+            return;
+        }
+
+        // Downsizing: only commit the parser resize after the debounce
+        // window (~32ms). During the drag the parser stays wide and the
+        // window frame just crops the right edge.
+        let elapsed = Instant::now()
+            .duration_since(self.last_resize_at.get())
+            .as_millis();
+        if elapsed >= 32 {
+            self.last_terminal_size.set(current_size);
+            self.last_resize_at.set(Instant::now());
+            for block in &mut self.blocks {
+                block.parser.resize(target_cols, target_rows);
             }
         }
     }
 
-    /// Propagate terminal size changes to PTY handles immediately.
+    /// Send PTY resize immediately from `view()`.
     ///
-    /// Called from `view()` — only needs `&self` since PTY handles use
-    /// internal `Arc<Mutex<>>`. This ensures running child processes
-    /// receive SIGWINCH without waiting for the next `update()` cycle.
-    ///
-    /// Does NOT update `last_terminal_size` — that is left for
-    /// `sync_terminal_size()` in `update()` so it still detects the
-    /// change and resizes the block parsers too.
+    /// Only needs `&self` since PTY handles use `Arc<Mutex<>>`.
+    /// Stamps the debounce timer so the downsize delay in
+    /// `sync_terminal_size()` can measure from the latest resize event.
+    /// Does NOT update `last_terminal_size` so `sync_terminal_size()`
+    /// in `update()` still fires and resizes parsers too.
     pub fn sync_pty_sizes(&self) {
         let current_size = self.terminal_size.get();
         if current_size != self.last_terminal_size.get() {
+            self.last_resize_at.set(Instant::now());
             let (cols, rows) = current_size;
             for handle in &self.pty_handles {
                 let _ = handle.resize(cols, rows);
