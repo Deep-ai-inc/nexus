@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, ProtocolObject, Sel};
-use objc2::{class, declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
+use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, ProtocolObject};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSDraggingItem, NSDraggingSession, NSImage,
     NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypeString,
-    NSPasteboardWriting, NSResponder, NSWorkspace,
+    NSPasteboardWriting, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSObject, NSPoint, NSRect, NSSize, NSString, NSURL,
@@ -157,6 +157,20 @@ pub fn preview_file_with_rect(path: &Path, source_rect: NSRect) -> Result<(), St
     show_quicklook_native(path, Some(source_rect))
 }
 
+/// Ensure the QuickLook framework is loaded (lazy, idempotent).
+fn ensure_quicklook_loaded() {
+    use std::sync::Once;
+    static LOAD: Once = Once::new();
+    LOAD.call_once(|| {
+        unsafe {
+            let path = std::ffi::CStr::from_bytes_with_nul_unchecked(
+                b"/System/Library/Frameworks/Quartz.framework/Quartz\0",
+            );
+            libc::dlopen(path.as_ptr(), libc::RTLD_LAZY);
+        }
+    });
+}
+
 fn show_quicklook_native(path: &Path, source_rect: Option<NSRect>) -> Result<(), String> {
     // Update global state
     {
@@ -165,9 +179,12 @@ fn show_quicklook_native(path: &Path, source_rect: Option<NSRect>) -> Result<(),
         state.source_rect = source_rect;
     }
 
+    ensure_quicklook_loaded();
+
     unsafe {
-        // Get QLPreviewPanel class
-        let ql_class: &AnyClass = class!(QLPreviewPanel);
+        // Get QLPreviewPanel class (safe lookup, no panic)
+        let ql_class = AnyClass::get("QLPreviewPanel")
+            .ok_or("QLPreviewPanel class not available")?;
 
         // Get shared panel: [QLPreviewPanel sharedPreviewPanel]
         let panel: *mut AnyObject = msg_send![ql_class, sharedPreviewPanel];
@@ -204,8 +221,10 @@ fn show_quicklook_native(path: &Path, source_rect: Option<NSRect>) -> Result<(),
 
 /// Close the Quick Look panel if it's open.
 pub fn close_quicklook() {
+    let Some(ql_class) = AnyClass::get("QLPreviewPanel") else {
+        return; // Framework not loaded, nothing to close
+    };
     unsafe {
-        let ql_class: &AnyClass = class!(QLPreviewPanel);
         let exists: Bool = msg_send![ql_class, sharedPreviewPanelExists];
         if exists.as_bool() {
             let panel: *mut AnyObject = msg_send![ql_class, sharedPreviewPanel];
