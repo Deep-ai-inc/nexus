@@ -19,7 +19,13 @@ static FONT_SYSTEM: OnceLock<Mutex<FontSystem>> = OnceLock::new();
 
 pub(crate) fn get_font_system() -> &'static Mutex<FontSystem> {
     FONT_SYSTEM.get_or_init(|| {
-        Mutex::new(FontSystem::new())
+        let mut font_system = FontSystem::new();
+        // Load embedded JetBrainsMono as the guaranteed monospace fallback.
+        // This ensures box drawing, powerline, and other glyphs render correctly
+        // even if the system monospace font lacks them.
+        let font_data = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
+        font_system.db_mut().load_font_data(font_data.to_vec());
+        Mutex::new(font_system)
     })
 }
 

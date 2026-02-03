@@ -1084,6 +1084,179 @@ impl StrataPipeline {
     }
 
     // =========================================================================
+    // Box drawing characters (custom geometric rendering)
+    // =========================================================================
+
+    /// Draw a single box drawing character as solid rectangles.
+    ///
+    /// Returns `true` if the character was handled (is a box drawing char).
+    /// Box drawing characters are rendered as geometric primitives to ensure
+    /// perfect cell-boundary alignment — font glyphs have gaps/misalignment.
+    pub fn draw_box_char(&mut self, ch: char, x: f32, y: f32, cell_w: f32, cell_h: f32, color: Color) -> bool {
+        // Decode the character into line segments.
+        // Each segment is (left, right, up, down) where the value indicates:
+        //   0 = no line, 1 = light, 2 = heavy, 3 = double
+        let segs = match box_drawing_segments(ch) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let (uv_tl, uv_br) = self.white_pixel_uv_f32();
+        let packed = color.pack();
+
+        let mid_x = x + cell_w * 0.5;
+        let mid_y = y + cell_h * 0.5;
+        let light = (cell_w * 0.1).max(1.0).round();
+        let heavy = (cell_w * 0.2).max(2.0).round();
+
+        let (left, right, up, down) = segs;
+
+        // Helper: emit a solid rect
+        let mut emit = |rx: f32, ry: f32, rw: f32, rh: f32| {
+            self.instances.push(GpuInstance {
+                pos: [rx, ry],
+                size: [rw, rh],
+                uv_tl,
+                uv_br,
+                color: packed,
+                mode: 0,
+                corner_radius: 0.0,
+                texture_layer: 0,
+                clip_rect: NO_CLIP,
+            });
+        };
+
+        // Horizontal segments
+        let draw_h = |emit: &mut dyn FnMut(f32, f32, f32, f32), style: u8, from_x: f32, to_x: f32| {
+            if style == 0 { return; }
+            let w = to_x - from_x;
+            if style == 3 {
+                // Double: two thin lines with gap
+                let gap = (light * 2.0).max(2.0);
+                let t = light;
+                emit(from_x, mid_y - gap * 0.5 - t * 0.5, w, t);
+                emit(from_x, mid_y + gap * 0.5 - t * 0.5, w, t);
+            } else {
+                let t = if style == 2 { heavy } else { light };
+                emit(from_x, mid_y - t * 0.5, w, t);
+            }
+        };
+
+        // Vertical segments
+        let draw_v = |emit: &mut dyn FnMut(f32, f32, f32, f32), style: u8, from_y: f32, to_y: f32| {
+            if style == 0 { return; }
+            let h = to_y - from_y;
+            if style == 3 {
+                let gap = (light * 2.0).max(2.0);
+                let t = light;
+                emit(mid_x - gap * 0.5 - t * 0.5, from_y, t, h);
+                emit(mid_x + gap * 0.5 - t * 0.5, from_y, t, h);
+            } else {
+                let t = if style == 2 { heavy } else { light };
+                emit(mid_x - t * 0.5, from_y, t, h);
+            }
+        };
+
+        draw_h(&mut emit, left, x, mid_x);
+        draw_h(&mut emit, right, mid_x, x + cell_w);
+        draw_v(&mut emit, up, y, mid_y);
+        draw_v(&mut emit, down, mid_y, y + cell_h);
+
+        // For single/heavy corners and intersections, fill the center junction
+        // to avoid a gap where horizontal and vertical strokes meet.
+        // Skip for double lines (style 3) — they have two separate strokes
+        // with a deliberate gap that a center fill would bridge.
+        let has_h = left > 0 || right > 0;
+        let has_v = up > 0 || down > 0;
+        let any_double = left == 3 || right == 3 || up == 3 || down == 3;
+        if has_h && has_v && !any_double {
+            let h_style = left.max(right);
+            let v_style = up.max(down);
+            let tw = if v_style == 2 { heavy } else { light };
+            let th = if h_style == 2 { heavy } else { light };
+            emit(mid_x - tw * 0.5, mid_y - th * 0.5, tw, th);
+        }
+
+        true
+    }
+
+    /// Draw a block element character (U+2580-U+259F) as solid rectangle(s).
+    ///
+    /// Returns `true` if the character was handled.
+    pub fn draw_block_char(&mut self, ch: char, x: f32, y: f32, cell_w: f32, cell_h: f32, color: Color) -> bool {
+        // Handle shade characters with alpha adjustment
+        match ch {
+            '░' => { // LIGHT SHADE — 25% alpha
+                let c = Color { a: color.a * 0.25, ..color };
+                self.add_solid_rect(x, y, cell_w, cell_h, c);
+                return true;
+            }
+            '▒' => { // MEDIUM SHADE — 50% alpha
+                let c = Color { a: color.a * 0.5, ..color };
+                self.add_solid_rect(x, y, cell_w, cell_h, c);
+                return true;
+            }
+            '▓' => { // DARK SHADE — 75% alpha
+                let c = Color { a: color.a * 0.75, ..color };
+                self.add_solid_rect(x, y, cell_w, cell_h, c);
+                return true;
+            }
+            _ => {}
+        }
+
+        // Handle multi-quadrant characters
+        let hw = cell_w * 0.5;
+        let hh = cell_h * 0.5;
+        match ch {
+            '▙' => { // UL + LL + LR (all except UR)
+                self.add_solid_rect(x, y, hw, hh, color);      // UL
+                self.add_solid_rect(x, y + hh, cell_w, hh, color); // full bottom
+                return true;
+            }
+            '▚' => { // UL + LR (diagonal)
+                self.add_solid_rect(x, y, hw, hh, color);           // UL
+                self.add_solid_rect(x + hw, y + hh, hw, hh, color); // LR
+                return true;
+            }
+            '▛' => { // UL + UR + LL (all except LR)
+                self.add_solid_rect(x, y, cell_w, hh, color);  // full top
+                self.add_solid_rect(x, y + hh, hw, hh, color); // LL
+                return true;
+            }
+            '▜' => { // UL + UR + LR (all except LL)
+                self.add_solid_rect(x, y, cell_w, hh, color);       // full top
+                self.add_solid_rect(x + hw, y + hh, hw, hh, color); // LR
+                return true;
+            }
+            '▞' => { // UR + LL (diagonal)
+                self.add_solid_rect(x + hw, y, hw, hh, color);  // UR
+                self.add_solid_rect(x, y + hh, hw, hh, color);  // LL
+                return true;
+            }
+            '▟' => { // UR + LL + LR (all except UL)
+                self.add_solid_rect(x + hw, y, hw, hh, color);     // UR
+                self.add_solid_rect(x, y + hh, cell_w, hh, color); // full bottom
+                return true;
+            }
+            _ => {}
+        }
+
+        // Simple single-rect block elements
+        let (rx, ry, rw, rh) = match block_element_rect(ch) {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let px = x + rx * cell_w;
+        let py = y + ry * cell_h;
+        let pw = rw * cell_w;
+        let ph = rh * cell_h;
+
+        self.add_solid_rect(px, py, pw, ph, color);
+        true
+    }
+
+    // =========================================================================
     // Text rendering
     // =========================================================================
 
@@ -1477,6 +1650,228 @@ impl StrataPipeline {
 }
 
 /// Create an orthographic projection matrix.
+/// Map a box drawing character (U+2500..U+257F) to its line segments.
+///
+/// Returns `(left, right, up, down)` where each value is:
+///   0 = none, 1 = light, 2 = heavy, 3 = double
+///
+/// Also handles rounded corners (U+256D-U+2570) and some extensions.
+fn box_drawing_segments(ch: char) -> Option<(u8, u8, u8, u8)> {
+    // (left, right, up, down)
+    Some(match ch {
+        // Light lines
+        '─' => (1, 1, 0, 0), // U+2500 LIGHT HORIZONTAL
+        '━' => (2, 2, 0, 0), // U+2501 HEAVY HORIZONTAL
+        '│' => (0, 0, 1, 1), // U+2502 LIGHT VERTICAL
+        '┃' => (0, 0, 2, 2), // U+2503 HEAVY VERTICAL
+
+        // Light triple-dash / quadruple-dash (render as light line)
+        '┄' | '┅' | '┆' | '┇' | '┈' | '┉' | '┊' | '┋' => {
+            let cp = ch as u32;
+            if cp % 2 == 0 { (1, 1, 0, 0) } else { (0, 0, 1, 1) }
+        }
+
+        // Light corners
+        '┌' => (0, 1, 0, 1), // U+250C
+        '┍' => (0, 2, 0, 1), // U+250D
+        '┎' => (0, 1, 0, 2), // U+250E
+        '┏' => (0, 2, 0, 2), // U+250F
+        '┐' => (1, 0, 0, 1), // U+2510
+        '┑' => (2, 0, 0, 1), // U+2511
+        '┒' => (1, 0, 0, 2), // U+2512
+        '┓' => (2, 0, 0, 2), // U+2513
+        '└' => (0, 1, 1, 0), // U+2514
+        '┕' => (0, 2, 1, 0), // U+2515
+        '┖' => (0, 1, 2, 0), // U+2516
+        '┗' => (0, 2, 2, 0), // U+2517
+        '┘' => (1, 0, 1, 0), // U+2518
+        '┙' => (2, 0, 1, 0), // U+2519
+        '┚' => (1, 0, 2, 0), // U+251A
+        '┛' => (2, 0, 2, 0), // U+251B
+
+        // T-pieces
+        '├' => (0, 1, 1, 1), // U+251C
+        '┝' => (0, 2, 1, 1), // U+251D
+        '┞' => (0, 1, 2, 1), // U+251E
+        '┟' => (0, 1, 1, 2), // U+251F
+        '┠' => (0, 1, 2, 2), // U+2520
+        '┡' => (0, 2, 2, 1), // U+2521
+        '┢' => (0, 2, 1, 2), // U+2522
+        '┣' => (0, 2, 2, 2), // U+2523
+        '┤' => (1, 0, 1, 1), // U+2524
+        '┥' => (2, 0, 1, 1), // U+2525
+        '┦' => (1, 0, 2, 1), // U+2526
+        '┧' => (1, 0, 1, 2), // U+2527
+        '┨' => (1, 0, 2, 2), // U+2528
+        '┩' => (2, 0, 2, 1), // U+2529
+        '┪' => (2, 0, 1, 2), // U+252A
+        '┫' => (2, 0, 2, 2), // U+252B
+        '┬' => (1, 1, 0, 1), // U+252C
+        '┭' => (2, 1, 0, 1), // U+252D
+        '┮' => (1, 2, 0, 1), // U+252E
+        '┯' => (2, 2, 0, 1), // U+252F
+        '┰' => (1, 1, 0, 2), // U+2530
+        '┱' => (2, 1, 0, 2), // U+2531
+        '┲' => (1, 2, 0, 2), // U+2532
+        '┳' => (2, 2, 0, 2), // U+2533
+        '┴' => (1, 1, 1, 0), // U+2534
+        '┵' => (2, 1, 1, 0), // U+2535
+        '┶' => (1, 2, 1, 0), // U+2536
+        '┷' => (2, 2, 1, 0), // U+2537
+        '┸' => (1, 1, 2, 0), // U+2538
+        '┹' => (2, 1, 2, 0), // U+2539
+        '┺' => (1, 2, 2, 0), // U+253A
+        '┻' => (2, 2, 2, 0), // U+253B
+
+        // Crosses
+        '┼' => (1, 1, 1, 1), // U+253C
+        '┽' => (2, 1, 1, 1), // U+253D
+        '┾' => (1, 2, 1, 1), // U+253E
+        '┿' => (2, 2, 1, 1), // U+253F
+        '╀' => (1, 1, 2, 1), // U+2540
+        '╁' => (1, 1, 1, 2), // U+2541
+        '╂' => (1, 1, 2, 2), // U+2542
+        '╃' => (2, 1, 2, 1), // U+2543
+        '╄' => (1, 2, 2, 1), // U+2544
+        '╅' => (2, 1, 1, 2), // U+2545
+        '╆' => (1, 2, 1, 2), // U+2546
+        '╇' => (2, 2, 2, 1), // U+2547
+        '╈' => (2, 2, 1, 2), // U+2548
+        '╉' => (2, 1, 2, 2), // U+2549
+        '╊' => (1, 2, 2, 2), // U+254A
+        '╋' => (2, 2, 2, 2), // U+254B
+
+        // Light/heavy half-lines
+        '╴' => (1, 0, 0, 0), // U+2574 LIGHT LEFT
+        '╵' => (0, 0, 1, 0), // U+2575 LIGHT UP
+        '╶' => (0, 1, 0, 0), // U+2576 LIGHT RIGHT
+        '╷' => (0, 0, 0, 1), // U+2577 LIGHT DOWN
+        '╸' => (2, 0, 0, 0), // U+2578 HEAVY LEFT
+        '╹' => (0, 0, 2, 0), // U+2579 HEAVY UP
+        '╺' => (0, 2, 0, 0), // U+257A HEAVY RIGHT
+        '╻' => (0, 0, 0, 2), // U+257B HEAVY DOWN
+
+        // Mixed light/heavy
+        '╼' => (1, 2, 0, 0), // U+257C LIGHT LEFT HEAVY RIGHT
+        '╽' => (0, 0, 1, 2), // U+257D LIGHT UP HEAVY DOWN
+        '╾' => (2, 1, 0, 0), // U+257E HEAVY LEFT LIGHT RIGHT
+        '╿' => (0, 0, 2, 1), // U+257F HEAVY UP LIGHT DOWN
+
+        // Double lines
+        '═' => (3, 3, 0, 0), // U+2550
+        '║' => (0, 0, 3, 3), // U+2551
+
+        // Double corners
+        '╔' => (0, 3, 0, 3), // U+2554
+        '╗' => (3, 0, 0, 3), // U+2557
+        '╚' => (0, 3, 3, 0), // U+255A
+        '╝' => (3, 0, 3, 0), // U+255D
+
+        // Double/single mixed corners
+        '╒' => (0, 3, 0, 1), // U+2552
+        '╓' => (0, 1, 0, 3), // U+2553
+        '╕' => (3, 0, 0, 1), // U+2555
+        '╖' => (1, 0, 0, 3), // U+2556
+        '╘' => (0, 3, 1, 0), // U+2558
+        '╙' => (0, 1, 3, 0), // U+2559
+        '╛' => (1, 0, 3, 0), // U+255B UP DOUBLE AND LEFT SINGLE
+        '╜' => (3, 0, 1, 0), // U+255C UP SINGLE AND LEFT DOUBLE
+
+        // Double T-pieces
+        '╠' => (0, 3, 3, 3), // U+2560
+        '╣' => (3, 0, 3, 3), // U+2563
+        '╦' => (3, 3, 0, 3), // U+2566
+        '╩' => (3, 3, 3, 0), // U+2569
+
+        // Double/single T-pieces
+        '╞' => (0, 3, 1, 1), // U+255E
+        '╟' => (0, 1, 3, 3), // U+255F
+        '╡' => (3, 0, 1, 1), // U+2561
+        '╢' => (1, 0, 3, 3), // U+2562
+        '╤' => (3, 3, 0, 1), // U+2564
+        '╥' => (1, 1, 0, 3), // U+2565
+        '╧' => (3, 3, 1, 0), // U+2567
+        '╨' => (1, 1, 3, 0), // U+2568
+
+        // Double crosses
+        '╪' => (3, 3, 1, 1), // U+256A
+        '╫' => (1, 1, 3, 3), // U+256B
+        '╬' => (3, 3, 3, 3), // U+256C
+
+        // Rounded corners (render as light lines — the rounding is visual sugar)
+        '╭' => (0, 1, 0, 1), // U+256D
+        '╮' => (1, 0, 0, 1), // U+256E
+        '╯' => (1, 0, 1, 0), // U+256F
+        '╰' => (0, 1, 1, 0), // U+2570
+
+        // Diagonal lines — not handled (rare, complex geometry)
+        '╱' | '╲' | '╳' => return None,
+
+        _ => return None,
+    })
+}
+
+/// Check if a character is a box drawing character that we handle.
+#[inline]
+pub fn is_box_drawing(ch: char) -> bool {
+    let cp = ch as u32;
+    (0x2500..=0x257F).contains(&cp) && !matches!(ch, '╱' | '╲' | '╳')
+}
+
+/// Check if a character is a block element that we handle.
+#[inline]
+pub fn is_block_element(ch: char) -> bool {
+    let cp = ch as u32;
+    (0x2580..=0x259F).contains(&cp)
+}
+
+/// Check if a character should be custom-drawn (box drawing or block element).
+#[inline]
+pub fn is_custom_drawn(ch: char) -> bool {
+    is_box_drawing(ch) || is_block_element(ch)
+}
+
+/// Map a block element character to its fractional cell rect (x, y, w, h).
+///
+/// All values are 0.0..1.0 fractions of the cell dimensions.
+fn block_element_rect(ch: char) -> Option<(f32, f32, f32, f32)> {
+    // (x_frac, y_frac, w_frac, h_frac)
+    Some(match ch {
+        '▀' => (0.0, 0.0, 1.0, 0.5),    // U+2580 UPPER HALF
+        '▁' => (0.0, 7.0/8.0, 1.0, 1.0/8.0), // U+2581 LOWER ONE EIGHTH
+        '▂' => (0.0, 3.0/4.0, 1.0, 1.0/4.0), // U+2582 LOWER ONE QUARTER
+        '▃' => (0.0, 5.0/8.0, 1.0, 3.0/8.0), // U+2583 LOWER THREE EIGHTHS
+        '▄' => (0.0, 0.5, 1.0, 0.5),     // U+2584 LOWER HALF
+        '▅' => (0.0, 3.0/8.0, 1.0, 5.0/8.0), // U+2585 LOWER FIVE EIGHTHS
+        '▆' => (0.0, 1.0/4.0, 1.0, 3.0/4.0), // U+2586 LOWER THREE QUARTERS
+        '▇' => (0.0, 1.0/8.0, 1.0, 7.0/8.0), // U+2587 LOWER SEVEN EIGHTHS
+        '█' => (0.0, 0.0, 1.0, 1.0),     // U+2588 FULL BLOCK
+        '▉' => (0.0, 0.0, 7.0/8.0, 1.0), // U+2589 LEFT SEVEN EIGHTHS
+        '▊' => (0.0, 0.0, 3.0/4.0, 1.0), // U+258A LEFT THREE QUARTERS
+        '▋' => (0.0, 0.0, 5.0/8.0, 1.0), // U+258B LEFT FIVE EIGHTHS
+        '▌' => (0.0, 0.0, 0.5, 1.0),     // U+258C LEFT HALF
+        '▍' => (0.0, 0.0, 3.0/8.0, 1.0), // U+258D LEFT THREE EIGHTHS
+        '▎' => (0.0, 0.0, 1.0/4.0, 1.0), // U+258E LEFT ONE QUARTER
+        '▏' => (0.0, 0.0, 1.0/8.0, 1.0), // U+258F LEFT ONE EIGHTH
+        '▐' => (0.5, 0.0, 0.5, 1.0),     // U+2590 RIGHT HALF
+        // Shade characters handled specially in draw_block_char (alpha adjustment)
+        '░' | '▒' | '▓' => return None,
+        '▔' => (0.0, 0.0, 1.0, 1.0/8.0), // U+2594 UPPER ONE EIGHTH
+        '▕' => (7.0/8.0, 0.0, 1.0/8.0, 1.0), // U+2595 RIGHT ONE EIGHTH
+        '▖' => (0.0, 0.5, 0.5, 0.5),     // U+2596 QUADRANT LOWER LEFT
+        '▗' => (0.5, 0.5, 0.5, 0.5),     // U+2597 QUADRANT LOWER RIGHT
+        '▘' => (0.0, 0.0, 0.5, 0.5),     // U+2598 QUADRANT UPPER LEFT
+        '▙' => return None, // U+2599 QUADRANT UPPER LEFT AND LOWER LEFT AND LOWER RIGHT (3 quads)
+        '▚' => return None, // U+259A QUADRANT UPPER LEFT AND LOWER RIGHT (2 quads, diagonal)
+        '▛' => return None, // U+259B QUADRANT UPPER LEFT AND UPPER RIGHT AND LOWER LEFT (3 quads)
+        '▜' => return None, // U+259C QUADRANT UPPER LEFT AND UPPER RIGHT AND LOWER RIGHT (3 quads)
+        '▝' => (0.5, 0.0, 0.5, 0.5),     // U+259D QUADRANT UPPER RIGHT
+        '▞' => return None, // U+259E QUADRANT UPPER RIGHT AND LOWER LEFT (2 quads, diagonal)
+        '▟' => return None, // U+259F QUADRANT UPPER RIGHT AND LOWER LEFT AND LOWER RIGHT (3 quads)
+        _ => return None,
+    })
+}
+
 fn create_orthographic_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
     let left = 0.0;
     let right = width;

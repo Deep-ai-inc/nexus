@@ -457,3 +457,4 @@ impl GlyphAtlas {
 fn size_key(font_size: f32) -> u16 {
     (font_size * 2.0).round() as u16
 }
+

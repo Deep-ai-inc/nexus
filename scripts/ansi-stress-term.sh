@@ -343,6 +343,222 @@ section "Tab Stops"
 printf '  Col0\tCol8\tCol16\tCol24\tCol32\tCol40\n'
 printf '  A\tB\tC\tD\tE\tF\n'
 
+# ── 19. Box Drawing Characters ─────────────────────────────────────────
+
+section "Box Drawing Characters"
+printf '  Light:  ─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼\n'
+printf '  Heavy:  ━ ┃ ┏ ┓ ┗ ┛ ┣ ┫ ┳ ┻ ╋\n'
+printf '  Double: ═ ║ ╔ ╗ ╚ ╝ ╠ ╣ ╦ ╩ ╬\n'
+printf '  Mixed:  ╒ ╕ ╘ ╛ ╞ ╡ ╥ ╨ ╪ ╫ ╳\n'
+printf '  Rounded: ╭ ╮ ╰ ╯\n'
+printf '  Box:\n'
+printf '    ┌──────┬──────┐\n'
+printf '    │ Cell │ Cell │\n'
+printf '    ├──────┼──────┤\n'
+printf '    │ Cell │ Cell │\n'
+printf '    └──────┴──────┘\n'
+printf '  Double box:\n'
+printf '    ╔══════╦══════╗\n'
+printf '    ║ Cell ║ Cell ║\n'
+printf '    ╠══════╬══════╣\n'
+printf '    ║ Cell ║ Cell ║\n'
+printf '    ╚══════╩══════╝\n'
+
+# ── 20. Cursor Movements ──────────────────────────────────────────────
+
+section "Cursor Movements"
+printf '  CUF (forward):  start%s[10C<-- 10 cols right\n' "${ESC}"
+printf '  CHA (col abs):  %s[20Gstarting at col 20\n' "${ESC}"
+printf '  Overwrite test: AAAAAAAAAA'
+printf '%s[10D' "${ESC}"  # move left 10
+printf 'BBBB'             # overwrite first 4 A's
+printf '\n'
+printf '  Backspace test: 12345\b\b\bXY\n'
+
+# ── 21. Erase Operations ──────────────────────────────────────────────
+
+section "Erase Operations"
+# EL mode 0: print text with trailing XXXXX, back up into Xs, erase to EOL
+printf '  EL mode 0 (erase to EOL): visibleXXXXX%s[5D%s[K ←Xs gone\n' "${ESC}" "${ESC}"
+# EL mode 1: erase from cursor to beginning of line
+printf '  EL mode 1 (erase to BOL): ERASED%s[1K visible\n' "${ESC}"
+# EL mode 2: erase entire line then overwrite
+printf '  EL mode 2 (erase line):   full line%s[2K  (line was erased and replaced)\n' "${ESC}"
+# ECH: erase 3 characters at cursor
+printf '  ECH (erase chars):        XXXXX%s[5D%s[3X ←3 Xs erased\n' "${ESC}" "${ESC}"
+
+# ── 22. Insert/Delete Characters and Lines ─────────────────────────────
+
+section "Insert/Delete Characters"
+printf '  ICH (insert 3): ABCDEF%s[4D%s[3@___\n' "${ESC}" "${ESC}"
+printf '  DCH (delete 2): ABCDEF%s[4D%s[2P\n' "${ESC}" "${ESC}"
+
+# ── 23. Scroll Up/Down ────────────────────────────────────────────────
+
+section "Scroll Operations (SU/SD)"
+# Simple scroll test — no cursor position query needed
+printf '  scroll-line A\n'
+printf '  scroll-line B\n'
+printf '  scroll-line C\n'
+printf '%s[1S' "${ESC}"      # SU: scroll up 1 — shifts content up
+printf '  (scrolled up 1 — line A should be further away)\n'
+printf '%s[1T' "${ESC}"      # SD: scroll down 1 — shifts content down
+printf '  (scrolled down 1 — blank line inserted above)\n'
+
+# ── 24. SGR Attribute Resets (Granular) ────────────────────────────────
+
+section "SGR Granular Resets"
+printf '  %sbold%s → reset bold(22m) → %snormal?%s\n'            "${CSI}1m" "" "${CSI}22m" "${CSI}0m"
+printf '  %sitalic%s → reset italic(23m) → %snormal?%s\n'        "${CSI}3m" "" "${CSI}23m" "${CSI}0m"
+printf '  %sunderline%s → reset UL(24m) → %snormal?%s\n'         "${CSI}4m" "" "${CSI}24m" "${CSI}0m"
+printf '  %sblink%s → reset blink(25m) → %snormal?%s\n'          "${CSI}5m" "" "${CSI}25m" "${CSI}0m"
+printf '  %sinverse%s → reset inverse(27m) → %snormal?%s\n'      "${CSI}7m" "" "${CSI}27m" "${CSI}0m"
+printf '  conceal(8m): [%sHIDDEN%s] ← should be blank between brackets%s\n' "${CSI}8m" "${CSI}28m" "${CSI}0m"
+printf '  %sstrikethrough%s → reset strike(29m) → %snormal?%s\n' "${CSI}9m" "" "${CSI}29m" "${CSI}0m"
+printf '  %soverline%s(53m) → reset overline(55m) → %snormal?%s\n' "${CSI}53m" "" "${CSI}55m" "${CSI}0m"
+
+# ── 25. Overline (SGR 53) ─────────────────────────────────────────────
+
+section "Overline (SGR 53)"
+printf '  %soverlined text%s  '                    "${CSI}53m"       "${CSI}0m"
+printf '%soverline+underline%s  '                 "${CSI}53;4m"     "${CSI}0m"
+printf '%soverline+bold+red%s\n'                  "${CSI}53;1;31m"  "${CSI}0m"
+
+# ── 26. Combining Characters and Diacritics ────────────────────────────
+
+section "Combining Characters / Diacritics"
+printf '  Single combining:  a\xCC\x81 e\xCC\x82 o\xCC\x88 u\xCC\x83 n\xCC\x83\n'
+printf '  Stacked combining: a\xCC\x81\xCC\x82\xCC\x83 (3 marks on one base)\n'
+printf '  Precomposed vs decomposed: é (precomposed) vs e\xCC\x81 (decomposed)\n'
+printf '  Zalgo-lite: H\xCC\x81\xCC\x82\xCC\x83e\xCC\x84\xCC\x85l\xCC\x86\xCC\x87l\xCC\x88\xCC\x89o\xCC\x8A\xCC\x8B\n'
+
+# ── 27. Wide Characters (CJK, Korean, etc.) ───────────────────────────
+
+section "Wide Characters (fullwidth)"
+printf '  CJK:       你好世界 (4 chars, 8 cells)\n'
+printf '  Korean:    안녕하세요 (5 chars, 10 cells)\n'
+printf '  Japanese:  日本語テスト (6 chars, 12 cells)\n'
+printf '  Fullwidth: ＡＢＣＤ (4 chars, 8 cells)\n'
+printf '  Mixed:     AB你好CD (6 chars, 10 cells)\n'
+printf '  Alignment test:\n'
+printf '    |12345678|\n'
+printf '    |你好世界|\n'
+printf '    |ABCDEFGH|\n'
+
+# ── 28. Variation Selectors (Emoji Presentation) ──────────────────────
+
+section "Variation Selectors"
+printf '  Text style (U+FE0E):  ☺︎ ☹︎ ❤︎ ⭐︎ ☀︎\n'
+printf '  Emoji style (U+FE0F): ☺️ ☹️ ❤️ ⭐️ ☀️\n'
+printf '  Mixed in line: Hello ❤️ World ⭐︎ End\n'
+
+# ── 29. Zero-Width Characters ──────────────────────────────────────────
+
+section "Zero-Width Characters"
+printf '  ZWSP between: A\xE2\x80\x8BB (should look like AB)\n'
+printf '  ZWNJ between: A\xE2\x80\x8CB (should look like AB)\n'
+printf '  ZWJ between:  A\xE2\x80\x8DB (should look like AB)\n'
+printf '  Soft hyphen:   syl\xC2\xADla\xC2\xADble (invisible hyphens)\n'
+
+# ── 30. Ambiguous-Width Characters ─────────────────────────────────────
+
+section "Ambiguous-Width Characters"
+printf '  Greek:   α β γ δ ε Ω\n'
+printf '  Math:    ± × ÷ √ ∞ ≈ ≠ ≤ ≥\n'
+printf '  Symbols: © ® ™ § ¶ • ·\n'
+printf '  Arrows:  ← → ↑ ↓ ↔ ↕\n'
+printf '  Blocks:  ░ ▒ ▓ █ ▀ ▄ ▌ ▐\n'
+
+# ── 31. DEC Special Graphics / Line Drawing (Alt Charset) ─────────────
+
+section "DEC Line Drawing (SI/SO charset switch)"
+printf '  Switch to G0 line drawing: '
+printf '%s(0' "${ESC}"  # Select DEC Special Graphics for G0
+printf 'lqqqqqqqqqqk\n'
+printf '                               x          x\n'
+printf '                               mqqqqqqqqqqj'
+printf '%s(B' "${ESC}"  # Back to ASCII
+printf '\n  (should draw a box if DEC graphics supported)\n'
+
+# ── 32. CSI s/u Cursor Save/Restore ───────────────────────────────────
+
+section "CSI s/u Cursor Save/Restore"
+printf '  Start here...'
+printf '%s[s' "${ESC}"       # Save cursor (CSI s)
+printf '%s[10C<inserted>' "${ESC}"  # Move right 10
+printf '%s[u' "${ESC}"       # Restore cursor (CSI u)
+printf '(restored)\n'
+
+# ── 33. Wraparound Edge Case ──────────────────────────────────────────
+
+section "Wraparound Mode (printing at last column)"
+COLS=$(tput cols 2>/dev/null || echo 80)
+PREFIX='  Fill to edge: '
+FILL=$((COLS - ${#PREFIX}))
+printf '%s' "$PREFIX"
+for i in $(seq 1 "$FILL"); do printf '#'; done
+printf '\n  (should have filled to right edge without wrapping early or late)\n'
+
+# ── 34. Tab Stops (HTS / TBC) ─────────────────────────────────────────
+
+section "Custom Tab Stops (HTS/TBC)"
+printf '%s[3g' "${ESC}"           # Clear all tab stops (TBC mode 3)
+printf '%s[5G%sH' "${ESC}" "${ESC}"   # Move to col 5, set tab stop (HTS)
+printf '%s[15G%sH' "${ESC}" "${ESC}"  # Move to col 15, set tab stop
+printf '%s[25G%sH' "${ESC}" "${ESC}"  # Move to col 25, set tab stop
+printf '\r'                            # Return to start of line
+printf '  \tA\tB\tC\n'
+printf '  (A at 5, B at 15, C at 25 if custom tabs work)\n'
+
+# ── 35. SGR Edge Cases: Colon vs Semicolon ─────────────────────────────
+
+section "SGR Colon-Separated Params"
+printf '  Colon truecolor:  %s38:2::255:100:0mOrange?%s\n'  "${CSI}" "${CSI}0m"
+printf '  Colon underline:  %s4:3mCurly?%s\n'               "${CSI}" "${CSI}0m"
+printf '  Semicolon equiv:  %s38;2;255;100;0mOrange?%s\n'   "${CSI}" "${CSI}0m"
+
+# ── 36. Overlong / Malformed Sequences ─────────────────────────────────
+
+section "Malformed Sequences (robustness)"
+printf '  Incomplete CSI: \033[  (bare CSI+space)\n'
+printf '  Missing final:  \033[1  (no m)\n'
+printf '  Huge param:     %s99999m(should ignore)%s\n'         "${CSI}" "${CSI}0m"
+printf '  Negative param:  %s-1m(should ignore)%s\n'           "${CSI}" "${CSI}0m"
+printf '  Empty params:    %s;;;m(should reset)%s\n'           "${CSI}" "${CSI}0m"
+printf '  Many semicolons: %s1;2;3;4;5;6;7;8;9;10;11;12;m%s\n' "${CSI}" "${CSI}0m"
+printf '  Embedded null:   AB\x00CD (null between chars)\n'
+
+# ── 37. Rapid Full-Row Color Stress ────────────────────────────────────
+
+section "Stress: True Color Per-Cell with BG (80 unique RGB fg+bg per row)"
+for row in 1 2 3 4; do
+    printf '  '
+    for col in $(seq 0 79); do
+        r=$(( (row * 60 + col * 3) % 256 ))
+        g=$(( (row * 40 + col * 7) % 256 ))
+        b=$(( (row * 80 + col * 11) % 256 ))
+        printf '%s█%s' "${CSI}38;2;${r};${g};${b};48;2;$(( 255 - r ));$(( 255 - g ));$(( 255 - b ))m" "${CSI}0m"
+    done
+    printf '\n'
+done
+
+# ── 38. Emoji Sequences ───────────────────────────────────────────────
+
+section "Emoji Sequences"
+printf '  Basic:     😀 😎 🤖 💀 🎉 🚀\n'
+printf '  Flags:     🇺🇸 🇬🇧 🇯🇵 🇩🇪 🇫🇷 🇰🇷\n'
+printf '  Skin tone: 👋🏻 👋🏼 👋🏽 👋🏾 👋🏿\n'
+printf '  ZWJ:       👨‍💻 👩‍🔬 👨‍👩‍👧‍👦 🏳️‍🌈 👩‍❤️‍👨\n'
+printf '  Keycap:    1️⃣ 2️⃣ 3️⃣ #️⃣ *️⃣\n'
+
+# ── 39. RTL / BiDi Text ───────────────────────────────────────────────
+
+section "RTL and BiDi Text"
+printf '  Arabic:    مرحبا بالعالم\n'
+printf '  Hebrew:    שלום עולם\n'
+printf '  Mixed LTR/RTL: Hello مرحبا World عالم End\n'
+printf '  Numbers in RTL: العدد 12345 هنا\n'
+
 # ── Done ────────────────────────────────────────────────────────────────────
 
-printf '\n%s━━━ ANSI Stress Test Complete ━━━%s\n' "${CSI}1;32m" "${CSI}0m"
+printf '\n%s━━━ ANSI Stress Test Complete (39 sections) ━━━%s\n' "${CSI}1;32m" "${CSI}0m"

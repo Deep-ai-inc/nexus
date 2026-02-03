@@ -932,7 +932,62 @@ impl PipelineWrapper {
                             // Text shaping (skip for whitespace-only runs)
                             if !is_whitespace {
                                 let start = pipeline.instance_count();
-                                pipeline.add_text_styled(&run.text, run_x, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
+                                // Check if run contains custom-drawn characters (box drawing / block elements)
+                                let has_custom = run.text.chars().any(crate::gpu::is_custom_drawn);
+                                if has_custom {
+                                    // Mixed or pure custom run: iterate per-cell.
+                                    // Each cell contributes a primary char (width 1 or 2)
+                                    // plus optional zero-width chars (combining marks,
+                                    // variation selectors). We use unicode-width to
+                                    // distinguish primary vs zero-width chars.
+                                    use unicode_width::UnicodeWidthChar;
+                                    let mut col = 0usize;
+                                    let mut text_buf = String::new();
+                                    let mut text_col_start = 0usize;
+                                    for ch in run.text.chars() {
+                                        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                                        if ch_width == 0 {
+                                            // Zero-width char (combining mark, VS, ZWJ) —
+                                            // append to current text buf, don't advance col
+                                            text_buf.push(ch);
+                                            continue;
+                                        }
+                                        // Primary character — check if custom-drawn
+                                        if crate::gpu::is_custom_drawn(ch) {
+                                            // Flush any accumulated text
+                                            if !text_buf.is_empty() {
+                                                let tx = run_x + text_col_start as f32 * cell_w;
+                                                pipeline.add_text_styled(&text_buf, tx, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
+                                                text_buf.clear();
+                                            }
+                                            let cx = run_x + col as f32 * cell_w;
+                                            // Try box drawing, then block elements, then fall back to text
+                                            if !pipeline.draw_box_char(ch, cx, row_y, cell_w, cell_h, fg_color)
+                                                && !pipeline.draw_block_char(ch, cx, row_y, cell_w, cell_h, fg_color)
+                                            {
+                                                // Unhandled custom char — fall back to font rendering
+                                                if text_buf.is_empty() {
+                                                    text_col_start = col;
+                                                }
+                                                text_buf.push(ch);
+                                            }
+                                            col += 1; // box/block chars are always single-width
+                                        } else {
+                                            if text_buf.is_empty() {
+                                                text_col_start = col;
+                                            }
+                                            text_buf.push(ch);
+                                            col += ch_width; // 1 for normal, 2 for CJK/fullwidth
+                                        }
+                                    }
+                                    // Flush remaining text
+                                    if !text_buf.is_empty() {
+                                        let tx = run_x + text_col_start as f32 * cell_w;
+                                        pipeline.add_text_styled(&text_buf, tx, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
+                                    }
+                                } else {
+                                    pipeline.add_text_styled(&run.text, run_x, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
+                                }
                                 maybe_clip(pipeline, start, grid_clip, scale);
                             }
 
