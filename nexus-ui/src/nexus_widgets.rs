@@ -21,7 +21,7 @@ use crate::nexus_app::source_ids;
 use strata::gpu::ImageHandle;
 use strata::layout::containers::{
     ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
-    ScrollColumn, TableCell, TableElement, TerminalElement, TextElement, Widget,
+    ScrollColumn, TerminalElement, TextElement, Widget,
 };
 use strata::layout_snapshot::CursorIcon;
 use strata::primitives::Color;
@@ -156,9 +156,22 @@ impl Widget for ShellBlockWidget<'_> {
             let mut term = TerminalElement::new(source_id, cols, content_rows)
                 .cell_size(8.4, 18.0);
 
-            // Extract text rows from the grid
+            // Extract text rows from the grid, preserving grapheme clusters
             for row in grid.rows_iter() {
-                let text: String = row.iter().map(|cell| cell.c).collect();
+                let mut text = String::with_capacity(row.len());
+                for cell in row {
+                    // Skip the spacer half of wide characters
+                    if cell.flags.wide_char_spacer {
+                        continue;
+                    }
+                    text.push(cell.c);
+                    // Append zero-width chars (combining marks, ZWJ, variation selectors)
+                    if let Some(ref zw) = cell.zerowidth {
+                        for &ch in zw.iter() {
+                            text.push(ch);
+                        }
+                    }
+                }
                 // Use cell foreground color from first non-default cell, or default
                 let fg = row.iter()
                     .find(|c| !matches!(c.fg, nexus_term::Color::Default))
@@ -1466,11 +1479,41 @@ fn render_native_value(
         }
 
         Value::Table { columns, rows } => {
+            let _t0 = std::time::Instant::now();
             let source_id = source_ids::table(block_id);
-            let mut table = TableElement::new(source_id);
 
-            // Estimate column widths from data
-            let col_widths = estimate_column_widths(columns, rows);
+            let char_w = 8.4_f32;
+            let cell_padding = 16.0_f32;
+            let num_cols = columns.len();
+
+            // Column width estimation: sample first 100 rows (O(1) vs O(n))
+            let sample_count = rows.len().min(100);
+            let mut max_col_lens = vec![0usize; num_cols];
+            for row in rows[..sample_count].iter() {
+                for (col_idx, cell) in row.iter().enumerate() {
+                    if col_idx >= num_cols { break; }
+                    let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
+                        format_value_for_display(cell, fmt)
+                    } else {
+                        cell.to_text()
+                    };
+                    let line_len = text.lines()
+                        .map(|l| unicode_width::UnicodeWidthStr::width(l))
+                        .max().unwrap_or(0);
+                    if line_len > max_col_lens[col_idx] {
+                        max_col_lens[col_idx] = line_len;
+                    }
+                }
+            }
+
+            let col_widths: Vec<f32> = columns.iter().enumerate().map(|(i, col)| {
+                let header_width = unicode_width::UnicodeWidthStr::width(col.name.as_str());
+                let max_len = header_width.max(max_col_lens[i]).max(4);
+                (max_len as f32 * char_w + cell_padding).min(400.0)
+            }).collect();
+
+            // Build VirtualTableElement — lightweight, no wrapping
+            let mut table = strata::layout::containers::VirtualTableElement::new(source_id);
 
             // Add column headers with sort support
             for (i, col) in columns.iter().enumerate() {
@@ -1487,20 +1530,15 @@ fn render_native_value(
                 table = table.column_sortable(&header_name, col_widths[i], sort_id);
             }
 
-            // Add data rows with line wrapping
-            let char_w = 8.4_f32;
-            let cell_padding = 16.0_f32;
+            // Build lightweight VirtualCell rows — no wrapping, no line splitting
             let mut anchor_idx = 0usize;
-            for row in rows {
-                let cells: Vec<TableCell> = row.iter().enumerate().map(|(col_idx, cell)| {
+            for (_row_idx, row) in rows.iter().enumerate() {
+                let cells: Vec<strata::layout::containers::VirtualCell> = row.iter().enumerate().map(|(col_idx, cell)| {
                     let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
                         format_value_for_display(cell, fmt)
                     } else {
                         cell.to_text()
                     };
-                    let col_width = col_widths.get(col_idx).copied().unwrap_or(400.0);
-                    let max_chars = ((col_width - cell_padding) / char_w + 0.5).max(1.0) as usize;
-                    let lines = wrap_cell_text(&text, max_chars);
                     let widget_id = if is_anchor_value(cell) {
                         let id = source_ids::anchor(block_id, anchor_idx);
                         register_anchor(click_registry, id, AnchorEntry {
@@ -1517,9 +1555,8 @@ fn render_native_value(
                     } else {
                         None
                     };
-                    TableCell {
+                    strata::layout::containers::VirtualCell {
                         text,
-                        lines,
                         color: value_text_color(cell),
                         widget_id,
                     }
@@ -1527,7 +1564,17 @@ fn render_native_value(
                 table = table.row(cells);
             }
 
-            parent.push(table)
+            let _t1 = _t0.elapsed();
+            let result = parent.push(table);
+            let _t2 = _t0.elapsed();
+            if strata::frame_timing::is_enabled() {
+                let frame = strata::frame_timing::current_frame();
+                if frame % 60 == 0 {
+                    eprintln!("[frame {}] vtable build: {:.2?} layout={:.2?} ({}rows x {}cols)",
+                        frame, _t1, _t2 - _t1, rows.len(), num_cols);
+                }
+            }
+            result
         }
 
         Value::List(items) => {
@@ -2279,86 +2326,10 @@ fn value_text_color(value: &Value) -> Color {
 
 /// Estimate column widths based on header names and data content.
 ///
-/// Uses the widest *line* (splitting on newlines) rather than total text length,
-/// so multi-line content doesn't inflate column widths.
-fn estimate_column_widths(columns: &[nexus_api::TableColumn], rows: &[Vec<Value>]) -> Vec<f32> {
-    let char_w = 8.4; // approximate monospace character width
-    let padding = 16.0;
-
-    columns.iter().enumerate().map(|(i, col)| {
-        let header_len = col.name.len();
-        let max_data_len = rows.iter()
-            .filter_map(|row| row.get(i))
-            .map(|v| {
-                let text = if let Some(fmt) = col.format {
-                    format_value_for_display(v, fmt)
-                } else {
-                    v.to_text()
-                };
-                text.lines()
-                    .map(|l| l.len())
-                    .max()
-                    .unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0);
-        let max_len = header_len.max(max_data_len).max(4);
-        (max_len as f32 * char_w + padding).min(400.0)
-    }).collect()
-}
-
 /// Word-wrap text to fit within `max_chars` characters per line.
 ///
 /// Preserves explicit newlines, breaks long lines at word boundaries,
 /// and force-breaks words exceeding `max_chars`.
-fn wrap_cell_text(text: &str, max_chars: usize) -> Vec<String> {
-    let max_chars = max_chars.max(1);
-    let mut result = Vec::new();
-
-    for paragraph in text.split('\n') {
-        if paragraph.len() <= max_chars {
-            result.push(paragraph.to_string());
-            continue;
-        }
-
-        let mut line = String::new();
-        for word in paragraph.split_whitespace() {
-            if word.len() > max_chars {
-                // Force-break long words
-                if !line.is_empty() {
-                    result.push(line);
-                    line = String::new();
-                }
-                let mut chars = word.chars().peekable();
-                while chars.peek().is_some() {
-                    let chunk: String = chars.by_ref().take(max_chars).collect();
-                    result.push(chunk);
-                }
-                // Last chunk becomes the current line to allow appending
-                if let Some(last) = result.pop() {
-                    line = last;
-                }
-            } else if line.is_empty() {
-                line = word.to_string();
-            } else if line.len() + 1 + word.len() <= max_chars {
-                line.push(' ');
-                line.push_str(word);
-            } else {
-                result.push(line);
-                line = word.to_string();
-            }
-        }
-        if !line.is_empty() || paragraph.is_empty() {
-            result.push(line);
-        }
-    }
-
-    if result.is_empty() {
-        result.push(String::new());
-    }
-    result
-}
-
 /// Whether a Value is anchor-worthy (clickable in the UI).
 pub(crate) fn is_anchor_value(value: &Value) -> bool {
     matches!(

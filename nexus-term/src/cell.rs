@@ -4,8 +4,7 @@ use alacritty_terminal::term::cell::Flags as AlacrittyFlags;
 use alacritty_terminal::vte::ansi::Color as AnsiColor;
 
 /// A single cell in the terminal grid.
-/// This struct is Copy since it's small (≈12 bytes) and frequently copied.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Cell {
     /// The character in this cell.
     pub c: char,
@@ -15,6 +14,24 @@ pub struct Cell {
     pub bg: Color,
     /// Cell attributes (bold, italic, etc.).
     pub flags: CellFlags,
+    /// Zero-width characters (combining marks, ZWJ, variation selectors).
+    /// These form the grapheme cluster together with `c`.
+    /// None for the vast majority of cells (pure ASCII).
+    pub zerowidth: Option<Box<[char]>>,
+}
+
+impl Cell {
+    /// Append this cell's full grapheme cluster (main char + zero-width chars)
+    /// to the given string. Zero allocations.
+    #[inline]
+    pub fn push_grapheme(&self, out: &mut String) {
+        out.push(self.c);
+        if let Some(ref zw) = self.zerowidth {
+            for &ch in zw.iter() {
+                out.push(ch);
+            }
+        }
+    }
 }
 
 /// Cell attribute flags.
@@ -27,6 +44,11 @@ pub struct CellFlags {
     pub dim: bool,
     pub inverse: bool,
     pub hidden: bool,
+    /// This cell contains a wide (double-width) character (CJK, emoji).
+    pub wide_char: bool,
+    /// This cell is a spacer for the right half of a wide character.
+    /// Should be skipped when building text strings.
+    pub wide_char_spacer: bool,
 }
 
 impl From<AlacrittyFlags> for CellFlags {
@@ -39,6 +61,8 @@ impl From<AlacrittyFlags> for CellFlags {
             dim: flags.contains(AlacrittyFlags::DIM),
             inverse: flags.contains(AlacrittyFlags::INVERSE),
             hidden: flags.contains(AlacrittyFlags::HIDDEN),
+            wide_char: flags.contains(AlacrittyFlags::WIDE_CHAR),
+            wide_char_spacer: flags.contains(AlacrittyFlags::WIDE_CHAR_SPACER),
         }
     }
 }

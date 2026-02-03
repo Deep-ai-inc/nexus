@@ -108,11 +108,16 @@ impl TerminalParser {
             let col = indexed_cell.point.column.0 as u16;
             let row = indexed_cell.point.line.0 as u16;
 
+            let zerowidth = indexed_cell.zerowidth()
+                .filter(|zw| !zw.is_empty())
+                .map(|zw| zw.to_vec().into_boxed_slice());
+
             let cell = Cell {
                 c: indexed_cell.c,
                 fg: Color::from(indexed_cell.fg),
                 bg: Color::from(indexed_cell.bg),
                 flags: CellFlags::from(indexed_cell.flags),
+                zerowidth,
             };
 
             grid.set(col, row, cell);
@@ -167,11 +172,15 @@ impl TerminalParser {
             let row = &grid[term_line];
             for col_idx in 0..cols {
                 let cell = &row[Column(col_idx)];
+                let zerowidth = cell.zerowidth()
+                    .filter(|zw| !zw.is_empty())
+                    .map(|zw| zw.to_vec().into_boxed_slice());
                 let our_cell = Cell {
                     c: cell.c,
                     fg: Color::from(cell.fg),
                     bg: Color::from(cell.bg),
                     flags: CellFlags::from(cell.flags),
+                    zerowidth,
                 };
                 result.set(col_idx as u16, line_idx as u16, our_cell);
             }

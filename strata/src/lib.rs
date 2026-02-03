@@ -69,6 +69,9 @@ pub mod platform;
 // GPU pipeline
 pub mod gpu;
 
+// Performance instrumentation
+pub mod frame_timing;
+
 // Re-export core types
 pub use primitives::{Color, Rect, Size, Constraints, Point};
 pub use content_address::{ContentAddress, SourceId, Selection, SourceOrdering};
@@ -86,7 +89,7 @@ pub use widgets::{TextWidget, TerminalWidget};
 pub use layout::{
     Column, Row, ScrollColumn, LayoutChild, Widget, Padding, Alignment, CrossAxisAlignment, Length, LineStyle, PrimitiveBatch,
 };
-pub use layout::containers::{TextElement, TerminalElement, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell};
+pub use layout::containers::{TextElement, TerminalElement, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell, VirtualTableElement, VirtualCell};
 pub use gpu::{ImageHandle, ImageStore};
 pub use text_input_state::{TextInputState, TextInputAction, TextInputMouseAction};
 pub use scroll_state::{ScrollState, ScrollAction};

@@ -287,6 +287,11 @@ pub struct StrataPipeline {
     /// Key is hash(text, font_size_bits), value is (atlas_generation, glyphs).
     /// When atlas generation mismatches, the entry is stale and must be rebuilt.
     shape_cache: LruCache<u64, (u32, Arc<Vec<CachedShapedGlyph>>)>,
+    /// Per-frame cache hit/miss counters (for timing diagnostics).
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+    /// Cumulative shaping time for cache misses this frame.
+    pub shaping_time: std::time::Duration,
 }
 
 impl StrataPipeline {
@@ -598,7 +603,10 @@ impl StrataPipeline {
             instances: Vec::new(),
             background: Color::BLACK,
             staging_belt,
-            shape_cache: LruCache::new(NonZeroUsize::new(2048).unwrap()),
+            shape_cache: LruCache::new(NonZeroUsize::new(16384).unwrap()),
+            cache_hits: 0,
+            cache_misses: 0,
+            shaping_time: std::time::Duration::ZERO,
         }
     }
 
@@ -627,6 +635,9 @@ impl StrataPipeline {
     /// Clear instances for new frame.
     pub fn clear(&mut self) {
         self.instances.clear();
+        self.cache_hits = 0;
+        self.cache_misses = 0;
+        self.shaping_time = std::time::Duration::ZERO;
     }
 
     /// Return the current instance count (used to mark a range start).
@@ -1100,6 +1111,7 @@ impl StrataPipeline {
             if *cached_gen == atlas_gen {
                 // Fast path: Rc::clone is a pointer bump, no Vec allocation.
                 // All UV/size/mode data is pre-baked, no HashMap lookups needed.
+                self.cache_hits += 1;
                 let glyphs = Arc::clone(cached);
                 for sg in glyphs.iter() {
                     self.instances.push(GpuInstance {
@@ -1119,13 +1131,17 @@ impl StrataPipeline {
             // Atlas generation mismatch — fall through to rebuild
         }
 
+        self.cache_misses += 1;
+
         // Cache miss (or stale) — shape via cosmic-text
+        let shape_start = std::time::Instant::now();
         let metrics = Metrics::new(font_size, font_size * 1.2);
         let mut buffer = Buffer::new(font_system, metrics);
         buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
         let attrs = Attrs::new().family(Family::Monospace);
         buffer.set_text(font_system, text, attrs, Shaping::Advanced);
         buffer.shape_until_scroll(font_system, false);
+        self.shaping_time += shape_start.elapsed();
 
         // Extract glyph data and emit instances
         let mut shaped_glyphs = Vec::new();

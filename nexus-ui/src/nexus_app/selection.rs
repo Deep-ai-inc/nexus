@@ -168,7 +168,11 @@ pub(crate) fn extract_block_text(
 
             let mut lines = Vec::new();
             for row in grid.rows_iter() {
-                let text: String = row.iter().map(|cell| cell.c).collect();
+                let mut text = String::with_capacity(row.len());
+                for cell in row {
+                    if cell.flags.wide_char_spacer { continue; }
+                    cell.push_grapheme(&mut text);
+                }
                 let trimmed = text.trim_end();
                 if !trimmed.is_empty() || !lines.is_empty() {
                     lines.push(trimmed.to_string());
@@ -434,11 +438,11 @@ fn extract_grid_range(rows: &[Vec<nexus_term::Cell>], cols: usize, start: usize,
         let col_start = if row_idx == start_row { start_col } else { 0 };
         let col_end = if row_idx == end_row { end_col } else { row.len() };
 
-        let line: String = row.iter()
-            .skip(col_start)
-            .take(col_end.saturating_sub(col_start))
-            .map(|cell| cell.c)
-            .collect();
+        let mut line = String::new();
+        for cell in row.iter().skip(col_start).take(col_end.saturating_sub(col_start)) {
+            if cell.flags.wide_char_spacer { continue; }
+            cell.push_grapheme(&mut line);
+        }
 
         result.push_str(line.trim_end());
         if row_idx < end_row {

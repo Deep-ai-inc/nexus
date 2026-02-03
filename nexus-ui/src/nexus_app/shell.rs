@@ -578,6 +578,12 @@ impl ShellWidget {
                         }
                     }
                 }
+                // Auto-enable frame timing for large tables (performance debugging)
+                if let Value::Table { ref rows, .. } = value {
+                    if rows.len() > 100 {
+                        strata::frame_timing::enable();
+                    }
+                }
                 if let Some(&idx) = self.block_index.get(&block_id) {
                     if let Some(block) = self.blocks.get_mut(idx) {
                         block.native_output = Some(value);

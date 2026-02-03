@@ -212,6 +212,13 @@ impl PrimitiveBatch {
         Some(clip)
     }
 
+    /// Get the current clip bounds for viewport culling.
+    /// Returns the effective clip rect if any clip is active.
+    #[inline]
+    pub fn current_clip_bounds(&self) -> Option<Rect> {
+        self.current_clip()
+    }
+
     // =========================================================================
     // Primitive add methods
     // =========================================================================

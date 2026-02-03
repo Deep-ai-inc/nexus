@@ -309,11 +309,27 @@ fn update<A: StrataApp>(
 
 /// Build the view.
 fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Message>> {
+    let timing_on = crate::frame_timing::is_enabled();
+
     // Build snapshot fresh each frame
     // (iced calls view() whenever it needs to render)
     let mut snapshot = LayoutSnapshot::new();
     snapshot.set_viewport(Rect::new(0.0, 0.0, state.window_size.0, state.window_size.1));
-    A::view(&state.app, &mut snapshot);
+
+    if timing_on {
+        let view_start = std::time::Instant::now();
+        A::view(&state.app, &mut snapshot);
+        let view_elapsed = view_start.elapsed();
+        // Use prepare's frame counter (peek without incrementing)
+        let frame = crate::frame_timing::current_frame();
+        if frame % 60 == 0 {
+            let prims = snapshot.primitives();
+            eprintln!("[frame {}] view: {:.2?} (text_runs={} solid_rects={})",
+                frame, view_elapsed, prims.text_runs.len(), prims.solid_rects.len());
+        }
+    } else {
+        A::view(&state.app, &mut snapshot);
+    }
 
     // Wrap in Arc to prevent deep copying when iced clones the primitive.
     // The shader only needs read access.
@@ -707,6 +723,11 @@ impl PipelineWrapper {
         pipeline.clear();
         pipeline.set_background(background);
 
+        // Frame timing
+        let timing_on = crate::frame_timing::is_enabled();
+        let frame = if timing_on { crate::frame_timing::next_frame() } else { u64::MAX };
+        let prepare_start = if timing_on { Some(std::time::Instant::now()) } else { None };
+
         // =====================================================================
         // RENDER ORDER (back to front via ubershader instance order):
         //   1. Background decorations
@@ -873,6 +894,8 @@ impl PipelineWrapper {
         }
 
         // 4. Grid content from sources (terminals use this path)
+        let grid_start_time = if timing_on { Some(std::time::Instant::now()) } else { None };
+        let mut grid_row_count: usize = 0;
         for (_source_id, source_layout) in snapshot.sources_in_order() {
             for item in &source_layout.items {
                 if let crate::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
@@ -881,6 +904,7 @@ impl PipelineWrapper {
                         if row.text.trim().is_empty() {
                             continue;
                         }
+                        grid_row_count += 1;
                         let start = pipeline.instance_count();
                         let x = grid_layout.bounds.x * scale;
                         let y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
@@ -891,9 +915,30 @@ impl PipelineWrapper {
                 }
             }
         }
+        if let Some(t) = grid_start_time {
+            crate::frame_timing::stat("prepare: grid rows", frame, grid_row_count);
+            if frame % 60 == 0 {
+                eprintln!("[frame {}] prepare: grid text: {:.2?}", frame, t.elapsed());
+            }
+        }
 
-        // 5. Primitive text runs
+        // 5. Primitive text runs (with viewport culling)
+        let text_runs_start = if timing_on { Some(std::time::Instant::now()) } else { None };
+        let viewport_bottom = bounds.height;
+        let mut culled_count: usize = 0;
         for prim in &primitives.text_runs {
+            // Cull text runs entirely outside the viewport (always check position)
+            if prim.position.y > viewport_bottom || prim.position.y + prim.font_size * 1.5 < 0.0 {
+                culled_count += 1;
+                continue;
+            }
+            // Also cull if clip rect is entirely offscreen
+            if let Some(clip) = &prim.clip_rect {
+                if clip.y > viewport_bottom || (clip.y + clip.height) < 0.0 {
+                    culled_count += 1;
+                    continue;
+                }
+            }
             let start = pipeline.instance_count();
             pipeline.add_text(
                 &prim.text,
@@ -904,6 +949,12 @@ impl PipelineWrapper {
                 &mut font_system,
             );
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
+        }
+        if let Some(t) = text_runs_start {
+            if frame % 60 == 0 {
+                eprintln!("[frame {}] prepare: text runs: {} (culled {})", frame, primitives.text_runs.len() - culled_count, culled_count);
+                eprintln!("[frame {}] prepare: prim text: {:.2?}", frame, t.elapsed());
+            }
         }
 
         // Render foreground decorations (on top of text).
@@ -967,6 +1018,7 @@ impl PipelineWrapper {
         });
 
         // Prepare for GPU (upload buffers via staging belt)
+        let gpu_upload_start = if timing_on { Some(std::time::Instant::now()) } else { None };
         pipeline.prepare(
             device,
             queue,
@@ -974,6 +1026,20 @@ impl PipelineWrapper {
             bounds.width * scale,
             bounds.height * scale,
         );
+        if let Some(t) = gpu_upload_start {
+            crate::frame_timing::stat("prepare: instances", frame, pipeline.instance_count());
+            if frame % 60 == 0 {
+                eprintln!("[frame {}] prepare: gpu upload: {:.2?}", frame, t.elapsed());
+            }
+        }
+        if timing_on && frame % 60 == 0 {
+            eprintln!("[frame {}] prepare: shape cache: {} hits, {} misses, shaping: {:.2?}", frame, pipeline.cache_hits, pipeline.cache_misses, pipeline.shaping_time);
+        }
+        if let Some(t) = prepare_start {
+            if frame % 60 == 0 {
+                eprintln!("[frame {}] prepare: TOTAL: {:.2?}", frame, t.elapsed());
+            }
+        }
 
         // Submit staging commands. The staging belt's copy commands need to
         // execute before the render commands that use the buffers.

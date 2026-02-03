@@ -129,7 +129,8 @@ fn extract_text_from_grid(grid: &Rc<TerminalGrid>) -> String {
         let mut line = String::new();
         for col in 0..grid.cols() {
             if let Some(cell) = grid.get(col, row) {
-                line.push(cell.c);
+                if cell.flags.wide_char_spacer { continue; }
+                cell.push_grapheme(&mut line);
             }
         }
         // Trim trailing whitespace from each line

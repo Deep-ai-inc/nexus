@@ -79,12 +79,13 @@ impl TerminalGrid {
     pub fn set(&mut self, col: u16, row: u16, cell: Cell) {
         if col < self.cols && row < self.rows {
             let idx = row as usize * self.cols as usize + col as usize;
+            let is_content = cell.c != '\0' && cell.c != ' ';
             self.cells[idx] = cell;
 
             // Incremental cache maintenance:
             // If we wrote visible content at or below cached bottom, bump cache upward.
             // If we might be clearing the last content row, drop cache to force rescan.
-            if cell.c != '\0' && cell.c != ' ' {
+            if is_content {
                 if let Some(cached) = self.content_rows_cache.get() {
                     let needed = row + 1;
                     if needed > cached {
@@ -203,9 +204,8 @@ impl TerminalGrid {
         for row in 0..copy_rows {
             let old_start = row * old_cols;
             let new_start = row * new_cols_usize;
-            // Copy entire row slice at once (Cell is Copy)
             new_cells[new_start..new_start + copy_cols]
-                .copy_from_slice(&self.cells[old_start..old_start + copy_cols]);
+                .clone_from_slice(&self.cells[old_start..old_start + copy_cols]);
         }
 
         self.cells = new_cells;
@@ -232,7 +232,19 @@ impl TerminalGrid {
         let mut result = String::new();
         for row in self.rows_iter() {
             for cell in row {
-                result.push(if cell.c == '\0' { ' ' } else { cell.c });
+                if cell.flags.wide_char_spacer {
+                    continue; // Skip right half of wide chars
+                }
+                if cell.c == '\0' {
+                    result.push(' ');
+                } else {
+                    result.push(cell.c);
+                    if let Some(ref zw) = cell.zerowidth {
+                        for &ch in zw.iter() {
+                            result.push(ch);
+                        }
+                    }
+                }
             }
             result.push('\n');
         }
