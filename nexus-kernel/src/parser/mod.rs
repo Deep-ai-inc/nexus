@@ -162,6 +162,10 @@ fn build_simple_command(node: &Node, source: &str) -> Result<SimpleCommand, Shel
             "command_substitution" => {
                 args.push(Word::CommandSubstitution(node_text(&child, source)));
             }
+            "arithmetic_expansion" => {
+                // $((expr)) — store as literal; expand_literal handles $((…))
+                args.push(Word::Literal(node_text(&child, source)));
+            }
             "file_redirect" | "heredoc_redirect" => {
                 if let Some(redir) = build_redirect(&child, source)? {
                     redirects.push(redir);
@@ -323,6 +327,10 @@ fn build_assignment(node: &Node, source: &str) -> Result<Assignment, ShellError>
             }
             "command_substitution" => {
                 value_word = Word::CommandSubstitution(node_text(&child, source));
+            }
+            "arithmetic_expansion" => {
+                // $((expr)) — store as literal; expand_literal handles $((…))
+                value_word = Word::Literal(node_text(&child, source));
             }
             "simple_expansion" | "expansion" => {
                 value_word = Word::Variable(extract_variable_name(&child, source));

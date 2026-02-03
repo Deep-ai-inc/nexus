@@ -276,6 +276,9 @@ mod tests {
     use super::*;
     use crate::commands::test_utils::test_helpers::TestContext;
 
+    /// umask is process-wide, so tests that read/write it must not run in parallel.
+    static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_tty_command_name() {
         let cmd = TtyCommand;
@@ -393,6 +396,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_umask_get() {
+        let _lock = UMASK_LOCK.lock().unwrap();
         let cmd = UmaskCommand;
         let mut test_ctx = TestContext::new_default();
 
@@ -410,6 +414,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_umask_symbolic() {
+        let _lock = UMASK_LOCK.lock().unwrap();
         let cmd = UmaskCommand;
         let mut test_ctx = TestContext::new_default();
 
@@ -431,6 +436,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_umask_set_and_restore() {
+        let _lock = UMASK_LOCK.lock().unwrap();
         use nix::sys::stat::{umask, Mode};
 
         // Save original umask

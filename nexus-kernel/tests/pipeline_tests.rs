@@ -1633,14 +1633,14 @@ fn test_for_brace_expansion() {
 
 #[test]
 fn test_for_glob_expansion() {
-    // for with glob expansion
+    // for with glob expansion — use a path that exists from the workspace root
     let mut t = PipelineTest::new();
-    // Count .rs files in src/commands (should have at least 1)
-    let value = t.run("count=0; for f in src/commands/*.rs; do count=$((count+1)); done; echo $count");
+    // Count .toml files in the workspace root (Cargo.toml + rustfmt.toml etc.)
+    let value = t.run("count=0; for f in *.toml; do count=$((count+1)); done; echo $count");
     match value {
         Some(Value::String(s)) => {
             let n: i32 = s.parse().unwrap_or(0);
-            assert!(n > 0, "Expected at least 1 .rs file, got {}", n);
+            assert!(n > 0, "Expected at least 1 .toml file, got {}", n);
         }
         other => panic!("Expected string number, got {:?}", other),
     }
