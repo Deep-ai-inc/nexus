@@ -101,10 +101,10 @@ impl NexusCommand for WcCommand {
             }
 
             if results.len() == 1 {
-                let (_, counts) = &results[0];
-                return Ok(format_counts(counts, &opts));
+                let (name, counts) = &results[0];
+                return Ok(format_counts_record(counts, &opts, Some(name)));
             } else {
-                // Multiple files: return table
+                // Multiple files: return table with totals row
                 let mut columns: Vec<&str> = Vec::new();
                 if opts.lines {
                     columns.push("lines");
@@ -120,9 +120,14 @@ impl NexusCommand for WcCommand {
                 }
                 columns.push("file");
 
-                let rows: Vec<Vec<Value>> = results
+                let mut total = (0usize, 0usize, 0usize, 0usize);
+                let mut rows: Vec<Vec<Value>> = results
                     .iter()
                     .map(|(name, counts)| {
+                        total.0 += counts.0;
+                        total.1 += counts.1;
+                        total.2 += counts.2;
+                        total.3 += counts.3;
                         let mut row = Vec::new();
                         if opts.lines {
                             row.push(Value::Int(counts.0 as i64));
@@ -140,6 +145,23 @@ impl NexusCommand for WcCommand {
                         row
                     })
                     .collect();
+
+                // Add totals row
+                let mut totals_row = Vec::new();
+                if opts.lines {
+                    totals_row.push(Value::Int(total.0 as i64));
+                }
+                if opts.words {
+                    totals_row.push(Value::Int(total.1 as i64));
+                }
+                if opts.chars {
+                    totals_row.push(Value::Int(total.2 as i64));
+                }
+                if opts.bytes {
+                    totals_row.push(Value::Int(total.3 as i64));
+                }
+                totals_row.push(Value::String("total".to_string()));
+                rows.push(totals_row);
 
                 return Ok(Value::table(columns, rows));
             }
@@ -228,25 +250,37 @@ fn count_string(s: &str, opts: &WcOptions) -> (usize, usize, usize, usize) {
 }
 
 fn format_counts(counts: &(usize, usize, usize, usize), opts: &WcOptions) -> Value {
-    let mut parts = Vec::new();
+    format_counts_record(counts, opts, None)
+}
+
+fn format_counts_record(
+    counts: &(usize, usize, usize, usize),
+    opts: &WcOptions,
+    filename: Option<&str>,
+) -> Value {
+    let mut fields = Vec::new();
     if opts.lines {
-        parts.push(counts.0);
+        fields.push(("lines".to_string(), Value::Int(counts.0 as i64)));
     }
     if opts.words {
-        parts.push(counts.1);
+        fields.push(("words".to_string(), Value::Int(counts.1 as i64)));
     }
     if opts.chars {
-        parts.push(counts.2);
+        fields.push(("chars".to_string(), Value::Int(counts.2 as i64)));
     }
     if opts.bytes {
-        parts.push(counts.3);
+        fields.push(("bytes".to_string(), Value::Int(counts.3 as i64)));
+    }
+    if let Some(name) = filename {
+        fields.push(("file".to_string(), Value::String(name.to_string())));
     }
 
-    if parts.len() == 1 {
-        Value::Int(parts[0] as i64)
-    } else {
-        Value::List(parts.into_iter().map(|n| Value::Int(n as i64)).collect())
+    // Single metric with no filename: return bare int for pipeline ergonomics
+    if fields.len() == 1 {
+        return fields.into_iter().next().unwrap().1;
     }
+
+    Value::Record(fields)
 }
 
 #[cfg(test)]

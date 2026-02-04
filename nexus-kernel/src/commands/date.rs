@@ -62,15 +62,29 @@ impl NexusCommand for DateCommand {
 
         let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
-        // Without chrono, we do basic formatting
-        let formatted = if let Some(fmt) = format {
-            format_date(secs, fmt, utc)
-        } else {
-            // Default format: "Sun Jan 24 12:34:56 UTC 2026"
-            format_date_default(secs, utc)
-        };
+        // If a format string was given, return plain formatted string
+        if let Some(fmt) = format {
+            return Ok(Value::String(format_date(secs, fmt, utc)));
+        }
 
-        Ok(Value::String(formatted))
+        // Default: return structured Record
+        let (year, month, day, hour, min, sec, weekday) = timestamp_to_components(secs);
+        let tz = if utc { "UTC" } else { "Local" };
+        let weekday_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        let formatted = format_date_default(secs, utc);
+
+        Ok(Value::Record(vec![
+            ("formatted".to_string(), Value::String(formatted)),
+            ("timestamp".to_string(), Value::Int(secs as i64)),
+            ("year".to_string(), Value::Int(year as i64)),
+            ("month".to_string(), Value::Int(month as i64)),
+            ("day".to_string(), Value::Int(day as i64)),
+            ("hour".to_string(), Value::Int(hour as i64)),
+            ("minute".to_string(), Value::Int(min as i64)),
+            ("second".to_string(), Value::Int(sec as i64)),
+            ("weekday".to_string(), Value::String(weekday_names[weekday as usize].to_string())),
+            ("timezone".to_string(), Value::String(tz.to_string())),
+        ]))
     }
 }
 

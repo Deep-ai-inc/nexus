@@ -135,6 +135,29 @@ fn execute_simple(
         })
         .collect();
 
+    // Check for builtins that return structured output (listing modes)
+    if let Some(value) = builtins::try_builtin_value(&name, &args, state) {
+        let bid = get_or_create_block_id(block_id);
+        if block_id.is_none() {
+            let _ = events.send(ShellEvent::CommandStarted {
+                block_id: bid,
+                command: format!("{} {}", name, args.join(" ")),
+                cwd: state.cwd.clone(),
+            });
+        }
+        state.store_output(bid, name.clone(), value.clone());
+        let _ = events.send(ShellEvent::CommandOutput {
+            block_id: bid,
+            value,
+        });
+        let _ = events.send(ShellEvent::CommandFinished {
+            block_id: bid,
+            exit_code: 0,
+            duration_ms: 0,
+        });
+        return Ok(0);
+    }
+
     // Check for builtins (shell-specific: cd, export, etc.)
     if let Some(exit_code) = builtins::try_builtin(&name, &args, state, events, commands)? {
         // Emit CommandFinished for builtins when we have a block_id

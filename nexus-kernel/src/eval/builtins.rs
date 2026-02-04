@@ -7,7 +7,7 @@
 //! - Replace shell process (exec)
 //! - Register signal handlers (trap)
 
-use nexus_api::ShellEvent;
+use nexus_api::{ShellEvent, TableColumn, Value};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use tokio::sync::broadcast::Sender;
@@ -83,6 +83,85 @@ pub fn try_builtin(
         // Variable scoping
         "local" => Ok(Some(builtin_local(args, state)?)),
         _ => Ok(None),
+    }
+}
+
+/// Try to execute a builtin that returns structured output.
+/// This handles listing modes (no-arg invocations) that should return
+/// a Value instead of printing to stdout.
+pub fn try_builtin_value(
+    name: &str,
+    args: &[String],
+    state: &ShellState,
+) -> Option<Value> {
+    match name {
+        "export" if args.is_empty() => {
+            let rows: Vec<Vec<Value>> = state
+                .env
+                .iter()
+                .map(|(k, v)| {
+                    vec![
+                        Value::String(k.clone()),
+                        Value::String(v.clone()),
+                    ]
+                })
+                .collect();
+            Some(Value::Table {
+                columns: vec![
+                    TableColumn::new("name"),
+                    TableColumn::new("value"),
+                ],
+                rows,
+            })
+        }
+        "set" if args.is_empty() => {
+            let mut rows: Vec<Vec<Value>> = state
+                .vars
+                .iter()
+                .map(|(k, v)| {
+                    vec![
+                        Value::String(k.clone()),
+                        Value::String(v.clone()),
+                        Value::String("var".to_string()),
+                    ]
+                })
+                .collect();
+            rows.extend(state.env.iter().map(|(k, v)| {
+                vec![
+                    Value::String(k.clone()),
+                    Value::String(v.clone()),
+                    Value::String("env".to_string()),
+                ]
+            }));
+            Some(Value::Table {
+                columns: vec![
+                    TableColumn::new("name"),
+                    TableColumn::new("value"),
+                    TableColumn::new("scope"),
+                ],
+                rows,
+            })
+        }
+        "alias" if args.is_empty() => {
+            let rows: Vec<Vec<Value>> = state
+                .aliases
+                .iter()
+                .map(|(k, v)| {
+                    vec![
+                        Value::String(k.clone()),
+                        Value::String(v.clone()),
+                    ]
+                })
+                .collect();
+            Some(Value::Table {
+                columns: vec![
+                    TableColumn::new("name"),
+                    TableColumn::new("command"),
+                ],
+                rows,
+            })
+        }
+        _ => None,
     }
 }
 

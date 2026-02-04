@@ -386,6 +386,8 @@ pub enum DisplayFormat {
     Duration,
     /// Format with octal representation (for permissions)
     Octal,
+    /// Format as percentage with a visual bar (e.g., "▓▓▓▓▓▓░░░░ 60%")
+    BarPercentage,
 }
 
 // =============================================================================
@@ -1238,6 +1240,23 @@ pub fn format_value_for_display(value: &Value, format: DisplayFormat) -> String 
                 Value::Int(n) => format!("{:o}", n),
                 _ => value.to_text(),
             }
+        }
+        DisplayFormat::BarPercentage => {
+            let pct = match value {
+                Value::Int(n) => *n as f64,
+                Value::Float(f) => *f,
+                _ => return value.to_text(),
+            };
+            let bar_width = 10;
+            let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+            let filled = filled.min(bar_width);
+            let empty = bar_width - filled;
+            format!(
+                "{}{} {:>3}%",
+                "▓".repeat(filled),
+                "░".repeat(empty),
+                pct as i64,
+            )
         }
     }
 }

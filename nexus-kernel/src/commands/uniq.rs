@@ -1,7 +1,7 @@
 //! The `uniq` command - report or omit repeated lines.
 
 use super::{CommandContext, NexusCommand};
-use nexus_api::Value;
+use nexus_api::{TableColumn, Value};
 
 pub struct UniqCommand;
 
@@ -89,8 +89,8 @@ fn uniq_value(value: Value, opts: &UniqOptions) -> Value {
                     }
                 }
 
-                // Filter and return with counts - preserve original types
-                let results: Vec<Value> = counts
+                // Filter and return as a proper Table
+                let rows: Vec<Vec<Value>> = counts
                     .into_iter()
                     .filter(|(_, count, _)| {
                         if opts.repeated {
@@ -102,15 +102,17 @@ fn uniq_value(value: Value, opts: &UniqOptions) -> Value {
                         }
                     })
                     .map(|(_, count, item)| {
-                        // Return a record with count and original typed value
-                        Value::Record(vec![
-                            ("count".to_string(), Value::Int(count as i64)),
-                            ("value".to_string(), item),
-                        ])
+                        vec![Value::Int(count as i64), item]
                     })
                     .collect();
 
-                Value::List(results)
+                Value::Table {
+                    columns: vec![
+                        TableColumn::new("count"),
+                        TableColumn::new("value"),
+                    ],
+                    rows,
+                }
             } else {
                 // Just dedupe adjacent
                 let mut result: Vec<Value> = Vec::new();
@@ -211,17 +213,18 @@ mod tests {
             ignore_case: false,
         };
         let result = uniq_value(list, &opts);
-        if let Value::List(items) = result {
-            assert_eq!(items.len(), 2);
-            // Now returns Record with count and value
-            if let Value::Record(fields) = &items[0] {
-                let count = fields.iter().find(|(k, _)| k == "count").map(|(_, v)| v);
-                assert_eq!(count, Some(&Value::Int(2)));
-                let value = fields.iter().find(|(k, _)| k == "value").map(|(_, v)| v);
-                assert_eq!(value, Some(&Value::String("a".to_string())));
-            } else {
-                panic!("Expected Record");
-            }
+        // Now returns Table with count and value columns
+        if let Value::Table { columns, rows } = result {
+            assert_eq!(columns.len(), 2);
+            assert_eq!(columns[0].name, "count");
+            assert_eq!(columns[1].name, "value");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::Int(2));
+            assert_eq!(rows[0][1], Value::String("a".to_string()));
+            assert_eq!(rows[1][0], Value::Int(1));
+            assert_eq!(rows[1][1], Value::String("b".to_string()));
+        } else {
+            panic!("Expected Table");
         }
     }
 }

@@ -177,9 +177,9 @@ fn nl_value(value: Value, opts: &NlOptions) -> Value {
     }
 }
 
-/// Number typed items while preserving their original types
+/// Number typed items while preserving their original types, returning a Table.
 fn number_typed_items(items: Vec<Value>, opts: &NlOptions) -> Value {
-    let mut result = Vec::new();
+    let mut rows = Vec::new();
     let mut line_num = opts.starting_line;
 
     for item in items {
@@ -190,27 +190,28 @@ fn number_typed_items(items: Vec<Value>, opts: &NlOptions) -> Value {
             NumberingStyle::None => false,
         };
 
-        if should_number {
-            // Return a record with line number and original typed value
-            result.push(Value::Record(vec![
-                ("line".to_string(), Value::Int(line_num)),
-                ("value".to_string(), item),
-            ]));
+        let num_value = if should_number {
+            let v = Value::Int(line_num);
             line_num += opts.increment;
+            v
         } else {
-            // No line number, but still include the item
-            result.push(Value::Record(vec![
-                ("line".to_string(), Value::Unit),
-                ("value".to_string(), item),
-            ]));
-        }
+            Value::Unit
+        };
+
+        rows.push(vec![num_value, item]);
     }
 
-    Value::List(result)
+    Value::Table {
+        columns: vec![
+            nexus_api::TableColumn::new("#"),
+            nexus_api::TableColumn::new("value"),
+        ],
+        rows,
+    }
 }
 
 fn number_lines(lines: &[String], opts: &NlOptions) -> Value {
-    let mut result = Vec::new();
+    let mut rows = Vec::new();
     let mut line_num = opts.starting_line;
 
     for line in lines {
@@ -220,19 +221,24 @@ fn number_lines(lines: &[String], opts: &NlOptions) -> Value {
             NumberingStyle::None => false,
         };
 
-        let numbered_line = if should_number {
-            let num_str = format!("{:>width$}", line_num, width = opts.width);
-            let formatted = format!("{}{}{}", num_str, opts.separator, line);
+        let num_value = if should_number {
+            let v = Value::Int(line_num);
             line_num += opts.increment;
-            formatted
+            v
         } else {
-            format!("{:>width$}{}{}", "", opts.separator, line, width = opts.width)
+            Value::Unit
         };
 
-        result.push(Value::String(numbered_line));
+        rows.push(vec![num_value, Value::String(line.clone())]);
     }
 
-    Value::List(result)
+    Value::Table {
+        columns: vec![
+            nexus_api::TableColumn::new("#"),
+            nexus_api::TableColumn::new("line"),
+        ],
+        rows,
+    }
 }
 
 #[cfg(test)]
@@ -252,10 +258,13 @@ mod tests {
         let lines = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let result = number_lines(&lines, &opts);
 
-        if let Value::List(items) = result {
-            assert_eq!(items.len(), 3);
-            assert!(items[0].to_text().contains("1"));
-            assert!(items[0].to_text().contains("a"));
+        if let Value::Table { columns, rows } = result {
+            assert_eq!(columns.len(), 2);
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0][0], Value::Int(1));
+            assert_eq!(rows[0][1], Value::String("a".to_string()));
+        } else {
+            panic!("Expected Table");
         }
     }
 
@@ -272,10 +281,14 @@ mod tests {
         let lines = vec!["a".to_string(), "".to_string(), "c".to_string()];
         let result = number_lines(&lines, &opts);
 
-        if let Value::List(items) = result {
-            assert_eq!(items.len(), 3);
+        if let Value::Table { rows, .. } = result {
+            assert_eq!(rows.len(), 3);
+            // Empty line should have Unit for number
+            assert_eq!(rows[1][0], Value::Unit);
             // Third line should be numbered 2, not 3
-            assert!(items[2].to_text().contains("2"));
+            assert_eq!(rows[2][0], Value::Int(2));
+        } else {
+            panic!("Expected Table");
         }
     }
 }

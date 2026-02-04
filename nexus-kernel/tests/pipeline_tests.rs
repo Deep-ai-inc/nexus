@@ -101,6 +101,15 @@ impl PipelineTest {
         }
     }
 
+    /// Execute and expect a table, returning columns and rows.
+    fn expect_table(&mut self, cmd: &str) -> (Vec<nexus_api::TableColumn>, Vec<Vec<Value>>) {
+        let value = self.run(cmd);
+        match value {
+            Some(Value::Table { columns, rows }) => (columns, rows),
+            other => panic!("Expected Table, got {:?} for command: {}", other, cmd),
+        }
+    }
+
     /// Execute and expect a float result.
     fn expect_float(&mut self, cmd: &str, expected: f64) {
         let value = self.run(cmd);
@@ -216,10 +225,15 @@ fn test_shuf_sort_consistency() {
 #[test]
 fn test_uniq_count() {
     let mut t = PipelineTest::new();
-    // Echo repeated values, uniq -c should count them
-    // Using seq and some manipulation
-    let items = t.expect_list("echo 'a\na\nb\nb\nb\nc' | lines | uniq -c");
-    assert!(items.len() >= 1); // Should have unique entries with counts
+    // Echo repeated values, uniq -c should return a table with count/value columns
+    let (columns, rows) = t.expect_table("echo 'a\na\nb\nb\nb\nc' | lines | uniq -c");
+    assert_eq!(columns.len(), 2);
+    assert_eq!(columns[0].name, "count");
+    assert_eq!(columns[1].name, "value");
+    assert_eq!(rows.len(), 3); // a, b, c
+    assert_eq!(rows[0][0], Value::Int(2)); // a appears 2 times
+    assert_eq!(rows[1][0], Value::Int(3)); // b appears 3 times
+    assert_eq!(rows[2][0], Value::Int(1)); // c appears 1 time
 }
 
 // ============================================================================
@@ -515,11 +529,11 @@ fn test_cut_characters() {
 #[test]
 fn test_nl_basic() {
     let mut t = PipelineTest::new();
-    let items = t.expect_list("echo 'a\nb\nc' | lines | nl");
-    assert_eq!(items.len(), 3);
-    // First line should contain "1" and "a"
-    let first = items[0].to_string();
-    assert!(first.contains('1') && first.contains('a'), "Expected numbered line, got {}", first);
+    let (columns, rows) = t.expect_table("echo 'a\nb\nc' | lines | nl");
+    assert_eq!(columns.len(), 2);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0], Value::Int(1));
+    assert_eq!(rows[0][1], Value::String("a".to_string()));
 }
 
 // ============================================================================
@@ -648,12 +662,13 @@ fn test_frequency_analysis() {
     // Pattern: sort | uniq -c | sort -rn (frequency analysis)
     let mut t = PipelineTest::new();
     let data = "apple\nbanana\napple\napple\ncherry\nbanana";
-    let items = t.expect_list(&format!("echo '{}' | lines | sort | uniq -c | sort -rn", data));
+    let (columns, rows) = t.expect_table(&format!("echo '{}' | lines | sort | uniq -c | sort -rn", data));
     // Should have 3 unique items, sorted by frequency (apple:3, banana:2, cherry:1)
-    assert_eq!(items.len(), 3);
-    // First item should be apple (most frequent)
-    let first = items[0].to_string();
-    assert!(first.contains("apple"), "Expected apple first (most frequent), got {}", first);
+    assert_eq!(columns[0].name, "count");
+    assert_eq!(rows.len(), 3);
+    // First row should be apple (most frequent, count=3)
+    assert_eq!(rows[0][0], Value::Int(3));
+    assert_eq!(rows[0][1], Value::String("apple".to_string()));
 }
 
 #[test]
@@ -1035,17 +1050,17 @@ fn test_tac_combined_with_head() {
 fn test_nl_numbers_lines() {
     // Pattern: nl (number lines)
     let mut t = PipelineTest::new();
-    let items = t.expect_list("echo 'first\nsecond\nthird' | lines | nl");
-    assert_eq!(items.len(), 3);
+    let (_columns, rows) = t.expect_table("echo 'first\nsecond\nthird' | lines | nl");
+    assert_eq!(rows.len(), 3);
 }
 
 #[test]
 fn test_nl_with_grep() {
     // Pattern: nl | grep (find line numbers of matches)
     let mut t = PipelineTest::new();
-    let items = t.expect_list("echo 'apple\nbanana\napricot' | lines | nl | grep apple");
+    let (_columns, rows) = t.expect_table("echo 'apple\nbanana\napricot' | lines | nl | grep apple");
     // Only line 1 contains "apple" (apricot doesn't contain "apple")
-    assert_eq!(items.len(), 1);
+    assert_eq!(rows.len(), 1);
 }
 
 // --- Flatten nested structures ---

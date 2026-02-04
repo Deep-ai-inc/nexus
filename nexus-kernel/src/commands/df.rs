@@ -56,7 +56,7 @@ impl NexusCommand for DfCommand {
                 TableColumn::with_format("size", DisplayFormat::HumanBytes),
                 TableColumn::with_format("used", DisplayFormat::HumanBytes),
                 TableColumn::with_format("avail", DisplayFormat::HumanBytes),
-                TableColumn::with_format("use%", DisplayFormat::Percentage),
+                TableColumn::with_format("use%", DisplayFormat::BarPercentage),
                 TableColumn::new("mounted"),
             ]
         } else {
@@ -65,7 +65,7 @@ impl NexusCommand for DfCommand {
                 TableColumn::new("1K-blocks"),
                 TableColumn::new("used"),
                 TableColumn::new("available"),
-                TableColumn::with_format("use%", DisplayFormat::Percentage),
+                TableColumn::with_format("use%", DisplayFormat::BarPercentage),
                 TableColumn::new("mounted"),
             ]
         };
