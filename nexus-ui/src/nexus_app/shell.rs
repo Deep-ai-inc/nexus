@@ -394,7 +394,17 @@ impl ShellWidget {
             ShellMsg::PtyExited(id, exit_code) => self.handle_pty_exited(id, exit_code),
             ShellMsg::KernelEvent(evt) => self.handle_kernel_event(evt, ctx.images),
             ShellMsg::SendInterrupt(id) => { self.pty.send_interrupt(id); ShellOutput::None }
-            ShellMsg::KillBlock(id) => { self.pty.kill(id); ShellOutput::None }
+            ShellMsg::KillBlock(id) => {
+                self.pty.kill(id);
+                // Also cancel kernel-native commands (e.g. top) which have
+                // no PTY handle — they use a cancel flag instead.
+                nexus_kernel::commands::cancel_block(id);
+                if let Some(block) = self.block_by_id_mut(id).filter(|b| b.view_state.is_some()) {
+                    block.view_state = None;
+                    block.version += 1;
+                }
+                ShellOutput::None
+            }
             ShellMsg::PtyInput(block_id, event) => {
                 let block = self.block_by_id(block_id);
                 if self.pty.forward_key(block, block_id, &event) {

@@ -57,6 +57,27 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
 
     // Phase 2: Focused block — viewer → PTY → static block navigation.
     if let Focus::Block(id) = state.focus {
+        // Ctrl+C always interrupts/exits, even when a viewer is active.
+        // (Viewer handle_key only sees Key, not modifiers, so it would
+        // misinterpret Ctrl+C as bare "c" — e.g. "sort by CPU" in top.)
+        if modifiers.ctrl {
+            if let Key::Character(c) = key {
+                if c == "c" {
+                    if state.block_has_active_pty(id) {
+                        return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
+                    }
+                    // No PTY — exit the viewer (calls cancel_block for native commands)
+                    if let Some(block) = state.shell.block_by_id(id) {
+                        if block.view_state.is_some() {
+                            return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
+                        }
+                    }
+                    // Static block, no PTY, no viewer — return to input
+                    return Some(NexusMessage::BlurAll);
+                }
+            }
+        }
+
         // If a viewer is active on this block, let the viewer handle keys.
         if let Some(block) = state.shell.block_by_id(id) {
             if let Some(ref view_state) = block.view_state {
