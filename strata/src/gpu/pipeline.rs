@@ -260,6 +260,20 @@ struct CachedShapedGlyph {
     mode: u32,
 }
 
+/// Cached GPU instances for a single terminal grid row.
+///
+/// Instances are stored with `pos.y` relative to row baseline (0.0).
+/// The gather phase adds the absolute Y offset for the current frame.
+struct CachedRow {
+    /// GPU instances for this row, with pos.y relative (0.0 = row top).
+    instances: Vec<GpuInstance>,
+    /// Content signature (hash of all runs' text, colors, styles).
+    signature: u64,
+    /// Atlas generation when this row was cached.
+    /// If atlas is repacked, UVs change and the row must be rebuilt.
+    atlas_gen: u32,
+}
+
 /// GPU pipeline for Strata rendering.
 ///
 /// Uses a unified ubershader that renders all 2D primitives in one draw call.
@@ -303,6 +317,12 @@ pub struct StrataPipeline {
     char_glyph_cache: CharGlyphCache,
     /// Cached baseline offset for grid text (single font size in practice).
     grid_line_y: Option<(u32, f32)>,
+    /// Per-row instance cache for terminal grid content.
+    /// Persists across frames; only rows with changed content are rebuilt.
+    grid_row_cache: Vec<Option<CachedRow>>,
+    /// Identity of the grid being cached (hash of cols + rows + x-origin).
+    /// If grid identity changes, the entire row cache is invalidated.
+    grid_cache_id: u64,
 }
 
 /// Fast per-character glyph lookup for terminal grid text.
@@ -692,6 +712,8 @@ impl StrataPipeline {
             reusable_buffer: None,
             char_glyph_cache: CharGlyphCache::new(),
             grid_line_y: None,
+            grid_row_cache: Vec::new(),
+            grid_cache_id: 0,
         }
     }
 
@@ -736,6 +758,118 @@ impl StrataPipeline {
     pub fn apply_clip_since(&mut self, start: usize, clip: [f32; 4]) {
         for inst in &mut self.instances[start..] {
             inst.clip_rect = clip;
+        }
+    }
+
+    // =========================================================================
+    // Grid row cache (row-dirty tracking)
+    // =========================================================================
+
+    /// Ensure the grid row cache matches the current grid dimensions.
+    ///
+    /// If the grid identity changes (different cols, rows, or x-origin),
+    /// the entire cache is invalidated and resized.
+    pub fn ensure_grid_cache(&mut self, cols: u16, num_rows: usize, bounds_x: f32) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&cols, &mut hasher);
+        std::hash::Hash::hash(&num_rows, &mut hasher);
+        std::hash::Hash::hash(&bounds_x.to_bits(), &mut hasher);
+        let id = std::hash::Hasher::finish(&hasher);
+
+        if id != self.grid_cache_id || self.grid_row_cache.len() != num_rows {
+            self.grid_cache_id = id;
+            self.grid_row_cache.clear();
+            self.grid_row_cache.resize_with(num_rows, || None);
+        }
+    }
+
+    /// Check if a grid row is cached with matching content.
+    ///
+    /// Returns `None` on cache hit (row will be gathered later — skip building).
+    /// Returns `Some(start_index)` on cache miss — the caller should build the
+    /// row's instances into `self.instances`, then call `end_grid_row()`.
+    ///
+    /// On miss, the old `CachedRow`'s Vec is recycled (cleared, not dropped).
+    pub fn begin_grid_row(&mut self, row_index: usize, signature: u64) -> Option<usize> {
+        let atlas_gen = self.glyph_atlas.generation();
+
+        if let Some(cached) = &self.grid_row_cache[row_index] {
+            if cached.signature == signature && cached.atlas_gen == atlas_gen {
+                return None; // Cache hit
+            }
+        }
+
+        // Cache miss — recycle the Vec if it exists
+        if let Some(cached) = &mut self.grid_row_cache[row_index] {
+            cached.instances.clear();
+        }
+
+        Some(self.instances.len())
+    }
+
+    /// Finalize a grid row after building its instances.
+    ///
+    /// Drains `instances[start..]` into the row cache with Y coordinates
+    /// made relative (subtract `row_y_used`). The recycled Vec from
+    /// `begin_grid_row` is reused to avoid allocation.
+    pub fn end_grid_row(&mut self, row_index: usize, signature: u64, start: usize, row_y_used: f32) {
+        let atlas_gen = self.glyph_atlas.generation();
+        let new_instances: Vec<GpuInstance> = self.instances.drain(start..).collect();
+
+        if let Some(cached) = &mut self.grid_row_cache[row_index] {
+            // Recycle: Vec was cleared in begin_grid_row
+            cached.instances.extend(new_instances.iter().map(|inst| {
+                let mut relative = *inst;
+                relative.pos[1] -= row_y_used;
+                relative
+            }));
+            cached.signature = signature;
+            cached.atlas_gen = atlas_gen;
+        } else {
+            // First time caching this row
+            let instances: Vec<GpuInstance> = new_instances.iter().map(|inst| {
+                let mut relative = *inst;
+                relative.pos[1] -= row_y_used;
+                relative
+            }).collect();
+            self.grid_row_cache[row_index] = Some(CachedRow {
+                instances,
+                signature,
+                atlas_gen,
+            });
+        }
+    }
+
+    /// Gather all cached grid rows into the instance buffer.
+    ///
+    /// For each row, copies cached instances and applies the absolute Y offset
+    /// (`base_y + row_idx * cell_h`) and optional clip rect.
+    /// This is a tight memcpy + float-add loop — auto-vectorizable.
+    pub fn gather_grid_rows(&mut self, base_y: f32, cell_h: f32, num_rows: usize, clip: Option<[f32; 4]>) {
+        for row_idx in 0..num_rows.min(self.grid_row_cache.len()) {
+            if let Some(cached) = &self.grid_row_cache[row_idx] {
+                if cached.instances.is_empty() {
+                    continue;
+                }
+                let row_y = base_y + row_idx as f32 * cell_h;
+                let start = self.instances.len();
+                self.instances.extend_from_slice(&cached.instances);
+
+                // Apply absolute Y offset and clip rect
+                for inst in &mut self.instances[start..] {
+                    inst.pos[1] += row_y;
+                    if let Some(c) = clip {
+                        inst.clip_rect = c;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Invalidate the entire grid row cache (e.g. after atlas resize).
+    pub fn invalidate_grid_row_cache(&mut self) {
+        for row in &mut self.grid_row_cache {
+            *row = None;
         }
     }
 
@@ -1802,6 +1936,8 @@ impl StrataPipeline {
             self.glyph_atlas.ack_resize();
             // Drain dirty region — full atlas was already uploaded by recreate
             self.glyph_atlas.take_dirty_region();
+            // Atlas UVs changed — all cached row instances are stale
+            self.invalidate_grid_row_cache();
         } else if let Some(dirty) = self.glyph_atlas.take_dirty_region() {
             self.upload_atlas_region(queue, dirty);
         }

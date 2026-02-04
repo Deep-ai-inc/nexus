@@ -740,6 +740,41 @@ impl PipelineWrapper {
             }
         }
 
+        /// Compute a content signature for a grid row (for row-dirty tracking).
+        ///
+        /// Hashes all run data that affects rendering: text, colors, position,
+        /// width, and style flags. Hash collisions are harmless (just a missed
+        /// cache opportunity — row is rebuilt unnecessarily, never rendered wrong).
+        #[inline]
+        fn hash_grid_row(row: &crate::layout_snapshot::GridRow) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for run in &row.runs {
+                run.text.hash(&mut hasher);
+                run.fg.hash(&mut hasher);
+                run.bg.hash(&mut hasher);
+                run.col_offset.hash(&mut hasher);
+                run.cell_len.hash(&mut hasher);
+                // Pack style flags into a u16 for hashing
+                use crate::layout_snapshot::UnderlineStyle;
+                let ul_bits: u8 = match run.style.underline {
+                    UnderlineStyle::None => 0,
+                    UnderlineStyle::Single => 1,
+                    UnderlineStyle::Double => 2,
+                    UnderlineStyle::Curly => 3,
+                    UnderlineStyle::Dotted => 4,
+                    UnderlineStyle::Dashed => 5,
+                };
+                let style_bits: u16 = (run.style.bold as u16)
+                    | ((run.style.italic as u16) << 1)
+                    | ((run.style.strikethrough as u16) << 2)
+                    | ((run.style.dim as u16) << 3)
+                    | ((ul_bits as u16) << 4);
+                style_bits.hash(&mut hasher);
+            }
+            hasher.finish()
+        }
+
         // 1. Background decorations
         for decoration in snapshot.background_decorations() {
             render_decoration(pipeline, decoration, scale);
@@ -875,16 +910,39 @@ impl PipelineWrapper {
         }
 
         // 4. Grid content from sources (terminals use this path)
+        //
+        // Row-dirty tracking: only rebuild instances for rows whose content
+        // changed. Cached rows are stored with relative Y (0.0) and gathered
+        // with the correct absolute offset each frame. This makes scrolling
+        // free (just changes the Y offset, not the cached instances).
         for (_source_id, source_layout) in snapshot.sources_in_order() {
             for item in &source_layout.items {
                 if let crate::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
                     let grid_clip = &grid_layout.clip_rect;
                     let cell_w = grid_layout.cell_width * scale;
                     let cell_h = grid_layout.cell_height * scale;
+
+                    // Ensure row cache matches current grid dimensions
+                    pipeline.ensure_grid_cache(
+                        grid_layout.cols,
+                        grid_layout.rows_content.len(),
+                        grid_layout.bounds.x,
+                    );
+
                     for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
                         if row.runs.is_empty() {
                             continue;
                         }
+
+                        let signature = hash_grid_row(row);
+
+                        // Check cache — None = hit (skip), Some(start) = miss (build)
+                        let Some(build_start) = pipeline.begin_grid_row(row_idx, signature) else {
+                            continue;
+                        };
+
+                        // Cache miss: build instances with absolute row_y (as before).
+                        // end_grid_row will subtract row_y to store relative coordinates.
                         let row_y = (grid_layout.bounds.y + row_idx as f32 * grid_layout.cell_height) * scale;
                         let base_x = grid_layout.bounds.x * scale;
 
@@ -896,9 +954,7 @@ impl PipelineWrapper {
                             // Background color rect
                             if run.bg != 0 {
                                 let bg_color = crate::primitives::Color::unpack(run.bg);
-                                let bg_start = pipeline.instance_count();
                                 pipeline.add_solid_rect(run_x, row_y, run_w, cell_h, bg_color);
-                                maybe_clip(pipeline, bg_start, grid_clip, scale);
                             }
 
                             // Foreground color (used for text and decorations)
@@ -909,15 +965,10 @@ impl PipelineWrapper {
 
                             // Text shaping (skip for whitespace-only runs)
                             if !is_whitespace {
-                                let start = pipeline.instance_count();
                                 // Check if run contains custom-drawn characters (box drawing / block elements)
                                 let has_custom = run.text.chars().any(crate::gpu::is_custom_drawn);
                                 if has_custom {
                                     // Mixed or pure custom run: iterate per-cell.
-                                    // Each cell contributes a primary char (width 1 or 2)
-                                    // plus optional zero-width chars (combining marks,
-                                    // variation selectors). We use unicode-width to
-                                    // distinguish primary vs zero-width chars.
                                     use unicode_width::UnicodeWidthChar;
                                     let mut col = 0usize;
                                     let mut text_buf = String::new();
@@ -925,40 +976,33 @@ impl PipelineWrapper {
                                     for ch in run.text.chars() {
                                         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
                                         if ch_width == 0 {
-                                            // Zero-width char (combining mark, VS, ZWJ) —
-                                            // append to current text buf, don't advance col
                                             text_buf.push(ch);
                                             continue;
                                         }
-                                        // Primary character — check if custom-drawn
                                         if crate::gpu::is_custom_drawn(ch) {
-                                            // Flush any accumulated text
                                             if !text_buf.is_empty() {
                                                 let tx = run_x + text_col_start as f32 * cell_w;
                                                 pipeline.add_text_grid(&text_buf, tx, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
                                                 text_buf.clear();
                                             }
                                             let cx = run_x + col as f32 * cell_w;
-                                            // Try box drawing, then block elements, then fall back to text
                                             if !pipeline.draw_box_char(ch, cx, row_y, cell_w, cell_h, fg_color)
                                                 && !pipeline.draw_block_char(ch, cx, row_y, cell_w, cell_h, fg_color)
                                             {
-                                                // Unhandled custom char — fall back to font rendering
                                                 if text_buf.is_empty() {
                                                     text_col_start = col;
                                                 }
                                                 text_buf.push(ch);
                                             }
-                                            col += 1; // box/block chars are always single-width
+                                            col += 1;
                                         } else {
                                             if text_buf.is_empty() {
                                                 text_col_start = col;
                                             }
                                             text_buf.push(ch);
-                                            col += ch_width; // 1 for normal, 2 for CJK/fullwidth
+                                            col += ch_width;
                                         }
                                     }
-                                    // Flush remaining text
                                     if !text_buf.is_empty() {
                                         let tx = run_x + text_col_start as f32 * cell_w;
                                         pipeline.add_text_grid(&text_buf, tx, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
@@ -966,7 +1010,6 @@ impl PipelineWrapper {
                                 } else {
                                     pipeline.add_text_grid(&run.text, run_x, row_y, fg_color, BASE_FONT_SIZE * scale, run.style.bold, run.style.italic, &mut font_system);
                                 }
-                                maybe_clip(pipeline, start, grid_clip, scale);
                             }
 
                             // Underline variants (render on whitespace too)
@@ -977,18 +1020,14 @@ impl PipelineWrapper {
                                     UnderlineStyle::None => {}
                                     UnderlineStyle::Single | UnderlineStyle::Curly | UnderlineStyle::Dotted | UnderlineStyle::Dashed => {
                                         let ul_y = row_y + cell_h * 0.85;
-                                        let ul_start = pipeline.instance_count();
                                         pipeline.add_solid_rect(run_x, ul_y, run_w, ul_thickness, fg_color);
-                                        maybe_clip(pipeline, ul_start, grid_clip, scale);
                                     }
                                     UnderlineStyle::Double => {
                                         let gap = (2.0 * scale).max(2.0);
                                         let ul_y1 = row_y + cell_h * 0.82;
                                         let ul_y2 = ul_y1 + gap;
-                                        let ul_start = pipeline.instance_count();
                                         pipeline.add_solid_rect(run_x, ul_y1, run_w, ul_thickness, fg_color);
                                         pipeline.add_solid_rect(run_x, ul_y2, run_w, ul_thickness, fg_color);
-                                        maybe_clip(pipeline, ul_start, grid_clip, scale);
                                     }
                                 }
                             }
@@ -996,12 +1035,23 @@ impl PipelineWrapper {
                             // Strikethrough (render on whitespace too)
                             if run.style.strikethrough {
                                 let st_y = row_y + cell_h * 0.5;
-                                let st_start = pipeline.instance_count();
                                 pipeline.add_solid_rect(run_x, st_y, run_w, 1.0 * scale, fg_color);
-                                maybe_clip(pipeline, st_start, grid_clip, scale);
                             }
                         }
+
+                        // Store built instances in cache (subtracts row_y for relative coords)
+                        pipeline.end_grid_row(row_idx, signature, build_start, row_y);
                     }
+
+                    // Gather all cached rows with absolute Y offsets and clip rect
+                    let grid_base_y = grid_layout.bounds.y * scale;
+                    let grid_clip_gpu = clip_to_gpu(grid_clip, scale);
+                    pipeline.gather_grid_rows(
+                        grid_base_y,
+                        cell_h,
+                        grid_layout.rows_content.len(),
+                        grid_clip_gpu,
+                    );
                 }
             }
         }
