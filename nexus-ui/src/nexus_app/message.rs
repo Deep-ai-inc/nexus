@@ -28,6 +28,7 @@ pub enum NexusMessage {
     Viewer(ViewerMsg),
 
     // Cross-cutting (root handles directly)
+    FocusBlock(BlockId),
     Scroll(ScrollAction),
     ContextMenu(ContextMenuMsg),
     Paste,

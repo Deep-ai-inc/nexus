@@ -317,6 +317,92 @@ impl TextInputState {
     }
 
     // =====================================================================
+    // Word-level operations
+    // =====================================================================
+
+    /// Move cursor one word to the left. Clears selection.
+    pub fn move_word_left(&mut self) {
+        self.selection = None;
+        self.cursor = word_boundary_left(&self.text, self.cursor);
+    }
+
+    /// Move cursor one word to the right. Clears selection.
+    pub fn move_word_right(&mut self) {
+        self.selection = None;
+        self.cursor = word_boundary_right(&self.text, self.cursor);
+    }
+
+    /// Delete one word backwards (Ctrl+W / Alt+Backspace).
+    pub fn delete_word_back(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let target = word_boundary_left(&self.text, self.cursor);
+        if target < self.cursor {
+            let lo_byte = char_to_byte(&self.text, target);
+            let hi_byte = char_to_byte(&self.text, self.cursor);
+            self.text.replace_range(lo_byte..hi_byte, "");
+            self.cursor = target;
+        }
+    }
+
+    /// Delete one word forward (Alt+D).
+    pub fn delete_word_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        let target = word_boundary_right(&self.text, self.cursor);
+        if target > self.cursor {
+            let lo_byte = char_to_byte(&self.text, self.cursor);
+            let hi_byte = char_to_byte(&self.text, target);
+            self.text.replace_range(lo_byte..hi_byte, "");
+        }
+    }
+
+    /// Delete from cursor to start of line (Ctrl+U).
+    pub fn kill_to_line_start(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        // Find line start (same logic as move_home)
+        let mut line_start = 0;
+        for (i, ch) in self.text.chars().enumerate() {
+            if i == self.cursor {
+                break;
+            }
+            if ch == '\n' {
+                line_start = i + 1;
+            }
+        }
+        if line_start < self.cursor {
+            let lo_byte = char_to_byte(&self.text, line_start);
+            let hi_byte = char_to_byte(&self.text, self.cursor);
+            self.text.replace_range(lo_byte..hi_byte, "");
+            self.cursor = line_start;
+        }
+    }
+
+    /// Delete from cursor to end of line (Ctrl+K).
+    pub fn kill_to_line_end(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        // Find line end (same logic as move_end)
+        let mut line_end = self.cursor;
+        for ch in self.text.chars().skip(self.cursor) {
+            if ch == '\n' {
+                break;
+            }
+            line_end += 1;
+        }
+        if line_end > self.cursor {
+            let lo_byte = char_to_byte(&self.text, self.cursor);
+            let hi_byte = char_to_byte(&self.text, line_end);
+            self.text.replace_range(lo_byte..hi_byte, "");
+        }
+    }
+
+    // =====================================================================
     // Selection
     // =====================================================================
 
@@ -516,8 +602,9 @@ impl TextInputState {
 
         let cmd = modifiers.meta;
         let ctrl = modifiers.ctrl;
+        let alt = modifiers.alt;
 
-        // Ctrl+A / Ctrl+E — Emacs-style line navigation (before cmd matching)
+        // Ctrl+key — readline/Emacs editing (before cmd matching)
         if ctrl && !cmd {
             match key {
                 Key::Character(c) if c == "a" => {
@@ -526,6 +613,75 @@ impl TextInputState {
                 }
                 Key::Character(c) if c == "e" => {
                     self.move_end();
+                    return TextInputAction::Changed;
+                }
+                Key::Character(c) if c == "w" => {
+                    self.delete_word_back();
+                    return TextInputAction::Changed;
+                }
+                Key::Character(c) if c == "u" => {
+                    self.kill_to_line_start();
+                    return TextInputAction::Changed;
+                }
+                Key::Character(c) if c == "k" => {
+                    self.kill_to_line_end();
+                    return TextInputAction::Changed;
+                }
+                _ => {}
+            }
+        }
+
+        // Alt+key — word-level navigation and deletion
+        if alt && !cmd {
+            match key {
+                Key::Character(c) if c == "b" => {
+                    self.move_word_left();
+                    return TextInputAction::Changed;
+                }
+                Key::Character(c) if c == "f" => {
+                    self.move_word_right();
+                    return TextInputAction::Changed;
+                }
+                Key::Character(c) if c == "d" => {
+                    self.delete_word_forward();
+                    return TextInputAction::Changed;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.delete_word_back();
+                    return TextInputAction::Changed;
+                }
+                _ => {}
+            }
+        }
+
+        // Cmd+Arrow — macOS-style word/line jump
+        if cmd && !ctrl {
+            match key {
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.move_home();
+                    return TextInputAction::Changed;
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.move_end();
+                    return TextInputAction::Changed;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.kill_to_line_start();
+                    return TextInputAction::Changed;
+                }
+                _ => {}
+            }
+        }
+
+        // Alt+Arrow — word jump (macOS Option+Arrow convention)
+        if alt && !cmd && !ctrl {
+            match key {
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.move_word_left();
+                    return TextInputAction::Changed;
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.move_word_right();
                     return TextInputAction::Changed;
                 }
                 _ => {}
@@ -665,6 +821,46 @@ pub fn line_col_to_offset(text: &str, target_line: usize, target_col: usize) -> 
     text.chars().count() // past end
 }
 
+/// Find the word boundary to the left of `pos`.
+///
+/// Skips whitespace/punctuation, then skips word characters.
+/// Matches readline/Emacs `backward-word` behavior.
+fn word_boundary_left(text: &str, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = pos;
+    // Skip whitespace/punctuation
+    while i > 0 && !chars[i - 1].is_alphanumeric() && chars[i - 1] != '_' {
+        i -= 1;
+    }
+    // Skip word characters
+    while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+        i -= 1;
+    }
+    i
+}
+
+/// Find the word boundary to the right of `pos`.
+///
+/// Skips word characters, then skips whitespace/punctuation.
+/// Matches readline/Emacs `forward-word` behavior.
+fn word_boundary_right(text: &str, pos: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = pos;
+    // Skip word characters
+    while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+        i += 1;
+    }
+    // Skip whitespace/punctuation
+    while i < len && !chars[i].is_alphanumeric() && chars[i] != '_' {
+        i += 1;
+    }
+    i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +938,147 @@ mod tests {
 
         state.move_down();
         assert_eq!(state.cursor, 9); // 'h'... col 1 on line 2
+    }
+
+    // =================================================================
+    // Word boundary tests
+    // =================================================================
+
+    #[test]
+    fn word_boundary_left_basic() {
+        let text = "hello world";
+        assert_eq!(word_boundary_left(text, 11), 6); // end → start of "world"
+        assert_eq!(word_boundary_left(text, 6), 0);  // start of "world" → start of "hello"
+        assert_eq!(word_boundary_left(text, 3), 0);  // mid-"hello" → start
+        assert_eq!(word_boundary_left(text, 0), 0);  // already at start
+    }
+
+    #[test]
+    fn word_boundary_right_basic() {
+        let text = "hello world";
+        assert_eq!(word_boundary_right(text, 0), 6);  // start → past "hello " to "world"
+        assert_eq!(word_boundary_right(text, 6), 11); // "world" → end
+        assert_eq!(word_boundary_right(text, 11), 11); // already at end
+    }
+
+    #[test]
+    fn word_boundary_with_punctuation() {
+        let text = "foo--bar baz";
+        // From end of "foo": skip "--" then land at start of "foo"
+        assert_eq!(word_boundary_left(text, 5), 0);
+        // From 0: skip "foo", skip "--" → at "bar"
+        assert_eq!(word_boundary_right(text, 0), 5);
+    }
+
+    #[test]
+    fn word_boundary_underscores() {
+        let text = "foo_bar baz";
+        // foo_bar is one word (underscores are word chars)
+        assert_eq!(word_boundary_left(text, 7), 0);
+        assert_eq!(word_boundary_right(text, 0), 8); // past "foo_bar "
+    }
+
+    // =================================================================
+    // Word navigation tests
+    // =================================================================
+
+    #[test]
+    fn move_word_left_right() {
+        let mut state = TextInputState::with_text("hello world foo");
+        state.cursor = 15; // end
+        state.move_word_left();
+        assert_eq!(state.cursor, 12); // start of "foo"
+        state.move_word_left();
+        assert_eq!(state.cursor, 6); // start of "world"
+        state.move_word_left();
+        assert_eq!(state.cursor, 0); // start of "hello"
+
+        state.move_word_right();
+        assert_eq!(state.cursor, 6); // past "hello " → at "world"
+        state.move_word_right();
+        assert_eq!(state.cursor, 12); // past "world " → at "foo"
+        assert!(state.selection.is_none());
+    }
+
+    // =================================================================
+    // Word/line deletion tests
+    // =================================================================
+
+    #[test]
+    fn delete_word_back_basic() {
+        let mut state = TextInputState::with_text("hello world");
+        state.cursor = 11;
+        state.delete_word_back();
+        assert_eq!(state.text, "hello ");
+        assert_eq!(state.cursor, 6);
+
+        state.delete_word_back();
+        assert_eq!(state.text, "");
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn delete_word_back_with_selection() {
+        let mut state = TextInputState::with_text("hello world");
+        state.selection = Some((2, 7));
+        state.delete_word_back();
+        assert_eq!(state.text, "heorld");
+        assert_eq!(state.cursor, 2);
+    }
+
+    #[test]
+    fn delete_word_forward_basic() {
+        let mut state = TextInputState::with_text("hello world");
+        state.cursor = 0;
+        state.delete_word_forward();
+        assert_eq!(state.text, "world");
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn kill_to_line_start_basic() {
+        let mut state = TextInputState::with_text("hello world");
+        state.cursor = 7;
+        state.kill_to_line_start();
+        assert_eq!(state.text, "orld");
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn kill_to_line_start_multiline() {
+        let mut state = TextInputState::with_text("abc\ndef\nghi");
+        state.cursor = 6; // 'f' on line 1
+        state.kill_to_line_start();
+        assert_eq!(state.text, "abc\nf\nghi");
+        assert_eq!(state.cursor, 4); // start of line 1
+    }
+
+    #[test]
+    fn kill_to_line_end_basic() {
+        let mut state = TextInputState::with_text("hello world");
+        state.cursor = 5;
+        state.kill_to_line_end();
+        assert_eq!(state.text, "hello");
+        assert_eq!(state.cursor, 5);
+    }
+
+    #[test]
+    fn kill_to_line_end_multiline() {
+        let mut state = TextInputState::with_text("abc\ndef\nghi");
+        state.cursor = 4; // 'd' on line 1
+        state.kill_to_line_end();
+        assert_eq!(state.text, "abc\n\nghi");
+        assert_eq!(state.cursor, 4);
+    }
+
+    #[test]
+    fn move_home_end_multiline() {
+        let mut state = TextInputState::with_text("abc\ndef\nghi");
+        state.cursor = 5; // 'e' on line 1
+        state.move_home();
+        assert_eq!(state.cursor, 4); // start of line 1
+        state.move_end();
+        assert_eq!(state.cursor, 7); // end of line 1 (before '\n')
     }
 
     #[test]

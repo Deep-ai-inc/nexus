@@ -36,9 +36,14 @@ const AGENT_QUESTION_TEXT: u64 = 20;
 const AGENT_FOOTER: u64 = 21;
 const VIEWER_EXIT: u64 = 22;
 const TREE_EXPAND: u64 = 23;
+const BLOCK_CONTAINER: u64 = 24;
 
 // --- Shell block IDs ---
 
+/// The outermost container Column for a shell block — used as a click target
+/// so that clicks on empty space (e.g. between rows) still register as
+/// belonging to this block for focus purposes.
+pub fn block_container(id: BlockId) -> SourceId { block_space(id).id(BLOCK_CONTAINER) }
 pub fn shell_header(id: BlockId) -> SourceId { block_space(id).id(SHELL_HEADER) }
 pub fn shell_term(id: BlockId) -> SourceId { block_space(id).id(SHELL_TERM) }
 pub fn native(id: BlockId) -> SourceId { block_space(id).id(NATIVE) }

@@ -353,13 +353,17 @@ impl ShellWidget {
     /// Check if a hit address belongs to a shell block. Returns the block_id if so.
     pub fn block_for_source(&self, source_id: SourceId) -> Option<BlockId> {
         for block in &self.blocks {
-            if source_id == source_ids::shell_term(block.id)
-                || source_id == source_ids::shell_header(block.id)
-                || source_id == source_ids::native(block.id)
-                || source_id == source_ids::table(block.id)
-                || source_id == source_ids::image_output(block.id)
+            let id = block.id;
+            if source_id == source_ids::block_container(id)
+                || source_id == source_ids::shell_term(id)
+                || source_id == source_ids::shell_header(id)
+                || source_id == source_ids::native(id)
+                || source_id == source_ids::table(id)
+                || source_id == source_ids::image_output(id)
+                || source_id == source_ids::kill(id)
+                || source_id == source_ids::viewer_exit(id)
             {
-                return Some(block.id);
+                return Some(id);
             }
         }
         None

@@ -102,6 +102,7 @@ impl Widget for ShellBlockWidget<'_> {
         let cols = grid.cols();
 
         let mut content = Column::new()
+            .id(source_ids::block_container(block.id))
             .padding(6.0)
             .spacing(4.0)
             .background(colors::BG_BLOCK)

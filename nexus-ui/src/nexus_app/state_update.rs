@@ -148,6 +148,10 @@ impl NexusState {
                 Command::none()
             }
             NexusMessage::Viewer(m) => { self.dispatch_viewer_msg(m); Command::none() }
+            NexusMessage::FocusBlock(id) => {
+                self.set_focus(Focus::Block(id));
+                Command::none()
+            }
             NexusMessage::ContextMenu(m) => self.dispatch_context_menu(m),
             NexusMessage::Scroll(action) => { self.scroll.apply_user_scroll(action); Command::none() }
             NexusMessage::ScrollToJob(_) => { self.scroll.force(); Command::none() }

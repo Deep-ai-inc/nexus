@@ -137,6 +137,7 @@ fn route_global_shortcut(
         if let Key::Character(c) = key {
             match c.as_str() {
                 "r" => return Some(NexusMessage::Input(InputMsg::HistorySearchToggle)),
+                "l" => return Some(NexusMessage::ClearScreen),
                 "c" => {
                     if state.agent.is_active() {
                         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
@@ -348,10 +349,22 @@ pub(super) fn on_mouse(
             );
         }
 
-        // Clicked empty space: blur inputs
-        if matches!(state.focus, Focus::Input) {
-            return MouseResponse::message(NexusMessage::BlurAll);
+        // Click landed on a shell block area (e.g. between rows, header,
+        // viewer background) but didn't match any specific widget handler
+        // above.  Focus the block so keyboard input routes to its PTY.
+        let hit_source = match &hit {
+            Some(HitResult::Widget(id)) => Some(*id),
+            Some(HitResult::Content(addr)) => Some(addr.source_id),
+            None => None,
+        };
+        if let Some(src) = hit_source {
+            if let Some(block_id) = state.shell.block_for_source(src) {
+                return MouseResponse::message(NexusMessage::FocusBlock(block_id));
+            }
         }
+
+        // Clicked empty space: blur inputs
+        return MouseResponse::message(NexusMessage::BlurAll);
     }
 
     MouseResponse::none()
