@@ -77,15 +77,14 @@ impl NexusState {
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
             // When a PTY block is focused, paste text directly into the
             // terminal (with bracketed paste wrapping if the shell requested
-            // it).  Images are not meaningful for a PTY, so we skip the image
-            // path in this case.
+            // it).  If the block has no PTY (e.g. a non-terminal block type),
+            // fall through to the normal input/image paste path.
             if let crate::blocks::Focus::Block(id) = self.focus {
                 if let Ok(text) = clipboard.get_text() {
-                    if !text.is_empty() {
-                        self.shell.paste_to_pty(id, &text);
+                    if !text.is_empty() && self.shell.paste_to_pty(id, &text) {
+                        return;
                     }
                 }
-                return;
             }
 
             if let Ok(img) = clipboard.get_image() {
