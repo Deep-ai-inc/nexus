@@ -132,9 +132,13 @@ enum ShellMessage<M> {
     /// A window was closed by the OS.
     WindowClosed(iced::window::Id),
 
-    /// macOS dock icon clicked — open a window if none exist.
+    /// macOS platform requests a new window (dock icon click or menu Cmd+N).
     #[cfg(target_os = "macos")]
-    DockReopen,
+    PlatformNewWindow,
+
+    /// One-shot: set up native platform integration after the event loop starts.
+    #[cfg(target_os = "macos")]
+    SetupNative,
 }
 
 impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
@@ -149,7 +153,9 @@ impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
             ShellMessage::ExitApp => write!(f, "ExitApp"),
             ShellMessage::WindowClosed(wid) => f.debug_tuple("WindowClosed").field(wid).finish(),
             #[cfg(target_os = "macos")]
-            ShellMessage::DockReopen => write!(f, "DockReopen"),
+            ShellMessage::PlatformNewWindow => write!(f, "PlatformNewWindow"),
+            #[cfg(target_os = "macos")]
+            ShellMessage::SetupNative => write!(f, "SetupNative"),
         }
     }
 }
@@ -192,13 +198,20 @@ fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMess
         },
     };
 
-    // Install macOS dock-click → reopen handler (idempotent, runs once).
+    // Install macOS reopen handler now (needs channel before event loop).
+    // Menu bar setup is deferred to SetupNative (needs winit's menu to exist first).
     #[cfg(target_os = "macos")]
     crate::platform::macos::install_reopen_handler();
 
     let app_task = command_to_task(cmd, window_id);
     let tick_task = Task::done(ShellMessage::Tick);
-    let task = Task::batch([open_task.discard(), app_task, tick_task]);
+
+    #[cfg(target_os = "macos")]
+    let native_task = Task::done(ShellMessage::SetupNative);
+    #[cfg(not(target_os = "macos"))]
+    let native_task = Task::none();
+
+    let task = Task::batch([open_task.discard(), app_task, tick_task, native_task]);
 
     (state, task)
 }
@@ -425,12 +438,14 @@ fn update<A: StrataApp>(
         }
 
         #[cfg(target_os = "macos")]
-        ShellMessage::DockReopen => {
-            if state.windows.is_empty() {
-                Task::done(ShellMessage::OpenNewWindow)
-            } else {
-                Task::none()
-            }
+        ShellMessage::SetupNative => {
+            crate::platform::macos::setup_menu_bar();
+            Task::none()
+        }
+
+        #[cfg(target_os = "macos")]
+        ShellMessage::PlatformNewWindow => {
+            Task::done(ShellMessage::OpenNewWindow)
         }
 
         ShellMessage::WindowClosed(wid) => {
@@ -510,9 +525,10 @@ fn subscription<A: StrataApp>(state: &MultiWindowState<A>) -> Subscription<Shell
 
     let mut all_subs = vec![events, tick, close_events];
 
-    // macOS dock-click reopen: channel-based subscription (no polling).
-    // A dedicated thread blocks on std::sync::mpsc::recv until the Apple
-    // Event handler fires, then forwards to the async iced stream.
+    // macOS platform → iced bridge: channel-based subscription (no polling).
+    // Handles dock-click reopen and menu bar Cmd+N (newDocument:).
+    // A dedicated thread blocks on std::sync::mpsc::recv until the ObjC
+    // handler fires, then forwards to the async iced stream.
     #[cfg(target_os = "macos")]
     {
         let reopen_stream = iced::stream::channel(1, |mut output| async move {
@@ -538,7 +554,7 @@ fn subscription<A: StrataApp>(state: &MultiWindowState<A>) -> Subscription<Shell
 
             use iced::futures::{SinkExt, StreamExt};
             while arx.next().await.is_some() {
-                let _ = output.send(ShellMessage::DockReopen).await;
+                let _ = output.send(ShellMessage::PlatformNewWindow).await;
             }
         });
         all_subs.push(Subscription::run_with_id("dock-reopen", reopen_stream));

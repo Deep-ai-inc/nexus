@@ -14,12 +14,13 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSDraggingItem, NSDraggingSession, NSImage,
-    NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypeString,
-    NSPasteboardWriting, NSWorkspace,
+    NSApplication, NSDraggingItem, NSDraggingSession,
+    NSImage, NSMenu, NSMenuItem, NSPasteboardItem, NSPasteboardTypeFileURL,
+    NSPasteboardTypeString, NSPasteboardWriting, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSObject, NSPoint, NSRect, NSSize, NSString, NSURL,
+    ns_string,
 };
 
 use crate::app::DragSource;
@@ -494,4 +495,123 @@ pub fn install_reopen_handler() {
 /// Take the reopen receiver (call exactly once from the subscription setup).
 pub fn take_reopen_receiver() -> Option<mpsc::Receiver<()>> {
     REOPEN_RX.lock().unwrap().take()
+}
+
+// =============================================================================
+// Native Menu Bar
+// =============================================================================
+
+/// C function injected into WinitApplicationDelegate for Cmd+N (newDocument:).
+///
+/// Reuses the same reopen channel — the iced subscription treats it as
+/// "platform requests a new window".
+extern "C" fn handle_new_document(
+    _this: &AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut AnyObject,
+) {
+    if let Some(tx) = REOPEN_TX.get() {
+        let _ = tx.send(());
+    }
+}
+
+/// Set up the macOS menu bar with File and Window menus.
+///
+/// Winit already creates an app menu (About, Hide, Quit). This adds:
+/// - **File**: New Window (Cmd+N), Close Window (Cmd+W)
+/// - **Window**: Minimize (Cmd+M), Bring All to Front
+///
+/// Also injects `newDocument:` into WinitApplicationDelegate so Cmd+N
+/// works even with no windows open.
+pub fn setup_menu_bar() {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+
+    let Some(menubar) = (unsafe { app.mainMenu() }) else { return };
+
+    // --- Inject newDocument: into WinitApplicationDelegate ---
+    unsafe {
+        let cls = AnyClass::get("WinitApplicationDelegate")
+            .expect("WinitApplicationDelegate class not found");
+        let cls_ptr = cls as *const _ as *mut objc2::ffi::objc_class;
+        let imp: objc2::ffi::IMP = Some(std::mem::transmute::<
+            extern "C" fn(&AnyObject, objc2::runtime::Sel, *mut AnyObject),
+            unsafe extern "C" fn(),
+        >(handle_new_document));
+        let types = c"v@:@";
+        objc2::ffi::class_addMethod(
+            cls_ptr,
+            sel!(newDocument:).as_ptr(),
+            imp,
+            types.as_ptr(),
+        );
+    }
+
+    // --- File menu ---
+    let file_menu = NSMenu::new(mtm);
+    unsafe { file_menu.setTitle(ns_string!("File")) };
+
+    let new_window = make_menu_item(
+        mtm,
+        ns_string!("New Window"),
+        sel!(newDocument:),
+        ns_string!("n"),
+    );
+    file_menu.addItem(&new_window);
+
+    let close_window = make_menu_item(
+        mtm,
+        ns_string!("Close Window"),
+        sel!(performClose:),
+        ns_string!("w"),
+    );
+    file_menu.addItem(&close_window);
+
+    let file_item = NSMenuItem::new(mtm);
+    file_item.setSubmenu(Some(&file_menu));
+    unsafe { menubar.insertItem_atIndex(&file_item, 1) }; // after app menu
+
+    // --- Window menu ---
+    let window_menu = NSMenu::new(mtm);
+    unsafe { window_menu.setTitle(ns_string!("Window")) };
+
+    let minimize = make_menu_item(
+        mtm,
+        ns_string!("Minimize"),
+        sel!(performMiniaturize:),
+        ns_string!("m"),
+    );
+    window_menu.addItem(&minimize);
+
+    let bring_all = make_menu_item(
+        mtm,
+        ns_string!("Bring All to Front"),
+        sel!(arrangeInFront:),
+        ns_string!(""),
+    );
+    window_menu.addItem(&bring_all);
+
+    let window_item = NSMenuItem::new(mtm);
+    window_item.setSubmenu(Some(&window_menu));
+    unsafe { menubar.insertItem_atIndex(&window_item, 2) }; // after File menu
+
+    // Tell AppKit this is the Window menu (enables automatic window list).
+    unsafe { app.setWindowsMenu(Some(&window_menu)) };
+}
+
+/// Create a menu item with a Cmd+key shortcut.
+fn make_menu_item(
+    mtm: MainThreadMarker,
+    title: &NSString,
+    action: objc2::runtime::Sel,
+    key: &NSString,
+) -> Retained<NSMenuItem> {
+    unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(),
+            title,
+            Some(action),
+            key,
+        )
+    }
 }
