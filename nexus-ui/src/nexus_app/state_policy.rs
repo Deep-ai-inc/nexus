@@ -102,8 +102,9 @@ impl NexusState {
     // --- Cursor ---
 
     pub(super) fn cursor_visible(&self) -> bool {
-        // Hide main input cursor when a block or agent question input has focus.
-        if matches!(self.focus, crate::blocks::Focus::Block(_) | crate::blocks::Focus::AgentInput) {
+        // Hide main input cursor when a static block has focus.
+        // AgentInput keeps the original blink logic (it has its own cursor).
+        if matches!(self.focus, crate::blocks::Focus::Block(_)) {
             return false;
         }
         let blink_elapsed = Instant::now()
