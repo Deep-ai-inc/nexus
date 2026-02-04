@@ -1437,10 +1437,24 @@ impl StrataPipeline {
         self.cache_misses += 1;
         let shape_start = std::time::Instant::now();
 
-        /// Returns true if `ch` is a Regional Indicator Symbol (U+1F1E6..=U+1F1FF).
+        /// Regional Indicator Symbol (U+1F1E6..=U+1F1FF) — pairs form flag emoji.
         #[inline]
         fn is_regional_indicator(ch: char) -> bool {
             ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch)
+        }
+
+        /// Emoji Modifier (Fitzpatrick skin tone) U+1F3FB..=U+1F3FF.
+        #[inline]
+        fn is_skin_tone_modifier(ch: char) -> bool {
+            ('\u{1F3FB}'..='\u{1F3FF}').contains(&ch)
+        }
+
+        /// Returns true if `next` should attach to the current cluster
+        /// (zero-width, skin tone modifier, or second regional indicator after first).
+        #[inline]
+        fn is_cluster_continuation(next: char) -> bool {
+            UnicodeWidthChar::width(next).unwrap_or(0) == 0
+                || is_skin_tone_modifier(next)
         }
 
         let mut cursor_x = x;
@@ -1451,13 +1465,14 @@ impl StrataPipeline {
 
             // Determine if this char starts a multi-codepoint cluster:
             // 1. Next char is zero-width (combining mark, VS, ZWJ)
-            // 2. This is a regional indicator followed by another regional indicator (flag pair)
-            let next_is_zw = chars.peek().map_or(false, |&next| {
-                UnicodeWidthChar::width(next).unwrap_or(0) == 0
+            // 2. Next char is a skin tone modifier (Fitzpatrick)
+            // 3. This is a regional indicator followed by another (flag pair)
+            let next_continues = chars.peek().map_or(false, |&next| {
+                is_cluster_continuation(next)
             });
             let is_flag_pair = is_regional_indicator(ch)
                 && chars.peek().map_or(false, |&next| is_regional_indicator(next));
-            let is_multi = next_is_zw || is_flag_pair;
+            let is_multi = next_continues || is_flag_pair;
 
             if !is_multi {
                 // ── Single-codepoint grapheme (Tier A/B) ─────────────────
@@ -1527,15 +1542,18 @@ impl StrataPipeline {
                     }
                 }
 
-                // Collect zero-width followers, continuing past ZWJ to grab
-                // the next primary char (and its zero-width followers).
+                // Collect continuation characters:
+                //  - Zero-width chars (combining marks, VS16, ZWJ)
+                //  - Skin tone modifiers (U+1F3FB..=U+1F3FF)
+                //  - After ZWJ (U+200D), the next primary char + its continuations
                 loop {
                     match chars.peek() {
-                        Some(&next) if UnicodeWidthChar::width(next).unwrap_or(0) == 0 => {
+                        Some(&next) if is_cluster_continuation(next) => {
                             let is_zwj = next == '\u{200D}';
                             grapheme.push(next);
                             chars.next();
                             // After ZWJ, also consume the next primary char
+                            // (and loop back to collect its continuations)
                             if is_zwj {
                                 if let Some(&primary) = chars.peek() {
                                     grapheme.push(primary);
