@@ -514,9 +514,27 @@ impl TextInputState {
             KeyEvent::Released { .. } => return TextInputAction::Noop,
         };
 
-        let cmd = modifiers.meta || modifiers.ctrl;
+        let cmd = modifiers.meta;
+        let ctrl = modifiers.ctrl;
 
-        match (key, modifiers.shift, cmd) {
+        // Ctrl+A / Ctrl+E — Emacs-style line navigation (before cmd matching)
+        if ctrl && !cmd {
+            match key {
+                Key::Character(c) if c == "a" => {
+                    self.move_home();
+                    return TextInputAction::Changed;
+                }
+                Key::Character(c) if c == "e" => {
+                    self.move_end();
+                    return TextInputAction::Changed;
+                }
+                _ => {}
+            }
+        }
+
+        let cmd_or_ctrl = cmd || ctrl;
+
+        match (key, modifiers.shift, cmd_or_ctrl) {
             (Key::Named(NamedKey::Escape), _, _) => {
                 self.blur();
                 TextInputAction::Blur

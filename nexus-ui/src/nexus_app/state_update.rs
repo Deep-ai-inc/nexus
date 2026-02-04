@@ -222,6 +222,11 @@ impl NexusState {
                 };
             }
             DragMsg::StartSelecting(addr, mode) => {
+                // If the click landed on a shell block, focus it so keyboard
+                // input flows to its PTY.
+                if let Some(block_id) = self.shell.block_for_source(addr.source_id) {
+                    self.set_focus(crate::blocks::Focus::Block(block_id));
+                }
                 // Immediate Active — no Pending hysteresis for raw text clicks.
                 self.selection.update(
                     super::message::SelectionMsg::Start(addr.clone(), mode),
