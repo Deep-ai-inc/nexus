@@ -28,16 +28,16 @@ impl NexusState {
             ShellOutput::None => Command::none(),
             ShellOutput::FocusInput | ShellOutput::PtyInputFailed => {
                 self.set_focus(Focus::Input);
-                self.scroll.force();
+                self.scroll.snap_to_bottom();
                 Command::none()
             }
             ShellOutput::FocusBlock(id) => {
                 self.set_focus(Focus::Block(id));
-                self.scroll.force();
+                self.scroll.snap_to_bottom();
                 Command::none()
             }
             ShellOutput::ScrollToBottom => {
-                self.scroll.hint();
+                self.scroll.hint_bottom();
                 Command::none()
             }
             ShellOutput::CwdChanged(path) => {
@@ -54,13 +54,13 @@ impl NexusState {
                 if !has_viewer {
                     self.set_focus(Focus::Input);
                 }
-                self.scroll.force();
+                self.scroll.snap_to_bottom();
                 Command::none()
             }
             ShellOutput::BlockExited { id } => {
                 if self.focus == Focus::Block(id) {
                     self.set_focus(Focus::Input);
-                    self.scroll.force();
+                    self.scroll.snap_to_bottom();
                 }
                 Command::none()
             }
@@ -88,11 +88,11 @@ impl NexusState {
         match output {
             AgentOutput::None => {}
             AgentOutput::ScrollToBottom => {
-                self.scroll.hint();
+                self.scroll.hint_bottom();
             }
             AgentOutput::FocusQuestionInput => {
                 self.set_focus(Focus::AgentInput);
-                self.scroll.hint();
+                self.scroll.hint_bottom();
             }
         }
     }
@@ -119,15 +119,14 @@ impl NexusState {
         ctx: &mut strata::component::Ctx,
     ) -> Command<NexusMessage> {
         // Apply deferred scroll offset from view() (scroll-to-block)
-        if let Some(offset) = self.pending_scroll_offset.take() {
-            self.scroll.state.offset = offset;
-            self.scroll.follow = false;
-        }
+        self.scroll.apply_pending();
 
         match msg {
             NexusMessage::Input(m) => {
                 if matches!(m, super::message::InputMsg::Mouse(_)) {
                     self.set_focus(Focus::Input);
+                } else {
+                    self.scroll.snap_to_bottom();
                 }
                 let (_cmd, output) = self.input.update(m, ctx);
                 self.apply_input_output(output)
@@ -160,7 +159,7 @@ impl NexusState {
             }
             NexusMessage::ContextMenu(m) => self.dispatch_context_menu(m),
             NexusMessage::Scroll(action) => { self.scroll.apply_user_scroll(action); Command::none() }
-            NexusMessage::ScrollToJob(_) => { self.scroll.force(); Command::none() }
+            NexusMessage::ScrollToJob(_) => { self.scroll.snap_to_bottom(); Command::none() }
             NexusMessage::Copy => { self.copy_selection_or_input(); Command::none() }
             NexusMessage::Paste => { self.paste_from_clipboard(ctx.images); Command::none() }
             NexusMessage::ClearScreen => { self.clear_screen(); Command::none() }
@@ -185,11 +184,11 @@ impl NexusState {
                 match target {
                     Some(id) => {
                         self.set_focus(Focus::Block(id));
-                        self.scroll_to_block(id);
+                        self.scroll.scroll_to_block(id);
                     }
                     None => {
                         self.set_focus(Focus::Input);
-                        self.scroll.force();
+                        self.scroll.snap_to_bottom();
                     }
                 }
                 Command::none()
@@ -199,11 +198,11 @@ impl NexusState {
                     match self.next_block_id(id) {
                         Some(next) => {
                             self.set_focus(Focus::Block(next));
-                            self.scroll_to_block(next);
+                            self.scroll.scroll_to_block(next);
                         }
                         None => {
                             self.set_focus(Focus::Input);
-                            self.scroll.force();
+                            self.scroll.snap_to_bottom();
                         }
                     }
                 }
@@ -212,25 +211,25 @@ impl NexusState {
             NexusMessage::FocusFirstBlock => {
                 if let Some(id) = self.all_block_ids_ordered().first().copied() {
                     self.set_focus(Focus::Block(id));
-                    self.scroll_to_block(id);
+                    self.scroll.scroll_to_block(id);
                 }
                 Command::none()
             }
             NexusMessage::FocusLastBlock => {
                 if let Some(id) = self.last_block_id() {
                     self.set_focus(Focus::Block(id));
-                    self.scroll_to_block(id);
+                    self.scroll.scroll_to_block(id);
                 }
                 Command::none()
             }
             NexusMessage::FocusAgentInput => {
                 self.set_focus(Focus::AgentInput);
-                self.scroll.force();
+                self.scroll.snap_to_bottom();
                 Command::none()
             }
             NexusMessage::TypeThrough(event) => {
                 self.set_focus(Focus::Input);
-                self.scroll.force();
+                self.scroll.snap_to_bottom();
                 if let Some(msg) = self.input.on_key(&event) {
                     let (_cmd, output) = self.input.update(msg, ctx);
                     self.apply_input_output(output)
@@ -277,7 +276,7 @@ impl NexusState {
                 format!("{}{}", shell_context, text)
             };
             self.agent.spawn(block_id, text, contextualized_query, attachments, &self.cwd);
-            self.scroll.force();
+            self.scroll.snap_to_bottom();
         } else {
             let block_id = self.next_id();
             let output =

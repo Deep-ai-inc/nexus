@@ -1,48 +1,87 @@
-//! Scroll model — owns scroll state + follow-output policy.
+//! Scroll model — owns scroll state + target-based follow policy.
 //!
-//! Prevents direct field writes from accidentally breaking sticky-bottom semantics.
+//! Three scroll targets:
+//!   Bottom    — tail mode, auto-scroll on new output
+//!   Block(id) — focusing a specific block, resolved after layout
+//!   None      — free scroll, user reading history
 
+use std::cell::Cell;
+
+use nexus_api::BlockId;
 use strata::{LayoutSnapshot, ScrollAction, ScrollState};
+
+/// Where the viewport wants to be.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ScrollTarget {
+    /// Tail mode: stick to bottom, follow new output.
+    Bottom,
+    /// Focus a specific block: resolve position after layout.
+    Block(BlockId),
+    /// Free scroll: user is reading history, don't auto-scroll.
+    None,
+}
 
 pub(crate) struct ScrollModel {
     pub(super) state: ScrollState,
-    pub(crate) follow: bool,
+    pub(crate) target: ScrollTarget,
+    /// Deferred offset computed in view() for Block(id) targets.
+    /// Applied at the start of the next update() frame.
+    pub(crate) pending_offset: Cell<Option<f32>>,
 }
 
 impl ScrollModel {
     pub fn new() -> Self {
         Self {
             state: ScrollState::new(),
-            follow: true,
+            target: ScrollTarget::Bottom,
+            pending_offset: Cell::new(None),
         }
     }
 
-    /// Hint: scroll to bottom only if the user is already following output.
-    /// Used by periodic output ticks and widget scroll-to-bottom outputs.
-    pub fn hint(&mut self) {
-        if self.follow {
-            self.state.offset = self.state.max.get();
-        }
+    /// Passive hint: returns true if target is Bottom (viewport will follow
+    /// new output via f32::MAX in view), false if the user is scrolled away.
+    pub fn hint_bottom(&mut self) -> bool {
+        self.target == ScrollTarget::Bottom
     }
 
-    /// Force: scroll to bottom and re-enable follow mode.
-    /// Used by explicit user actions: submit, clear, command finished.
-    pub fn force(&mut self) {
-        self.state.offset = self.state.max.get();
-        self.follow = true;
+    /// Active snap: set target to Bottom. The view pass uses f32::MAX
+    /// so the layout engine clamps to the true new bottom.
+    pub fn snap_to_bottom(&mut self) {
+        self.target = ScrollTarget::Bottom;
     }
 
-    /// Reset scroll to top with follow enabled. Used by clear screen.
+    /// Navigate to a specific block. Sets target to Block(id).
+    /// Actual offset is computed in view() after layout, applied next frame.
+    pub fn scroll_to_block(&mut self, id: BlockId) {
+        self.target = ScrollTarget::Block(id);
+    }
+
+    /// Reset scroll to top with Bottom target. Used by clear screen.
     pub fn reset(&mut self) {
         self.state.offset = 0.0;
-        self.follow = true;
+        self.target = ScrollTarget::Bottom;
     }
 
-    /// Apply a user scroll action, then update follow based on position.
+    /// Apply a user scroll action (wheel, scrollbar drag, etc.).
+    /// If locked to Bottom, sync offset to the real max first (since view()
+    /// uses f32::MAX) and break the lock so the delta applies correctly.
     pub fn apply_user_scroll(&mut self, action: ScrollAction) {
+        if self.target == ScrollTarget::Bottom {
+            self.state.offset = self.state.max.get();
+            self.target = ScrollTarget::None;
+        }
         self.state.apply(action);
-        let max = self.state.max.get();
-        self.follow = (max - self.state.offset).abs() < 2.0;
+    }
+
+    /// Apply deferred offset from Block(id) resolution.
+    /// Called at the top of dispatch_update().
+    pub fn apply_pending(&mut self) {
+        if let Some(offset) = self.pending_offset.take() {
+            self.state.offset = offset;
+            // After navigating to a block, enter free-scroll so output
+            // arriving doesn't yank the viewport away from the target.
+            self.target = ScrollTarget::None;
+        }
     }
 
     pub fn sync_from_snapshot(&self, snapshot: &mut LayoutSnapshot) {

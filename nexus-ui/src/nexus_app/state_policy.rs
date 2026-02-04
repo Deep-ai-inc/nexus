@@ -29,7 +29,7 @@ impl NexusState {
         if self.shell.needs_redraw() || self.agent.needs_redraw() {
             self.shell.terminal_dirty = false;
             self.agent.dirty = false;
-            self.scroll.hint();
+            self.scroll.hint_bottom();
         }
 
         // Auto-scroll during active drag/selection
@@ -92,11 +92,6 @@ impl NexusState {
 
     pub(super) fn block_has_active_pty(&self, id: nexus_api::BlockId) -> bool {
         self.shell.pty.has_handle(id)
-    }
-
-    /// Request scroll-to-block in the next view pass.
-    pub(super) fn scroll_to_block(&self, id: nexus_api::BlockId) {
-        self.scroll_target.set(Some(id));
     }
 
     // --- Cursor ---

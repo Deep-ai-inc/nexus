@@ -123,11 +123,6 @@ pub struct NexusState {
     last_frame: Cell<Instant>,
     fps_smooth: Cell<f32>,
     pub context: NexusContext,
-
-    // --- Block navigation ---
-    scroll_target: Cell<Option<nexus_api::BlockId>>,
-    /// Pending scroll offset computed in view(), applied in next update().
-    pending_scroll_offset: Cell<Option<f32>>,
 }
 
 // =========================================================================
@@ -171,10 +166,13 @@ impl Component for NexusState {
 
         self.shell.clear_click_registry();
 
-        let scroll = ScrollColumn::from_state(&self.scroll.state)
+        let mut scroll = ScrollColumn::from_state(&self.scroll.state)
             .spacing(4.0)
             .width(Length::Fill)
             .height(Length::Fill);
+        if self.scroll.target == scroll_model::ScrollTarget::Bottom {
+            scroll = scroll.scroll_offset(f32::MAX);
+        }
         let scroll = self.layout_blocks(scroll);
 
         let mut main_col = Column::new()
@@ -197,15 +195,24 @@ impl Component for NexusState {
         self.sync_scroll_states(snapshot);
 
         // Scroll-to-block: compute content-space position and store as pending offset.
-        // The actual scroll mutation happens in update (on_output_arrived/Tick).
-        if let Some(target_id) = self.scroll_target.take() {
+        // The actual scroll mutation happens in update() via apply_pending().
+        if let scroll_model::ScrollTarget::Block(target_id) = self.scroll.target {
             let source = source_ids::block_container(target_id);
             if let Some(bounds) = snapshot.widget_bounds(&source) {
                 let scroll_bounds = self.scroll.state.bounds.get();
                 let content_y = bounds.y - scroll_bounds.y + self.scroll.state.offset;
-                let target_offset = (content_y - scroll_bounds.height / 3.0).max(0.0);
+                let viewport_h = scroll_bounds.height;
+
+                let target_offset = if bounds.height > viewport_h {
+                    // Tall block: snap top to maximize visible content
+                    content_y
+                } else {
+                    // Short block: position at 1/3 down for context
+                    (content_y - viewport_h / 3.0).max(0.0)
+                };
+
                 let max = self.scroll.state.max.get();
-                self.pending_scroll_offset.set(Some(target_offset.min(max)));
+                self.scroll.pending_offset.set(Some(target_offset.min(max)));
             }
         }
 
@@ -433,8 +440,6 @@ impl RootComponent for NexusState {
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             context,
-            scroll_target: Cell::new(None),
-            pending_scroll_offset: Cell::new(None),
         };
 
         (state, Command::none())
