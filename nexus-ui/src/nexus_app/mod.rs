@@ -12,6 +12,7 @@ pub(crate) mod completion;
 pub(crate) mod history_search;
 pub(crate) mod input;
 pub(crate) mod selection;
+pub(crate) mod pty_backend;
 pub(crate) mod shell;
 pub(crate) mod agent;
 mod event_routing;
@@ -158,8 +159,8 @@ impl Component for NexusState {
         let vh = vp.height;
 
         let (cols, rows) = NexusState::compute_terminal_size(vw, vh);
-        self.shell.terminal_size.set((cols, rows));
-        self.shell.sync_pty_sizes();
+        self.shell.pty.terminal_size.set((cols, rows));
+        self.shell.pty.sync_pty_sizes();
 
         let cursor_visible = self.cursor_visible();
 
@@ -301,7 +302,7 @@ impl NexusState {
         // If a PTY block is focused, delegate to it.
         if let Focus::Block(id) = self.focus {
             if let Some(block) = self.shell.block_by_id(id) {
-                let has_pty = self.shell.pty_handles.iter().any(|h| h.block_id == id);
+                let has_pty = self.shell.pty.has_handle(id);
                 if has_pty || block.osc_title.is_some() {
                     let context = block.osc_title.as_deref()
                         .unwrap_or(&block.command);
