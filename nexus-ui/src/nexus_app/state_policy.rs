@@ -48,11 +48,62 @@ impl NexusState {
         self.set_focus(crate::blocks::Focus::Input);
     }
 
+    // --- Block navigation ---
+
+    /// All block IDs (shell + agent) in display order (ascending BlockId).
+    /// Single source of truth used by both navigation and layout.
+    pub(super) fn all_block_ids_ordered(&self) -> Vec<nexus_api::BlockId> {
+        let mut ids = Vec::with_capacity(self.shell.blocks.len() + self.agent.blocks.len());
+        let mut si = 0;
+        let mut ai = 0;
+        while si < self.shell.blocks.len() || ai < self.agent.blocks.len() {
+            let take_shell = match (self.shell.blocks.get(si), self.agent.blocks.get(ai)) {
+                (Some(s), Some(a)) => s.id.0 <= a.id.0,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => unreachable!(),
+            };
+            if take_shell {
+                ids.push(self.shell.blocks[si].id);
+                si += 1;
+            } else {
+                ids.push(self.agent.blocks[ai].id);
+                ai += 1;
+            }
+        }
+        ids
+    }
+
+    pub(super) fn prev_block_id(&self, current: nexus_api::BlockId) -> Option<nexus_api::BlockId> {
+        let ids = self.all_block_ids_ordered();
+        let pos = ids.iter().position(|&id| id == current)?;
+        if pos > 0 { Some(ids[pos - 1]) } else { None }
+    }
+
+    pub(super) fn next_block_id(&self, current: nexus_api::BlockId) -> Option<nexus_api::BlockId> {
+        let ids = self.all_block_ids_ordered();
+        let pos = ids.iter().position(|&id| id == current)?;
+        ids.get(pos + 1).copied()
+    }
+
+    pub(super) fn last_block_id(&self) -> Option<nexus_api::BlockId> {
+        self.all_block_ids_ordered().last().copied()
+    }
+
+    pub(super) fn block_has_active_pty(&self, id: nexus_api::BlockId) -> bool {
+        self.shell.pty.has_handle(id)
+    }
+
+    /// Request scroll-to-block in the next view pass.
+    pub(super) fn scroll_to_block(&self, id: nexus_api::BlockId) {
+        self.scroll_target.set(Some(id));
+    }
+
     // --- Cursor ---
 
     pub(super) fn cursor_visible(&self) -> bool {
-        // Hide main input cursor when agent question input has focus.
-        if matches!(self.focus, crate::blocks::Focus::AgentInput) {
+        // Hide main input cursor when a block or agent question input has focus.
+        if matches!(self.focus, crate::blocks::Focus::Block(_) | crate::blocks::Focus::AgentInput) {
             return false;
         }
         let blink_elapsed = Instant::now()

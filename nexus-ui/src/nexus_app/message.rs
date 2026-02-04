@@ -42,6 +42,19 @@ pub enum NexusMessage {
     ScrollToJob(u32),
     FileDrop(FileDropMsg),
     Drag(DragMsg),
+
+    // Block navigation
+    FocusPrevBlock,
+    FocusNextBlock,
+    FocusFirstBlock,
+    FocusLastBlock,
+    FocusAgentInput,
+    TypeThrough(KeyEvent),
+
+    // Zoom (stubs — rendering deferred)
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 /// File drop messages (from OS → Nexus).

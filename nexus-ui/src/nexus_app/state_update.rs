@@ -118,6 +118,12 @@ impl NexusState {
         msg: NexusMessage,
         ctx: &mut strata::component::Ctx,
     ) -> Command<NexusMessage> {
+        // Apply deferred scroll offset from view() (scroll-to-block)
+        if let Some(offset) = self.pending_scroll_offset.take() {
+            self.scroll.state.offset = offset;
+            self.scroll.follow = false;
+        }
+
         match msg {
             NexusMessage::Input(m) => {
                 if matches!(m, super::message::InputMsg::Mouse(_)) {
@@ -170,6 +176,72 @@ impl NexusState {
             NexusMessage::Tick => { self.on_output_arrived(); Command::none() }
             NexusMessage::FileDrop(m) => self.dispatch_file_drop(m),
             NexusMessage::Drag(m) => { self.dispatch_drag(m, ctx); Command::none() }
+            NexusMessage::FocusPrevBlock => {
+                let target = match self.focus {
+                    Focus::Block(id) => self.prev_block_id(id),
+                    Focus::Input => self.last_block_id(),
+                    _ => None,
+                };
+                match target {
+                    Some(id) => {
+                        self.set_focus(Focus::Block(id));
+                        self.scroll_to_block(id);
+                    }
+                    None => {
+                        self.set_focus(Focus::Input);
+                        self.scroll.force();
+                    }
+                }
+                Command::none()
+            }
+            NexusMessage::FocusNextBlock => {
+                if let Focus::Block(id) = self.focus {
+                    match self.next_block_id(id) {
+                        Some(next) => {
+                            self.set_focus(Focus::Block(next));
+                            self.scroll_to_block(next);
+                        }
+                        None => {
+                            self.set_focus(Focus::Input);
+                            self.scroll.force();
+                        }
+                    }
+                }
+                Command::none()
+            }
+            NexusMessage::FocusFirstBlock => {
+                if let Some(id) = self.all_block_ids_ordered().first().copied() {
+                    self.set_focus(Focus::Block(id));
+                    self.scroll_to_block(id);
+                }
+                Command::none()
+            }
+            NexusMessage::FocusLastBlock => {
+                if let Some(id) = self.last_block_id() {
+                    self.set_focus(Focus::Block(id));
+                    self.scroll_to_block(id);
+                }
+                Command::none()
+            }
+            NexusMessage::FocusAgentInput => {
+                self.set_focus(Focus::AgentInput);
+                self.scroll.force();
+                Command::none()
+            }
+            NexusMessage::TypeThrough(event) => {
+                self.set_focus(Focus::Input);
+                self.scroll.force();
+                if let Some(msg) = self.input.on_key(&event) {
+                    let (_cmd, output) = self.input.update(msg, ctx);
+                    self.apply_input_output(output)
+                } else {
+                    Command::none()
+                }
+            }
+            NexusMessage::ZoomIn | NexusMessage::ZoomOut | NexusMessage::ZoomReset => {
+                // Zoom stubs — shortcuts wired, rendering deferred
+                Command::none()
+            }
         }
     }
 }

@@ -55,7 +55,7 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         }
     }
 
-    // Phase 2: Focused PTY block — terminal gets first right of refusal.
+    // Phase 2: Focused block — viewer → PTY → static block navigation.
     if let Focus::Block(id) = state.focus {
         // If a viewer is active on this block, let the viewer handle keys.
         if let Some(block) = state.shell.block_by_id(id) {
@@ -67,9 +67,12 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
                 return None;
             }
         }
-        // No viewer — forward directly to the PTY.  Ctrl+C, Escape, Ctrl+R,
-        // etc. all flow here as raw terminal input.
-        return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
+        // Block has active PTY — forward directly to the terminal.
+        if state.block_has_active_pty(id) {
+            return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
+        }
+        // Static block (no PTY, no viewer) — block navigation keys.
+        return route_block_navigation(state, id, key, modifiers, event.clone());
     }
 
     // ── Below here: focus is Input or AgentInput ─────────────────────
@@ -99,6 +102,26 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         Focus::Block(_) => unreachable!(), // handled above
     }
 
+    // Phase 6b: Alt+Up/Down for prev/next block (works from Input focus too)
+    if modifiers.alt && !modifiers.meta && !modifiers.ctrl {
+        match key {
+            Key::Named(NamedKey::ArrowUp) => return Some(NexusMessage::FocusPrevBlock),
+            Key::Named(NamedKey::ArrowDown) => return Some(NexusMessage::FocusNextBlock),
+            _ => {}
+        }
+    }
+
+    // Phase 6c: Context-aware Tab — empty input cycles focus to agent question
+    if matches!(key, Key::Named(NamedKey::Tab))
+        && matches!(state.focus, Focus::Input)
+        && state.input.text_input.text.trim().is_empty()
+    {
+        if state.agent.has_pending_question() {
+            return Some(NexusMessage::FocusAgentInput);
+        }
+        // No agent question — fall through to InputWidget (TabComplete)
+    }
+
     // Phase 7: Input-focused keys (delegated to InputWidget)
     if let Some(msg) = state.input.on_key(&event) {
         return Some(NexusMessage::Input(msg));
@@ -120,8 +143,17 @@ fn route_cmd_shortcut(_state: &NexusState, key: &Key) -> Option<NexusMessage> {
             "c" => return Some(NexusMessage::Copy),
             "v" => return Some(NexusMessage::Paste),
             "." => return Some(NexusMessage::Input(InputMsg::ToggleMode)),
+            "=" | "+" => return Some(NexusMessage::ZoomIn),
+            "-" => return Some(NexusMessage::ZoomOut),
+            "0" => return Some(NexusMessage::ZoomReset),
             _ => {}
         }
+    }
+    // Cmd+Arrow for first/last block (macOS top/bottom convention)
+    match key {
+        Key::Named(NamedKey::ArrowUp) => return Some(NexusMessage::FocusFirstBlock),
+        Key::Named(NamedKey::ArrowDown) => return Some(NexusMessage::FocusLastBlock),
+        _ => {}
     }
     None
 }
@@ -179,7 +211,48 @@ fn route_escape(state: &NexusState) -> Option<NexusMessage> {
     if state.selection.selection.is_some() {
         return Some(NexusMessage::Selection(SelectionMsg::Clear));
     }
+    // Navigate to last block when input is empty (avoids surprise mode switch mid-command)
+    if matches!(state.focus, Focus::Input)
+        && state.input.text_input.text.is_empty()
+        && state.has_blocks()
+    {
+        return Some(NexusMessage::FocusLastBlock);
+    }
     None
+}
+
+/// Key routing for a focused static block (no active PTY, no viewer).
+/// Provides arrow-key navigation between blocks, Escape to return to input,
+/// and type-through for character keys.
+fn route_block_navigation(
+    _state: &NexusState,
+    _id: nexus_api::BlockId,
+    key: &Key,
+    modifiers: &strata::event_context::Modifiers,
+    event: KeyEvent,
+) -> Option<NexusMessage> {
+    // Alt+Arrow for prev/next block (also handled from Input focus below)
+    if modifiers.alt && !modifiers.meta && !modifiers.ctrl {
+        match key {
+            Key::Named(NamedKey::ArrowUp) => return Some(NexusMessage::FocusPrevBlock),
+            Key::Named(NamedKey::ArrowDown) => return Some(NexusMessage::FocusNextBlock),
+            _ => {}
+        }
+    }
+
+    match key {
+        Key::Named(NamedKey::Escape) => Some(NexusMessage::BlurAll),
+        Key::Named(NamedKey::ArrowUp) => Some(NexusMessage::FocusPrevBlock),
+        Key::Named(NamedKey::ArrowDown) => Some(NexusMessage::FocusNextBlock),
+        Key::Named(NamedKey::Enter) => Some(NexusMessage::BlurAll),
+        // Character key or Space without modifiers → type-through to input
+        Key::Character(_) | Key::Named(NamedKey::Space)
+            if !modifiers.ctrl && !modifiers.meta && !modifiers.alt =>
+        {
+            Some(NexusMessage::TypeThrough(event))
+        }
+        _ => None,
+    }
 }
 
 fn route_global_fallback(key: &Key) -> Option<NexusMessage> {
@@ -258,6 +331,7 @@ pub(super) fn on_mouse(
         ..
     } = &event
     {
+        eprintln!("[DEBUG click] hit={:?}", hit);
         // Z-order: Selection > Anchor > Text
         // If clicking inside an existing non-collapsed selection, start a selection drag.
         if let Some((source, origin_addr)) = state.selection.hit_in_selection(

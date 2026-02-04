@@ -6,7 +6,7 @@ use strata::{LayoutSnapshot, ScrollAction, ScrollState};
 
 pub(crate) struct ScrollModel {
     pub(super) state: ScrollState,
-    follow: bool,
+    pub(crate) follow: bool,
 }
 
 impl ScrollModel {

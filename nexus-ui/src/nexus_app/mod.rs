@@ -123,6 +123,11 @@ pub struct NexusState {
     last_frame: Cell<Instant>,
     fps_smooth: Cell<f32>,
     pub context: NexusContext,
+
+    // --- Block navigation ---
+    scroll_target: Cell<Option<nexus_api::BlockId>>,
+    /// Pending scroll offset computed in view(), applied in next update().
+    pending_scroll_offset: Cell<Option<f32>>,
 }
 
 // =========================================================================
@@ -190,6 +195,19 @@ impl Component for NexusState {
         main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
 
         self.sync_scroll_states(snapshot);
+
+        // Scroll-to-block: compute content-space position and store as pending offset.
+        // The actual scroll mutation happens in update (on_output_arrived/Tick).
+        if let Some(target_id) = self.scroll_target.take() {
+            let source = source_ids::block_container(target_id);
+            if let Some(bounds) = snapshot.widget_bounds(&source) {
+                let scroll_bounds = self.scroll.state.bounds.get();
+                let content_y = bounds.y - scroll_bounds.y + self.scroll.state.offset;
+                let target_offset = (content_y - scroll_bounds.height / 3.0).max(0.0);
+                let max = self.scroll.state.max.get();
+                self.pending_scroll_offset.set(Some(target_offset.min(max)));
+            }
+        }
 
         if let Some(menu) = self.transient.context_menu() {
             render_context_menu(snapshot, menu);
@@ -415,6 +433,8 @@ impl RootComponent for NexusState {
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             context,
+            scroll_target: Cell::new(None),
+            pending_scroll_offset: Cell::new(None),
         };
 
         (state, Command::none())
