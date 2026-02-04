@@ -21,6 +21,7 @@
 //!
 //! Uses `StagingBelt` for buffer uploads to exploit unified memory on M1/M2/M3.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -28,7 +29,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight,
+    Attrs, Buffer, CacheKey, CacheKeyFlags, Family, FontSystem, Metrics, Shaping, Style,
+    SubpixelBin, Weight, fontdb,
 };
 use iced::widget::shader::wgpu;
 use lru::LruCache;
@@ -294,6 +296,83 @@ pub struct StrataPipeline {
     pub shaping_time: std::time::Duration,
     /// Shape keys that caused cosmic-text panics — skip on future frames.
     poisoned_texts: std::collections::HashSet<u64>,
+    /// Reusable cosmic-text buffer — avoids allocation + font resolution per cache miss.
+    reusable_buffer: Option<Buffer>,
+    /// Per-character glyph cache for monospace grid text.
+    /// Populated lazily; avoids cosmic-text Buffer/shaping entirely for known chars.
+    char_glyph_cache: CharGlyphCache,
+    /// Cached baseline offset for grid text (single font size in practice).
+    grid_line_y: Option<(u32, f32)>,
+}
+
+/// Fast per-character glyph lookup for terminal grid text.
+///
+/// Uses a flat array for ASCII (0-127) × 4 style combos = 512 slots.
+/// Falls back to HashMap for non-ASCII (emoji, CJK, etc.).
+struct CharGlyphCache {
+    /// Font size these entries were cached for.
+    font_size_bits: u32,
+    /// Flat array: index = char_code * 4 + style_bits (bold=1, italic=2).
+    /// `None` = not yet cached for this char+style.
+    ascii: Vec<Option<(fontdb::ID, u16, CacheKeyFlags)>>,
+    /// Overflow for non-ASCII single-codepoint characters.
+    other: HashMap<(char, bool, bool), (fontdb::ID, u16, CacheKeyFlags)>,
+    /// Cache for multi-codepoint grapheme clusters (combining marks, ZWJ emoji, etc.).
+    /// Key: (grapheme string, bold, italic).
+    /// Value: positioned glyphs — (font_id, glyph_id, flags, x_offset, y_offset) per glyph.
+    graphemes: HashMap<(String, bool, bool), Vec<(fontdb::ID, u16, CacheKeyFlags, i32, i32)>>,
+}
+
+impl CharGlyphCache {
+    fn new() -> Self {
+        Self {
+            font_size_bits: 0,
+            ascii: vec![None; 128 * 4],
+            other: HashMap::new(),
+            graphemes: HashMap::new(),
+        }
+    }
+
+    /// Invalidate if font size changed.
+    #[inline]
+    fn ensure_size(&mut self, font_size_bits: u32) {
+        if self.font_size_bits != font_size_bits {
+            self.font_size_bits = font_size_bits;
+            self.ascii.fill(None);
+            self.other.clear();
+            self.graphemes.clear();
+        }
+    }
+
+    #[inline]
+    fn style_bits(bold: bool, italic: bool) -> usize {
+        (bold as usize) | ((italic as usize) << 1)
+    }
+
+    #[inline]
+    fn get(&self, ch: char, bold: bool, italic: bool) -> Option<(fontdb::ID, u16, CacheKeyFlags)> {
+        let code = ch as u32;
+        if code < 128 {
+            self.ascii[code as usize * 4 + Self::style_bits(bold, italic)]
+        } else {
+            self.other.get(&(ch, bold, italic)).copied()
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, ch: char, bold: bool, italic: bool, val: (fontdb::ID, u16, CacheKeyFlags)) {
+        let code = ch as u32;
+        if code < 128 {
+            self.ascii[code as usize * 4 + Self::style_bits(bold, italic)] = Some(val);
+        } else {
+            self.other.insert((ch, bold, italic), val);
+        }
+    }
+
+    #[inline]
+    fn contains(&self, ch: char, bold: bool, italic: bool) -> bool {
+        self.get(ch, bold, italic).is_some()
+    }
 }
 
 impl StrataPipeline {
@@ -610,6 +689,9 @@ impl StrataPipeline {
             cache_misses: 0,
             shaping_time: std::time::Duration::ZERO,
             poisoned_texts: std::collections::HashSet::new(),
+            reusable_buffer: None,
+            char_glyph_cache: CharGlyphCache::new(),
+            grid_line_y: None,
         }
     }
 
@@ -1269,7 +1351,274 @@ impl StrataPipeline {
         self.add_text_styled(text, x, y, color, font_size, false, false, font_system);
     }
 
-    /// Add shaped text with optional bold/italic styling.
+    /// Add shaped text for terminal grid content.
+    ///
+    /// Bypasses cosmic-text's Buffer/shaping pipeline entirely. Uses a per-character
+    /// glyph cache (flat array for ASCII) that maps `char → CacheKey` directly, then
+    /// looks up glyphs in the atlas. Only falls back to cosmic-text shaping for
+    /// characters not yet seen. After warmup, every call is the fast path.
+    pub fn add_text_grid(&mut self, text: &str, x: f32, y: f32, color: Color, font_size: f32, bold: bool, italic: bool, font_system: &mut FontSystem) {
+        use unicode_width::UnicodeWidthChar;
+
+        if text.is_empty() {
+            return;
+        }
+
+        let packed_color = color.pack();
+        let font_size_bits = font_size.to_bits();
+        let cell_width = self.glyph_atlas.cell_width;
+
+        // Invalidate char cache if font size changed (e.g. scale factor change)
+        self.char_glyph_cache.ensure_size(font_size_bits);
+
+        // Get or compute baseline offset for this font size
+        let line_y = match self.grid_line_y {
+            Some((bits, ly)) if bits == font_size_bits => ly,
+            _ => {
+                let metrics = Metrics::new(font_size, font_size * 1.2);
+                let mut buffer = Buffer::new(font_system, metrics);
+                buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+                buffer.set_text(font_system, "M", Attrs::new().family(Family::Monospace), Shaping::Advanced);
+                buffer.shape_until_scroll(font_system, false);
+                let ly = buffer.layout_runs().next().map(|r| r.line_y).unwrap_or(font_size * 0.8);
+                self.grid_line_y = Some((font_size_bits, ly));
+                ly
+            }
+        };
+
+        // ── Tier A: all-simple fast path ─────────────────────────────────
+        // Every char is single-width (1 column) and already cached.
+        // This covers 99%+ of terminal output (ASCII from top, ls, etc.).
+        let all_simple_cached = text.chars().all(|ch| {
+            UnicodeWidthChar::width(ch) == Some(1)
+                && self.char_glyph_cache.contains(ch, bold, italic)
+        });
+
+        if all_simple_cached {
+            self.cache_hits += 1;
+            let mut cursor_x = x;
+            for ch in text.chars() {
+                if let Some((font_id, glyph_id, flags)) = self.char_glyph_cache.get(ch, bold, italic) {
+                    let cache_key = CacheKey {
+                        font_id,
+                        glyph_id,
+                        font_size_bits,
+                        x_bin: SubpixelBin::Zero,
+                        y_bin: SubpixelBin::Zero,
+                        flags,
+                    };
+                    let ag = self.glyph_atlas.get_glyph(cache_key, font_system);
+                    if ag.width > 0 && ag.height > 0 {
+                        let mode = if ag.is_color { 5 } else { 0 };
+                        self.instances.push(GpuInstance {
+                            pos: [(cursor_x + ag.offset_x as f32).round(), (y + line_y - ag.offset_y as f32).round()],
+                            size: [ag.width as f32, ag.height as f32],
+                            uv_tl: [Self::uv_to_f32(ag.uv_x), Self::uv_to_f32(ag.uv_y)],
+                            uv_br: [Self::uv_to_f32(ag.uv_x + ag.uv_w), Self::uv_to_f32(ag.uv_y + ag.uv_h)],
+                            color: packed_color,
+                            mode,
+                            corner_radius: 0.0,
+                            texture_layer: 0,
+                            clip_rect: NO_CLIP,
+                        });
+                    }
+                }
+                cursor_x += cell_width;
+            }
+            return;
+        }
+
+        // ── General path: unicode-width–aware, grapheme clusters ─────────
+        // Handles wide chars (CJK = 2 columns), zero-width combining marks,
+        // and multi-codepoint grapheme clusters (ZWJ emoji, flags, etc.).
+        //
+        // Grapheme clusters are reconstructed using unicode-width plus
+        // special rules for ZWJ continuation and regional indicator pairs.
+        self.cache_misses += 1;
+        let shape_start = std::time::Instant::now();
+
+        /// Returns true if `ch` is a Regional Indicator Symbol (U+1F1E6..=U+1F1FF).
+        #[inline]
+        fn is_regional_indicator(ch: char) -> bool {
+            ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch)
+        }
+
+        let mut cursor_x = x;
+        let mut chars = text.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+            // Determine if this char starts a multi-codepoint cluster:
+            // 1. Next char is zero-width (combining mark, VS, ZWJ)
+            // 2. This is a regional indicator followed by another regional indicator (flag pair)
+            let next_is_zw = chars.peek().map_or(false, |&next| {
+                UnicodeWidthChar::width(next).unwrap_or(0) == 0
+            });
+            let is_flag_pair = is_regional_indicator(ch)
+                && chars.peek().map_or(false, |&next| is_regional_indicator(next));
+            let is_multi = next_is_zw || is_flag_pair;
+
+            if !is_multi {
+                // ── Single-codepoint grapheme (Tier A/B) ─────────────────
+                // Use the per-char cache. Shape on miss via cosmic-text.
+                if self.char_glyph_cache.get(ch, bold, italic).is_none() {
+                    let mut buffer = self.reusable_buffer.take().unwrap_or_else(|| {
+                        let metrics = Metrics::new(font_size, font_size * 1.2);
+                        let mut buf = Buffer::new(font_system, metrics);
+                        buf.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+                        buf
+                    });
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        buffer.set_metrics(font_system, Metrics::new(font_size, font_size * 1.2));
+                        let mut attrs = Attrs::new().family(Family::Monospace);
+                        if bold { attrs = attrs.weight(Weight::BOLD); }
+                        if italic { attrs = attrs.style(Style::Italic); }
+                        buffer.set_text(font_system, &ch.to_string(), attrs, Shaping::Advanced);
+                        buffer.shape_until_scroll(font_system, false);
+                        buffer.layout_runs().next().and_then(|run| {
+                            run.glyphs.first().map(|g| g.physical((0., 0.), 1.0).cache_key)
+                        })
+                    }));
+                    if let Ok(Some(ck)) = result {
+                        self.char_glyph_cache.insert(ch, bold, italic,
+                            (ck.font_id, ck.glyph_id, ck.flags));
+                    }
+                    self.reusable_buffer = Some(buffer);
+                }
+
+                // Render from cache
+                if let Some((font_id, glyph_id, flags)) = self.char_glyph_cache.get(ch, bold, italic) {
+                    let cache_key = CacheKey {
+                        font_id, glyph_id, font_size_bits,
+                        x_bin: SubpixelBin::Zero, y_bin: SubpixelBin::Zero, flags,
+                    };
+                    let ag = self.glyph_atlas.get_glyph(cache_key, font_system);
+                    if ag.width > 0 && ag.height > 0 {
+                        let mode = if ag.is_color { 5 } else { 0 };
+                        self.instances.push(GpuInstance {
+                            pos: [(cursor_x + ag.offset_x as f32).round(), (y + line_y - ag.offset_y as f32).round()],
+                            size: [ag.width as f32, ag.height as f32],
+                            uv_tl: [Self::uv_to_f32(ag.uv_x), Self::uv_to_f32(ag.uv_y)],
+                            uv_br: [Self::uv_to_f32(ag.uv_x + ag.uv_w), Self::uv_to_f32(ag.uv_y + ag.uv_h)],
+                            color: packed_color,
+                            mode,
+                            corner_radius: 0.0,
+                            texture_layer: 0,
+                            clip_rect: NO_CLIP,
+                        });
+                    }
+                }
+                cursor_x += ch_width as f32 * cell_width;
+            } else {
+                // ── Multi-codepoint grapheme cluster (Tier C) ────────────
+                // Collect the full cluster using these rules:
+                //  - Zero-width chars (combining marks, VS, ZWJ) attach to the cluster
+                //  - After ZWJ (U+200D), continue collecting the next primary char
+                //    and its zero-width followers (handles ZWJ emoji sequences)
+                //  - A regional indicator pair forms one cluster (flag emoji)
+                let mut grapheme = String::with_capacity(8);
+                grapheme.push(ch);
+
+                // For flag pairs: consume the second regional indicator
+                if is_flag_pair {
+                    if let Some(next) = chars.next() {
+                        grapheme.push(next);
+                    }
+                }
+
+                // Collect zero-width followers, continuing past ZWJ to grab
+                // the next primary char (and its zero-width followers).
+                loop {
+                    match chars.peek() {
+                        Some(&next) if UnicodeWidthChar::width(next).unwrap_or(0) == 0 => {
+                            let is_zwj = next == '\u{200D}';
+                            grapheme.push(next);
+                            chars.next();
+                            // After ZWJ, also consume the next primary char
+                            if is_zwj {
+                                if let Some(&primary) = chars.peek() {
+                                    grapheme.push(primary);
+                                    chars.next();
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+
+                // Check grapheme cache
+                let cache_key_tuple = (grapheme.clone(), bold, italic);
+                if !self.char_glyph_cache.graphemes.contains_key(&cache_key_tuple) {
+                    // Shape the full grapheme via cosmic-text to get correct
+                    // GSUB substitutions (composed forms, ligatures, ZWJ).
+                    let mut buffer = self.reusable_buffer.take().unwrap_or_else(|| {
+                        let metrics = Metrics::new(font_size, font_size * 1.2);
+                        let mut buf = Buffer::new(font_system, metrics);
+                        buf.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+                        buf
+                    });
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        buffer.set_metrics(font_system, Metrics::new(font_size, font_size * 1.2));
+                        let mut attrs = Attrs::new().family(Family::Monospace);
+                        if bold { attrs = attrs.weight(Weight::BOLD); }
+                        if italic { attrs = attrs.style(Style::Italic); }
+                        buffer.set_text(font_system, &grapheme, attrs, Shaping::Advanced);
+                        buffer.shape_until_scroll(font_system, false);
+                        let mut glyphs = Vec::new();
+                        for run in buffer.layout_runs() {
+                            for g in run.glyphs.iter() {
+                                let phys = g.physical((0., 0.), 1.0);
+                                glyphs.push((
+                                    phys.cache_key.font_id,
+                                    phys.cache_key.glyph_id,
+                                    phys.cache_key.flags,
+                                    phys.x,
+                                    phys.y,
+                                ));
+                            }
+                        }
+                        glyphs
+                    }));
+                    if let Ok(glyphs) = result {
+                        self.char_glyph_cache.graphemes.insert(cache_key_tuple.clone(), glyphs);
+                    }
+                    self.reusable_buffer = Some(buffer);
+                }
+
+                // Render all glyphs in this grapheme cluster
+                if let Some(glyphs) = self.char_glyph_cache.graphemes.get(&cache_key_tuple) {
+                    for &(font_id, glyph_id, flags, gx, gy) in glyphs {
+                        let cache_key = CacheKey {
+                            font_id, glyph_id, font_size_bits,
+                            x_bin: SubpixelBin::Zero, y_bin: SubpixelBin::Zero, flags,
+                        };
+                        let ag = self.glyph_atlas.get_glyph(cache_key, font_system);
+                        if ag.width > 0 && ag.height > 0 {
+                            let mode = if ag.is_color { 5 } else { 0 };
+                            self.instances.push(GpuInstance {
+                                pos: [(cursor_x + gx as f32 + ag.offset_x as f32).round(),
+                                      (y + line_y + gy as f32 - ag.offset_y as f32).round()],
+                                size: [ag.width as f32, ag.height as f32],
+                                uv_tl: [Self::uv_to_f32(ag.uv_x), Self::uv_to_f32(ag.uv_y)],
+                                uv_br: [Self::uv_to_f32(ag.uv_x + ag.uv_w), Self::uv_to_f32(ag.uv_y + ag.uv_h)],
+                                color: packed_color,
+                                mode,
+                                corner_radius: 0.0,
+                                texture_layer: 0,
+                                clip_rect: NO_CLIP,
+                            });
+                        }
+                    }
+                }
+                cursor_x += ch_width as f32 * cell_width;
+            }
+        }
+
+        self.shaping_time += shape_start.elapsed();
+    }
+
+    /// Add shaped text with optional bold/italic styling (non-grid text: UI labels, etc).
     pub fn add_text_styled(&mut self, text: &str, x: f32, y: f32, color: Color, font_size: f32, bold: bool, italic: bool, font_system: &mut FontSystem) {
         if text.is_empty() {
             return;
@@ -1322,15 +1671,21 @@ impl StrataPipeline {
         }
 
         // Cache miss (or stale) — shape via cosmic-text
+        // Reuse a persistent Buffer to avoid allocation + font resolution overhead.
         // Wrap shaping in catch_unwind because cosmic-text can panic on certain
         // glyph cache operations (e.g. arithmetic overflow in glyph_cache.rs).
         // Atlas insertion happens outside the unwind boundary.
         let shape_start = std::time::Instant::now();
 
-        let shaping_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut buffer = self.reusable_buffer.take().unwrap_or_else(|| {
             let metrics = Metrics::new(font_size, font_size * 1.2);
-            let mut buffer = Buffer::new(font_system, metrics);
-            buffer.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+            let mut buf = Buffer::new(font_system, metrics);
+            buf.set_size(font_system, Some(f32::MAX), Some(f32::MAX));
+            buf
+        });
+
+        let shaping_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buffer.set_metrics(font_system, Metrics::new(font_size, font_size * 1.2));
             let mut attrs = Attrs::new().family(Family::Monospace);
             if bold {
                 attrs = attrs.weight(Weight::BOLD);
@@ -1353,6 +1708,8 @@ impl StrataPipeline {
             glyph_data
         }));
 
+        // Return buffer for reuse (even if shaping panicked, the buffer may be ok)
+        self.reusable_buffer = Some(buffer);
         self.shaping_time += shape_start.elapsed();
 
         let glyph_data = match shaping_result {

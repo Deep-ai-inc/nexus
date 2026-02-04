@@ -389,9 +389,8 @@ impl ShellWidget {
 
         let pty_rx = self.pty_rx.clone();
         subs.push(Subscription::from_iced(
-            pty_subscription(pty_rx).map(|(id, evt)| match evt {
-                PtyEvent::Output(data) => NexusMessage::Shell(ShellMsg::PtyOutput(id, data)),
-                PtyEvent::Exited(code) => NexusMessage::Shell(ShellMsg::PtyExited(id, code)),
+            pty_subscription(pty_rx).map(|batch| {
+                NexusMessage::Shell(ShellMsg::PtyBatch(batch))
             }),
         ));
 
@@ -406,6 +405,7 @@ impl ShellWidget {
     /// Handle a message, returning commands and cross-cutting output.
     pub fn update(&mut self, msg: ShellMsg, ctx: &mut strata::component::Ctx) -> (strata::Command<ShellMsg>, ShellOutput) {
         let output = match msg {
+            ShellMsg::PtyBatch(batch) => self.handle_pty_batch(batch),
             ShellMsg::PtyOutput(id, data) => self.handle_pty_output(id, data),
             ShellMsg::PtyExited(id, exit_code) => self.handle_pty_exited(id, exit_code),
             ShellMsg::KernelEvent(evt) => self.handle_kernel_event(evt, ctx.images),
@@ -455,7 +455,89 @@ impl ShellWidget {
         }
     }
 
-    /// Handle PTY output data.
+    /// Handle a batch of PTY events. Coalesces consecutive Output events
+    /// for the same block into a single `feed()` call, preserving ordering
+    /// relative to Exited events.
+    pub fn handle_pty_batch(&mut self, batch: Vec<(BlockId, PtyEvent)>) -> ShellOutput {
+        // Coalesce: merge consecutive Output(data) for the same block.
+        // When we hit an Exited or a different block, flush the accumulator.
+        let mut acc_id: Option<BlockId> = None;
+        let mut acc_data: Vec<u8> = Vec::new();
+        let mut last_output = ShellOutput::None;
+
+        let flush = |acc_id: &mut Option<BlockId>,
+                     acc_data: &mut Vec<u8>,
+                     blocks: &mut Vec<Block>,
+                     block_index: &HashMap<BlockId, usize>| {
+            if let Some(id) = acc_id.take() {
+                if !acc_data.is_empty() {
+                    if let Some(&idx) = block_index.get(&id) {
+                        if let Some(block) = blocks.get_mut(idx) {
+                            block.parser.feed(acc_data);
+                            block.version += 1;
+                        }
+                    }
+                    acc_data.clear();
+                }
+            }
+        };
+
+        for (id, evt) in batch {
+            match evt {
+                PtyEvent::Output(data) => {
+                    if acc_id == Some(id) {
+                        // Same block — just append.
+                        acc_data.extend_from_slice(&data);
+                    } else {
+                        // Different block — flush previous, start new accumulator.
+                        flush(
+                            &mut acc_id,
+                            &mut acc_data,
+                            &mut self.blocks,
+                            &self.block_index,
+                        );
+                        acc_id = Some(id);
+                        acc_data = data;
+                    }
+                }
+                PtyEvent::Exited(code) => {
+                    // Flush any pending output for this or previous block first.
+                    flush(
+                        &mut acc_id,
+                        &mut acc_data,
+                        &mut self.blocks,
+                        &self.block_index,
+                    );
+                    last_output = self.handle_pty_exited(id, code);
+                }
+            }
+        }
+
+        // Flush remaining accumulated output.
+        if let Some(id) = acc_id {
+            if !acc_data.is_empty() {
+                if let Some(&idx) = self.block_index.get(&id) {
+                    if let Some(block) = self.blocks.get_mut(idx) {
+                        block.parser.feed(&acc_data);
+                        block.version += 1;
+                    }
+                }
+            }
+        }
+
+        // Don't set terminal_dirty here — the batch message itself triggers
+        // a render via the iced adapter (every App message bumps frame).
+        // Setting dirty would activate the 16ms tick, which fires yet
+        // another redundant render with no new content.
+
+        // If the last event was an exit, propagate that; otherwise scroll.
+        match last_output {
+            ShellOutput::None => ShellOutput::ScrollToBottom,
+            other => other,
+        }
+    }
+
+    /// Handle a single PTY output event (unbatched fallback).
     pub fn handle_pty_output(&mut self, id: BlockId, data: Vec<u8>) -> ShellOutput {
         if let Some(&idx) = self.block_index.get(&id) {
             if let Some(block) = self.blocks.get_mut(idx) {
@@ -463,13 +545,8 @@ impl ShellWidget {
                 block.version += 1;
             }
         }
-        if data.len() < 128 {
-            self.terminal_dirty = false;
-            ShellOutput::ScrollToBottom
-        } else {
-            self.terminal_dirty = true;
-            ShellOutput::None
-        }
+        self.terminal_dirty = true;
+        ShellOutput::ScrollToBottom
     }
 
     /// Handle PTY exit. Returns the exited block ID so root can decide focus.

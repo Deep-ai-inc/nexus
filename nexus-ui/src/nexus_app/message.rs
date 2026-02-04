@@ -124,6 +124,8 @@ pub enum InputMsg {
 pub enum ShellMsg {
     PtyOutput(BlockId, Vec<u8>),
     PtyExited(BlockId, i32),
+    /// Batched PTY events (coalesced by the subscription to reduce render passes).
+    PtyBatch(Vec<(BlockId, crate::blocks::PtyEvent)>),
     /// Root resolves the target block and passes its ID.
     PtyInput(BlockId, KeyEvent),
     /// Root resolves the target block and passes its ID.
