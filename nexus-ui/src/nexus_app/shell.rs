@@ -807,8 +807,36 @@ impl ShellWidget {
     /// Forward a key event to a focused PTY block. Returns false if PTY is gone.
     pub fn forward_key(&self, block_id: BlockId, event: &KeyEvent) -> bool {
         if let Some(handle) = self.pty_handles.iter().find(|h| h.block_id == block_id) {
-            if let Some(bytes) = strata_key_to_bytes(event) {
+            let flags = self
+                .block_by_id(block_id)
+                .map(|b| TermKeyFlags { app_cursor: b.parser.app_cursor(), ..TermKeyFlags::default() })
+                .unwrap_or_default();
+            if let Some(bytes) = strata_key_to_bytes(event, flags) {
                 let _ = handle.write(&bytes);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Paste text into a PTY, respecting Bracketed Paste mode.
+    ///
+    /// If the terminal has enabled bracketed paste (`\x1b[?2004h`), the text
+    /// is wrapped in `\x1b[200~` / `\x1b[201~` to prevent accidental command
+    /// execution.
+    pub fn paste_to_pty(&self, block_id: BlockId, text: &str) -> bool {
+        if let Some(handle) = self.pty_handles.iter().find(|h| h.block_id == block_id) {
+            let bracketed = self
+                .block_by_id(block_id)
+                .map(|b| b.parser.bracketed_paste())
+                .unwrap_or(false);
+            if bracketed {
+                let _ = handle.write(b"\x1b[200~");
+                let _ = handle.write(text.as_bytes());
+                let _ = handle.write(b"\x1b[201~");
+            } else {
+                let _ = handle.write(text.as_bytes());
             }
             true
         } else {
@@ -1067,11 +1095,40 @@ impl ShellWidget {
 }
 
 // =========================================================================
-// Key-to-bytes conversion for PTY input
+// Terminal key encoding — converts GUI key events to PTY byte sequences
 // =========================================================================
 
-/// Convert a Strata KeyEvent to bytes suitable for writing to a PTY.
-pub(crate) fn strata_key_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
+/// Flags from the terminal that affect how keys are encoded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TermKeyFlags {
+    /// DECCKM: Application Cursor Keys mode.  When true, arrow keys use
+    /// SS3 (`\x1bO`) instead of CSI (`\x1b[`).
+    pub app_cursor: bool,
+
+    /// macOS "Option as Meta" toggle.  When true, Option+key sends
+    /// `\x1b` + key (Meta/Alt behaviour for shells and Emacs).  When false,
+    /// the OS-composed character is sent (e.g., Option+a → å).
+    pub option_as_meta: bool,
+}
+
+impl Default for TermKeyFlags {
+    fn default() -> Self {
+        Self {
+            app_cursor: false,
+            // Default to true — terminal users on macOS almost always want
+            // Option to behave as Meta for readline/Emacs keybindings.
+            option_as_meta: true,
+        }
+    }
+}
+
+/// Encode a key event into the byte sequence a real terminal would send.
+///
+/// `flags` carries live terminal state (DECCKM, etc.) that affects encoding.
+pub(crate) fn strata_key_to_bytes(
+    event: &KeyEvent,
+    flags: TermKeyFlags,
+) -> Option<Vec<u8>> {
     let (key, modifiers, text) = match event {
         KeyEvent::Pressed {
             key,
@@ -1082,91 +1139,192 @@ pub(crate) fn strata_key_to_bytes(event: &KeyEvent) -> Option<Vec<u8>> {
     };
 
     match key {
-        Key::Character(c) => {
-            if modifiers.ctrl && c.len() == 1 {
-                let ch = c.chars().next()?;
-                if ch.is_ascii_alphabetic() {
-                    let ctrl_code = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
-                    return Some(vec![ctrl_code]);
-                }
-            }
-            if let Some(t) = text {
-                if !t.is_empty() {
-                    return Some(t.as_bytes().to_vec());
-                }
-            }
-            Some(c.as_bytes().to_vec())
+        Key::Character(c) => encode_character(c, modifiers, text, flags),
+        Key::Named(named) => encode_named(*named, modifiers, flags),
+    }
+}
+
+// -- Character keys ---------------------------------------------------------
+
+fn encode_character(
+    c: &str,
+    modifiers: &strata::event_context::Modifiers,
+    text: Option<&str>,
+    flags: TermKeyFlags,
+) -> Option<Vec<u8>> {
+    // Ctrl+letter → ASCII control code (0x01–0x1a)
+    if modifiers.ctrl && c.len() == 1 {
+        let ch = c.chars().next()?;
+        if ch.is_ascii_alphabetic() {
+            let ctrl_code = (ch.to_ascii_lowercase() as u8) - b'a' + 1;
+            return Some(vec![ctrl_code]);
         }
-        Key::Named(named) => {
-            if modifiers.ctrl {
-                match named {
-                    NamedKey::ArrowLeft => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'5', b'D'])
-                    }
-                    NamedKey::ArrowRight => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'5', b'C'])
-                    }
-                    NamedKey::ArrowUp => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'5', b'A'])
-                    }
-                    NamedKey::ArrowDown => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'5', b'B'])
-                    }
-                    _ => {}
-                }
-            }
-            if modifiers.shift {
-                match named {
-                    NamedKey::ArrowLeft => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'2', b'D'])
-                    }
-                    NamedKey::ArrowRight => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'2', b'C'])
-                    }
-                    NamedKey::ArrowUp => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'2', b'A'])
-                    }
-                    NamedKey::ArrowDown => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'2', b'B'])
-                    }
-                    _ => {}
-                }
-            }
-            if modifiers.alt {
-                match named {
-                    NamedKey::ArrowLeft => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'3', b'D'])
-                    }
-                    NamedKey::ArrowRight => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'3', b'C'])
-                    }
-                    NamedKey::ArrowUp => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'3', b'A'])
-                    }
-                    NamedKey::ArrowDown => {
-                        return Some(vec![0x1b, b'[', b'1', b';', b'3', b'B'])
-                    }
-                    _ => {}
-                }
-            }
-            match named {
-                NamedKey::Enter => Some(vec![b'\r']),
-                NamedKey::Backspace => Some(vec![0x7f]),
-                NamedKey::Tab => Some(vec![b'\t']),
-                NamedKey::Escape => Some(vec![0x1b]),
-                NamedKey::Space => Some(vec![b' ']),
-                NamedKey::ArrowUp => Some(vec![0x1b, b'[', b'A']),
-                NamedKey::ArrowDown => Some(vec![0x1b, b'[', b'B']),
-                NamedKey::ArrowRight => Some(vec![0x1b, b'[', b'C']),
-                NamedKey::ArrowLeft => Some(vec![0x1b, b'[', b'D']),
-                NamedKey::Home => Some(vec![0x1b, b'[', b'H']),
-                NamedKey::End => Some(vec![0x1b, b'[', b'F']),
-                NamedKey::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
-                NamedKey::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
-                NamedKey::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
-                _ => None,
+        // Ctrl+special punctuation
+        match ch {
+            ' ' | '2' | '@' => return Some(vec![0x00]), // Ctrl+Space / Ctrl+@
+            '[' => return Some(vec![0x1b]),               // Ctrl+[ = Escape
+            '\\' => return Some(vec![0x1c]),              // Ctrl+\ = FS (SIGQUIT)
+            ']' => return Some(vec![0x1d]),               // Ctrl+] = GS
+            '/' => return Some(vec![0x1f]),               // Ctrl+/ = US
+            '_' => return Some(vec![0x1f]),               // Ctrl+_ = US
+            _ => {}
+        }
+    }
+
+    // Alt/Option+character handling.
+    //
+    // When `option_as_meta` is true (default for terminal users):
+    //   Option+b → \x1b b  (Meta-b = backward-word in readline/Emacs)
+    //   Ignore the OS-composed text (å, ∫, etc.)
+    //
+    // When `option_as_meta` is false:
+    //   Option+a → å  (fall through to normal text path, using OS-composed text)
+    if modifiers.alt && flags.option_as_meta {
+        let raw = c.as_bytes();
+        let mut bytes = Vec::with_capacity(1 + raw.len());
+        bytes.push(0x1b);
+        bytes.extend_from_slice(raw);
+        return Some(bytes);
+    }
+
+    // Normal character — prefer OS-composed text (handles Shift, dead keys, IME)
+    if let Some(t) = text {
+        if !t.is_empty() {
+            return Some(t.as_bytes().to_vec());
+        }
+    }
+    Some(c.as_bytes().to_vec())
+}
+
+// -- Named keys -------------------------------------------------------------
+
+/// Compute the xterm modifier parameter: shift=2, alt=3, shift+alt=4, ctrl=5,
+/// ctrl+shift=6, ctrl+alt=7, ctrl+shift+alt=8.  Returns 0 when no modifiers.
+fn modifier_param(m: &strata::event_context::Modifiers) -> u8 {
+    let mut p: u8 = 0;
+    if m.shift { p |= 1; }
+    if m.alt { p |= 2; }
+    if m.ctrl { p |= 4; }
+    if p == 0 { 0 } else { p + 1 }
+}
+
+/// Build a CSI sequence with an optional modifier parameter.
+///
+/// *Letter-terminated* keys (arrows, Home, End):
+///   unmodified  → `\x1b[ <suffix>`
+///   modified    → `\x1b[1;<mod> <suffix>`
+///
+/// *Tilde-terminated* keys (Insert, Delete, PgUp, PgDn, F5+):
+///   unmodified  → `\x1b[ <code> ~`
+///   modified    → `\x1b[ <code>;<mod> ~`
+fn csi_modified_letter(suffix: u8, m: &strata::event_context::Modifiers) -> Vec<u8> {
+    let p = modifier_param(m);
+    if p == 0 {
+        vec![0x1b, b'[', suffix]
+    } else {
+        vec![0x1b, b'[', b'1', b';', b'0' + p, suffix]
+    }
+}
+
+fn csi_modified_tilde(code: &[u8], m: &strata::event_context::Modifiers) -> Vec<u8> {
+    let p = modifier_param(m);
+    let mut v = vec![0x1b, b'['];
+    v.extend_from_slice(code);
+    if p != 0 {
+        v.push(b';');
+        v.push(b'0' + p);
+    }
+    v.push(b'~');
+    v
+}
+
+/// SS3 sequence (used for F1-F4 unmodified, and application-mode arrows).
+fn ss3(suffix: u8) -> Vec<u8> {
+    vec![0x1b, b'O', suffix]
+}
+
+fn encode_named(
+    named: NamedKey,
+    modifiers: &strata::event_context::Modifiers,
+    flags: TermKeyFlags,
+) -> Option<Vec<u8>> {
+    let m = modifiers;
+    let has_mods = m.shift || m.alt || m.ctrl;
+
+    match named {
+        // -- Simple keys (no CSI) ------------------------------------------
+        NamedKey::Enter => Some(vec![b'\r']),
+        NamedKey::Escape => Some(vec![0x1b]),
+        NamedKey::Space => {
+            if m.ctrl {
+                Some(vec![0x00]) // Ctrl+Space = NUL
+            } else {
+                Some(vec![b' '])
             }
         }
+        NamedKey::Backspace => {
+            if m.ctrl {
+                Some(vec![0x08]) // Ctrl+Backspace = BS
+            } else if m.alt {
+                Some(vec![0x1b, 0x7f]) // Alt+Backspace = ESC DEL
+            } else {
+                Some(vec![0x7f]) // Backspace = DEL
+            }
+        }
+        NamedKey::Tab => {
+            if m.shift {
+                Some(vec![0x1b, b'[', b'Z']) // Shift+Tab = backtab
+            } else {
+                Some(vec![b'\t'])
+            }
+        }
+
+        // -- Arrow keys (DECCKM-aware) -------------------------------------
+        NamedKey::ArrowUp | NamedKey::ArrowDown |
+        NamedKey::ArrowRight | NamedKey::ArrowLeft => {
+            let suffix = match named {
+                NamedKey::ArrowUp => b'A',
+                NamedKey::ArrowDown => b'B',
+                NamedKey::ArrowRight => b'C',
+                NamedKey::ArrowLeft => b'D',
+                _ => unreachable!(),
+            };
+            if has_mods {
+                Some(csi_modified_letter(suffix, m))
+            } else if flags.app_cursor {
+                Some(ss3(suffix))
+            } else {
+                Some(vec![0x1b, b'[', suffix])
+            }
+        }
+
+        // -- Home / End (letter-terminated) --------------------------------
+        NamedKey::Home => Some(csi_modified_letter(b'H', m)),
+        NamedKey::End => Some(csi_modified_letter(b'F', m)),
+
+        // -- Tilde-terminated keys -----------------------------------------
+        NamedKey::Insert => Some(csi_modified_tilde(b"2", m)),
+        NamedKey::Delete => Some(csi_modified_tilde(b"3", m)),
+        NamedKey::PageUp => Some(csi_modified_tilde(b"5", m)),
+        NamedKey::PageDown => Some(csi_modified_tilde(b"6", m)),
+
+        // -- Function keys -------------------------------------------------
+        // F1-F4: SS3 when unmodified, CSI with modifier when modified
+        NamedKey::F1 => if has_mods { Some(csi_modified_tilde(b"11", m)) } else { Some(ss3(b'P')) },
+        NamedKey::F2 => if has_mods { Some(csi_modified_tilde(b"12", m)) } else { Some(ss3(b'Q')) },
+        NamedKey::F3 => if has_mods { Some(csi_modified_tilde(b"13", m)) } else { Some(ss3(b'R')) },
+        NamedKey::F4 => if has_mods { Some(csi_modified_tilde(b"14", m)) } else { Some(ss3(b'S')) },
+        // F5-F12: always tilde-terminated
+        NamedKey::F5 => Some(csi_modified_tilde(b"15", m)),
+        NamedKey::F6 => Some(csi_modified_tilde(b"17", m)),
+        NamedKey::F7 => Some(csi_modified_tilde(b"18", m)),
+        NamedKey::F8 => Some(csi_modified_tilde(b"19", m)),
+        NamedKey::F9 => Some(csi_modified_tilde(b"20", m)),
+        NamedKey::F10 => Some(csi_modified_tilde(b"21", m)),
+        NamedKey::F11 => Some(csi_modified_tilde(b"23", m)),
+        NamedKey::F12 => Some(csi_modified_tilde(b"24", m)),
+
+        _ => None,
     }
 }
 

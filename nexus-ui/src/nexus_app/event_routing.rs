@@ -21,6 +21,12 @@ use super::NexusState;
 // =========================================================================
 
 /// Route keyboard events to the appropriate widget or message.
+///
+/// When a PTY block is focused (and no viewer is active), the terminal gets
+/// "first right of refusal" on all keys.  Only a small set of GUI chrome
+/// shortcuts (`Cmd`+key on macOS) are carved out before the PTY sees them.
+/// This ensures Escape, Ctrl+C, Ctrl+R, Ctrl+Z, etc. all reach the terminal
+/// exactly as they would in iTerm2, Alacritty, or Kitty.
 pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage> {
     if matches!(&event, KeyEvent::Released { .. }) {
         return None;
@@ -35,74 +41,98 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
         return None;
     };
 
-    // Phase 0: Active drag — Escape cancels
+    // Phase 0: Active drag — Escape cancels (always, regardless of focus)
     if state.drag.is_active() && matches!(key, Key::Named(NamedKey::Escape)) {
         return Some(NexusMessage::Drag(DragMsg::Cancel));
     }
 
-    // Phase 1: Input overlay intercepts (history search, completion)
+    // Phase 1: Cmd-key chrome shortcuts (window management, copy/paste).
+    // These are intercepted regardless of focus — they control the GUI, not
+    // the terminal.
+    if modifiers.meta {
+        if let Some(msg) = route_cmd_shortcut(state, key) {
+            return Some(msg);
+        }
+    }
+
+    // Phase 2: Focused PTY block — terminal gets first right of refusal.
+    if let Focus::Block(id) = state.focus {
+        // If a viewer is active on this block, let the viewer handle keys.
+        if let Some(block) = state.shell.block_by_id(id) {
+            if let Some(ref view_state) = block.view_state {
+                if let Some(viewer_msg) = view_state.handle_key(id, key) {
+                    return Some(NexusMessage::Viewer(viewer_msg));
+                }
+                // Viewer consumed focus; don't pass to PTY or fall through.
+                return None;
+            }
+        }
+        // No viewer — forward directly to the PTY.  Ctrl+C, Escape, Ctrl+R,
+        // etc. all flow here as raw terminal input.
+        return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
+    }
+
+    // ── Below here: focus is Input or AgentInput ─────────────────────
+
+    // Phase 3: Input overlay intercepts (history search, completion)
     if state.input.captures_keys() {
         return state.input.on_key(&event).map(NexusMessage::Input);
     }
 
-    // Phase 2: Global shortcuts
+    // Phase 4: Non-PTY global shortcuts (Ctrl+R for history, Ctrl+C for
+    // agent interrupt, etc.)
     if let Some(msg) = route_global_shortcut(state, key, modifiers) {
         return Some(msg);
     }
 
-    // Phase 3: Escape cascade
+    // Phase 5: Escape cascade (context menu dismiss, agent interrupt, etc.)
     if matches!(key, Key::Named(NamedKey::Escape)) {
         return route_escape(state);
     }
 
-    // Phase 4: Focus-based routing
+    // Phase 6: Focus-based routing for non-PTY focuses
     match state.focus {
-        Focus::Block(id) => {
-            // If a viewer is active on this block, dispatch to viewer keybindings
-            if let Some(block) = state.shell.block_by_id(id) {
-                if let Some(ref view_state) = block.view_state {
-                    if let Some(viewer_msg) = view_state.handle_key(id, key) {
-                        return Some(NexusMessage::Viewer(viewer_msg));
-                    }
-                    // Viewer consumed the focus; don't pass to PTY
-                    return None;
-                }
-            }
-            return Some(NexusMessage::Shell(ShellMsg::PtyInput(id, event)));
-        }
         Focus::AgentInput => {
             return Some(NexusMessage::Agent(AgentMsg::QuestionInputKey(event)));
         }
         Focus::Input => {} // fall through to input widget
+        Focus::Block(_) => unreachable!(), // handled above
     }
 
-    // Phase 5: Input-focused keys (delegated to InputWidget)
+    // Phase 7: Input-focused keys (delegated to InputWidget)
     if let Some(msg) = state.input.on_key(&event) {
         return Some(NexusMessage::Input(msg));
     }
 
-    // Phase 6: Global fallback
+    // Phase 8: Global fallback
     route_global_fallback(key)
 }
 
+/// Cmd+key shortcuts — GUI chrome that is always intercepted, even when a PTY
+/// is focused.  These are the macOS standard window/edit shortcuts.
+fn route_cmd_shortcut(_state: &NexusState, key: &Key) -> Option<NexusMessage> {
+    if let Key::Character(c) = key {
+        match c.as_str() {
+            "n" => return Some(NexusMessage::NewWindow),
+            "q" => return Some(NexusMessage::QuitApp),
+            "w" => return Some(NexusMessage::CloseWindow),
+            "k" => return Some(NexusMessage::ClearScreen),
+            "c" => return Some(NexusMessage::Copy),
+            "v" => return Some(NexusMessage::Paste),
+            "." => return Some(NexusMessage::Input(InputMsg::ToggleMode)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Global shortcuts that only apply when a PTY block is NOT focused.
+/// (Cmd+key shortcuts are handled earlier by `route_cmd_shortcut`.)
 fn route_global_shortcut(
     state: &NexusState,
     key: &Key,
     modifiers: &strata::event_context::Modifiers,
 ) -> Option<NexusMessage> {
-    if modifiers.meta {
-        if let Key::Character(c) = key {
-            match c.as_str() {
-                "q" | "w" => return Some(NexusMessage::CloseWindow),
-                "k" => return Some(NexusMessage::ClearScreen),
-                "c" => return Some(NexusMessage::Copy),
-                "v" => return Some(NexusMessage::Paste),
-                "." => return Some(NexusMessage::Input(InputMsg::ToggleMode)),
-                _ => {}
-            }
-        }
-    }
-
     if modifiers.ctrl {
         if let Key::Character(c) = key {
             match c.as_str() {
@@ -111,23 +141,12 @@ fn route_global_shortcut(
                     if state.agent.is_active() {
                         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
                     }
-                    // Ctrl+C exits active viewers (top, less, man, tree)
-                    if let Focus::Block(id) = state.focus {
-                        if let Some(block) = state.shell.block_by_id(id) {
-                            if block.view_state.is_some() {
-                                return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
-                            }
-                        }
-                    }
                     // Fallback: exit any active viewer even when focus is Input
                     if let Some(id) = state.shell.active_viewer_block() {
                         return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
                     }
-                    let focused = match state.focus {
-                        Focus::Block(id) => Some(id),
-                        _ => None,
-                    };
-                    if let Some(id) = state.shell.interrupt_target(focused) {
+                    // Try to interrupt the most relevant running process
+                    if let Some(id) = state.shell.interrupt_target(None) {
                         return Some(NexusMessage::Shell(ShellMsg::SendInterrupt(id)));
                     }
                     return None;
@@ -140,8 +159,10 @@ fn route_global_shortcut(
     None
 }
 
+/// Escape handler for non-PTY focuses (Input, AgentInput).
+/// When a PTY block is focused, Escape is forwarded to the terminal directly
+/// (handled in Phase 2 of `on_key`).
 fn route_escape(state: &NexusState) -> Option<NexusMessage> {
-    // Close Quick Look on Esc (always, before other handlers)
     strata::platform::close_quicklook();
 
     if state.transient.context_menu().is_some() {
@@ -149,15 +170,6 @@ fn route_escape(state: &NexusState) -> Option<NexusMessage> {
     }
     if state.agent.is_active() {
         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
-    }
-    // Escape exits active viewers (top, less, man, tree)
-    if let Focus::Block(id) = state.focus {
-        if let Some(block) = state.shell.block_by_id(id) {
-            if block.view_state.is_some() {
-                return Some(NexusMessage::Viewer(ViewerMsg::Exit(id)));
-            }
-        }
-        return Some(NexusMessage::BlurAll);
     }
     // Fallback: exit any active viewer even when focus is Input
     if let Some(id) = state.shell.active_viewer_block() {

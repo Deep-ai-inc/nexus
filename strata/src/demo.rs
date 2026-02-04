@@ -370,8 +370,9 @@ pub struct DemoApp;
 impl StrataApp for DemoApp {
     type State = DemoState;
     type Message = DemoMessage;
+    type SharedState = ();
 
-    fn init(images: &mut ImageStore) -> (Self::State, Command<Self::Message>) {
+    fn init(_shared: &(), images: &mut ImageStore) -> (Self::State, Command<Self::Message>) {
         let test_image = images
             .load_png("nexus-ui/assets/demo.png")
             .unwrap_or_else(|e| {

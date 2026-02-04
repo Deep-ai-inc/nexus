@@ -251,6 +251,18 @@ impl TerminalParser {
         self.term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
     }
 
+    /// DECCKM: Application Cursor Keys mode.  When true, unmodified arrow
+    /// keys should emit SS3 sequences (`\x1bOA`) instead of CSI (`\x1b[A`).
+    pub fn app_cursor(&self) -> bool {
+        self.term.mode().contains(alacritty_terminal::term::TermMode::APP_CURSOR)
+    }
+
+    /// Whether the terminal has enabled Bracketed Paste mode (`\x1b[?2004h`).
+    /// When true, pasted text must be wrapped in `\x1b[200~` / `\x1b[201~`.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    }
+
     /// Calculate the number of rows that have actual content.
     /// Includes both visible screen AND scrollback history.
     /// Used for sizing finished blocks to show all their content.

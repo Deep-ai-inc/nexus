@@ -6,6 +6,7 @@
 //! **This is the ONLY file in Strata that imports iced.**
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use iced::widget::shader::{self, wgpu};
@@ -50,23 +51,41 @@ pub fn run<A: StrataApp>() -> Result<(), Error> {
 }
 
 /// Run a Strata application with custom configuration.
+///
+/// Uses `iced::daemon()` for multi-window support. The first window is opened
+/// explicitly during initialization; additional windows via `ShellMessage::OpenNewWindow`.
 pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
-    iced::application(
-        |state: &ShellState<A>| A::title(&state.app),
+    iced::daemon(
+        title::<A>,
         update::<A>,
         view::<A>,
     )
     .subscription(subscription::<A>)
-    .theme(|_| Theme::Dark)
-    .window_size(iced::Size::new(config.window_size.0, config.window_size.1))
+    .theme(|_, _| Theme::Dark)
     .antialiasing(config.antialiasing)
-    .run_with(init::<A>)
+    .run_with(move || init::<A>(config))
     .map_err(Error::from)
 }
 
-/// Internal shell state wrapping the application state.
-struct ShellState<A: StrataApp> {
-    /// The application state.
+// ============================================================================
+// Multi-Window State
+// ============================================================================
+
+/// Top-level state holding all windows and shared cross-window resources.
+struct MultiWindowState<A: StrataApp> {
+    /// Shared state across all windows (kernel, block IDs, etc.)
+    shared: A::SharedState,
+
+    /// Per-window state indexed by iced window ID.
+    windows: HashMap<iced::window::Id, WindowState<A>>,
+
+    /// Window configuration for spawning new windows.
+    window_config: WindowConfig,
+}
+
+/// Per-window state.
+struct WindowState<A: StrataApp> {
+    /// The application state for this window.
     app: A::State,
 
     /// Current pointer capture state.
@@ -85,82 +104,140 @@ struct ShellState<A: StrataApp> {
     image_store: crate::gpu::ImageStore,
 
     /// Cached layout snapshot from the most recent view() call.
-    /// Reused by update() for hit-testing to avoid rebuilding layout twice per frame.
     cached_snapshot: RefCell<Option<Arc<LayoutSnapshot>>>,
+}
+
+/// Saved window settings for spawning new windows.
+struct WindowConfig {
+    size: (f32, f32),
 }
 
 /// Messages handled by the shell.
 enum ShellMessage<M> {
-    /// Message from the application.
-    App(M),
+    /// Message from a specific window's application.
+    App(iced::window::Id, M),
 
     /// Event from iced (mouse, keyboard, window).
     Event(Event, iced::window::Id),
 
     /// Frame tick for animation/rendering.
     Tick,
+
+    /// Request to open a new window (from app via is_new_window_request).
+    OpenNewWindow,
+
+    /// Request to exit the entire application (from app via is_exit_request).
+    ExitApp,
+
+    /// A window was closed by the OS.
+    WindowClosed(iced::window::Id),
 }
 
 impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShellMessage::App(msg) => f.debug_tuple("App").field(msg).finish(),
+            ShellMessage::App(wid, msg) => f.debug_tuple("App").field(wid).field(msg).finish(),
             ShellMessage::Event(_, window_id) => {
                 f.debug_tuple("Event").field(&"...").field(window_id).finish()
             }
             ShellMessage::Tick => write!(f, "Tick"),
+            ShellMessage::OpenNewWindow => write!(f, "OpenNewWindow"),
+            ShellMessage::ExitApp => write!(f, "ExitApp"),
+            ShellMessage::WindowClosed(wid) => f.debug_tuple("WindowClosed").field(wid).finish(),
         }
     }
 }
 
-/// Initialize the shell state.
-fn init<A: StrataApp>() -> (ShellState<A>, Task<ShellMessage<A::Message>>) {
-    let mut image_store = crate::gpu::ImageStore::new();
-    let (app_state, cmd) = A::init(&mut image_store);
+// ============================================================================
+// Init, Update, View, Subscription
+// ============================================================================
 
-    let shell_state = ShellState {
+/// Initialize the multi-window state with the first window.
+fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMessage<A::Message>>) {
+    let shared = A::SharedState::default();
+    let mut image_store = crate::gpu::ImageStore::new();
+    let (app_state, cmd) = A::init(&shared, &mut image_store);
+
+    // Open the first window explicitly (daemon doesn't auto-create one)
+    let window_settings = iced::window::Settings {
+        size: iced::Size::new(config.window_size.0, config.window_size.1),
+        ..Default::default()
+    };
+    let (window_id, open_task) = iced::window::open(window_settings);
+
+    let window_state = WindowState {
         app: app_state,
         capture: CaptureState::None,
-        window_size: (1200.0, 800.0),
+        window_size: (config.window_size.0, config.window_size.1),
         cursor_position: None,
         frame: 0,
         image_store,
         cached_snapshot: RefCell::new(None),
     };
 
-    // Convert app command to shell tasks, and send initial tick to trigger first render
-    let app_task = command_to_task(cmd);
-    let tick_task = Task::done(ShellMessage::Tick);
-    let task = Task::batch([app_task, tick_task]);
+    let mut windows = HashMap::new();
+    windows.insert(window_id, window_state);
 
-    (shell_state, task)
+    let state = MultiWindowState {
+        shared,
+        windows,
+        window_config: WindowConfig {
+            size: (config.window_size.0, config.window_size.1),
+        },
+    };
+
+    let app_task = command_to_task(cmd, window_id);
+    let tick_task = Task::done(ShellMessage::Tick);
+    let task = Task::batch([open_task.discard(), app_task, tick_task]);
+
+    (state, task)
 }
 
-/// Handle a shell message.
+/// Handle a shell message, routing to the correct window.
 fn update<A: StrataApp>(
-    state: &mut ShellState<A>,
+    state: &mut MultiWindowState<A>,
     message: ShellMessage<A::Message>,
 ) -> Task<ShellMessage<A::Message>> {
     match message {
-        ShellMessage::App(msg) => {
-            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
-            state.frame = state.frame.wrapping_add(1); // Trigger redraw
-            maybe_exit::<A>(&state.app, command_to_task(cmd))
+        ShellMessage::App(wid, msg) => {
+            // Check for window management requests before dispatching
+            if A::is_new_window_request(&msg) {
+                return Task::done(ShellMessage::OpenNewWindow);
+            }
+            if A::is_exit_request(&msg) {
+                return Task::done(ShellMessage::ExitApp);
+            }
+
+            if let Some(window) = state.windows.get_mut(&wid) {
+                let cmd = A::update(&mut window.app, msg, &mut window.image_store);
+                window.frame = window.frame.wrapping_add(1);
+                let task = command_to_task(cmd, wid);
+
+                // Check if this window wants to close
+                if A::should_exit(&window.app) {
+                    return Task::batch([task, close_window::<A>(state, wid)]);
+                }
+                task
+            } else {
+                Task::none()
+            }
         }
 
-        ShellMessage::Event(event, _window_id) => {
-            // Increment frame counter to trigger redraw
-            state.frame = state.frame.wrapping_add(1);
+        ShellMessage::Event(event, wid) => {
+            let Some(window) = state.windows.get_mut(&wid) else {
+                return Task::none();
+            };
+
+            window.frame = window.frame.wrapping_add(1);
 
             // Handle window events
             if let Event::Window(ref win_event) = event {
                 match win_event {
                     iced::window::Event::Resized(size) => {
-                        state.window_size = (size.width, size.height);
+                        window.window_size = (size.width, size.height);
                     }
                     iced::window::Event::CloseRequested => {
-                        // Cmd+Q on macOS triggers CloseRequested
-                        std::process::exit(0);
+                        return close_window::<A>(state, wid);
                     }
                     _ => {}
                 }
@@ -168,29 +245,23 @@ fn update<A: StrataApp>(
 
             // Handle mouse events
             if let Event::Mouse(mouse_event) = &event {
-                // Update cursor position
                 if let iced::mouse::Event::CursorMoved { position } = mouse_event {
-                    state.cursor_position = Some(Point::new(position.x, position.y));
+                    window.cursor_position = Some(Point::new(position.x, position.y));
                 }
 
-                // Convert to Strata mouse event and dispatch
-                if let Some(strata_event) = convert_mouse_event(mouse_event, state.cursor_position)
+                if let Some(strata_event) = convert_mouse_event(mouse_event, window.cursor_position)
                 {
-                    // Reuse previous frame's cached snapshot for hit-testing
-                    // (avoids rebuilding layout twice per frame)
                     let hit: Option<HitResult> = {
-                        let cache = state.cached_snapshot.borrow();
+                        let cache = window.cached_snapshot.borrow();
                         match cache.as_ref() {
                             Some(snapshot) => {
-                                let raw_hit = state.cursor_position
+                                let raw_hit = window.cursor_position
                                     .and_then(|pos| snapshot.hit_test(pos));
 
-                                // During active capture (selection drag), bridge gaps by
-                                // falling back to nearest content when hit_test misses.
-                                if state.capture.is_captured()
+                                if window.capture.is_captured()
                                     && !matches!(&raw_hit, Some(HitResult::Content(_)))
                                 {
-                                    state.cursor_position
+                                    window.cursor_position
                                         .and_then(|pos| snapshot.nearest_content(pos.x, pos.y))
                                         .or(raw_hit)
                                 } else {
@@ -198,48 +269,41 @@ fn update<A: StrataApp>(
                                 }
                             }
                             None => {
-                                // First frame before any view() call — build once
                                 drop(cache);
                                 let mut snapshot = LayoutSnapshot::new();
                                 snapshot.set_viewport(Rect::new(
                                     0.0, 0.0,
-                                    state.window_size.0, state.window_size.1,
+                                    window.window_size.0, window.window_size.1,
                                 ));
-                                A::view(&state.app, &mut snapshot);
-                                let hit = state.cursor_position
+                                A::view(&window.app, &mut snapshot);
+                                let hit = window.cursor_position
                                     .and_then(|pos| snapshot.hit_test(pos));
-                                *state.cached_snapshot.borrow_mut() = Some(Arc::new(snapshot));
+                                *window.cached_snapshot.borrow_mut() = Some(Arc::new(snapshot));
                                 hit
                             }
                         }
                     };
 
-                    // Dispatch when:
-                    // 1. Hit something — normal interaction
-                    // 2. Captured — dragging outside widget/window bounds
-                    // 3. CursorMoved — always, so apps can clear hover state on empty space
                     let is_cursor_moved = matches!(strata_event, MouseEvent::CursorMoved { .. });
-                    let should_dispatch = hit.is_some() || state.capture.is_captured() || is_cursor_moved;
+                    let should_dispatch = hit.is_some() || window.capture.is_captured() || is_cursor_moved;
 
                     if should_dispatch {
-                        let response = A::on_mouse(&state.app, strata_event, hit, &state.capture);
+                        let response = A::on_mouse(&window.app, strata_event, hit, &window.capture);
 
-                        // Process capture request
                         use crate::app::CaptureRequest;
                         match response.capture {
                             CaptureRequest::Capture(source) => {
-                                state.capture = CaptureState::Captured(source);
+                                window.capture = CaptureState::Captured(source);
                             }
                             CaptureRequest::Release => {
-                                state.capture = CaptureState::None;
+                                window.capture = CaptureState::None;
                             }
                             CaptureRequest::None => {}
                         }
 
-                        // Process message
                         if let Some(msg) = response.message {
-                            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
-                            return command_to_task(cmd);
+                            let cmd = A::update(&mut window.app, msg, &mut window.image_store);
+                            return command_to_task(cmd, wid);
                         }
                     }
                 }
@@ -254,9 +318,20 @@ fn update<A: StrataApp>(
                             modifiers: convert_modifiers(*modifiers),
                             text: text.as_ref().map(|s| s.to_string()),
                         };
-                        if let Some(msg) = A::on_key(&state.app, strata_event) {
-                            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
-                            return maybe_exit::<A>(&state.app, command_to_task(cmd));
+                        if let Some(msg) = A::on_key(&window.app, strata_event) {
+                            // Check for window management before dispatching
+                            if A::is_new_window_request(&msg) {
+                                return Task::done(ShellMessage::OpenNewWindow);
+                            }
+                            if A::is_exit_request(&msg) {
+                                return Task::done(ShellMessage::ExitApp);
+                            }
+                            let cmd = A::update(&mut window.app, msg, &mut window.image_store);
+                            let task = command_to_task(cmd, wid);
+                            if A::should_exit(&window.app) {
+                                return Task::batch([task, close_window::<A>(state, wid)]);
+                            }
+                            return task;
                         }
                     }
                     iced::keyboard::Event::KeyReleased { key, modifiers, .. } => {
@@ -264,9 +339,13 @@ fn update<A: StrataApp>(
                             key: convert_key(key),
                             modifiers: convert_modifiers(*modifiers),
                         };
-                        if let Some(msg) = A::on_key(&state.app, strata_event) {
-                            let cmd = A::update(&mut state.app, msg, &mut state.image_store);
-                            return maybe_exit::<A>(&state.app, command_to_task(cmd));
+                        if let Some(msg) = A::on_key(&window.app, strata_event) {
+                            let cmd = A::update(&mut window.app, msg, &mut window.image_store);
+                            let task = command_to_task(cmd, wid);
+                            if A::should_exit(&window.app) {
+                                return Task::batch([task, close_window::<A>(state, wid)]);
+                            }
+                            return task;
                         }
                     }
                     _ => {}
@@ -284,14 +363,14 @@ fn update<A: StrataApp>(
                 };
                 if let Some(fe) = file_event {
                     let hit = {
-                        let cache = state.cached_snapshot.borrow();
+                        let cache = window.cached_snapshot.borrow();
                         cache.as_ref().and_then(|snapshot| {
-                            state.cursor_position.and_then(|pos| snapshot.hit_test(pos))
+                            window.cursor_position.and_then(|pos| snapshot.hit_test(pos))
                         })
                     };
-                    if let Some(msg) = A::on_file_drop(&state.app, fe, hit) {
-                        let cmd = A::update(&mut state.app, msg, &mut state.image_store);
-                        return command_to_task(cmd);
+                    if let Some(msg) = A::on_file_drop(&window.app, fe, hit) {
+                        let cmd = A::update(&mut window.app, msg, &mut window.image_store);
+                        return command_to_task(cmd, wid);
                     }
                 }
             }
@@ -300,45 +379,99 @@ fn update<A: StrataApp>(
         }
 
         ShellMessage::Tick => {
-            // Increment frame to trigger view rebuild
-            state.frame = state.frame.wrapping_add(1);
+            for window in state.windows.values_mut() {
+                window.frame = window.frame.wrapping_add(1);
+            }
             Task::none()
+        }
+
+        ShellMessage::OpenNewWindow => {
+            let mut image_store = crate::gpu::ImageStore::new();
+            if let Some((app_state, cmd)) = A::create_window(&state.shared, &mut image_store) {
+                let window_settings = iced::window::Settings {
+                    size: iced::Size::new(state.window_config.size.0, state.window_config.size.1),
+                    ..Default::default()
+                };
+                let (new_id, open_task) = iced::window::open(window_settings);
+
+                state.windows.insert(new_id, WindowState {
+                    app: app_state,
+                    capture: CaptureState::None,
+                    window_size: state.window_config.size,
+                    cursor_position: None,
+                    frame: 0,
+                    image_store,
+                    cached_snapshot: RefCell::new(None),
+                });
+
+                Task::batch([open_task.discard(), command_to_task(cmd, new_id)])
+            } else {
+                Task::none()
+            }
+        }
+
+        ShellMessage::ExitApp => {
+            iced::exit()
+        }
+
+        ShellMessage::WindowClosed(wid) => {
+            state.windows.remove(&wid);
+            if state.windows.is_empty() {
+                iced::exit()
+            } else {
+                Task::none()
+            }
         }
     }
 }
 
-/// Build the view.
-fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Message>> {
-    // Build snapshot fresh each frame
-    // (iced calls view() whenever it needs to render)
+/// Close a specific window. If it's the last window, exit the app.
+fn close_window<A: StrataApp>(
+    state: &mut MultiWindowState<A>,
+    wid: iced::window::Id,
+) -> Task<ShellMessage<A::Message>> {
+    state.windows.remove(&wid);
+    if state.windows.is_empty() {
+        iced::exit()
+    } else {
+        iced::window::close(wid)
+    }
+}
+
+/// Get the title for a specific window.
+fn title<A: StrataApp>(state: &MultiWindowState<A>, window_id: iced::window::Id) -> String {
+    state.windows.get(&window_id)
+        .map(|w| A::title(&w.app))
+        .unwrap_or_else(|| String::from("Strata App"))
+}
+
+/// Build the view for a specific window.
+fn view<A: StrataApp>(state: &MultiWindowState<A>, window_id: iced::window::Id) -> Element<'_, ShellMessage<A::Message>> {
+    let Some(window) = state.windows.get(&window_id) else {
+        return iced::widget::text("").into();
+    };
+
     let mut snapshot = LayoutSnapshot::new();
-    snapshot.set_viewport(Rect::new(0.0, 0.0, state.window_size.0, state.window_size.1));
+    snapshot.set_viewport(Rect::new(0.0, 0.0, window.window_size.0, window.window_size.1));
 
-    A::view(&state.app, &mut snapshot);
+    A::view(&window.app, &mut snapshot);
 
-    // Wrap in Arc to prevent deep copying when iced clones the primitive.
-    // The shader only needs read access.
     let snapshot = Arc::new(snapshot);
+    *window.cached_snapshot.borrow_mut() = Some(snapshot.clone());
 
-    // Cache for next frame's hit-testing in update() (avoids double layout rebuild)
-    *state.cached_snapshot.borrow_mut() = Some(snapshot.clone());
-
-    // Drain any pending image uploads/unloads from the image store.
-    // These will be applied to the GPU atlas during prepare().
-    let pending = state.image_store.drain_pending();
+    let pending = window.image_store.drain_pending();
     let pending_images = Arc::new(Mutex::new(pending));
-    let pending_unloads = state.image_store.drain_pending_unloads();
+    let pending_unloads = window.image_store.drain_pending_unloads();
     let pending_image_unloads = Arc::new(Mutex::new(pending_unloads));
 
-    // Create the shader widget that will render Strata content
     let program = StrataShaderProgram {
-        snapshot, // Cheap Arc clone
-        selection: A::selection(&state.app).cloned(),
-        background: A::background_color(&state.app),
-        frame: state.frame,
+        snapshot,
+        selection: A::selection(&window.app).cloned(),
+        background: A::background_color(&window.app),
+        frame: window.frame,
         pending_images,
         pending_image_unloads,
-        is_selecting: state.capture.is_captured(),
+        is_selecting: window.capture.is_captured(),
     };
 
     shader::Shader::new(program)
@@ -347,44 +480,41 @@ fn view<A: StrataApp>(state: &ShellState<A>) -> Element<'_, ShellMessage<A::Mess
         .into()
 }
 
-/// Create subscriptions.
-fn subscription<A: StrataApp>(state: &ShellState<A>) -> Subscription<ShellMessage<A::Message>> {
-    // Listen to window events
+/// Create subscriptions for all windows.
+fn subscription<A: StrataApp>(state: &MultiWindowState<A>) -> Subscription<ShellMessage<A::Message>> {
+    // Global event listener (already provides window_id per event)
     let events = iced::event::listen_with(|event, _status, window_id| {
         Some(ShellMessage::Event(event, window_id))
     });
 
-    // Animation tick synced to monitor refresh rate (vsync)
+    // Global animation tick
     let tick = iced::window::frames()
         .map(|_| ShellMessage::Tick);
 
-    // Convert app subscriptions to iced subscriptions
-    let app_sub = A::subscription(&state.app);
-    let app_subs: Vec<Subscription<ShellMessage<A::Message>>> = app_sub
-        .subs
-        .into_iter()
-        .map(|s| s.map(ShellMessage::App))
-        .collect();
+    // Window close events (for cleanup after OS closes a window)
+    let close_events = iced::window::close_events()
+        .map(ShellMessage::WindowClosed);
 
-    let mut all_subs = vec![events, tick];
-    all_subs.extend(app_subs);
+    let mut all_subs = vec![events, tick, close_events];
+
+    // Per-window app subscriptions, tagged with window ID.
+    // Use `with(wid)` to attach the window ID as data, then a non-capturing
+    // map to restructure — iced panics if map closures capture variables.
+    for (&wid, window) in &state.windows {
+        let app_sub = A::subscription(&window.app);
+        for s in app_sub.subs {
+            all_subs.push(
+                s.with(wid)
+                    .map(|(wid, m)| ShellMessage::App(wid, m))
+            );
+        }
+    }
+
     Subscription::batch(all_subs)
 }
 
-/// If the app wants to exit, batch the given task with a window-close task.
-fn maybe_exit<A: StrataApp>(
-    app: &A::State,
-    task: Task<ShellMessage<A::Message>>,
-) -> Task<ShellMessage<A::Message>> {
-    if A::should_exit(app) {
-        Task::batch([task, iced::window::get_oldest().and_then(iced::window::close)])
-    } else {
-        task
-    }
-}
-
-/// Convert a Strata Command to an iced Task.
-fn command_to_task<M: Send + 'static>(mut cmd: Command<M>) -> Task<ShellMessage<M>> {
+/// Convert a Strata Command to an iced Task, tagged with a window ID.
+fn command_to_task<M: Send + 'static>(mut cmd: Command<M>, wid: iced::window::Id) -> Task<ShellMessage<M>> {
     let futures = cmd.take_futures();
 
     if futures.is_empty() {
@@ -393,7 +523,7 @@ fn command_to_task<M: Send + 'static>(mut cmd: Command<M>) -> Task<ShellMessage<
 
     let tasks: Vec<Task<ShellMessage<M>>> = futures
         .into_iter()
-        .map(|fut| Task::future(async move { ShellMessage::App(fut.await) }))
+        .map(|fut| Task::future(async move { ShellMessage::App(wid, fut.await) }))
         .collect();
 
     Task::batch(tasks)

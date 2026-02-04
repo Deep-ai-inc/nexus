@@ -34,6 +34,7 @@ use transient_ui::TransientUi;
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use tokio::sync::{broadcast, Mutex};
@@ -63,7 +64,31 @@ pub struct Attachment {
 }
 
 // =========================================================================
-// Application State
+// Shared State (across all windows)
+// =========================================================================
+
+/// State shared across all Nexus windows.
+///
+/// Deliberately minimal — only truly global state lives here.
+/// Each window gets its own Kernel (own CWD, variables, last_output).
+/// History/persistence is naturally shared because all Kernels open
+/// the same SQLite file.
+#[derive(Clone)]
+pub struct NexusShared {
+    /// Global block ID counter — ensures unique IDs across all windows.
+    pub next_block_id: Arc<AtomicU64>,
+}
+
+impl Default for NexusShared {
+    fn default() -> Self {
+        Self {
+            next_block_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+}
+
+// =========================================================================
+// Application State (per-window)
 // =========================================================================
 
 pub struct NexusState {
@@ -79,7 +104,7 @@ pub struct NexusState {
 
     // --- Shared context ---
     pub cwd: String,
-    pub next_block_id: u64,
+    pub next_block_id: Arc<AtomicU64>,
     pub focus: Focus,
     pub kernel: Arc<Mutex<Kernel>>,
     pub kernel_tx: broadcast::Sender<nexus_api::ShellEvent>,
@@ -332,8 +357,12 @@ fn truncate_title(s: &str, max: usize) -> String {
 }
 
 impl RootComponent for NexusState {
-    fn create(_images: &mut ImageStore) -> (Self, Command<NexusMessage>) {
-        let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
+    type SharedState = NexusShared;
+
+    fn create(shared: &NexusShared, _images: &mut ImageStore) -> (Self, Command<NexusMessage>) {
+        // Each window gets its own Kernel — full CWD/variable/output isolation.
+        // History is naturally shared (all kernels open the same SQLite file).
+        let (mut kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
         let kernel_tx = kernel.event_sender().clone();
 
         let command_history: Vec<String> = kernel
@@ -342,11 +371,17 @@ impl RootComponent for NexusState {
             .map(|entries| entries.into_iter().rev().map(|e| e.command).collect())
             .unwrap_or_default();
 
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~".to_string());
+        // Each window starts in $HOME. The process-level CWD is not meaningful
+        // in multi-window mode — each window tracks its own CWD independently.
+        let home = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+        let cwd = home.display().to_string();
 
-        let context = NexusContext::new(std::env::current_dir().unwrap_or_default());
+        let context = NexusContext::new(home.clone());
+
+        // Sync the kernel's internal CWD to match this window's starting dir.
+        kernel.state_mut().set_cwd(home).ok();
 
         let kernel = Arc::new(Mutex::new(kernel));
 
@@ -365,7 +400,7 @@ impl RootComponent for NexusState {
             transient: TransientUi::new(),
 
             cwd,
-            next_block_id: 1,
+            next_block_id: shared.next_block_id.clone(),
             focus: Focus::Input,
             kernel,
             kernel_tx,
@@ -382,6 +417,18 @@ impl RootComponent for NexusState {
         };
 
         (state, Command::none())
+    }
+
+    fn create_window(shared: &NexusShared, images: &mut ImageStore) -> Option<(Self, Command<NexusMessage>)> {
+        Some(Self::create(shared, images))
+    }
+
+    fn is_new_window_request(msg: &NexusMessage) -> bool {
+        matches!(msg, NexusMessage::NewWindow)
+    }
+
+    fn is_exit_request(msg: &NexusMessage) -> bool {
+        matches!(msg, NexusMessage::QuitApp)
     }
 
     fn title(&self) -> String {

@@ -42,7 +42,6 @@ impl NexusState {
             }
             ShellOutput::CwdChanged(path) => {
                 self.cwd = path.display().to_string();
-                let _ = std::env::set_current_dir(&path);
                 self.context.set_cwd(path);
                 Command::none()
             }
@@ -156,6 +155,9 @@ impl NexusState {
             NexusMessage::Paste => { self.paste_from_clipboard(ctx.images); Command::none() }
             NexusMessage::ClearScreen => { self.clear_screen(); Command::none() }
             NexusMessage::CloseWindow => { self.exit_requested = true; Command::none() }
+            // NewWindow and QuitApp are intercepted by the shell adapter before
+            // reaching update(). If they somehow arrive here, treat as no-ops.
+            NexusMessage::NewWindow | NexusMessage::QuitApp => Command::none(),
             NexusMessage::BlurAll => {
                 self.transient.dismiss_all(&mut self.input);
                 self.set_focus(Focus::Input);

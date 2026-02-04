@@ -10,9 +10,8 @@ use super::NexusState;
 
 impl NexusState {
     pub(super) fn next_id(&mut self) -> nexus_api::BlockId {
-        let id = nexus_api::BlockId(self.next_block_id);
-        self.next_block_id += 1;
-        id
+        let id = self.next_block_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        nexus_api::BlockId(id)
     }
 
     // --- Focus ---
@@ -76,6 +75,19 @@ impl NexusState {
 
     pub(super) fn paste_from_clipboard(&mut self, images: &mut ImageStore) {
         if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            // When a PTY block is focused, paste text directly into the
+            // terminal (with bracketed paste wrapping if the shell requested
+            // it).  Images are not meaningful for a PTY, so we skip the image
+            // path in this case.
+            if let crate::blocks::Focus::Block(id) = self.focus {
+                if let Ok(text) = clipboard.get_text() {
+                    if !text.is_empty() {
+                        self.shell.paste_to_pty(id, &text);
+                    }
+                }
+                return;
+            }
+
             if let Ok(img) = clipboard.get_image() {
                 let width = img.width as u32;
                 let height = img.height as u32;

@@ -279,8 +279,18 @@ impl ShellState {
     }
 
     /// Change the working directory.
+    ///
+    /// Only updates the kernel's internal CWD — does NOT call
+    /// `std::env::set_current_dir()`. The process-level CWD is
+    /// meaningless in multi-window mode; child processes receive
+    /// the correct CWD via fork/exec setup.
     pub fn set_cwd(&mut self, path: PathBuf) -> std::io::Result<()> {
-        std::env::set_current_dir(&path)?;
+        if !path.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{}: not a directory", path.display()),
+            ));
+        }
         self.cwd = path;
         Ok(())
     }

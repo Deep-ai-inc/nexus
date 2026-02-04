@@ -34,6 +34,8 @@ pub enum NexusMessage {
     Copy,
     ClearScreen,
     CloseWindow,
+    NewWindow,
+    QuitApp,
     BlurAll,
     Tick,
     ScrollToJob(u32),

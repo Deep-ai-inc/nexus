@@ -268,19 +268,44 @@ impl<M> Default for Subscription<M> {
 ///
 /// Applications implement this trait and run via `strata::shell::run()`.
 /// The architecture follows the Elm pattern: init → update → view.
+///
+/// Multi-window support: Apps that want multiple windows implement
+/// `SharedState` (for cross-window resources like a shared kernel)
+/// and `create_window()`. The shell adapter manages window lifecycle.
 pub trait StrataApp: Sized + 'static {
-    /// Application state type.
+    /// Application state type (per-window).
     type State: 'static;
 
     /// Message type that drives state updates.
     type Message: Clone + Send + std::fmt::Debug + 'static;
 
-    /// Initialize the application state.
+    /// Shared state across all windows. Clone-based (use Arc internally).
+    /// Default `()` for single-window apps.
+    type SharedState: Clone + Default + 'static;
+
+    /// Initialize the first window's application state.
     ///
     /// Returns the initial state and an optional command to run.
     /// The `images` store can be used to load images (PNG, raw RGBA)
     /// that will be uploaded to the GPU before the first frame.
-    fn init(images: &mut ImageStore) -> (Self::State, Command<Self::Message>);
+    fn init(shared: &Self::SharedState, images: &mut ImageStore) -> (Self::State, Command<Self::Message>);
+
+    /// Create state for a new window (e.g. Cmd+N).
+    /// Returns `None` if multi-window is not supported.
+    fn create_window(_shared: &Self::SharedState, _images: &mut ImageStore) -> Option<(Self::State, Command<Self::Message>)> {
+        None
+    }
+
+    /// Check if a message is a request to open a new window.
+    /// The adapter intercepts these before dispatching to `update()`.
+    fn is_new_window_request(_msg: &Self::Message) -> bool {
+        false
+    }
+
+    /// Check if a message is a request to quit the entire application.
+    fn is_exit_request(_msg: &Self::Message) -> bool {
+        false
+    }
 
     /// Update state in response to a message.
     ///

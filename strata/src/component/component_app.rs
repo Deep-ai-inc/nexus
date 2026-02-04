@@ -19,8 +19,26 @@ use super::{Component, Ctx, IdSpace};
 /// Provides the `create()` factory (matching `StrataApp::init()`) and
 /// app-level metadata (title, background color, exit condition).
 pub trait RootComponent: Component + Sized {
+    /// Shared state across all windows. Clone-based (use Arc internally).
+    type SharedState: Clone + Default + 'static;
+
     /// Create the root component and any initial async commands.
-    fn create(images: &mut ImageStore) -> (Self, Command<Self::Message>);
+    fn create(shared: &Self::SharedState, images: &mut ImageStore) -> (Self, Command<Self::Message>);
+
+    /// Create state for a new window. Returns `None` if unsupported.
+    fn create_window(_shared: &Self::SharedState, _images: &mut ImageStore) -> Option<(Self, Command<Self::Message>)> {
+        None
+    }
+
+    /// Check if a message is a request to open a new window.
+    fn is_new_window_request(_msg: &Self::Message) -> bool {
+        false
+    }
+
+    /// Check if a message is a request to quit the entire application.
+    fn is_exit_request(_msg: &Self::Message) -> bool {
+        false
+    }
 
     /// Application window title.
     fn title(&self) -> String {
@@ -58,9 +76,22 @@ where
 {
     type State = C;
     type Message = C::Message;
+    type SharedState = C::SharedState;
 
-    fn init(images: &mut ImageStore) -> (C, Command<C::Message>) {
-        C::create(images)
+    fn init(shared: &Self::SharedState, images: &mut ImageStore) -> (C, Command<C::Message>) {
+        C::create(shared, images)
+    }
+
+    fn create_window(shared: &Self::SharedState, images: &mut ImageStore) -> Option<(C, Command<C::Message>)> {
+        C::create_window(shared, images)
+    }
+
+    fn is_new_window_request(msg: &C::Message) -> bool {
+        C::is_new_window_request(msg)
+    }
+
+    fn is_exit_request(msg: &C::Message) -> bool {
+        C::is_exit_request(msg)
     }
 
     fn update(
