@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU16;
 use std::time::Instant;
 
 use nexus_api::{BlockId, BlockState, FileEntry, OutputFormat, Value};
@@ -147,6 +148,9 @@ pub struct Block {
     pub file_tree: Option<FileTreeState>,
     /// OSC title set by the child process (via escape sequences).
     pub osc_title: Option<String>,
+    /// High-water mark for content_rows, used to debounce shrink flicker
+    /// on running blocks that do clear+reprint cycles (e.g. Claude Code).
+    pub peak_content_rows: AtomicU16,
 }
 
 impl Block {
@@ -171,6 +175,7 @@ impl Block {
             view_state: None,
             file_tree: None,
             osc_title: None,
+            peak_content_rows: AtomicU16::new(0),
         }
     }
 

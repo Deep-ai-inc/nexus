@@ -92,13 +92,36 @@ impl Widget for ShellBlockWidget<'_> {
             header = header.push(TextElement::new(duration).color(colors::TEXT_MUTED));
         }
 
-        // Extract terminal content from parser
-        let grid = if block.parser.is_alternate_screen() || block.is_running() {
+        // Extract terminal content from parser.
+        // Alt-screen apps (vim, htop) get viewport only; normal-screen apps
+        // (including running ones like Claude Code) get full scrollback.
+        let grid = if block.parser.is_alternate_screen() {
             block.parser.grid()
         } else {
             block.parser.grid_with_scrollback()
         };
         let content_rows = grid.content_rows();
+
+        // Debounce shrink for running non-alt-screen blocks to mask
+        // clear+reprint flicker (e.g. Claude Code doing \x1b[3J + \x1b[2J).
+        let content_rows = if block.is_running() && !block.parser.is_alternate_screen() {
+            let peak = block.peak_content_rows.load(std::sync::atomic::Ordering::Relaxed);
+            if content_rows >= peak {
+                block.peak_content_rows.store(content_rows, std::sync::atomic::Ordering::Relaxed);
+                content_rows
+            } else if content_rows < peak / 2 {
+                // Dramatic shrink (clear+reprint mid-cycle): hold at peak
+                peak
+            } else {
+                // Moderate shrink (real content reduction): follow it
+                block.peak_content_rows.store(content_rows, std::sync::atomic::Ordering::Relaxed);
+                content_rows
+            }
+        } else {
+            block.peak_content_rows.store(0, std::sync::atomic::Ordering::Relaxed);
+            content_rows
+        };
+
         let cols = grid.cols();
 
         let mut content = Column::new()
