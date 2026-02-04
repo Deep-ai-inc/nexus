@@ -145,6 +145,8 @@ pub struct Block {
     pub view_state: Option<ViewState>,
     /// Lazy tree expansion state (only allocated when a user clicks a chevron).
     pub file_tree: Option<FileTreeState>,
+    /// OSC title set by the child process (via escape sequences).
+    pub osc_title: Option<String>,
 }
 
 impl Block {
@@ -168,6 +170,7 @@ impl Block {
             stream_seq: 0,
             view_state: None,
             file_tree: None,
+            osc_title: None,
         }
     }
 

@@ -474,6 +474,9 @@ impl ShellWidget {
                     if let Some(&idx) = block_index.get(&id) {
                         if let Some(block) = blocks.get_mut(idx) {
                             block.parser.feed(acc_data);
+                            if let Some(title) = block.parser.take_title() {
+                                block.osc_title = Some(title);
+                            }
                             block.version += 1;
                         }
                     }
@@ -519,6 +522,9 @@ impl ShellWidget {
                 if let Some(&idx) = self.block_index.get(&id) {
                     if let Some(block) = self.blocks.get_mut(idx) {
                         block.parser.feed(&acc_data);
+                        if let Some(title) = block.parser.take_title() {
+                            block.osc_title = Some(title);
+                        }
                         block.version += 1;
                     }
                 }
@@ -542,6 +548,9 @@ impl ShellWidget {
         if let Some(&idx) = self.block_index.get(&id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.parser.feed(&data);
+                if let Some(title) = block.parser.take_title() {
+                    block.osc_title = Some(title);
+                }
                 block.version += 1;
             }
         }

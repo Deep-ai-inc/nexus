@@ -257,6 +257,80 @@ impl Component for NexusState {
     }
 }
 
+// =========================================================================
+// Window title
+// =========================================================================
+
+impl NexusState {
+    /// Compute the dynamic window title based on current app state.
+    ///
+    /// Priority chain:
+    ///   1. Focused PTY block with OSC title → "Nexus — <osc_title>"
+    ///   2. Focused PTY block without OSC    → "Nexus — <command>"
+    ///   3. Agent active                     → "Nexus — <cwd> (<branch>) · Agent"
+    ///   4. Running kernel command            → "Nexus — <cwd> (<branch>) · <command>"
+    ///   5. Idle                              → "Nexus — <cwd> (<branch>)"
+    fn compute_title(&self) -> String {
+        let prefix = "Nexus";
+
+        // If a PTY block is focused, delegate to it.
+        if let Focus::Block(id) = self.focus {
+            if let Some(block) = self.shell.block_by_id(id) {
+                let has_pty = self.shell.pty_handles.iter().any(|h| h.block_id == id);
+                if has_pty || block.osc_title.is_some() {
+                    let context = block.osc_title.as_deref()
+                        .unwrap_or(&block.command);
+                    return format!("{} — {}", prefix, truncate_title(context, 80));
+                }
+            }
+        }
+
+        // Native context: CWD + git branch + activity.
+        let path = shorten_path(&self.cwd);
+
+        let branch = self.context.git.as_ref().map(|g| g.branch.as_str());
+
+        let location = match branch {
+            Some(b) if !b.is_empty() => format!("{} ({})", path, b),
+            _ => path,
+        };
+
+        if self.agent.is_active() {
+            format!("{} — {} · Agent", prefix, location)
+        } else if let Some(cmd) = self.last_running_command() {
+            format!("{} — {} · {}", prefix, location, truncate_title(&cmd, 40))
+        } else {
+            format!("{} — {}", prefix, location)
+        }
+    }
+
+    /// Get the command string of the most recent running block (kernel or PTY).
+    fn last_running_command(&self) -> Option<String> {
+        self.shell.blocks.iter().rev()
+            .find(|b| b.is_running())
+            .map(|b| b.command.clone())
+    }
+}
+
+/// Shorten a filesystem path for display (replace home dir with ~).
+fn shorten_path(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if path.starts_with(&home) {
+            return format!("~{}", &path[home.len()..]);
+        }
+    }
+    path.to_string()
+}
+
+/// Truncate a title string to a maximum character width, adding ellipsis if needed.
+fn truncate_title(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
+}
+
 impl RootComponent for NexusState {
     fn create(_images: &mut ImageStore) -> (Self, Command<NexusMessage>) {
         let (kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
@@ -311,7 +385,7 @@ impl RootComponent for NexusState {
     }
 
     fn title(&self) -> String {
-        String::from("Nexus (Strata)")
+        self.compute_title()
     }
 
     fn background_color(&self) -> strata::primitives::Color {

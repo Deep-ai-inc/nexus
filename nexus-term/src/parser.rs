@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -25,6 +26,8 @@ pub struct TerminalParser {
     cached_viewport: RefCell<Option<Rc<TerminalGrid>>>,
     /// Cached full grid with scrollback (for finished blocks).
     cached_scrollback: RefCell<Option<Rc<TerminalGrid>>>,
+    /// Shared storage for the latest OSC title set by the child process.
+    title_slot: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for TerminalParser {
@@ -35,12 +38,22 @@ impl std::fmt::Debug for TerminalParser {
     }
 }
 
-/// Dummy event listener for headless operation.
-struct EventProxy;
+/// Event listener that captures title changes from the terminal.
+struct EventProxy {
+    title_slot: Arc<Mutex<Option<String>>>,
+}
 
 impl EventListener for EventProxy {
-    fn send_event(&self, _event: Event) {
-        // We don't need to handle events in headless mode
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::Title(title) => {
+                *self.title_slot.lock().unwrap() = Some(title);
+            }
+            Event::ResetTitle => {
+                *self.title_slot.lock().unwrap() = None;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -56,7 +69,9 @@ impl TerminalParser {
             scrolling_history: SCROLLBACK_LINES,
             ..Config::default()
         };
-        let term = Term::new(config, &size, EventProxy);
+        let title_slot = Arc::new(Mutex::new(None));
+        let proxy = EventProxy { title_slot: title_slot.clone() };
+        let term = Term::new(config, &size, proxy);
         let processor = Processor::new();
 
         Self {
@@ -64,6 +79,7 @@ impl TerminalParser {
             processor,
             cached_viewport: RefCell::new(None),
             cached_scrollback: RefCell::new(None),
+            title_slot,
         }
     }
 
@@ -73,6 +89,18 @@ impl TerminalParser {
         // Invalidate caches - new content means grids need regeneration
         *self.cached_viewport.borrow_mut() = None;
         *self.cached_scrollback.borrow_mut() = None;
+    }
+
+    /// Take the latest OSC title set by the child process, if any.
+    /// Returns `Some(title)` if the child set a title since the last call,
+    /// or `None` if no title was set (or it was reset).
+    pub fn take_title(&self) -> Option<String> {
+        self.title_slot.lock().unwrap().take()
+    }
+
+    /// Peek at the current OSC title without consuming it.
+    pub fn osc_title(&self) -> Option<String> {
+        self.title_slot.lock().unwrap().clone()
     }
 
     /// Invalidate all cached grids (call after resize).

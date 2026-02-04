@@ -43,6 +43,7 @@ impl NexusState {
             ShellOutput::CwdChanged(path) => {
                 self.cwd = path.display().to_string();
                 let _ = std::env::set_current_dir(&path);
+                self.context.set_cwd(path);
                 Command::none()
             }
             ShellOutput::CommandFinished { block_id, exit_code, command, output } => {
