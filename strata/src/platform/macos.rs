@@ -8,11 +8,11 @@
 //! initiate OS-level drags without needing Iced to expose its NSView/NSEvent.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, Once, mpsc};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, ProtocolObject};
-use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSDraggingItem, NSDraggingSession, NSImage,
     NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypeString,
@@ -426,4 +426,72 @@ fn write_drag_temp_file(filename: &str, data: &[u8]) -> Result<PathBuf, std::io:
     let path = temp_dir.join(filename);
     std::fs::write(&path, data)?;
     Ok(path)
+}
+
+// =============================================================================
+// Dock Icon Reopen Handler
+// =============================================================================
+
+/// Sender for the reopen channel — the delegate method sends on this.
+static REOPEN_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
+
+/// Receiver half, taken once by the iced subscription.
+static REOPEN_RX: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
+
+/// C function injected into winit's WinitApplicationDelegate at runtime.
+///
+/// Signature matches `applicationShouldHandleReopen:hasVisibleWindows:`:
+///   `- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag`
+extern "C" fn handle_reopen(
+    _this: &AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: &AnyObject,
+    has_visible_windows: Bool,
+) -> Bool {
+    if !has_visible_windows.as_bool() {
+        if let Some(tx) = REOPEN_TX.get() {
+            let _ = tx.send(());
+        }
+    }
+    Bool::YES
+}
+
+/// Add `applicationShouldHandleReopen:hasVisibleWindows:` to winit's
+/// `WinitApplicationDelegate` class.
+///
+/// Winit registers its own NSApplicationDelegate but doesn't implement this
+/// method, so we inject it via the ObjC runtime. When the user clicks the
+/// dock icon with no visible windows, our implementation fires and sends a
+/// message through the reopen channel.
+///
+/// Idempotent — safe to call multiple times, only the first call registers.
+pub fn install_reopen_handler() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let (tx, rx) = mpsc::channel();
+        REOPEN_TX.set(tx).ok();
+        *REOPEN_RX.lock().unwrap() = Some(rx);
+
+        unsafe {
+            let cls = AnyClass::get("WinitApplicationDelegate")
+                .expect("WinitApplicationDelegate class not found");
+
+            // Cast to raw pointer for class_addMethod (needs *mut).
+            let cls_ptr = cls as *const _ as *mut objc2::ffi::objc_class;
+            let sel = sel!(applicationShouldHandleReopen:hasVisibleWindows:);
+            let imp: objc2::ffi::IMP = Some(std::mem::transmute::<
+                extern "C" fn(&AnyObject, objc2::runtime::Sel, &AnyObject, Bool) -> Bool,
+                unsafe extern "C" fn(),
+            >(handle_reopen));
+
+            // Type encoding: returns BOOL, params (id self, SEL _cmd, id app, BOOL flag)
+            let types = c"B@:@B";
+            objc2::ffi::class_addMethod(cls_ptr, sel.as_ptr(), imp, types.as_ptr());
+        }
+    });
+}
+
+/// Take the reopen receiver (call exactly once from the subscription setup).
+pub fn take_reopen_receiver() -> Option<mpsc::Receiver<()>> {
+    REOPEN_RX.lock().unwrap().take()
 }

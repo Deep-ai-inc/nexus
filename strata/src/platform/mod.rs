@@ -7,7 +7,7 @@
 pub mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{start_drag, preview_file, preview_file_with_rect, close_quicklook, preview_file_with_local_rect};
+pub use macos::{start_drag, preview_file, preview_file_with_rect, close_quicklook, preview_file_with_local_rect, install_reopen_handler, take_reopen_receiver};
 
 #[cfg(not(target_os = "macos"))]
 pub fn start_drag(_source: &crate::app::DragSource) -> Result<(), String> {

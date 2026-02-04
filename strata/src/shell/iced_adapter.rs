@@ -131,6 +131,10 @@ enum ShellMessage<M> {
 
     /// A window was closed by the OS.
     WindowClosed(iced::window::Id),
+
+    /// macOS dock icon clicked — open a window if none exist.
+    #[cfg(target_os = "macos")]
+    DockReopen,
 }
 
 impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
@@ -144,6 +148,8 @@ impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
             ShellMessage::OpenNewWindow => write!(f, "OpenNewWindow"),
             ShellMessage::ExitApp => write!(f, "ExitApp"),
             ShellMessage::WindowClosed(wid) => f.debug_tuple("WindowClosed").field(wid).finish(),
+            #[cfg(target_os = "macos")]
+            ShellMessage::DockReopen => write!(f, "DockReopen"),
         }
     }
 }
@@ -185,6 +191,10 @@ fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMess
             size: (config.window_size.0, config.window_size.1),
         },
     };
+
+    // Install macOS dock-click → reopen handler (idempotent, runs once).
+    #[cfg(target_os = "macos")]
+    crate::platform::macos::install_reopen_handler();
 
     let app_task = command_to_task(cmd, window_id);
     let tick_task = Task::done(ShellMessage::Tick);
@@ -414,28 +424,31 @@ fn update<A: StrataApp>(
             iced::exit()
         }
 
-        ShellMessage::WindowClosed(wid) => {
-            state.windows.remove(&wid);
+        #[cfg(target_os = "macos")]
+        ShellMessage::DockReopen => {
             if state.windows.is_empty() {
-                iced::exit()
+                Task::done(ShellMessage::OpenNewWindow)
             } else {
                 Task::none()
             }
         }
+
+        ShellMessage::WindowClosed(wid) => {
+            state.windows.remove(&wid);
+            // Daemon stays alive when all windows close — dock icon or
+            // Cmd+N (via macOS app menu) can reopen a window.
+            Task::none()
+        }
     }
 }
 
-/// Close a specific window. If it's the last window, exit the app.
+/// Close a specific window.
 fn close_window<A: StrataApp>(
     state: &mut MultiWindowState<A>,
     wid: iced::window::Id,
 ) -> Task<ShellMessage<A::Message>> {
     state.windows.remove(&wid);
-    if state.windows.is_empty() {
-        iced::exit()
-    } else {
-        iced::window::close(wid)
-    }
+    iced::window::close(wid)
 }
 
 /// Get the title for a specific window.
@@ -496,6 +509,40 @@ fn subscription<A: StrataApp>(state: &MultiWindowState<A>) -> Subscription<Shell
         .map(ShellMessage::WindowClosed);
 
     let mut all_subs = vec![events, tick, close_events];
+
+    // macOS dock-click reopen: channel-based subscription (no polling).
+    // A dedicated thread blocks on std::sync::mpsc::recv until the Apple
+    // Event handler fires, then forwards to the async iced stream.
+    #[cfg(target_os = "macos")]
+    {
+        let reopen_stream = iced::stream::channel(1, |mut output| async move {
+            let Some(rx) = crate::platform::macos::take_reopen_receiver() else {
+                // Already taken by a previous subscription — idle forever.
+                std::future::pending::<()>().await;
+                return;
+            };
+
+            // Bridge: one thread that sleeps until the Apple Event fires,
+            // then forwards to an async-compatible unbounded channel.
+            let (atx, mut arx) = iced::futures::channel::mpsc::unbounded::<()>();
+            std::thread::Builder::new()
+                .name("dock-reopen".into())
+                .spawn(move || {
+                    while rx.recv().is_ok() {
+                        if atx.unbounded_send(()).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .ok();
+
+            use iced::futures::{SinkExt, StreamExt};
+            while arx.next().await.is_some() {
+                let _ = output.send(ShellMessage::DockReopen).await;
+            }
+        });
+        all_subs.push(Subscription::run_with_id("dock-reopen", reopen_stream));
+    }
 
     // Per-window app subscriptions, tagged with window ID.
     // Use `with(wid)` to attach the window ID as data, then a non-capturing
