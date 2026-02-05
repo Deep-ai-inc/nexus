@@ -287,3 +287,104 @@ impl Default for CommandRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_new_creates_commands() {
+        let registry = CommandRegistry::new();
+        // Should have many commands registered
+        let count = registry.names().count();
+        assert!(count > 100, "Expected 100+ commands, got {}", count);
+    }
+
+    #[test]
+    fn test_registry_default_same_as_new() {
+        let new_registry = CommandRegistry::new();
+        let default_registry = CommandRegistry::default();
+        assert_eq!(
+            new_registry.names().count(),
+            default_registry.names().count()
+        );
+    }
+
+    #[test]
+    fn test_registry_contains_basic_commands() {
+        let registry = CommandRegistry::new();
+        assert!(registry.contains("echo"));
+        assert!(registry.contains("ls"));
+        assert!(registry.contains("cat"));
+        assert!(registry.contains("grep"));
+        assert!(registry.contains("pwd"));
+    }
+
+    #[test]
+    fn test_registry_contains_git_commands() {
+        let registry = CommandRegistry::new();
+        assert!(registry.contains("git"));
+        assert!(registry.contains("git-status"));
+        assert!(registry.contains("git-log"));
+        assert!(registry.contains("git-branch"));
+    }
+
+    #[test]
+    fn test_registry_contains_math_commands() {
+        let registry = CommandRegistry::new();
+        assert!(registry.contains("sum"));
+        assert!(registry.contains("avg"));
+        assert!(registry.contains("min"));
+        assert!(registry.contains("max"));
+        assert!(registry.contains("count"));
+    }
+
+    #[test]
+    fn test_registry_contains_path_commands() {
+        let registry = CommandRegistry::new();
+        assert!(registry.contains("basename"));
+        assert!(registry.contains("dirname"));
+        assert!(registry.contains("realpath"));
+    }
+
+    #[test]
+    fn test_registry_does_not_contain_invalid() {
+        let registry = CommandRegistry::new();
+        assert!(!registry.contains("nonexistent-command"));
+        assert!(!registry.contains(""));
+        assert!(!registry.contains("invalid_cmd_xyz"));
+    }
+
+    #[test]
+    fn test_registry_get_returns_command() {
+        let registry = CommandRegistry::new();
+        let cmd = registry.get("echo");
+        assert!(cmd.is_some());
+        assert_eq!(cmd.unwrap().name(), "echo");
+    }
+
+    #[test]
+    fn test_registry_get_returns_none_for_invalid() {
+        let registry = CommandRegistry::new();
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_registry_names_returns_all() {
+        let registry = CommandRegistry::new();
+        let names: Vec<&str> = registry.names().collect();
+        assert!(names.contains(&"echo"));
+        assert!(names.contains(&"ls"));
+        assert!(names.contains(&"git"));
+    }
+
+    #[test]
+    fn test_registered_commands_have_correct_names() {
+        let registry = CommandRegistry::new();
+        // Verify a few commands return their expected names
+        assert_eq!(registry.get("wc").unwrap().name(), "wc");
+        assert_eq!(registry.get("sort").unwrap().name(), "sort");
+        assert_eq!(registry.get("head").unwrap().name(), "head");
+        assert_eq!(registry.get("tail").unwrap().name(), "tail");
+    }
+}
