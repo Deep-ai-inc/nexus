@@ -365,23 +365,21 @@ impl ShellWidget {
 
     /// Create the subscription for PTY and kernel events.
     ///
-    /// Returns `Subscription<NexusMessage>` directly because iced's
-    /// `Subscription::map` panics on capturing closures, so we can't
-    /// return `Subscription<ShellMsg>` and `map_msg` at the root.
+    /// Returns `Subscription<NexusMessage>` directly.
     pub fn subscription(&self) -> Subscription<NexusMessage> {
         let mut subs = Vec::new();
 
         let pty_rx = self.pty.rx.clone();
-        subs.push(Subscription::from_iced(
+        subs.push(
             pty_subscription(pty_rx).map(|batch| {
                 NexusMessage::Shell(ShellMsg::PtyBatch(batch))
             }),
-        ));
+        );
 
         let kernel_rx = self.kernel_rx.clone();
-        subs.push(Subscription::from_iced(
+        subs.push(
             kernel_subscription(kernel_rx).map(|evt| NexusMessage::Shell(ShellMsg::KernelEvent(evt))),
-        ));
+        );
 
         Subscription::batch(subs)
     }

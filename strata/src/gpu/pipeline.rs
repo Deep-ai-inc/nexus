@@ -32,7 +32,7 @@ use cosmic_text::{
     Attrs, Buffer, CacheKey, CacheKeyFlags, Family, FontSystem, Metrics, Shaping, Style,
     SubpixelBin, Weight, fontdb,
 };
-use iced::widget::shader::wgpu;
+use crate::shell::wgpu;
 use lru::LruCache;
 use wgpu::util::StagingBelt;
 
@@ -481,7 +481,8 @@ impl StrataPipeline {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<GpuInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
@@ -545,7 +546,8 @@ impl StrataPipeline {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -559,6 +561,7 @@ impl StrataPipeline {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
+            cache: None,
         });
 
         // Create globals buffer
@@ -624,14 +627,14 @@ impl StrataPipeline {
             view_formats: &[],
         });
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &placeholder_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &[255u8, 255, 255, 255],
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4),
                 rows_per_image: Some(1),
@@ -1172,7 +1175,7 @@ impl StrataPipeline {
 
         // Upload the modified region to GPU
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &atlas.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: ax, y: ay, z: 0 },
@@ -1180,7 +1183,7 @@ impl StrataPipeline {
             },
             // Upload just the rows we wrote (contiguous in source data)
             data,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(width * 4),
                 rows_per_image: Some(height),
@@ -1266,14 +1269,14 @@ impl StrataPipeline {
 
         // Upload entire atlas data
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &atlas.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &atlas.data,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(new_width * 4),
                 rows_per_image: Some(new_height),
@@ -2000,7 +2003,7 @@ impl StrataPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
-        clip_bounds: &iced::Rectangle<u32>,
+        clip_bounds: &crate::shell::Rectangle<u32>,
     ) {
         // Background color is specified in sRGB but the render target is sRGB format,
         // which means the GPU will apply linear→sRGB conversion on output. We must
@@ -2024,6 +2027,7 @@ impl StrataPipeline {
             label: Some("Strata Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(clear_color),
@@ -2114,14 +2118,14 @@ impl StrataPipeline {
         let byte_offset = ((min_y * atlas_width + min_x) * 4) as u64;
 
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.atlas_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: min_x, y: min_y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             data,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: byte_offset,
                 bytes_per_row: Some(atlas_width * 4), // stride = full atlas row width
                 rows_per_image: None,
@@ -2139,14 +2143,14 @@ impl StrataPipeline {
         let atlas_width = self.glyph_atlas.atlas_width;
         let atlas_height = self.glyph_atlas.atlas_height;
         queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.atlas_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             self.glyph_atlas.atlas_data(),
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(atlas_width * 4),
                 rows_per_image: Some(atlas_height),

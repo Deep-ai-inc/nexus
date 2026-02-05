@@ -297,7 +297,7 @@ impl Component for NexusState {
 
         if self.shell.needs_redraw() || self.agent.needs_redraw() || self.drag.auto_scroll.get().is_some() {
             subs.push(Subscription::from_iced(
-                iced::time::every(std::time::Duration::from_millis(16))
+                strata::shell::time::every(std::time::Duration::from_millis(16))
                     .map(|_| NexusMessage::Tick),
             ));
         }

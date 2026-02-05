@@ -950,7 +950,7 @@ impl StrataApp for DemoApp {
 
     fn subscription(_state: &Self::State) -> Subscription<Self::Message> {
         Subscription::from_iced(
-            iced::time::every(std::time::Duration::from_secs(1))
+            crate::shell::time::every(std::time::Duration::from_secs(1))
                 .map(|_| DemoMessage::TimerTick),
         )
     }

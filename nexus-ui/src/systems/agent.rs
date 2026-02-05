@@ -7,8 +7,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use iced::futures::stream;
-use iced::Subscription;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::agent_adapter::AgentEvent;
@@ -41,18 +39,6 @@ pub async fn spawn_agent_task(
 /// Returns raw AgentEvent for caller to map to messages.
 pub fn agent_subscription(
     rx: Arc<Mutex<mpsc::UnboundedReceiver<AgentEvent>>>,
-) -> Subscription<AgentEvent> {
-    struct AgentSubscription;
-
-    Subscription::run_with_id(
-        std::any::TypeId::of::<AgentSubscription>(),
-        stream::unfold(rx, |rx| async move {
-            let event = {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            };
-
-            event.map(|agent_event| (agent_event, rx))
-        }),
-    )
+) -> strata::Subscription<AgentEvent> {
+    strata::shell::subscription::from_receiver(rx)
 }

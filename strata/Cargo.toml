@@ -10,6 +10,7 @@ unicode-width = { workspace = true }
 bytemuck = { workspace = true }
 wgpu = { workspace = true }
 image = { workspace = true }
+tokio = { workspace = true }
 lru = "0.12"
 raw-window-handle = "0.6"
 

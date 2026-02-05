@@ -7,7 +7,7 @@
 
 use tracing_subscriber::EnvFilter;
 
-fn main() -> iced::Result {
+fn main() -> strata::shell::Result {
     let args: Vec<String> = std::env::args().collect();
 
     // Hidden subcommand: `nexus mcp-proxy --port <PORT>`
@@ -27,15 +27,10 @@ fn main() -> iced::Result {
 
     if args.iter().any(|a| a == "--demo") {
         tracing::info!("Starting Strata demo");
-        strata::demo::run().map_err(strata_err)
+        strata::demo::run()?;
     } else {
         tracing::info!("Starting Nexus");
-        nexus_ui::nexus_app::run().map_err(strata_err)
+        nexus_ui::nexus_app::run()?;
     }
-}
-
-fn strata_err(e: strata::shell::Error) -> iced::Error {
-    match e {
-        strata::shell::Error::Iced(ice) => ice,
-    }
+    Ok(())
 }

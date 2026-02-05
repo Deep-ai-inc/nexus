@@ -238,18 +238,28 @@ impl<M> Subscription<M> {
         }
     }
 
-    /// Map the message type using a function item.
+    /// Map the message type using a closure.
     ///
-    /// Internally creates a closure per iced subscription. Subscriptions are
-    /// rebuilt per-frame but the mapping is applied to async event streams,
-    /// not per-frame — this is not hot-path.
+    /// The closure must be Clone because subscriptions are rebuilt per-frame.
+    pub fn map<F, N>(self, f: F) -> Subscription<N>
+    where
+        M: 'static,
+        N: 'static,
+        F: Fn(M) -> N + Clone + Send + 'static,
+    {
+        Subscription {
+            subs: self.subs.into_iter().map(|s| s.map(f.clone())).collect(),
+        }
+    }
+
+    /// Map the message type using a function pointer.
+    ///
+    /// Useful when you have a named function or method reference.
     pub fn map_msg<N: 'static>(self, f: fn(M) -> N) -> Subscription<N>
     where
         M: 'static,
     {
-        Subscription {
-            subs: self.subs.into_iter().map(|s| s.map(move |m| f(m))).collect(),
-        }
+        self.map(f)
     }
 
     /// Check if this subscription is empty.
@@ -411,6 +421,7 @@ pub enum DragSource {
 }
 
 /// Configuration for running a Strata application.
+#[derive(Clone)]
 pub struct AppConfig {
     /// Window title.
     pub title: String,

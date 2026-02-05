@@ -59,7 +59,7 @@ alacritty_terminal = "0.25"
 # UI dependencies (Iced + WGPU)
 # "lazy" feature enables cached/memoized widget rendering for performance
 # Use wgpu-only (no tiny-skia fallback) to enable Shader widget
-iced = { version = "0.13", default-features = false, features = ["tokio", "advanced", "wgpu", "lazy", "image"] }
+iced = { version = "0.14", default-features = false, features = ["tokio", "advanced", "wgpu", "lazy", "image"] }
 cosmic-text = "0.12"
 arboard = "3.4"  # Cross-platform clipboard
 dirs = "5.0"  # Platform-specific directories (home, config, etc.)

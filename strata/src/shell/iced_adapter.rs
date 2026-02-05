@@ -2,14 +2,13 @@
 //!
 //! This module bridges Strata applications to iced for window management,
 //! event handling, and GPU rendering.
-//!
-//! **This is the ONLY file in Strata that imports iced.**
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use iced::widget::shader::{self, wgpu};
+use iced::widget::shader;
+use iced::wgpu;
 use iced::{Element, Event, Length, Subscription, Task, Theme};
 
 use crate::app::{AppConfig, Command, StrataApp};
@@ -56,14 +55,18 @@ pub fn run<A: StrataApp>() -> Result<(), Error> {
 /// explicitly during initialization; additional windows via `ShellMessage::OpenNewWindow`.
 pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     iced::daemon(
-        title::<A>,
+        {
+            let config = config.clone();
+            move || init::<A>(config.clone())
+        },
         update::<A>,
         view::<A>,
     )
+    .title(title::<A>)
     .subscription(subscription::<A>)
-    .theme(|_, _| Theme::Dark)
+    .theme(dark_theme::<A>)
     .antialiasing(config.antialiasing)
-    .run_with(move || init::<A>(config))
+    .run()
     .map_err(Error::from)
 }
 
@@ -527,37 +530,11 @@ fn subscription<A: StrataApp>(state: &MultiWindowState<A>) -> Subscription<Shell
 
     // macOS platform → iced bridge: channel-based subscription (no polling).
     // Handles dock-click reopen and menu bar Cmd+N (newDocument:).
-    // A dedicated thread blocks on std::sync::mpsc::recv until the ObjC
-    // handler fires, then forwards to the async iced stream.
+    // Note: Using run() instead of run_with() means the subscription identity is based
+    // on the function pointer alone. This is fine since there's only one dock-reopen subscription.
     #[cfg(target_os = "macos")]
     {
-        let reopen_stream = iced::stream::channel(1, |mut output| async move {
-            let Some(rx) = crate::platform::macos::take_reopen_receiver() else {
-                // Already taken by a previous subscription — idle forever.
-                std::future::pending::<()>().await;
-                return;
-            };
-
-            // Bridge: one thread that sleeps until the Apple Event fires,
-            // then forwards to an async-compatible unbounded channel.
-            let (atx, mut arx) = iced::futures::channel::mpsc::unbounded::<()>();
-            std::thread::Builder::new()
-                .name("dock-reopen".into())
-                .spawn(move || {
-                    while rx.recv().is_ok() {
-                        if atx.unbounded_send(()).is_err() {
-                            break;
-                        }
-                    }
-                })
-                .ok();
-
-            use iced::futures::{SinkExt, StreamExt};
-            while arx.next().await.is_some() {
-                let _ = output.send(ShellMessage::PlatformNewWindow).await;
-            }
-        });
-        all_subs.push(Subscription::run_with_id("dock-reopen", reopen_stream));
+        all_subs.push(Subscription::run(macos_reopen_stream::<A>));
     }
 
     // Per-window app subscriptions, tagged with window ID.
@@ -574,6 +551,42 @@ fn subscription<A: StrataApp>(state: &MultiWindowState<A>) -> Subscription<Shell
     }
 
     Subscription::batch(all_subs)
+}
+
+/// Returns the dark theme for the application.
+fn dark_theme<A: StrataApp>(_state: &MultiWindowState<A>, _window: iced::window::Id) -> Theme {
+    Theme::Dark
+}
+
+/// Creates the macOS dock reopen stream for the subscription system.
+#[cfg(target_os = "macos")]
+fn macos_reopen_stream<A: StrataApp>() -> impl iced::futures::Stream<Item = ShellMessage<A::Message>> {
+    iced::stream::channel(1, |mut output: iced::futures::channel::mpsc::Sender<ShellMessage<A::Message>>| async move {
+        let Some(rx) = crate::platform::macos::take_reopen_receiver() else {
+            // Already taken by a previous subscription — idle forever.
+            std::future::pending::<()>().await;
+            return;
+        };
+
+        // Bridge: one thread that sleeps until the Apple Event fires,
+        // then forwards to an async-compatible unbounded channel.
+        let (atx, mut arx) = iced::futures::channel::mpsc::unbounded::<()>();
+        std::thread::Builder::new()
+            .name("dock-reopen".into())
+            .spawn(move || {
+                while rx.recv().is_ok() {
+                    if atx.unbounded_send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+
+        use iced::futures::{SinkExt, StreamExt};
+        while arx.next().await.is_some() {
+            let _ = output.send(ShellMessage::PlatformNewWindow).await;
+        }
+    })
 }
 
 /// Convert a Strata Command to an iced Task, tagged with a window ID.
@@ -776,29 +789,22 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
 }
 
 impl shader::Primitive for StrataPrimitive {
+    type Pipeline = PipelineWrapper;
+
     fn prepare(
         &self,
+        pipeline: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        format: wgpu::TextureFormat,
-        storage: &mut shader::Storage,
         bounds: &iced::Rectangle,
         viewport: &iced::advanced::graphics::Viewport,
     ) {
-        // Get or create the pipeline wrapper
-        if !storage.has::<PipelineWrapper>() {
-            let wrapper = PipelineWrapper::new(device, format);
-            storage.store(wrapper);
-        }
-
-        let wrapper = storage.get_mut::<PipelineWrapper>().unwrap();
-
         // Drain pending image loads/unloads — pass them into prepare() so they're
         // applied after the pipeline is guaranteed to exist.
         let pending = std::mem::take(&mut *self.pending_images.lock().unwrap());
         let pending_unloads = std::mem::take(&mut *self.pending_image_unloads.lock().unwrap());
 
-        wrapper.prepare(
+        pipeline.prepare_frame(
             device,
             queue,
             &*self.snapshot, // Deref Arc to get &LayoutSnapshot
@@ -813,16 +819,12 @@ impl shader::Primitive for StrataPrimitive {
 
     fn render(
         &self,
+        pipeline: &Self::Pipeline,
         encoder: &mut wgpu::CommandEncoder,
-        storage: &shader::Storage,
         target: &wgpu::TextureView,
         clip_bounds: &iced::Rectangle<u32>,
     ) {
-        let Some(wrapper) = storage.get::<PipelineWrapper>() else {
-            return;
-        };
-
-        wrapper.render(encoder, target, clip_bounds);
+        pipeline.render(encoder, target, clip_bounds);
     }
 }
 
@@ -840,17 +842,19 @@ struct PipelineWrapper {
     current_scale: f32,
 }
 
-impl PipelineWrapper {
-    fn new(_device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        // Don't create pipeline yet - we need scale factor first
+impl shader::Pipeline for PipelineWrapper {
+    fn new(_device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        // Don't create the actual StrataPipeline yet - we need scale factor first
         Self {
             pipeline: None,
             format,
             current_scale: 0.0,
         }
     }
+}
 
-    fn prepare(
+impl PipelineWrapper {
+    fn prepare_frame(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,

@@ -213,15 +213,9 @@ impl AgentWidget {
     }
 
     /// Create the subscription for agent events.
-    ///
-    /// Returns `Subscription<NexusMessage>` directly because iced's
-    /// `Subscription::map` panics on capturing closures, so we can't
-    /// return `Subscription<AgentMsg>` and `map_msg` at the root.
     pub fn subscription(&self) -> Subscription<NexusMessage> {
         let rx = self.event_rx.clone();
-        Subscription::from_iced(
-            agent_subscription(rx).map(|evt| NexusMessage::Agent(AgentMsg::Event(evt))),
-        )
+        agent_subscription(rx).map(|evt| NexusMessage::Agent(AgentMsg::Event(evt)))
     }
 
     /// Start the TCP permission server (once, reused across spawns).
