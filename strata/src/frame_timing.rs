@@ -86,3 +86,68 @@ pub fn stat(label: &'static str, frame: u64, value: impl std::fmt::Display) {
         eprintln!("[frame {}] {}: {}", frame, label, value);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enable_disable() {
+        // Start in known state
+        disable();
+        assert!(!is_enabled());
+
+        enable();
+        assert!(is_enabled());
+
+        disable();
+        assert!(!is_enabled());
+    }
+
+    #[test]
+    fn test_frame_counter() {
+        // Note: Frame counter is global, so we just check it increments
+        let before = current_frame();
+        let returned = next_frame();
+        let after = current_frame();
+
+        assert_eq!(returned, before);
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn test_timing_guard_creation() {
+        let frame = current_frame();
+        let _guard = TimingGuard::new("test_label", frame);
+        // Guard should be created without panicking
+        // Drop happens at end of scope
+    }
+
+    #[test]
+    fn test_measure_returns_value() {
+        let frame = current_frame();
+        let result = measure("test", frame, || {
+            42
+        });
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_measure_executes_closure() {
+        let frame = current_frame();
+        let mut executed = false;
+        measure("test", frame, || {
+            executed = true;
+        });
+        assert!(executed);
+    }
+
+    #[test]
+    fn test_stat_does_not_panic() {
+        // Just verify it doesn't panic at various frame numbers
+        stat("test", 0, "value");
+        stat("test", 1, 42);
+        stat("test", 60, 3.14);
+        stat("test", 120, "another value");
+    }
+}

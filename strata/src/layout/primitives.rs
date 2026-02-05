@@ -426,3 +426,382 @@ impl PrimitiveBatch {
             + self.images.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn white() -> Color {
+        Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+    }
+
+    fn red() -> Color {
+        Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }
+    }
+
+    // =========================================================================
+    // Basic batch operations
+    // =========================================================================
+
+    #[test]
+    fn test_new_creates_empty_batch() {
+        let batch = PrimitiveBatch::new();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+    }
+
+    #[test]
+    fn test_default_creates_empty_batch() {
+        let batch = PrimitiveBatch::default();
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+    }
+
+    #[test]
+    fn test_clear_resets_batch() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_solid_rect(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, white());
+        batch.add_circle(Point { x: 5.0, y: 5.0 }, 3.0, red());
+        batch.push_clip(Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 });
+
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 2);
+
+        batch.clear();
+
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert!(batch.current_clip_public().is_none());
+    }
+
+    // =========================================================================
+    // Clip stack
+    // =========================================================================
+
+    #[test]
+    fn test_clip_stack_empty_returns_none() {
+        let batch = PrimitiveBatch::new();
+        assert!(batch.current_clip_public().is_none());
+        assert!(batch.current_clip_bounds().is_none());
+    }
+
+    #[test]
+    fn test_push_clip_single() {
+        let mut batch = PrimitiveBatch::new();
+        let clip = Rect { x: 10.0, y: 20.0, width: 100.0, height: 50.0 };
+        batch.push_clip(clip);
+
+        let result = batch.current_clip_public().unwrap();
+        assert_eq!(result.x, 10.0);
+        assert_eq!(result.y, 20.0);
+        assert_eq!(result.width, 100.0);
+        assert_eq!(result.height, 50.0);
+    }
+
+    #[test]
+    fn test_push_clip_intersection() {
+        let mut batch = PrimitiveBatch::new();
+        // First clip: 0,0 to 100,100
+        batch.push_clip(Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 });
+        // Second clip: 50,50 to 150,150 — intersection should be 50,50 to 100,100
+        batch.push_clip(Rect { x: 50.0, y: 50.0, width: 100.0, height: 100.0 });
+
+        let result = batch.current_clip_public().unwrap();
+        assert_eq!(result.x, 50.0);
+        assert_eq!(result.y, 50.0);
+        assert_eq!(result.width, 50.0);
+        assert_eq!(result.height, 50.0);
+    }
+
+    #[test]
+    fn test_pop_clip_restores_previous() {
+        let mut batch = PrimitiveBatch::new();
+        let clip1 = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        let clip2 = Rect { x: 50.0, y: 50.0, width: 100.0, height: 100.0 };
+
+        batch.push_clip(clip1);
+        batch.push_clip(clip2);
+        batch.pop_clip();
+
+        let result = batch.current_clip_public().unwrap();
+        assert_eq!(result.x, 0.0);
+        assert_eq!(result.width, 100.0);
+    }
+
+    #[test]
+    fn test_pop_clip_to_empty() {
+        let mut batch = PrimitiveBatch::new();
+        batch.push_clip(Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 });
+        batch.pop_clip();
+
+        assert!(batch.current_clip_public().is_none());
+    }
+
+    #[test]
+    fn test_clip_non_intersecting_returns_sentinel() {
+        let mut batch = PrimitiveBatch::new();
+        // Two clips that don't overlap
+        batch.push_clip(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 });
+        batch.push_clip(Rect { x: 100.0, y: 100.0, width: 10.0, height: 10.0 });
+
+        // Should return the CLIP_EVERYTHING sentinel
+        let result = batch.current_clip_public().unwrap();
+        assert!(result.width < 1.0); // sentinel has tiny dimensions
+    }
+
+    // =========================================================================
+    // Solid rects
+    // =========================================================================
+
+    #[test]
+    fn test_add_solid_rect() {
+        let mut batch = PrimitiveBatch::new();
+        let rect = Rect { x: 10.0, y: 20.0, width: 30.0, height: 40.0 };
+
+        batch.add_solid_rect(rect, white());
+
+        assert_eq!(batch.len(), 1);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.solid_rects.len(), 1);
+        assert_eq!(batch.solid_rects[0].rect.x, 10.0);
+        assert!(batch.solid_rects[0].clip_rect.is_none());
+    }
+
+    #[test]
+    fn test_add_solid_rect_with_clip() {
+        let mut batch = PrimitiveBatch::new();
+        let clip = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        batch.push_clip(clip);
+
+        batch.add_solid_rect(Rect { x: 10.0, y: 10.0, width: 20.0, height: 20.0 }, red());
+
+        assert!(batch.solid_rects[0].clip_rect.is_some());
+    }
+
+    #[test]
+    fn test_add_solid_rect_returns_self() {
+        let mut batch = PrimitiveBatch::new();
+        batch
+            .add_solid_rect(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, white())
+            .add_solid_rect(Rect { x: 20.0, y: 0.0, width: 10.0, height: 10.0 }, red());
+
+        assert_eq!(batch.solid_rects.len(), 2);
+    }
+
+    // =========================================================================
+    // Rounded rects
+    // =========================================================================
+
+    #[test]
+    fn test_add_rounded_rect() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_rounded_rect(Rect { x: 0.0, y: 0.0, width: 50.0, height: 30.0 }, 5.0, white());
+
+        assert_eq!(batch.rounded_rects.len(), 1);
+        assert_eq!(batch.rounded_rects[0].corner_radius, 5.0);
+        assert_eq!(batch.len(), 1);
+    }
+
+    // =========================================================================
+    // Circles
+    // =========================================================================
+
+    #[test]
+    fn test_add_circle() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_circle(Point { x: 50.0, y: 50.0 }, 25.0, red());
+
+        assert_eq!(batch.circles.len(), 1);
+        assert_eq!(batch.circles[0].center.x, 50.0);
+        assert_eq!(batch.circles[0].radius, 25.0);
+    }
+
+    // =========================================================================
+    // Lines
+    // =========================================================================
+
+    #[test]
+    fn test_add_line() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_line(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 100.0, y: 100.0 },
+            2.0,
+            white(),
+        );
+
+        assert_eq!(batch.lines.len(), 1);
+        assert_eq!(batch.lines[0].thickness, 2.0);
+        assert_eq!(batch.lines[0].style, LineStyle::Solid);
+    }
+
+    #[test]
+    fn test_add_line_styled() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_line_styled(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 50.0, y: 50.0 },
+            1.0,
+            red(),
+            LineStyle::Dashed,
+        );
+
+        assert_eq!(batch.lines[0].style, LineStyle::Dashed);
+    }
+
+    // =========================================================================
+    // Polylines
+    // =========================================================================
+
+    #[test]
+    fn test_add_polyline() {
+        let mut batch = PrimitiveBatch::new();
+        let points = vec![
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 10.0, y: 20.0 },
+            Point { x: 20.0, y: 10.0 },
+        ];
+        batch.add_polyline(points, 2.0, white());
+
+        assert_eq!(batch.polylines.len(), 1);
+        assert_eq!(batch.polylines[0].points.len(), 3);
+    }
+
+    #[test]
+    fn test_add_polyline_requires_at_least_two_points() {
+        let mut batch = PrimitiveBatch::new();
+
+        // Single point should not add a polyline
+        batch.add_polyline(vec![Point { x: 0.0, y: 0.0 }], 1.0, white());
+        assert_eq!(batch.polylines.len(), 0);
+
+        // Empty should not add a polyline
+        batch.add_polyline(vec![], 1.0, white());
+        assert_eq!(batch.polylines.len(), 0);
+
+        // Two points should work
+        batch.add_polyline(vec![Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 10.0 }], 1.0, white());
+        assert_eq!(batch.polylines.len(), 1);
+    }
+
+    #[test]
+    fn test_add_polyline_styled() {
+        let mut batch = PrimitiveBatch::new();
+        let points = vec![Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 10.0 }];
+        batch.add_polyline_styled(points, 1.5, red(), LineStyle::Dotted);
+
+        assert_eq!(batch.polylines[0].style, LineStyle::Dotted);
+    }
+
+    // =========================================================================
+    // Text
+    // =========================================================================
+
+    #[test]
+    fn test_add_text() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_text("Hello", Point { x: 10.0, y: 20.0 }, white(), 14.0);
+
+        assert_eq!(batch.text_runs.len(), 1);
+        assert_eq!(batch.text_runs[0].text, "Hello");
+        assert_eq!(batch.text_runs[0].font_size, 14.0);
+        assert!(batch.text_runs[0].cache_key.is_none());
+    }
+
+    #[test]
+    fn test_add_text_cached() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_text_cached("Cached text", Point { x: 0.0, y: 0.0 }, white(), 16.0, 12345);
+
+        assert_eq!(batch.text_runs[0].cache_key, Some(12345));
+    }
+
+    // =========================================================================
+    // Borders
+    // =========================================================================
+
+    #[test]
+    fn test_add_border() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_border(
+            Rect { x: 0.0, y: 0.0, width: 100.0, height: 50.0 },
+            8.0,  // corner_radius
+            2.0,  // border_width
+            red(),
+        );
+
+        assert_eq!(batch.borders.len(), 1);
+        assert_eq!(batch.borders[0].corner_radius, 8.0);
+        assert_eq!(batch.borders[0].border_width, 2.0);
+    }
+
+    // =========================================================================
+    // Shadows
+    // =========================================================================
+
+    #[test]
+    fn test_add_shadow() {
+        let mut batch = PrimitiveBatch::new();
+        batch.add_shadow(
+            Rect { x: 5.0, y: 5.0, width: 100.0, height: 50.0 },
+            4.0,  // corner_radius
+            10.0, // blur_radius
+            Color { r: 0.0, g: 0.0, b: 0.0, a: 0.5 },
+        );
+
+        assert_eq!(batch.shadows.len(), 1);
+        assert_eq!(batch.shadows[0].blur_radius, 10.0);
+    }
+
+    // =========================================================================
+    // Images
+    // =========================================================================
+
+    #[test]
+    fn test_add_image() {
+        let mut batch = PrimitiveBatch::new();
+        let handle = ImageHandle(42);
+        batch.add_image(
+            Rect { x: 0.0, y: 0.0, width: 64.0, height: 64.0 },
+            handle,
+            4.0,  // corner_radius
+            white(), // tint
+        );
+
+        assert_eq!(batch.images.len(), 1);
+        assert_eq!(batch.images[0].handle.0, 42);
+        assert_eq!(batch.images[0].corner_radius, 4.0);
+    }
+
+    // =========================================================================
+    // Len counts all primitive types
+    // =========================================================================
+
+    #[test]
+    fn test_len_counts_all_types() {
+        let mut batch = PrimitiveBatch::new();
+
+        batch.add_solid_rect(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, white());
+        batch.add_rounded_rect(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, 2.0, white());
+        batch.add_circle(Point { x: 5.0, y: 5.0 }, 5.0, white());
+        batch.add_line(Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 10.0 }, 1.0, white());
+        batch.add_polyline(vec![Point { x: 0.0, y: 0.0 }, Point { x: 5.0, y: 5.0 }], 1.0, white());
+        batch.add_text("test", Point { x: 0.0, y: 0.0 }, white(), 12.0);
+        batch.add_border(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, 2.0, 1.0, white());
+        batch.add_shadow(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, 2.0, 5.0, white());
+        batch.add_image(Rect { x: 0.0, y: 0.0, width: 10.0, height: 10.0 }, ImageHandle(1), 0.0, white());
+
+        assert_eq!(batch.len(), 9);
+        assert!(!batch.is_empty());
+    }
+
+    // =========================================================================
+    // LineStyle
+    // =========================================================================
+
+    #[test]
+    fn test_line_style_default() {
+        let style = LineStyle::default();
+        assert_eq!(style, LineStyle::Solid);
+    }
+}

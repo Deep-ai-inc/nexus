@@ -414,4 +414,107 @@ mod tests {
         assert!(!no_mods.any());
         assert!(no_mods.none());
     }
+
+    #[test]
+    fn capture_state_is_captured() {
+        let none = CaptureState::None;
+        assert!(!none.is_captured());
+        assert!(none.captured_by().is_none());
+
+        let source = SourceId::new();
+        let captured = CaptureState::Captured(source);
+        assert!(captured.is_captured());
+        assert_eq!(captured.captured_by(), Some(source));
+    }
+
+    #[test]
+    fn capture_state_default() {
+        let state: CaptureState = Default::default();
+        assert!(!state.is_captured());
+    }
+
+    #[test]
+    fn event_context_with_capture() {
+        let snapshot = LayoutSnapshot::new();
+        let source = SourceId::new();
+        let ctx = EventContext::with_capture(&snapshot, CaptureState::Captured(source));
+
+        assert!(ctx.is_captured());
+        assert_eq!(ctx.capture_state(), CaptureState::Captured(source));
+    }
+
+    #[test]
+    fn event_context_take_capture() {
+        let snapshot = LayoutSnapshot::new();
+        let source = SourceId::new();
+        let ctx = EventContext::new(&snapshot);
+        ctx.capture_pointer(source);
+
+        let taken = ctx.take_capture();
+        assert_eq!(taken, CaptureState::Captured(source));
+        // After take, context should be None
+        assert!(!ctx.is_captured());
+    }
+
+    #[test]
+    fn key_constructors() {
+        let named = Key::named(NamedKey::Enter);
+        assert!(matches!(named, Key::Named(NamedKey::Enter)));
+
+        let char_key = Key::character("a");
+        assert!(matches!(char_key, Key::Character(s) if s == "a"));
+
+        let char_key_string = Key::character(String::from("abc"));
+        assert!(matches!(char_key_string, Key::Character(s) if s == "abc"));
+    }
+
+    #[test]
+    fn modifiers_command() {
+        let meta = Modifiers::META;
+        let ctrl = Modifiers::CTRL;
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(meta.command());
+            assert!(!ctrl.command());
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!meta.command());
+            assert!(ctrl.command());
+        }
+    }
+
+    #[test]
+    fn modifiers_constants() {
+        assert!(Modifiers::SHIFT.shift);
+        assert!(!Modifiers::SHIFT.ctrl);
+
+        assert!(Modifiers::CTRL.ctrl);
+        assert!(!Modifiers::CTRL.shift);
+
+        assert!(Modifiers::ALT.alt);
+        assert!(!Modifiers::ALT.meta);
+
+        assert!(Modifiers::META.meta);
+        assert!(!Modifiers::META.alt);
+    }
+
+    #[test]
+    fn event_from_mouse() {
+        let mouse = MouseEvent::CursorEntered;
+        let event: Event = mouse.into();
+        assert!(matches!(event, Event::Mouse(MouseEvent::CursorEntered)));
+    }
+
+    #[test]
+    fn event_from_keyboard() {
+        let key = KeyEvent::Released {
+            key: Key::named(NamedKey::Escape),
+            modifiers: Modifiers::NONE,
+        };
+        let event: Event = key.into();
+        assert!(matches!(event, Event::Keyboard(KeyEvent::Released { .. })));
+    }
 }

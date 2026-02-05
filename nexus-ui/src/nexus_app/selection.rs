@@ -562,3 +562,264 @@ fn extract_agent_footer_text(block: &AgentBlock) -> String {
 
     parts.join(" ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== SelectionWidget tests ==========
+
+    #[test]
+    fn test_selection_widget_new() {
+        let widget = SelectionWidget::new();
+        assert!(widget.selection.is_none());
+        assert!(!widget.is_selecting);
+    }
+
+    #[test]
+    fn test_selection_widget_default_select_mode() {
+        let widget = SelectionWidget::new();
+        assert!(matches!(widget.select_mode, super::super::drag_state::SelectMode::Char));
+    }
+
+    // ========== extract_multi_item_range tests ==========
+
+    #[test]
+    fn test_extract_multi_item_range_empty_lines() {
+        let lines: Vec<&str> = vec![];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 0);
+        let end = ContentAddress::new(SourceId::from_raw(1), 0, 5);
+
+        let result = extract_multi_item_range(&lines, true, true, &start, &end);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_single_line_full() {
+        let lines: Vec<&str> = vec!["Hello, World!"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 0);
+        let end = ContentAddress::new(SourceId::from_raw(1), 0, 13);
+
+        let result = extract_multi_item_range(&lines, true, true, &start, &end);
+        assert_eq!(result, "Hello, World!");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_single_line_partial() {
+        let lines: Vec<&str> = vec!["Hello, World!"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 0);
+        let end = ContentAddress::new(SourceId::from_raw(1), 0, 5);
+
+        let result = extract_multi_item_range(&lines, true, true, &start, &end);
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_single_line_middle() {
+        let lines: Vec<&str> = vec!["Hello, World!"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 7);
+        let end = ContentAddress::new(SourceId::from_raw(1), 0, 12);
+
+        let result = extract_multi_item_range(&lines, true, true, &start, &end);
+        assert_eq!(result, "World");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_multiple_lines() {
+        let lines: Vec<&str> = vec!["Line 1", "Line 2", "Line 3"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 0);
+        let end = ContentAddress::new(SourceId::from_raw(1), 2, 6);
+
+        let result = extract_multi_item_range(&lines, true, true, &start, &end);
+        assert_eq!(result, "Line 1\nLine 2\nLine 3");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_multiple_lines_partial() {
+        let lines: Vec<&str> = vec!["Line 1", "Line 2", "Line 3"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 5);
+        let end = ContentAddress::new(SourceId::from_raw(1), 2, 4);
+
+        let result = extract_multi_item_range(&lines, true, true, &start, &end);
+        assert_eq!(result, "1\nLine 2\nLine");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_not_start_source() {
+        let lines: Vec<&str> = vec!["Line 1", "Line 2"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 5);
+        let end = ContentAddress::new(SourceId::from_raw(1), 1, 6);
+
+        // is_start=false means we start from beginning of first line
+        let result = extract_multi_item_range(&lines, false, true, &start, &end);
+        assert_eq!(result, "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_not_end_source() {
+        let lines: Vec<&str> = vec!["Line 1", "Line 2"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 0, 0);
+        let end = ContentAddress::new(SourceId::from_raw(1), 0, 3);
+
+        // is_end=false means we go to end of last line
+        let result = extract_multi_item_range(&lines, true, false, &start, &end);
+        assert_eq!(result, "Line 1\nLine 2");
+    }
+
+    #[test]
+    fn test_extract_multi_item_range_start_beyond_lines() {
+        let lines: Vec<&str> = vec!["Line 1"];
+        let start = ContentAddress::new(SourceId::from_raw(1), 5, 0);
+        let end = ContentAddress::new(SourceId::from_raw(1), 5, 10);
+
+        let result = extract_multi_item_range(&lines, true, true, &start, &end);
+        assert_eq!(result, "");
+    }
+
+    // ========== extract_tool_text tests ==========
+
+    use crate::agent_block::ToolStatus;
+    use std::collections::HashMap;
+
+    fn make_test_tool(name: &str) -> ToolInvocation {
+        ToolInvocation {
+            id: "tool-1".to_string(),
+            name: name.to_string(),
+            parameters: HashMap::new(),
+            output: None,
+            status: ToolStatus::Success,
+            message: None,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn test_extract_tool_text_basic() {
+        let mut tool = make_test_tool("read_file");
+        tool.parameters.insert("path".to_string(), "/test/file.txt".to_string());
+        tool.output = Some("File contents here".to_string());
+
+        let result = extract_tool_text(&tool);
+        assert!(result.contains("read_file"));
+        assert!(result.contains("path: /test/file.txt"));
+        assert!(result.contains("File contents here"));
+    }
+
+    #[test]
+    fn test_extract_tool_text_collapsed() {
+        let mut tool = make_test_tool("bash");
+        tool.parameters.insert("command".to_string(), "ls -la".to_string());
+        tool.output = Some("First line\nSecond line\nThird line".to_string());
+        tool.collapsed = true;
+
+        let result = extract_tool_text(&tool);
+        assert!(result.contains("bash"));
+        assert!(result.contains("First line"));
+        // Collapsed should only show first line
+        assert!(!result.contains("Second line"));
+    }
+
+    #[test]
+    fn test_extract_tool_text_with_message() {
+        let mut tool = make_test_tool("write_file");
+        tool.message = Some("Writing to /test.txt".to_string());
+
+        let result = extract_tool_text(&tool);
+        assert!(result.contains("write_file"));
+        assert!(result.contains("Writing to /test.txt"));
+    }
+
+    #[test]
+    fn test_extract_tool_text_long_parameter_truncated() {
+        let long_value = "x".repeat(200);
+        let mut tool = make_test_tool("test");
+        tool.parameters.insert("content".to_string(), long_value);
+
+        let result = extract_tool_text(&tool);
+        assert!(result.contains("content: "));
+        assert!(result.contains("...")); // Should be truncated
+    }
+
+    // ========== extract_agent_footer_text tests ==========
+
+    fn make_test_agent_block(state: AgentBlockState) -> AgentBlock {
+        AgentBlock {
+            id: BlockId(1),
+            query: "test".to_string(),
+            thinking: String::new(),
+            thinking_collapsed: true,
+            response: String::new(),
+            tools: vec![],
+            active_tool_id: None,
+            images: vec![],
+            state,
+            started_at: std::time::Instant::now(),
+            pending_permission: None,
+            pending_question: None,
+            duration_ms: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn test_extract_agent_footer_text_pending() {
+        let block = make_test_agent_block(AgentBlockState::Pending);
+        let result = extract_agent_footer_text(&block);
+        assert_eq!(result, "Waiting...");
+    }
+
+    #[test]
+    fn test_extract_agent_footer_text_completed_with_stats() {
+        let mut block = make_test_agent_block(AgentBlockState::Completed);
+        block.response = "Done".to_string();
+        block.duration_ms = Some(1500);
+        block.cost_usd = Some(0.0023);
+        block.input_tokens = Some(100);
+        block.output_tokens = Some(50);
+
+        let result = extract_agent_footer_text(&block);
+        assert!(result.contains("Completed"));
+        assert!(result.contains("1.5s"));
+        assert!(result.contains("$0.0023"));
+        assert!(result.contains("150 tokens"));
+    }
+
+    #[test]
+    fn test_extract_agent_footer_text_duration_ms() {
+        let mut block = make_test_agent_block(AgentBlockState::Completed);
+        block.duration_ms = Some(500);
+
+        let result = extract_agent_footer_text(&block);
+        assert!(result.contains("500ms"));
+    }
+
+    #[test]
+    fn test_extract_agent_footer_text_large_tokens() {
+        let mut block = make_test_agent_block(AgentBlockState::Completed);
+        block.input_tokens = Some(500_000);
+        block.output_tokens = Some(600_000);
+
+        let result = extract_agent_footer_text(&block);
+        assert!(result.contains("1.1M tokens"));
+    }
+
+    #[test]
+    fn test_extract_agent_footer_text_k_tokens() {
+        let mut block = make_test_agent_block(AgentBlockState::Completed);
+        block.input_tokens = Some(1500);
+        block.output_tokens = Some(500);
+
+        let result = extract_agent_footer_text(&block);
+        assert!(result.contains("2.0k tokens"));
+    }
+
+    #[test]
+    fn test_extract_agent_footer_text_failed() {
+        let block = make_test_agent_block(AgentBlockState::Failed("Connection error".to_string()));
+        let result = extract_agent_footer_text(&block);
+        assert!(result.contains("Connection error"));
+    }
+}
