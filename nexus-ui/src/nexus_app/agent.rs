@@ -318,6 +318,7 @@ impl AgentWidget {
             }
             AgentMsg::ToggleThinking(id) => { self.toggle_thinking(id); AgentOutput::None }
             AgentMsg::ToggleTool(id, idx) => { self.toggle_tool(id, idx); AgentOutput::None }
+            AgentMsg::ExpandAllTools => { self.expand_all_tools(); AgentOutput::None }
             AgentMsg::PermissionGrant(block_id, perm_id) => { self.permission_grant(block_id, perm_id); AgentOutput::None }
             AgentMsg::PermissionGrantSession(block_id, perm_id) => { self.permission_grant_session(block_id, perm_id); AgentOutput::None }
             AgentMsg::PermissionDeny(block_id, perm_id) => { self.permission_deny(block_id, perm_id); AgentOutput::None }
@@ -469,6 +470,19 @@ impl AgentWidget {
                     block.version += 1;
                 }
             }
+        }
+    }
+
+    /// Toggle all tools in the most recent agent block (Ctrl+O).
+    /// If any are collapsed, expand all. Otherwise collapse all.
+    pub fn expand_all_tools(&mut self) {
+        if let Some(block) = self.blocks.last_mut() {
+            let any_collapsed = block.tools.iter().any(|t| t.collapsed);
+            let new_state = !any_collapsed; // If any collapsed, expand all (false); otherwise collapse all (true)
+            for tool in &mut block.tools {
+                tool.collapsed = new_state;
+            }
+            block.version += 1;
         }
     }
 

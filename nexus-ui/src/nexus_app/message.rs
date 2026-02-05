@@ -180,6 +180,8 @@ pub enum AgentMsg {
     Event(AgentEvent),
     ToggleThinking(BlockId),
     ToggleTool(BlockId, usize),
+    /// Expand all collapsed tools in the most recent agent block (Ctrl+O).
+    ExpandAllTools,
     PermissionGrant(BlockId, String),
     PermissionGrantSession(BlockId, String),
     PermissionDeny(BlockId, String),

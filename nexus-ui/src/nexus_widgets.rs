@@ -720,22 +720,36 @@ fn build_bash_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
     }
 
     if let Some(ref output) = tool.output {
-        let mut code_col = Column::new()
-            .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
-            .background(colors::TOOL_ARTIFACT_BG)
-            .corner_radius(4.0)
-            .width(Length::Fill);
-        for line in output.lines().take(30) {
-            code_col = code_col.push(TextElement::new(line).color(colors::TOOL_OUTPUT).source(source_id));
+        let lines: Vec<&str> = output.lines().collect();
+        let max_lines = 30;
+
+        // First line gets tree prefix, rest are just indented (matching Claude Code)
+        for (i, line) in lines.iter().take(max_lines).enumerate() {
+            if i == 0 {
+                col = col.push(
+                    Row::new()
+                        .fixed_spacer(16.0)
+                        .spacing(4.0)
+                        .push(TextElement::new("└").color(colors::TEXT_MUTED))
+                        .push(TextElement::new(*line).color(colors::TOOL_OUTPUT).source(source_id)),
+                );
+            } else {
+                col = col.push(
+                    Row::new()
+                        .fixed_spacer(28.0)
+                        .push(TextElement::new(*line).color(colors::TOOL_OUTPUT).source(source_id)),
+                );
+            }
         }
-        let total = output.lines().count();
-        if total > 30 {
-            code_col = code_col.push(
-                TextElement::new(&format!("  \u{2026} ({} more lines)", total - 30))
-                    .color(colors::TEXT_MUTED).source(source_id),
+
+        // Show remaining lines indicator
+        if lines.len() > max_lines {
+            col = col.push(
+                Row::new()
+                    .fixed_spacer(16.0)
+                    .push(TextElement::new(format!("… ({} more lines)", lines.len() - max_lines)).color(colors::TEXT_MUTED).source(source_id)),
             );
         }
-        col = col.push(code_col);
     }
     col
 }

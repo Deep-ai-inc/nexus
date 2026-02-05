@@ -191,6 +191,12 @@ fn route_global_shortcut(
             match c.as_str() {
                 "r" => return Some(NexusMessage::Input(InputMsg::HistorySearchToggle)),
                 "l" => return Some(NexusMessage::ClearScreen),
+                "o" => {
+                    // Expand collapsed tools in the most recent agent block
+                    if !state.agent.blocks.is_empty() {
+                        return Some(NexusMessage::Agent(AgentMsg::ExpandAllTools));
+                    }
+                }
                 "c" => {
                     if state.agent.is_active() {
                         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
