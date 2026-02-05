@@ -56,8 +56,11 @@ pub(crate) struct InputWidget {
 
 impl InputWidget {
     pub fn new(command_history: Vec<String>, kernel: Arc<Mutex<Kernel>>) -> Self {
+        let mut text_input = TextInputState::new();
+        // Must match the element padding in NexusInputBar::view()
+        text_input.set_padding(Padding::new(0.0, 4.0, 0.0, 4.0));
         Self {
-            text_input: TextInputState::new(),
+            text_input,
             mode: InputMode::Shell,
             saved_input: String::new(),
             attachments: Vec::new(),
@@ -448,12 +451,11 @@ impl InputWidget {
         cursor_visible: bool,
     ) -> Column {
         let line_count = {
-            let count = self.text_input.text.lines().count()
-                + if self.text_input.text.ends_with('\n') {
-                    1
-                } else {
-                    0
-                };
+            // Use visual line count (accounts for soft wrapping) based on
+            // the bounds from the previous layout frame.
+            let count = self.text_input.visual_line_count_for_width(
+                self.text_input.bounds().width - Padding::new(0.0, 4.0, 0.0, 4.0).horizontal(),
+            );
             count.max(1).min(6)
         };
 

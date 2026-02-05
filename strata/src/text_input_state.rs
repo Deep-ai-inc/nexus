@@ -6,11 +6,14 @@
 
 use std::cell::Cell;
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::app::MouseResponse;
 use crate::content_address::SourceId;
 use crate::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
+use crate::layout::containers::Padding;
 use crate::layout_snapshot::{HitResult, LayoutSnapshot};
 use crate::primitives::Rect;
 
@@ -18,6 +21,193 @@ use crate::primitives::Rect;
 const CHAR_WIDTH: f32 = 8.4;
 /// Line height (must match containers.rs LINE_HEIGHT).
 const LINE_HEIGHT: f32 = 18.0;
+
+// =========================================================================
+// Visual line wrapping
+// =========================================================================
+
+/// A visual line produced by soft-wrapping a logical line.
+#[derive(Debug, Clone)]
+pub struct VisualLine {
+    /// Index of the logical line (from `text.split('\n')`).
+    pub logical_line: usize,
+    /// Byte offset of the start within the logical line (for O(1) slicing).
+    pub start_byte: usize,
+    /// Byte offset of the end within the logical line.
+    pub end_byte: usize,
+    /// Char offset of the start within the logical line.
+    pub start_col: usize,
+    /// Number of chars in this visual line.
+    pub char_count: usize,
+    /// Display width in columns (accounting for unicode widths).
+    pub display_width: usize,
+    /// Absolute char offset from the start of the full text.
+    pub global_char_start: usize,
+}
+
+/// Compute visual lines by greedy word-wrapping text at `max_cols` display columns.
+///
+/// Uses unicode display width for column calculations. Words that exceed
+/// `max_cols` are character-broken as a fallback. When `max_cols == usize::MAX`,
+/// wrapping is effectively disabled.
+pub fn compute_visual_lines(text: &str, max_cols: usize) -> Vec<VisualLine> {
+    let mut result = Vec::new();
+    let mut global_char = 0usize;
+
+    for (line_idx, logical_line) in text.split('\n').enumerate() {
+        if logical_line.is_empty() {
+            result.push(VisualLine {
+                logical_line: line_idx,
+                start_byte: 0,
+                end_byte: 0,
+                start_col: 0,
+                char_count: 0,
+                display_width: 0,
+                global_char_start: global_char,
+            });
+            global_char += 1; // account for the '\n'
+            continue;
+        }
+
+        // Greedy word wrapping
+        let mut vis_start_byte = 0usize;
+        let mut vis_start_col = 0usize;
+        let mut vis_width = 0usize;
+        let mut vis_chars = 0usize;
+        let mut word_start_byte = 0usize;
+        let mut word_start_col = 0usize;
+        let mut word_width = 0usize;
+        let mut word_chars = 0usize;
+        let mut in_whitespace = false;
+
+        let chars: Vec<(usize, char)> = logical_line.char_indices().collect();
+        let line_byte_len = logical_line.len();
+
+        for &(byte_idx, ch) in &chars {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let is_ws = ch == ' ' || ch == '\t';
+
+            if is_ws && !in_whitespace {
+                // End of a word — commit the word to the current visual line
+                // (word was already accumulated into vis_width)
+                in_whitespace = true;
+            }
+            if !is_ws && in_whitespace {
+                // Start of a new word after whitespace
+                in_whitespace = false;
+                word_start_byte = byte_idx;
+                word_start_col = vis_start_col + vis_chars;
+                word_width = 0;
+                word_chars = 0;
+            }
+
+            // Check if adding this char would exceed max_cols
+            if vis_width + cw > max_cols && vis_chars > 0 {
+                if !is_ws && word_chars > 0 && word_chars < vis_chars {
+                    // Wrap at word boundary: push visual line up to word start
+                    let vis_end_byte = word_start_byte;
+                    let chars_before_word = vis_chars - word_chars;
+                    let width_before_word = vis_width - word_width;
+                    result.push(VisualLine {
+                        logical_line: line_idx,
+                        start_byte: vis_start_byte,
+                        end_byte: vis_end_byte,
+                        start_col: vis_start_col,
+                        char_count: chars_before_word,
+                        display_width: width_before_word,
+                        global_char_start: global_char + vis_start_col,
+                    });
+                    // Start new visual line from the word
+                    vis_start_byte = word_start_byte;
+                    vis_start_col = word_start_col;
+                    vis_width = word_width + cw;
+                    vis_chars = word_chars + 1;
+                    word_width += cw;
+                    word_chars += 1;
+                } else {
+                    // Character-break: current char starts a new line
+                    let vis_end_byte = byte_idx;
+                    result.push(VisualLine {
+                        logical_line: line_idx,
+                        start_byte: vis_start_byte,
+                        end_byte: vis_end_byte,
+                        start_col: vis_start_col,
+                        char_count: vis_chars,
+                        display_width: vis_width,
+                        global_char_start: global_char + vis_start_col,
+                    });
+                    vis_start_byte = byte_idx;
+                    vis_start_col += vis_chars;
+                    vis_width = cw;
+                    vis_chars = 1;
+                    if !is_ws {
+                        word_start_byte = byte_idx;
+                        word_start_col = vis_start_col;
+                        word_width = cw;
+                        word_chars = 1;
+                    } else {
+                        word_width = 0;
+                        word_chars = 0;
+                    }
+                }
+            } else {
+                vis_width += cw;
+                vis_chars += 1;
+                if !is_ws {
+                    word_width += cw;
+                    word_chars += 1;
+                }
+            }
+        }
+
+        // Push the last visual line
+        result.push(VisualLine {
+            logical_line: line_idx,
+            start_byte: vis_start_byte,
+            end_byte: line_byte_len,
+            start_col: vis_start_col,
+            char_count: vis_chars,
+            display_width: vis_width,
+            global_char_start: global_char + vis_start_col,
+        });
+
+        global_char += logical_line.chars().count() + 1; // +1 for '\n'
+    }
+
+    result
+}
+
+/// Convert a char offset to (visual_line_index, col_within_visual_line).
+///
+/// Uses binary search on `global_char_start` for O(log N) lookup.
+/// At wrap boundaries, prefers the end of the current visual line (cursor affinity).
+pub fn offset_to_visual(visual_lines: &[VisualLine], char_offset: usize) -> (usize, usize) {
+    if visual_lines.is_empty() {
+        return (0, 0);
+    }
+    // Binary search: find the last visual line whose global_char_start <= char_offset
+    let idx = match visual_lines.binary_search_by_key(&char_offset, |vl| vl.global_char_start) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    let vl = &visual_lines[idx];
+    let col = char_offset.saturating_sub(vl.global_char_start);
+    // Clamp col to char_count (cursor can sit at end of visual line)
+    (idx, col.min(vl.char_count))
+}
+
+/// Convert (visual_line_index, col_within_visual_line) to a char offset.
+///
+/// Clamps vis_line and vis_col to valid ranges.
+pub fn visual_to_offset(visual_lines: &[VisualLine], vis_line: usize, vis_col: usize) -> usize {
+    if visual_lines.is_empty() {
+        return 0;
+    }
+    let vis_line = vis_line.min(visual_lines.len() - 1);
+    let vl = &visual_lines[vis_line];
+    let col = vis_col.min(vl.char_count);
+    vl.global_char_start + col
+}
 
 /// Result of a text input key/mouse interaction.
 #[derive(Debug, Clone)]
@@ -69,10 +259,18 @@ pub struct TextInputState {
     id: SourceId,
     /// Widget bounds (synced from layout snapshot each frame).
     bounds: Cell<Rect>,
-    /// Padding inside the widget (for mouse position calculation).
-    padding: f32,
+    /// Padding inside the widget (for mouse position and wrapping calculation).
+    padding: Padding,
     /// Whether this is a multi-line editor.
     multiline: bool,
+    /// Incremented on every text mutation for cache invalidation.
+    text_revision: usize,
+    /// Cached visual lines from soft-wrapping.
+    cached_visual_lines: Vec<VisualLine>,
+    /// The text_revision when the cache was last built.
+    cache_revision: usize,
+    /// The max_cols used when the cache was last built.
+    cache_max_cols: usize,
 }
 
 impl TextInputState {
@@ -86,8 +284,12 @@ impl TextInputState {
             focused: false,
             id: SourceId::new(),
             bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
-            padding: 6.0,
+            padding: Padding::all(6.0),
             multiline: false,
+            text_revision: 0,
+            cached_visual_lines: Vec::new(),
+            cache_revision: usize::MAX,
+            cache_max_cols: 0,
         }
     }
 
@@ -101,8 +303,12 @@ impl TextInputState {
             focused: false,
             id: SourceId::new(),
             bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
-            padding: 6.0,
+            padding: Padding::all(6.0),
             multiline: false,
+            text_revision: 0,
+            cached_visual_lines: Vec::new(),
+            cache_revision: usize::MAX,
+            cache_max_cols: 0,
         }
     }
 
@@ -116,8 +322,12 @@ impl TextInputState {
             focused: false,
             id: SourceId::named(name),
             bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
-            padding: 6.0,
+            padding: Padding::all(6.0),
             multiline: false,
+            text_revision: 0,
+            cached_visual_lines: Vec::new(),
+            cache_revision: usize::MAX,
+            cache_max_cols: 0,
         }
     }
 
@@ -131,8 +341,12 @@ impl TextInputState {
             focused: false,
             id: SourceId::named(name),
             bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
-            padding: 6.0,
+            padding: Padding::all(6.0),
             multiline: true,
+            text_revision: 0,
+            cached_visual_lines: Vec::new(),
+            cache_revision: usize::MAX,
+            cache_max_cols: 0,
         }
     }
 
@@ -146,8 +360,12 @@ impl TextInputState {
             focused: false,
             id: SourceId::named(name),
             bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
-            padding: 6.0,
+            padding: Padding::all(6.0),
             multiline: true,
+            text_revision: 0,
+            cached_visual_lines: Vec::new(),
+            cache_revision: usize::MAX,
+            cache_max_cols: 0,
         }
     }
 
@@ -159,6 +377,12 @@ impl TextInputState {
     /// Whether this input is multi-line.
     pub fn is_multiline(&self) -> bool {
         self.multiline
+    }
+
+    /// Set the padding (must match the element's padding for correct mouse
+    /// and wrapping alignment).
+    pub fn set_padding(&mut self, padding: Padding) {
+        self.padding = padding;
     }
 
     /// Get the current bounds (set from layout snapshot).
@@ -174,6 +398,50 @@ impl TextInputState {
         if let Some(bounds) = snapshot.widget_bounds(&self.id) {
             self.bounds.set(bounds);
         }
+    }
+
+    /// Compute the max display columns for wrapping based on current bounds.
+    fn max_display_cols(&self) -> usize {
+        let avail = self.bounds.get().width - self.padding.horizontal();
+        if avail <= CHAR_WIDTH {
+            return usize::MAX;
+        }
+        (avail / CHAR_WIDTH).floor().max(1.0) as usize
+    }
+
+    /// Ensure cached visual lines are up-to-date. Returns the max_cols used.
+    fn ensure_visual_lines(&mut self) -> usize {
+        let max_cols = self.max_display_cols();
+        if self.cache_revision != self.text_revision || self.cache_max_cols != max_cols {
+            self.cached_visual_lines = compute_visual_lines(&self.text, max_cols);
+            self.cache_revision = self.text_revision;
+            self.cache_max_cols = max_cols;
+        }
+        max_cols
+    }
+
+    /// Get the total number of visual lines (after wrapping).
+    pub fn visual_line_count(&mut self) -> usize {
+        self.ensure_visual_lines();
+        self.cached_visual_lines.len().max(1)
+    }
+
+    /// Compute the visual line count for a given available pixel width.
+    ///
+    /// This is a pure computation (no caching, no `&mut self`) so it can be
+    /// called from `view()` where only `&self` is available.
+    pub fn visual_line_count_for_width(&self, avail_width: f32) -> usize {
+        let max_cols = if avail_width <= CHAR_WIDTH {
+            usize::MAX
+        } else {
+            (avail_width / CHAR_WIDTH).floor().max(1.0) as usize
+        };
+        compute_visual_lines(&self.text, max_cols).len().max(1)
+    }
+
+    /// Mark text as changed (invalidates visual line cache).
+    fn bump_revision(&mut self) {
+        self.text_revision = self.text_revision.wrapping_add(1);
     }
 
     /// Focus this input.
@@ -199,6 +467,7 @@ impl TextInputState {
             let hi_byte = char_to_byte(&self.text, hi);
             self.text.replace_range(lo_byte..hi_byte, "");
             self.cursor = lo;
+            self.bump_revision();
             true
         } else {
             false
@@ -211,6 +480,7 @@ impl TextInputState {
         let byte_pos = char_to_byte(&self.text, self.cursor);
         self.text.insert_str(byte_pos, s);
         self.cursor += s.chars().count();
+        self.bump_revision();
     }
 
     /// Insert a newline at the cursor position (multiline).
@@ -219,6 +489,7 @@ impl TextInputState {
         let byte_pos = char_to_byte(&self.text, self.cursor);
         self.text.insert(byte_pos, '\n');
         self.cursor += 1;
+        self.bump_revision();
     }
 
     /// Delete the character before the cursor (Backspace).
@@ -231,6 +502,7 @@ impl TextInputState {
             let byte_pos = char_to_byte(&self.text, self.cursor);
             let next_byte = char_to_byte(&self.text, self.cursor + 1);
             self.text.replace_range(byte_pos..next_byte, "");
+            self.bump_revision();
         }
     }
 
@@ -244,6 +516,7 @@ impl TextInputState {
             let byte_pos = char_to_byte(&self.text, self.cursor);
             let next_byte = char_to_byte(&self.text, self.cursor + 1);
             self.text.replace_range(byte_pos..next_byte, "");
+            self.bump_revision();
         }
     }
 
@@ -268,22 +541,23 @@ impl TextInputState {
         }
     }
 
-    /// Move cursor up one line (multiline). Clears selection.
+    /// Move cursor up one visual line (multiline). Clears selection.
     pub fn move_up(&mut self) {
         self.selection = None;
-        let (line, col) = line_col(&self.text, self.cursor);
-        if line > 0 {
-            self.cursor = line_col_to_offset(&self.text, line - 1, col);
+        self.ensure_visual_lines();
+        let (vis_line, vis_col) = offset_to_visual(&self.cached_visual_lines, self.cursor);
+        if vis_line > 0 {
+            self.cursor = visual_to_offset(&self.cached_visual_lines, vis_line - 1, vis_col);
         }
     }
 
-    /// Move cursor down one line (multiline). Clears selection.
+    /// Move cursor down one visual line (multiline). Clears selection.
     pub fn move_down(&mut self) {
         self.selection = None;
-        let (line, col) = line_col(&self.text, self.cursor);
-        let line_count = self.text.split('\n').count();
-        if line + 1 < line_count {
-            self.cursor = line_col_to_offset(&self.text, line + 1, col);
+        self.ensure_visual_lines();
+        let (vis_line, vis_col) = offset_to_visual(&self.cached_visual_lines, self.cursor);
+        if vis_line + 1 < self.cached_visual_lines.len() {
+            self.cursor = visual_to_offset(&self.cached_visual_lines, vis_line + 1, vis_col);
         }
     }
 
@@ -343,6 +617,7 @@ impl TextInputState {
             let hi_byte = char_to_byte(&self.text, self.cursor);
             self.text.replace_range(lo_byte..hi_byte, "");
             self.cursor = target;
+            self.bump_revision();
         }
     }
 
@@ -356,6 +631,7 @@ impl TextInputState {
             let lo_byte = char_to_byte(&self.text, self.cursor);
             let hi_byte = char_to_byte(&self.text, target);
             self.text.replace_range(lo_byte..hi_byte, "");
+            self.bump_revision();
         }
     }
 
@@ -379,6 +655,7 @@ impl TextInputState {
             let hi_byte = char_to_byte(&self.text, self.cursor);
             self.text.replace_range(lo_byte..hi_byte, "");
             self.cursor = line_start;
+            self.bump_revision();
         }
     }
 
@@ -399,6 +676,7 @@ impl TextInputState {
             let lo_byte = char_to_byte(&self.text, self.cursor);
             let hi_byte = char_to_byte(&self.text, line_end);
             self.text.replace_range(lo_byte..hi_byte, "");
+            self.bump_revision();
         }
     }
 
@@ -446,9 +724,10 @@ impl TextInputState {
 
     /// Handle a multi-line click at a relative (x, y) position.
     pub fn click_at_2d(&mut self, rel_x: f32, rel_y: f32) {
-        let line = ((rel_y + self.scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
-        let col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
-        self.cursor = line_col_to_offset(&self.text, line, col);
+        self.ensure_visual_lines();
+        let vis_line = ((rel_y + self.scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
+        let vis_col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
+        self.cursor = visual_to_offset(&self.cached_visual_lines, vis_line, vis_col);
         self.selection = None;
     }
 
@@ -466,9 +745,10 @@ impl TextInputState {
 
     /// Handle multi-line drag to a relative (x, y) position.
     pub fn drag_to_2d(&mut self, rel_x: f32, rel_y: f32) {
-        let line = ((rel_y + self.scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
-        let col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
-        let pos = line_col_to_offset(&self.text, line, col);
+        self.ensure_visual_lines();
+        let vis_line = ((rel_y + self.scroll_offset) / LINE_HEIGHT).floor().max(0.0) as usize;
+        let vis_col = (rel_x / CHAR_WIDTH).round().max(0.0) as usize;
+        let pos = visual_to_offset(&self.cached_visual_lines, vis_line, vis_col);
         let anchor = self.selection.map(|(a, _)| a).unwrap_or(self.cursor);
         if pos != anchor {
             self.selection = Some((anchor, pos));
@@ -479,8 +759,9 @@ impl TextInputState {
     /// Scroll the multi-line editor by a delta (positive = scroll content up).
     pub fn scroll_by(&mut self, delta: f32) {
         self.scroll_offset = (self.scroll_offset - delta).max(0.0);
-        let line_count = self.text.split('\n').count() as f32;
-        let max_scroll = (line_count * LINE_HEIGHT - 80.0).max(0.0);
+        let vis_line_count = self.visual_line_count() as f32;
+        let visible_h = self.bounds.get().height - self.padding.vertical();
+        let max_scroll = (vis_line_count * LINE_HEIGHT - visible_h).max(0.0);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
     }
 
@@ -513,19 +794,12 @@ impl TextInputState {
                 if let Some(HitResult::Widget(id)) = hit {
                     if *id == self.id {
                         let bounds = self.bounds.get();
-                        let rel_x = (position.x - bounds.x - self.padding).max(0.0);
-                        if self.multiline {
-                            let rel_y = (position.y - bounds.y - self.padding).max(0.0);
-                            return Some(MouseResponse::message_and_capture(
-                                TextInputMouseAction::Click2D(rel_x, rel_y),
-                                self.id,
-                            ));
-                        } else {
-                            return Some(MouseResponse::message_and_capture(
-                                TextInputMouseAction::Click1D(rel_x),
-                                self.id,
-                            ));
-                        }
+                        let rel_x = (position.x - bounds.x - self.padding.left).max(0.0);
+                        let rel_y = (position.y - bounds.y - self.padding.top).max(0.0);
+                        return Some(MouseResponse::message_and_capture(
+                            TextInputMouseAction::Click2D(rel_x, rel_y),
+                            self.id,
+                        ));
                     }
                 }
                 None
@@ -534,17 +808,11 @@ impl TextInputState {
                 if let CaptureState::Captured(id) = capture {
                     if *id == self.id {
                         let bounds = self.bounds.get();
-                        let rel_x = (position.x - bounds.x - self.padding).max(0.0);
-                        if self.multiline {
-                            let rel_y = (position.y - bounds.y - self.padding).max(0.0);
-                            return Some(MouseResponse::message(
-                                TextInputMouseAction::Drag2D(rel_x, rel_y),
-                            ));
-                        } else {
-                            return Some(MouseResponse::message(
-                                TextInputMouseAction::Drag1D(rel_x),
-                            ));
-                        }
+                        let rel_x = (position.x - bounds.x - self.padding.left).max(0.0);
+                        let rel_y = (position.y - bounds.y - self.padding.top).max(0.0);
+                        return Some(MouseResponse::message(
+                            TextInputMouseAction::Drag2D(rel_x, rel_y),
+                        ));
                     }
                 }
                 None
@@ -704,6 +972,7 @@ impl TextInputState {
                     self.text.clear();
                     self.cursor = 0;
                     self.selection = None;
+                    self.bump_revision();
                     TextInputAction::Submit(t)
                 }
             }
@@ -1091,5 +1360,105 @@ mod tests {
         state.drag_to(CHAR_WIDTH * 4.4); // rounds to 4
         assert_eq!(state.cursor, 4);
         assert_eq!(state.selection, Some((3, 4)));
+    }
+
+    // =================================================================
+    // Visual line wrapping tests
+    // =================================================================
+
+    #[test]
+    fn compute_visual_lines_no_wrap() {
+        let text = "hello";
+        let vls = compute_visual_lines(text, 80);
+        assert_eq!(vls.len(), 1);
+        assert_eq!(vls[0].logical_line, 0);
+        assert_eq!(vls[0].char_count, 5);
+        assert_eq!(vls[0].global_char_start, 0);
+    }
+
+    #[test]
+    fn compute_visual_lines_char_break() {
+        // 10 chars, max_cols=4 → 3 visual lines: 4, 4, 2
+        let text = "abcdefghij";
+        let vls = compute_visual_lines(text, 4);
+        assert_eq!(vls.len(), 3);
+        assert_eq!(vls[0].char_count, 4);
+        assert_eq!(vls[0].global_char_start, 0);
+        assert_eq!(vls[1].char_count, 4);
+        assert_eq!(vls[1].global_char_start, 4);
+        assert_eq!(vls[2].char_count, 2);
+        assert_eq!(vls[2].global_char_start, 8);
+    }
+
+    #[test]
+    fn compute_visual_lines_word_wrap() {
+        // "hello world" with max_cols=7 → wraps at word boundary
+        // "hello " (6 cols) fits, "w" would make 7 → "hello w" fits (7 <= 7)
+        // Actually "hello world" = 11 chars. At max_cols=7: "hello w" = 7, then "orld" = 4
+        // Wait — word wrap should keep "world" together.
+        // "hello " = 6 display cols. Adding "world" = 5 → 11 > 7. So wrap before "world".
+        let text = "hello world";
+        let vls = compute_visual_lines(text, 7);
+        assert_eq!(vls.len(), 2);
+        // First visual line: "hello " (6 chars)
+        assert_eq!(&text[vls[0].start_byte..vls[0].end_byte], "hello ");
+        // Second visual line: "world" (5 chars)
+        assert_eq!(&text[vls[1].start_byte..vls[1].end_byte], "world");
+    }
+
+    #[test]
+    fn compute_visual_lines_multiline() {
+        let text = "abc\ndefgh";
+        let vls = compute_visual_lines(text, 4);
+        // Line 0: "abc" → 1 visual line
+        // Line 1: "defgh" → "defg" + "h" → 2 visual lines
+        assert_eq!(vls.len(), 3);
+        assert_eq!(vls[0].logical_line, 0);
+        assert_eq!(vls[0].char_count, 3);
+        assert_eq!(vls[0].global_char_start, 0);
+        assert_eq!(vls[1].logical_line, 1);
+        assert_eq!(vls[1].char_count, 4);
+        assert_eq!(vls[1].global_char_start, 4); // "abc\n" = 4 chars
+        assert_eq!(vls[2].logical_line, 1);
+        assert_eq!(vls[2].char_count, 1);
+        assert_eq!(vls[2].global_char_start, 8);
+    }
+
+    #[test]
+    fn compute_visual_lines_empty() {
+        let text = "";
+        let vls = compute_visual_lines(text, 80);
+        assert_eq!(vls.len(), 1);
+        assert_eq!(vls[0].char_count, 0);
+    }
+
+    #[test]
+    fn offset_to_visual_basic() {
+        let text = "abcdefghij";
+        let vls = compute_visual_lines(text, 4);
+        // vls: [0..4], [4..8], [8..10]
+        assert_eq!(offset_to_visual(&vls, 0), (0, 0));
+        assert_eq!(offset_to_visual(&vls, 3), (0, 3));
+        assert_eq!(offset_to_visual(&vls, 4), (1, 0));
+        assert_eq!(offset_to_visual(&vls, 9), (2, 1));
+    }
+
+    #[test]
+    fn visual_to_offset_basic() {
+        let text = "abcdefghij";
+        let vls = compute_visual_lines(text, 4);
+        assert_eq!(visual_to_offset(&vls, 0, 0), 0);
+        assert_eq!(visual_to_offset(&vls, 1, 0), 4);
+        assert_eq!(visual_to_offset(&vls, 2, 1), 9);
+        // Clamped col
+        assert_eq!(visual_to_offset(&vls, 2, 100), 10);
+    }
+
+    #[test]
+    fn visual_to_offset_clamped_line() {
+        let text = "abc";
+        let vls = compute_visual_lines(text, 80);
+        // Line 100 doesn't exist, clamp to last
+        assert_eq!(visual_to_offset(&vls, 100, 2), 2);
     }
 }

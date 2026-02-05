@@ -11,7 +11,7 @@ use crate::gpu::ImageHandle;
 use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
 use crate::primitives::{Color, Rect, Size};
 use crate::scroll_state::ScrollState;
-use crate::text_input_state::TextInputState;
+use crate::text_input_state::{TextInputState, compute_visual_lines, offset_to_visual};
 
 /// Estimate display width in cell units (1 for Latin, 2 for CJK, 0 for combining marks).
 fn unicode_display_width(text: &str) -> f32 {
@@ -462,9 +462,18 @@ fn render_text_input_multiline(
     let text_x = x + input.padding.left;
     let text_y = y + input.padding.top;
     let visible_h = h - input.padding.vertical();
+    let avail_w = w - input.padding.horizontal();
 
-    // Split text into lines
-    let lines: Vec<&str> = if input.text.is_empty() {
+    // Compute max display columns for wrapping
+    let max_cols = if avail_w <= CHAR_WIDTH {
+        usize::MAX
+    } else {
+        (avail_w / CHAR_WIDTH).floor().max(1.0) as usize
+    };
+
+    // Compute visual lines (soft-wrapped)
+    let visual_lines = compute_visual_lines(&input.text, max_cols);
+    let logical_lines: Vec<&str> = if input.text.is_empty() {
         vec![""]
     } else {
         input.text.split('\n').collect()
@@ -473,30 +482,30 @@ fn render_text_input_multiline(
     // Compute visible line range (virtualized rendering)
     let first_visible = (input.scroll_offset / LINE_HEIGHT).floor().max(0.0) as usize;
     let visible_count = (visible_h / LINE_HEIGHT).ceil() as usize + 1;
-    let last_visible = (first_visible + visible_count).min(lines.len());
+    let last_visible = (first_visible + visible_count).min(visual_lines.len());
 
-    // Compute cursor (line, col) from byte offset
-    let (cursor_line, cursor_col) = offset_to_line_col(&input.text, input.cursor);
+    // Compute cursor visual position
+    let (cursor_vis_line, cursor_vis_col) = offset_to_visual(&visual_lines, input.cursor);
 
-    // Selection highlight (per-line)
+    // Selection highlight (per visual line)
     if let Some((sel_start, sel_end)) = input.selection {
         let s = sel_start.min(sel_end);
         let e = sel_start.max(sel_end);
-        let (s_line, s_col) = offset_to_line_col(&input.text, s);
-        let (e_line, e_col) = offset_to_line_col(&input.text, e);
+        let (s_vis_line, s_vis_col) = offset_to_visual(&visual_lines, s);
+        let (e_vis_line, e_vis_col) = offset_to_visual(&visual_lines, e);
 
-        for line_idx in s_line..=e_line {
-            if line_idx < first_visible || line_idx >= last_visible { continue; }
-            let line_len = lines.get(line_idx).map(|l| l.chars().count()).unwrap_or(0);
-            let col_start = if line_idx == s_line { s_col } else { 0 };
-            let col_end = if line_idx == e_line { e_col } else { line_len };
-            if col_start == col_end && s_line != e_line && line_idx != e_line {
-                // Full-line selection indicator for empty-col lines in middle
-            }
-            let line_text = lines.get(line_idx).map(|l| *l).unwrap_or("");
-            let sel_x = text_x + unicode_col_x(line_text, col_start) * CHAR_WIDTH;
-            let sel_w = (unicode_col_x(line_text, col_end) - unicode_col_x(line_text, col_start)).max(1.0) * CHAR_WIDTH;
-            let sel_y = text_y + line_idx as f32 * LINE_HEIGHT - input.scroll_offset;
+        for vis_idx in s_vis_line..=e_vis_line {
+            if vis_idx < first_visible || vis_idx >= last_visible { continue; }
+            let vl = &visual_lines[vis_idx];
+            let ll = logical_lines.get(vl.logical_line).copied().unwrap_or("");
+            let vis_text = &ll[vl.start_byte..vl.end_byte];
+
+            let col_start = if vis_idx == s_vis_line { s_vis_col } else { 0 };
+            let col_end = if vis_idx == e_vis_line { e_vis_col } else { vl.char_count };
+
+            let sel_x = text_x + unicode_col_x(vis_text, col_start) * CHAR_WIDTH;
+            let sel_w = (unicode_col_x(vis_text, col_end) - unicode_col_x(vis_text, col_start)).max(1.0) * CHAR_WIDTH;
+            let sel_y = text_y + vis_idx as f32 * LINE_HEIGHT - input.scroll_offset;
             snapshot.primitives_mut().add_solid_rect(
                 Rect::new(sel_x, sel_y, sel_w, LINE_HEIGHT),
                 Color::rgba(0.3, 0.5, 0.8, 0.4),
@@ -504,7 +513,7 @@ fn render_text_input_multiline(
         }
     }
 
-    // Render visible lines
+    // Render visible visual lines
     if input.text.is_empty() && !input.focused {
         snapshot.primitives_mut().add_text_cached(
             input.placeholder.clone(),
@@ -514,16 +523,18 @@ fn render_text_input_multiline(
             hash_text(&input.placeholder),
         );
     } else {
-        for line_idx in first_visible..last_visible {
-            let line = lines[line_idx];
-            let ly = text_y + line_idx as f32 * LINE_HEIGHT - input.scroll_offset;
-            if !line.is_empty() {
+        for vis_idx in first_visible..last_visible {
+            let vl = &visual_lines[vis_idx];
+            let ll = logical_lines.get(vl.logical_line).copied().unwrap_or("");
+            let vis_text = &ll[vl.start_byte..vl.end_byte];
+            let ly = text_y + vis_idx as f32 * LINE_HEIGHT - input.scroll_offset;
+            if !vis_text.is_empty() {
                 snapshot.primitives_mut().add_text_cached(
-                    line.to_string(),
+                    vis_text.to_string(),
                     Point::new(text_x, ly),
                     input.text_color,
                     BASE_FONT_SIZE,
-                    hash_text(line).wrapping_add(line_idx as u64),
+                    hash_text(vis_text).wrapping_add(vis_idx as u64),
                 );
             }
         }
@@ -531,13 +542,16 @@ fn render_text_input_multiline(
 
     // Cursor (blinking)
     if input.focused && input.cursor_visible {
-        let cursor_line_text = lines.get(cursor_line).map(|l| *l).unwrap_or("");
-        let cursor_x = text_x + unicode_col_x(cursor_line_text, cursor_col) * CHAR_WIDTH;
-        let cursor_y = text_y + cursor_line as f32 * LINE_HEIGHT - input.scroll_offset;
-        snapshot.primitives_mut().add_solid_rect(
-            Rect::new(cursor_x, cursor_y, 2.0, LINE_HEIGHT),
-            Color::rgba(0.85, 0.85, 0.88, 0.8),
-        );
+        if let Some(vl) = visual_lines.get(cursor_vis_line) {
+            let ll = logical_lines.get(vl.logical_line).copied().unwrap_or("");
+            let vis_text = &ll[vl.start_byte..vl.end_byte];
+            let cursor_x = text_x + unicode_col_x(vis_text, cursor_vis_col) * CHAR_WIDTH;
+            let cursor_y = text_y + cursor_vis_line as f32 * LINE_HEIGHT - input.scroll_offset;
+            snapshot.primitives_mut().add_solid_rect(
+                Rect::new(cursor_x, cursor_y, 2.0, LINE_HEIGHT),
+                Color::rgba(0.85, 0.85, 0.88, 0.8),
+            );
+        }
     }
 
     snapshot.primitives_mut().pop_clip();
@@ -545,24 +559,6 @@ fn render_text_input_multiline(
     // Register for hit-testing
     snapshot.register_widget(input.id, input_rect);
     snapshot.set_cursor_hint(input.id, CursorIcon::Text);
-}
-
-/// Convert a char offset to (line, col) within newline-delimited text.
-fn offset_to_line_col(text: &str, char_offset: usize) -> (usize, usize) {
-    let mut line = 0;
-    let mut col = 0;
-    for (i, ch) in text.chars().enumerate() {
-        if i == char_offset {
-            return (line, col);
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
 }
 
 /// Fast non-cryptographic hash for cache keys.

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 use nexus_api::{BlockId, Value};
-use strata::{Subscription, TextInputState};
+use strata::{Padding, Subscription, TextInputState};
 use strata::content_address::SourceId;
 use strata::event_context::KeyEvent;
 
@@ -89,7 +89,12 @@ impl AgentWidget {
             dirty: false,
             session_id: None,
             cwd: String::new(),
-            question_input: TextInputState::new(),
+            question_input: {
+                let mut qi = TextInputState::new();
+                // Default element padding: Padding::new(8.0, 12.0, 8.0, 12.0)
+                qi.set_padding(Padding::new(8.0, 12.0, 8.0, 12.0));
+                qi
+            },
             event_rx: Arc::new(Mutex::new(event_rx)),
         }
     }
