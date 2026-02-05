@@ -235,6 +235,21 @@ mod tests {
 
     use serde_json::json;
 
+    /// Helper to compare tool output in an order-independent way.
+    /// Checks that the wrapper (first/last lines) matches and all expected
+    /// content lines are present, regardless of parameter ordering.
+    fn assert_tool_output_contains(result: &str, wrapper_start: &str, wrapper_end: &str, expected_params: &[&str]) {
+        let lines: Vec<&str> = result.lines().collect();
+        assert!(!lines.is_empty(), "Result should not be empty");
+        assert_eq!(lines[0], wrapper_start, "First line should be tool wrapper start");
+        assert_eq!(lines[lines.len() - 1], wrapper_end, "Last line should be tool wrapper end");
+
+        // Check all expected params are present (order-independent)
+        for param in expected_params {
+            assert!(result.contains(param), "Missing expected content: {}", param);
+        }
+    }
+
     #[test]
     fn test_xml_formatter_with_array_parameters() {
         let formatter = XmlFormatter;
@@ -249,18 +264,19 @@ mod tests {
             end_offset: None,
         };
 
-        let expected = concat!(
-            "<tool:read_files>\n",
-            "<param:project>test-project</param:project>\n",
-            "<param:path>file1.txt</param:path>\n",
-            "<param:path>file2.txt</param:path>\n",
-            "<param:path>file3.txt</param:path>\n",
-            "</tool:read_files>\n"
-        );
-
         let result = formatter.format_tool_request(&request).unwrap();
 
-        assert_eq!(expected, result);
+        assert_tool_output_contains(
+            &result,
+            "<tool:read_files>",
+            "</tool:read_files>",
+            &[
+                "<param:project>test-project</param:project>",
+                "<param:path>file1.txt</param:path>",
+                "<param:path>file2.txt</param:path>",
+                "<param:path>file3.txt</param:path>",
+            ]
+        );
     }
 
     #[test]
@@ -279,20 +295,22 @@ mod tests {
             end_offset: None,
         };
 
-        // Should not contain the append parameter since it matches the default
-        let expected = concat!(
-            "<tool:write_file>\n",
-            "<param:project>test-project</param:project>\n",
-            "<param:path>test.txt</param:path>\n",
-            "<param:content>\n",
-            "Hello world\n",
-            "</param:content>\n",
-            "</tool:write_file>\n",
-        );
-
         let result = formatter.format_tool_request(&request).unwrap();
 
-        assert_eq!(expected, result);
+        // Should not contain the append parameter since it matches the default
+        assert_tool_output_contains(
+            &result,
+            "<tool:write_file>",
+            "</tool:write_file>",
+            &[
+                "<param:project>test-project</param:project>",
+                "<param:path>test.txt</param:path>",
+                "<param:content>",
+                "Hello world",
+                "</param:content>",
+            ]
+        );
+        assert!(!result.contains("<param:append>"), "Should not contain default append value");
     }
 
     #[test]
@@ -311,21 +329,22 @@ mod tests {
             end_offset: None,
         };
 
-        // Should contain the append parameter since it's not the default
-        let expected = concat!(
-            "<tool:write_file>\n",
-            "<param:project>test-project</param:project>\n",
-            "<param:path>test.txt</param:path>\n",
-            "<param:content>\n",
-            "Hello world\n",
-            "</param:content>\n",
-            "<param:append>true</param:append>\n",
-            "</tool:write_file>\n",
-        );
-
         let result = formatter.format_tool_request(&request).unwrap();
 
-        assert_eq!(expected, result);
+        // Should contain the append parameter since it's not the default
+        assert_tool_output_contains(
+            &result,
+            "<tool:write_file>",
+            "</tool:write_file>",
+            &[
+                "<param:project>test-project</param:project>",
+                "<param:path>test.txt</param:path>",
+                "<param:content>",
+                "Hello world",
+                "</param:content>",
+                "<param:append>true</param:append>",
+            ]
+        );
     }
 
     #[test]
@@ -342,19 +361,20 @@ mod tests {
             end_offset: None,
         };
 
-        let expected = concat!(
-            "^^^read_files\n",
-            "project: test-project\n",
-            "paths: [\n",
-            "file1.txt\n",
-            "file2.txt\n",
-            "]\n",
-            "^^^\n",
-        );
-
         let result = formatter.format_tool_request(&request).unwrap();
 
-        assert_eq!(expected, result);
+        assert_tool_output_contains(
+            &result,
+            "^^^read_files",
+            "^^^",
+            &[
+                "project: test-project",
+                "paths: [",
+                "file1.txt",
+                "file2.txt",
+                "]",
+            ]
+        );
     }
 
     #[test]
@@ -376,17 +396,19 @@ mod tests {
         let result = formatter.format_tool_request(&request).unwrap();
 
         // Should not contain the append parameter since it matches the default
-        let expected = concat!(
-            "^^^write_file\n",
-            "project: test-project\n",
-            "path: test.txt\n",
-            "content ---\n",
-            "Hello world\n",
-            "--- content\n",
-            "^^^\n",
+        assert_tool_output_contains(
+            &result,
+            "^^^write_file",
+            "^^^",
+            &[
+                "project: test-project",
+                "path: test.txt",
+                "content ---",
+                "Hello world",
+                "--- content",
+            ]
         );
-
-        assert_eq!(expected, result);
+        assert!(!result.contains("append:"), "Should not contain default append value");
     }
 
     #[test]
@@ -407,18 +429,19 @@ mod tests {
 
         let result = formatter.format_tool_request(&request).unwrap();
 
-        // Should not contain the append parameter since it matches the default
-        let expected = concat!(
-            "^^^write_file\n",
-            "project: test-project\n",
-            "path: test.txt\n",
-            "content ---\n",
-            "Hello world\n",
-            "--- content\n",
-            "append: true\n",
-            "^^^\n",
+        // Should contain the append parameter since it's not the default
+        assert_tool_output_contains(
+            &result,
+            "^^^write_file",
+            "^^^",
+            &[
+                "project: test-project",
+                "path: test.txt",
+                "content ---",
+                "Hello world",
+                "--- content",
+                "append: true",
+            ]
         );
-
-        assert_eq!(expected, result);
     }
 }

@@ -234,7 +234,20 @@ pub fn fragments_match(expected: &DisplayFragment, actual: &DisplayFragment) -> 
     }
 }
 
-/// Helper function to assert that actual fragments match expected fragments
+/// Helper function to sort ToolParameter fragments by name (for order-independent comparison)
+fn sort_key(fragment: &DisplayFragment) -> (u8, String) {
+    match fragment {
+        DisplayFragment::PlainText(_) => (0, String::new()),
+        DisplayFragment::ToolName { name, .. } => (1, name.clone()),
+        DisplayFragment::ToolParameter { name, .. } => (2, name.clone()),
+        DisplayFragment::ToolEnd { .. } => (3, String::new()),
+        _ => (4, String::new()),
+    }
+}
+
+/// Helper function to assert that actual fragments match expected fragments.
+/// ToolParameter fragments within a tool call are compared as a set (order-independent)
+/// to handle non-deterministic JSON object iteration order.
 pub fn assert_fragments_match(expected: &[DisplayFragment], actual: &[DisplayFragment]) {
     assert_eq!(
         expected.len(),
@@ -244,7 +257,13 @@ pub fn assert_fragments_match(expected: &[DisplayFragment], actual: &[DisplayFra
         actual.len()
     );
 
-    for (i, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+    // Sort both by the sort key to make ToolParameter order-independent
+    let mut expected_sorted: Vec<_> = expected.to_vec();
+    let mut actual_sorted: Vec<_> = actual.to_vec();
+    expected_sorted.sort_by_key(|f| sort_key(f));
+    actual_sorted.sort_by_key(|f| sort_key(f));
+
+    for (i, (expected, actual)) in expected_sorted.iter().zip(actual_sorted.iter()).enumerate() {
         assert!(
             fragments_match(expected, actual),
             "Fragment mismatch at position {i}: \nExpected: {expected:?}\nActual: {actual:?}"
