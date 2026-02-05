@@ -192,6 +192,15 @@ We use `cargo-llvm-cov` for code coverage. It uses native LLVM instrumentation b
 # Install (one-time)
 cargo install cargo-llvm-cov
 
+# Quick summary of all crates
+./coverage-summary.sh
+
+# Detailed per-file coverage for all crates
+./coverage-by-file.sh
+
+# Detailed coverage for a specific crate
+./coverage-by-file.sh nexus-kernel
+
 # Run tests with coverage and open HTML report
 cargo llvm-cov --open
 
@@ -201,6 +210,8 @@ cargo llvm-cov -p nexus-kernel --open
 # Generate lcov report (for CI integration)
 cargo llvm-cov --lcov --output-path lcov.info
 ```
+
+**Current coverage targets:** 25% minimum for `nexus-ui` and `strata`.
 
 ### Strata Demo
 

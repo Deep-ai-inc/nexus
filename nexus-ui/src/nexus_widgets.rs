@@ -2469,3 +2469,256 @@ fn file_entry_color(entry: &nexus_api::FileEntry) -> Color {
         _ => Color::rgb(0.8, 0.8, 0.8),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // =========================================================================
+    // format_tokens tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_tokens_small() {
+        assert_eq!(format_tokens(0), "0 tokens");
+        assert_eq!(format_tokens(1), "1 tokens");
+        assert_eq!(format_tokens(100), "100 tokens");
+        assert_eq!(format_tokens(999), "999 tokens");
+    }
+
+    #[test]
+    fn test_format_tokens_thousands() {
+        assert_eq!(format_tokens(1_000), "1.0k tokens");
+        assert_eq!(format_tokens(1_500), "1.5k tokens");
+        assert_eq!(format_tokens(10_000), "10.0k tokens");
+        assert_eq!(format_tokens(999_999), "1000.0k tokens");
+    }
+
+    #[test]
+    fn test_format_tokens_millions() {
+        assert_eq!(format_tokens(1_000_000), "1.0M tokens");
+        assert_eq!(format_tokens(1_500_000), "1.5M tokens");
+        assert_eq!(format_tokens(10_000_000), "10.0M tokens");
+    }
+
+    // =========================================================================
+    // shorten_path tests
+    // =========================================================================
+
+    #[test]
+    fn test_shorten_path_short() {
+        assert_eq!(shorten_path("file.txt"), "file.txt");
+        assert_eq!(shorten_path("/foo"), "/foo");
+        assert_eq!(shorten_path("foo/bar"), "foo/bar");
+    }
+
+    #[test]
+    fn test_shorten_path_long() {
+        assert_eq!(shorten_path("/a/b/c"), "…/b/c");
+        assert_eq!(shorten_path("/home/user/projects/file.txt"), "…/projects/file.txt");
+        assert_eq!(shorten_path("/very/long/deeply/nested/path"), "…/nested/path");
+    }
+
+    #[test]
+    fn test_shorten_path_trailing_slash() {
+        // Filter removes empty parts from trailing slash
+        assert_eq!(shorten_path("/a/b/c/"), "…/b/c");
+    }
+
+    // =========================================================================
+    // truncate_str tests
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_str_short() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_exact() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_str_long() {
+        assert_eq!(truncate_str("hello world", 5), "hello…");
+        assert_eq!(truncate_str("abcdefghij", 3), "abc…");
+    }
+
+    #[test]
+    fn test_truncate_str_empty() {
+        assert_eq!(truncate_str("", 5), "");
+        assert_eq!(truncate_str("", 0), "");
+    }
+
+    // =========================================================================
+    // format_eta tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_eta_subsecond() {
+        assert_eq!(format_eta(0.0), "<1s");
+        assert_eq!(format_eta(0.5), "<1s");
+        assert_eq!(format_eta(0.99), "<1s");
+    }
+
+    #[test]
+    fn test_format_eta_seconds() {
+        assert_eq!(format_eta(1.0), "1s");
+        assert_eq!(format_eta(30.0), "30s");
+        assert_eq!(format_eta(59.9), "59s");
+    }
+
+    #[test]
+    fn test_format_eta_minutes() {
+        assert_eq!(format_eta(60.0), "1m 0s");
+        assert_eq!(format_eta(90.0), "1m 30s");
+        assert_eq!(format_eta(125.0), "2m 5s");
+        assert_eq!(format_eta(3599.0), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_eta_hours() {
+        assert_eq!(format_eta(3600.0), "1h 0m");
+        assert_eq!(format_eta(3660.0), "1h 1m");
+        assert_eq!(format_eta(7200.0), "2h 0m");
+        assert_eq!(format_eta(7320.0), "2h 2m");
+    }
+
+    // =========================================================================
+    // tool_header_label tests
+    // =========================================================================
+
+    fn make_tool(name: &str, params: &[(&str, &str)]) -> ToolInvocation {
+        let mut parameters = HashMap::new();
+        for (k, v) in params {
+            parameters.insert(k.to_string(), v.to_string());
+        }
+        ToolInvocation {
+            id: "test".to_string(),
+            name: name.to_string(),
+            parameters,
+            output: None,
+            message: None,
+            status: crate::agent_block::ToolStatus::Pending,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn test_tool_header_label_read() {
+        let tool = make_tool("Read", &[("file_path", "/home/user/file.txt")]);
+        assert_eq!(tool_header_label(&tool), "Read(…/user/file.txt)");
+    }
+
+    #[test]
+    fn test_tool_header_label_edit() {
+        let tool = make_tool("Edit", &[("file_path", "/home/user/src/main.rs")]);
+        assert_eq!(tool_header_label(&tool), "Update(…/src/main.rs)");
+    }
+
+    #[test]
+    fn test_tool_header_label_write() {
+        let tool = make_tool("Write", &[("file_path", "output.txt")]);
+        assert_eq!(tool_header_label(&tool), "Write(output.txt)");
+    }
+
+    #[test]
+    fn test_tool_header_label_bash() {
+        let tool = make_tool("Bash", &[("command", "ls -la")]);
+        assert_eq!(tool_header_label(&tool), "Bash(ls -la)");
+    }
+
+    #[test]
+    fn test_tool_header_label_bash_long() {
+        let long_cmd = "a".repeat(100);
+        let tool = make_tool("Bash", &[("command", &long_cmd)]);
+        let result = tool_header_label(&tool);
+        assert!(result.starts_with("Bash("));
+        assert!(result.contains("…")); // Should be truncated
+    }
+
+    #[test]
+    fn test_tool_header_label_bash_multiline() {
+        let tool = make_tool("Bash", &[("command", "line1\nline2\nline3")]);
+        assert_eq!(tool_header_label(&tool), "Bash(line1)");
+    }
+
+    #[test]
+    fn test_tool_header_label_grep() {
+        let tool = make_tool("Grep", &[("pattern", "TODO"), ("path", "/src")]);
+        assert_eq!(tool_header_label(&tool), "Search(\"TODO\", /src)");
+    }
+
+    #[test]
+    fn test_tool_header_label_glob() {
+        let tool = make_tool("Glob", &[("pattern", "**/*.rs")]);
+        assert_eq!(tool_header_label(&tool), "Glob(**/*.rs)");
+    }
+
+    #[test]
+    fn test_tool_header_label_task() {
+        let tool = make_tool("Task", &[("description", "Find all tests")]);
+        assert_eq!(tool_header_label(&tool), "Task(Find all tests)");
+    }
+
+    #[test]
+    fn test_tool_header_label_todo_write() {
+        let tool = make_tool("TodoWrite", &[]);
+        assert_eq!(tool_header_label(&tool), "TodoWrite");
+    }
+
+    #[test]
+    fn test_tool_header_label_unknown() {
+        let tool = make_tool("CustomTool", &[]);
+        assert_eq!(tool_header_label(&tool), "CustomTool");
+    }
+
+    // =========================================================================
+    // tool_collapsed_summary tests
+    // =========================================================================
+
+    fn make_tool_with_output(name: &str, params: &[(&str, &str)], output: &str) -> ToolInvocation {
+        let mut tool = make_tool(name, params);
+        tool.output = Some(output.to_string());
+        tool
+    }
+
+    #[test]
+    fn test_tool_collapsed_summary_no_output() {
+        let tool = make_tool("Read", &[]);
+        assert!(tool_collapsed_summary(&tool).is_none());
+    }
+
+    #[test]
+    fn test_tool_collapsed_summary_read() {
+        let tool = make_tool_with_output("Read", &[], "line1\nline2\nline3");
+        assert_eq!(tool_collapsed_summary(&tool), Some("Read 3 lines".to_string()));
+    }
+
+    #[test]
+    fn test_tool_collapsed_summary_edit() {
+        let tool = make_tool_with_output("Edit", &[], "anything");
+        assert_eq!(tool_collapsed_summary(&tool), Some("Applied edits".to_string()));
+    }
+
+    #[test]
+    fn test_tool_collapsed_summary_write() {
+        let tool = make_tool_with_output("Write", &[("content", "a\nb\nc\nd")], "success");
+        assert_eq!(tool_collapsed_summary(&tool), Some("Wrote 4 lines".to_string()));
+    }
+
+    #[test]
+    fn test_tool_collapsed_summary_bash_empty() {
+        let tool = make_tool_with_output("Bash", &[], "");
+        assert_eq!(tool_collapsed_summary(&tool), Some("(no output)".to_string()));
+    }
+
+    #[test]
+    fn test_tool_collapsed_summary_bash_single_line() {
+        let tool = make_tool_with_output("Bash", &[], "Hello world");
+        assert_eq!(tool_collapsed_summary(&tool), Some("Hello world".to_string()));
+    }
+}

@@ -1450,3 +1450,323 @@ fn builtin_local(args: &[String], state: &mut ShellState) -> anyhow::Result<i32>
 
     Ok(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // is_builtin tests
+    // =========================================================================
+
+    #[test]
+    fn test_is_builtin_recognized() {
+        assert!(is_builtin("cd"));
+        assert!(is_builtin("exit"));
+        assert!(is_builtin("export"));
+        assert!(is_builtin("unset"));
+        assert!(is_builtin("set"));
+        assert!(is_builtin(":"));
+        assert!(is_builtin("test"));
+        assert!(is_builtin("["));
+        assert!(is_builtin("[["));
+        assert!(is_builtin("alias"));
+        assert!(is_builtin("unalias"));
+        assert!(is_builtin("source"));
+        assert!(is_builtin("."));
+        assert!(is_builtin("eval"));
+        assert!(is_builtin("read"));
+        assert!(is_builtin("shift"));
+        assert!(is_builtin("return"));
+        assert!(is_builtin("break"));
+        assert!(is_builtin("continue"));
+        assert!(is_builtin("readonly"));
+        assert!(is_builtin("command"));
+        assert!(is_builtin("getopts"));
+        assert!(is_builtin("trap"));
+        assert!(is_builtin("exec"));
+        assert!(is_builtin("local"));
+    }
+
+    #[test]
+    fn test_is_builtin_not_recognized() {
+        assert!(!is_builtin("ls"));
+        assert!(!is_builtin("grep"));
+        assert!(!is_builtin("cat"));
+        assert!(!is_builtin("echo")); // echo is a native command, not a builtin
+        assert!(!is_builtin("pwd"));
+        assert!(!is_builtin(""));
+        assert!(!is_builtin("CD")); // case sensitive
+        assert!(!is_builtin("Exit"));
+    }
+
+    // =========================================================================
+    // parse_signal tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_signal_numeric() {
+        assert_eq!(parse_signal("1"), Some(1));
+        assert_eq!(parse_signal("2"), Some(2));
+        assert_eq!(parse_signal("9"), Some(9));
+        assert_eq!(parse_signal("15"), Some(15));
+        assert_eq!(parse_signal("0"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_signal_named() {
+        assert_eq!(parse_signal("HUP"), Some(1));
+        assert_eq!(parse_signal("INT"), Some(2));
+        assert_eq!(parse_signal("QUIT"), Some(3));
+        assert_eq!(parse_signal("KILL"), Some(9));
+        assert_eq!(parse_signal("TERM"), Some(15));
+        assert_eq!(parse_signal("USR1"), Some(10));
+        assert_eq!(parse_signal("USR2"), Some(12));
+    }
+
+    #[test]
+    fn test_parse_signal_with_sig_prefix() {
+        assert_eq!(parse_signal("SIGHUP"), Some(1));
+        assert_eq!(parse_signal("SIGINT"), Some(2));
+        assert_eq!(parse_signal("SIGKILL"), Some(9));
+        assert_eq!(parse_signal("SIGTERM"), Some(15));
+    }
+
+    #[test]
+    fn test_parse_signal_case_insensitive() {
+        assert_eq!(parse_signal("hup"), Some(1));
+        assert_eq!(parse_signal("Hup"), Some(1));
+        assert_eq!(parse_signal("sigint"), Some(2));
+        assert_eq!(parse_signal("SigInt"), Some(2));
+    }
+
+    #[test]
+    fn test_parse_signal_special() {
+        assert_eq!(parse_signal("EXIT"), Some(0));
+        assert_eq!(parse_signal("ERR"), Some(-1));
+        assert_eq!(parse_signal("DEBUG"), Some(-2));
+    }
+
+    #[test]
+    fn test_parse_signal_invalid() {
+        assert_eq!(parse_signal("INVALID"), None);
+        assert_eq!(parse_signal("SIGFOO"), None);
+        assert_eq!(parse_signal(""), None);
+        assert_eq!(parse_signal("abc"), None);
+    }
+
+    // =========================================================================
+    // signal_name tests
+    // =========================================================================
+
+    #[test]
+    fn test_signal_name_common() {
+        assert_eq!(signal_name(0), "EXIT");
+        assert_eq!(signal_name(1), "SIGHUP");
+        assert_eq!(signal_name(2), "SIGINT");
+        assert_eq!(signal_name(9), "SIGKILL");
+        assert_eq!(signal_name(15), "SIGTERM");
+    }
+
+    #[test]
+    fn test_signal_name_special() {
+        assert_eq!(signal_name(-1), "ERR");
+        assert_eq!(signal_name(-2), "DEBUG");
+    }
+
+    #[test]
+    fn test_signal_name_unknown() {
+        assert_eq!(signal_name(99), "UNKNOWN");
+        assert_eq!(signal_name(-99), "UNKNOWN");
+        assert_eq!(signal_name(1000), "UNKNOWN");
+    }
+
+    // =========================================================================
+    // glob_match_str tests
+    // =========================================================================
+
+    #[test]
+    fn test_glob_exact_match() {
+        assert!(glob_match_str("hello", "hello"));
+        assert!(!glob_match_str("hello", "world"));
+        assert!(!glob_match_str("hello", "hell"));
+        assert!(!glob_match_str("hell", "hello"));
+    }
+
+    #[test]
+    fn test_glob_star_matches_everything() {
+        assert!(glob_match_str("anything", "*"));
+        assert!(glob_match_str("", "*"));
+        assert!(glob_match_str("hello world", "*"));
+    }
+
+    #[test]
+    fn test_glob_star_prefix() {
+        assert!(glob_match_str("test.txt", "*.txt"));
+        assert!(glob_match_str("file.txt", "*.txt"));
+        assert!(glob_match_str(".txt", "*.txt"));
+        assert!(!glob_match_str("test.rs", "*.txt"));
+        assert!(!glob_match_str("testtxt", "*.txt"));
+    }
+
+    #[test]
+    fn test_glob_star_suffix() {
+        assert!(glob_match_str("test.txt", "test*"));
+        assert!(glob_match_str("test", "test*"));
+        assert!(glob_match_str("test123", "test*"));
+        assert!(!glob_match_str("tes", "test*"));
+        assert!(!glob_match_str("atest", "test*"));
+    }
+
+    #[test]
+    fn test_glob_star_middle() {
+        assert!(glob_match_str("test.txt", "test*txt"));
+        assert!(glob_match_str("test123txt", "test*txt"));
+        assert!(glob_match_str("testtxt", "test*txt"));
+        assert!(!glob_match_str("test.rs", "test*txt"));
+    }
+
+    #[test]
+    fn test_glob_multiple_stars() {
+        assert!(glob_match_str("a/b/c", "*/*"));
+        assert!(glob_match_str("abc/def/ghi", "*/*/*"));
+        assert!(glob_match_str("test.min.js", "*.*.js"));
+    }
+
+    #[test]
+    fn test_glob_question_mark() {
+        assert!(glob_match_str("a", "?"));
+        assert!(glob_match_str("ab", "??"));
+        assert!(glob_match_str("abc", "???"));
+        assert!(!glob_match_str("", "?"));
+        assert!(!glob_match_str("ab", "?"));
+        assert!(!glob_match_str("a", "??"));
+    }
+
+    #[test]
+    fn test_glob_question_mark_mixed() {
+        assert!(glob_match_str("test1.txt", "test?.txt"));
+        assert!(glob_match_str("testA.txt", "test?.txt"));
+        assert!(!glob_match_str("test.txt", "test?.txt"));
+        assert!(!glob_match_str("test12.txt", "test?.txt"));
+    }
+
+    #[test]
+    fn test_glob_char_class_simple() {
+        assert!(glob_match_str("a", "[abc]"));
+        assert!(glob_match_str("b", "[abc]"));
+        assert!(glob_match_str("c", "[abc]"));
+        assert!(!glob_match_str("d", "[abc]"));
+        assert!(!glob_match_str("", "[abc]"));
+    }
+
+    #[test]
+    fn test_glob_char_class_range() {
+        assert!(glob_match_str("a", "[a-z]"));
+        assert!(glob_match_str("m", "[a-z]"));
+        assert!(glob_match_str("z", "[a-z]"));
+        assert!(!glob_match_str("A", "[a-z]"));
+        assert!(!glob_match_str("0", "[a-z]"));
+
+        assert!(glob_match_str("5", "[0-9]"));
+        assert!(!glob_match_str("a", "[0-9]"));
+    }
+
+    #[test]
+    fn test_glob_char_class_negation() {
+        assert!(!glob_match_str("a", "[!abc]"));
+        assert!(glob_match_str("d", "[!abc]"));
+        assert!(glob_match_str("z", "[!abc]"));
+
+        // ^ also works for negation
+        assert!(!glob_match_str("a", "[^abc]"));
+        assert!(glob_match_str("d", "[^abc]"));
+    }
+
+    #[test]
+    fn test_glob_char_class_in_pattern() {
+        assert!(glob_match_str("file1.txt", "file[0-9].txt"));
+        assert!(glob_match_str("file9.txt", "file[0-9].txt"));
+        assert!(!glob_match_str("filea.txt", "file[0-9].txt"));
+        assert!(!glob_match_str("file12.txt", "file[0-9].txt"));
+    }
+
+    #[test]
+    fn test_glob_complex_patterns() {
+        assert!(glob_match_str("test_file_1.rs", "test_*_[0-9].rs"));
+        assert!(glob_match_str("test_anything_5.rs", "test_*_[0-9].rs"));
+        assert!(!glob_match_str("test_file_a.rs", "test_*_[0-9].rs"));
+    }
+
+    // =========================================================================
+    // match_char_class tests
+    // =========================================================================
+
+    #[test]
+    fn test_match_char_class_simple() {
+        let pattern: Vec<char> = "[abc]".chars().collect();
+        assert_eq!(match_char_class(&pattern, 'a'), (true, 5));
+        assert_eq!(match_char_class(&pattern, 'b'), (true, 5));
+        assert_eq!(match_char_class(&pattern, 'c'), (true, 5));
+        assert_eq!(match_char_class(&pattern, 'd'), (false, 5));
+    }
+
+    #[test]
+    fn test_match_char_class_range() {
+        let pattern: Vec<char> = "[a-z]".chars().collect();
+        assert_eq!(match_char_class(&pattern, 'a'), (true, 5));
+        assert_eq!(match_char_class(&pattern, 'm'), (true, 5));
+        assert_eq!(match_char_class(&pattern, 'z'), (true, 5));
+        assert_eq!(match_char_class(&pattern, 'A'), (false, 5));
+    }
+
+    #[test]
+    fn test_match_char_class_negation_exclamation() {
+        let pattern: Vec<char> = "[!abc]".chars().collect();
+        assert_eq!(match_char_class(&pattern, 'a'), (false, 6));
+        assert_eq!(match_char_class(&pattern, 'd'), (true, 6));
+    }
+
+    #[test]
+    fn test_match_char_class_negation_caret() {
+        let pattern: Vec<char> = "[^abc]".chars().collect();
+        assert_eq!(match_char_class(&pattern, 'a'), (false, 6));
+        assert_eq!(match_char_class(&pattern, 'd'), (true, 6));
+    }
+
+    #[test]
+    fn test_match_char_class_not_a_class() {
+        let pattern: Vec<char> = "abc".chars().collect();
+        assert_eq!(match_char_class(&pattern, 'a'), (false, 0));
+    }
+
+    #[test]
+    fn test_match_char_class_empty() {
+        let pattern: Vec<char> = vec![];
+        assert_eq!(match_char_class(&pattern, 'a'), (false, 0));
+    }
+
+    // =========================================================================
+    // extended_pattern_match tests
+    // =========================================================================
+
+    #[test]
+    fn test_extended_pattern_exact() {
+        assert!(extended_pattern_match("hello", "hello"));
+        assert!(!extended_pattern_match("hello", "world"));
+    }
+
+    #[test]
+    fn test_extended_pattern_with_glob() {
+        assert!(extended_pattern_match("hello.txt", "*.txt"));
+        assert!(extended_pattern_match("test", "t?st"));
+        assert!(extended_pattern_match("a", "[abc]"));
+    }
+
+    #[test]
+    fn test_extended_pattern_no_glob_chars() {
+        // When no glob chars, should do exact match
+        assert!(extended_pattern_match("hello", "hello"));
+        assert!(!extended_pattern_match("hello", "hell"));
+    }
+}

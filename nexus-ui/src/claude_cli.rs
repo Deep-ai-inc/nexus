@@ -740,6 +740,410 @@ fn write_mcp_config(port: u16) -> PathBuf {
     path
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -------------------------------------------------------------------------
+    // deserialize_tool_content tests
+    // -------------------------------------------------------------------------
+
+    /// Helper struct to test the custom deserializer
+    #[derive(Debug, Deserialize)]
+    struct TestToolResult {
+        #[serde(default, deserialize_with = "deserialize_tool_content")]
+        content: Option<String>,
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_null() {
+        let json = json!({"content": null});
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, None);
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_missing() {
+        let json = json!({});
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, None);
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_string() {
+        let json = json!({"content": "hello world"});
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_array_single() {
+        let json = json!({
+            "content": [{"type": "text", "text": "first block"}]
+        });
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, Some("first block".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_array_multiple() {
+        let json = json!({
+            "content": [
+                {"type": "text", "text": "line one"},
+                {"type": "text", "text": "line two"},
+                {"type": "text", "text": "line three"}
+            ]
+        });
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, Some("line one\nline two\nline three".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_array_empty() {
+        let json = json!({"content": []});
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, None);
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_array_no_text_field() {
+        let json = json!({
+            "content": [{"type": "image", "url": "http://example.com"}]
+        });
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, None);
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_number() {
+        let json = json!({"content": 42});
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_tool_content_object() {
+        let json = json!({"content": {"key": "value"}});
+        let result: TestToolResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.content, Some("{\"key\":\"value\"}".to_string()));
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_user_questions tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_user_questions_basic() {
+        let input = json!({
+            "questions": [{
+                "question": "Which option do you prefer?",
+                "header": "Choice",
+                "multiSelect": false,
+                "options": [
+                    {"label": "Option A", "description": "First choice"},
+                    {"label": "Option B", "description": "Second choice"}
+                ]
+            }]
+        });
+        let result = parse_user_questions(&input).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].question, "Which option do you prefer?");
+        assert_eq!(result[0].header, "Choice");
+        assert!(!result[0].multi_select);
+        assert_eq!(result[0].options.len(), 2);
+        assert_eq!(result[0].options[0].label, "Option A");
+        assert_eq!(result[0].options[0].description, "First choice");
+    }
+
+    #[test]
+    fn test_parse_user_questions_multi_select() {
+        let input = json!({
+            "questions": [{
+                "question": "Select all that apply",
+                "header": "Multi",
+                "multiSelect": true,
+                "options": [
+                    {"label": "A", "description": ""},
+                    {"label": "B", "description": ""}
+                ]
+            }]
+        });
+        let result = parse_user_questions(&input).unwrap();
+        assert!(result[0].multi_select);
+    }
+
+    #[test]
+    fn test_parse_user_questions_multiple_questions() {
+        let input = json!({
+            "questions": [
+                {
+                    "question": "First question?",
+                    "header": "Q1",
+                    "options": [{"label": "Yes", "description": ""}]
+                },
+                {
+                    "question": "Second question?",
+                    "header": "Q2",
+                    "options": [{"label": "No", "description": ""}]
+                }
+            ]
+        });
+        let result = parse_user_questions(&input).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].question, "First question?");
+        assert_eq!(result[1].question, "Second question?");
+    }
+
+    #[test]
+    fn test_parse_user_questions_no_questions_field() {
+        let input = json!({"other": "data"});
+        let result = parse_user_questions(&input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_user_questions_empty_questions() {
+        let input = json!({"questions": []});
+        let result = parse_user_questions(&input).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_questions_missing_optional_fields() {
+        let input = json!({
+            "questions": [{
+                "question": "What?",
+                "options": [{"label": "X"}]
+            }]
+        });
+        let result = parse_user_questions(&input).unwrap();
+        assert_eq!(result[0].header, ""); // default
+        assert!(!result[0].multi_select); // default false
+        assert_eq!(result[0].options[0].description, ""); // default
+    }
+
+    #[test]
+    fn test_parse_user_questions_invalid_question_missing_text() {
+        // When a question is missing required "question" field, the ? operator
+        // causes early return of None from the function
+        let input = json!({
+            "questions": [{
+                "header": "H",
+                "options": []
+            }]
+        });
+        let result = parse_user_questions(&input);
+        assert!(result.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // session_file_path tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_session_file_path_basic() {
+        let path = session_file_path("/home/user/project", "abc123");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.ends_with("abc123.jsonl"));
+        assert!(path_str.contains(".claude/projects"));
+        assert!(path_str.contains("-home-user-project")); // slashes replaced with dashes
+    }
+
+    #[test]
+    fn test_session_file_path_root() {
+        let path = session_file_path("/", "session-id");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("-")); // "/" becomes "-"
+        assert!(path_str.ends_with("session-id.jsonl"));
+    }
+
+    #[test]
+    fn test_session_file_path_nested() {
+        let path = session_file_path("/a/b/c/d/e", "test");
+        let path_str = path.to_string_lossy();
+        assert!(path_str.contains("-a-b-c-d-e"));
+    }
+
+    // -------------------------------------------------------------------------
+    // CliMessage parsing tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_system_message() {
+        let json = json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "sess-123",
+            "tools": ["Read", "Write", "Bash"],
+            "model": "claude-sonnet"
+        });
+        let msg: CliMessage = serde_json::from_value(json).unwrap();
+        if let CliMessage::System(sys) = msg {
+            assert_eq!(sys.session_id, "sess-123");
+            assert_eq!(sys.subtype, "init");
+            assert_eq!(sys.tools, vec!["Read", "Write", "Bash"]);
+            assert_eq!(sys.model, Some("claude-sonnet".to_string()));
+        } else {
+            panic!("Expected System message");
+        }
+    }
+
+    #[test]
+    fn test_parse_assistant_message_text() {
+        let json = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Hello, world!"}
+                ],
+                "id": "msg-1",
+                "stop_reason": "end_turn"
+            }
+        });
+        let msg: CliMessage = serde_json::from_value(json).unwrap();
+        if let CliMessage::Assistant(asst) = msg {
+            assert_eq!(asst.message.content.len(), 1);
+            if let ContentBlock::Text { text } = &asst.message.content[0] {
+                assert_eq!(text, "Hello, world!");
+            } else {
+                panic!("Expected Text block");
+            }
+        } else {
+            panic!("Expected Assistant message");
+        }
+    }
+
+    #[test]
+    fn test_parse_assistant_message_tool_use() {
+        let json = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/test.txt"}
+                    }
+                ]
+            }
+        });
+        let msg: CliMessage = serde_json::from_value(json).unwrap();
+        if let CliMessage::Assistant(asst) = msg {
+            if let ContentBlock::ToolUse { id, name, input } = &asst.message.content[0] {
+                assert_eq!(id, "tool-1");
+                assert_eq!(name, "Read");
+                assert_eq!(input.get("file_path").unwrap().as_str().unwrap(), "/tmp/test.txt");
+            } else {
+                panic!("Expected ToolUse block");
+            }
+        } else {
+            panic!("Expected Assistant message");
+        }
+    }
+
+    #[test]
+    fn test_parse_result_message() {
+        let json = json!({
+            "type": "result",
+            "session_id": "sess-456",
+            "result": "Task completed",
+            "cost_usd": 0.05,
+            "duration_ms": 1234,
+            "num_turns": 3,
+            "usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500
+            }
+        });
+        let msg: CliMessage = serde_json::from_value(json).unwrap();
+        if let CliMessage::Result(result) = msg {
+            assert_eq!(result.session_id, "sess-456");
+            assert_eq!(result.result, Some("Task completed".to_string()));
+            assert_eq!(result.cost_usd, Some(0.05));
+            assert_eq!(result.duration_ms, Some(1234));
+            assert_eq!(result.num_turns, Some(3));
+            assert_eq!(result.usage.as_ref().unwrap().input_tokens, Some(1000));
+            assert_eq!(result.usage.as_ref().unwrap().output_tokens, Some(500));
+        } else {
+            panic!("Expected Result message");
+        }
+    }
+
+    #[test]
+    fn test_parse_thinking_block() {
+        let json = json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "Let me think about this..."}
+                ]
+            }
+        });
+        let msg: CliMessage = serde_json::from_value(json).unwrap();
+        if let CliMessage::Assistant(asst) = msg {
+            if let ContentBlock::Thinking { thinking } = &asst.message.content[0] {
+                assert_eq!(thinking, "Let me think about this...");
+            } else {
+                panic!("Expected Thinking block");
+            }
+        } else {
+            panic!("Expected Assistant message");
+        }
+    }
+
+    #[test]
+    fn test_parse_tool_result_with_content_array() {
+        let json = json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {"type": "text", "text": "File contents here"}
+                        ],
+                        "is_error": false
+                    }
+                ]
+            }
+        });
+        let msg: CliMessage = serde_json::from_value(json).unwrap();
+        if let CliMessage::User(user) = msg {
+            if let ContentBlock::ToolResult { tool_use_id, content, is_error } = &user.message.content[0] {
+                assert_eq!(tool_use_id, "tool-1");
+                assert_eq!(content, &Some("File contents here".to_string()));
+                assert_eq!(*is_error, Some(false));
+            } else {
+                panic!("Expected ToolResult block");
+            }
+        } else {
+            panic!("Expected User message");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // CliOptions tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_cli_options_default() {
+        let opts = CliOptions::default();
+        assert!(opts.allowed_tools.is_empty());
+        assert!(opts.disallowed_tools.is_empty());
+        assert!(opts.max_turns.is_none());
+        assert!(opts.model.is_none());
+        assert!(opts.resume.is_none());
+        assert!(!opts.continue_session);
+    }
+}
+
 /// Spawn a Claude Code CLI query and stream events to the UI.
 ///
 /// This replaces the old `spawn_agent_task` function that used nexus-agent directly.

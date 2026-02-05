@@ -396,3 +396,387 @@ fn format_time(ts: Option<u64>) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // LsOptions::parse tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_no_args() {
+        let opts = LsOptions::parse(&[]).unwrap();
+        assert!(!opts.all);
+        assert!(!opts.almost_all);
+        assert!(!opts.long);
+        assert!(!opts.human_readable);
+        assert!(!opts.sort_by_time);
+        assert!(!opts.reverse);
+        assert!(opts.paths.is_empty());
+    }
+
+    #[test]
+    fn test_parse_short_options_individual() {
+        let opts = LsOptions::parse(&["-a".to_string()]).unwrap();
+        assert!(opts.all);
+
+        let opts = LsOptions::parse(&["-l".to_string()]).unwrap();
+        assert!(opts.long);
+
+        let opts = LsOptions::parse(&["-h".to_string()]).unwrap();
+        assert!(opts.human_readable);
+
+        let opts = LsOptions::parse(&["-t".to_string()]).unwrap();
+        assert!(opts.sort_by_time);
+
+        let opts = LsOptions::parse(&["-r".to_string()]).unwrap();
+        assert!(opts.reverse);
+
+        let opts = LsOptions::parse(&["-A".to_string()]).unwrap();
+        assert!(opts.almost_all);
+
+        let opts = LsOptions::parse(&["-d".to_string()]).unwrap();
+        assert!(opts.directory);
+    }
+
+    #[test]
+    fn test_parse_short_options_combined() {
+        let opts = LsOptions::parse(&["-la".to_string()]).unwrap();
+        assert!(opts.long);
+        assert!(opts.all);
+
+        let opts = LsOptions::parse(&["-lah".to_string()]).unwrap();
+        assert!(opts.long);
+        assert!(opts.all);
+        assert!(opts.human_readable);
+
+        let opts = LsOptions::parse(&["-ltr".to_string()]).unwrap();
+        assert!(opts.long);
+        assert!(opts.sort_by_time);
+        assert!(opts.reverse);
+    }
+
+    #[test]
+    fn test_parse_long_options() {
+        let opts = LsOptions::parse(&["--all".to_string()]).unwrap();
+        assert!(opts.all);
+
+        let opts = LsOptions::parse(&["--almost-all".to_string()]).unwrap();
+        assert!(opts.almost_all);
+
+        let opts = LsOptions::parse(&["--human-readable".to_string()]).unwrap();
+        assert!(opts.human_readable);
+
+        let opts = LsOptions::parse(&["--reverse".to_string()]).unwrap();
+        assert!(opts.reverse);
+
+        let opts = LsOptions::parse(&["--directory".to_string()]).unwrap();
+        assert!(opts.directory);
+    }
+
+    #[test]
+    fn test_parse_paths() {
+        let opts = LsOptions::parse(&["/tmp".to_string()]).unwrap();
+        assert_eq!(opts.paths.len(), 1);
+        assert_eq!(opts.paths[0], PathBuf::from("/tmp"));
+
+        let opts = LsOptions::parse(&["/tmp".to_string(), "/var".to_string()]).unwrap();
+        assert_eq!(opts.paths.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_mixed_options_and_paths() {
+        let opts = LsOptions::parse(&[
+            "-la".to_string(),
+            "/tmp".to_string(),
+            "--human-readable".to_string(),
+            "/var".to_string(),
+        ]).unwrap();
+        assert!(opts.long);
+        assert!(opts.all);
+        assert!(opts.human_readable);
+        assert_eq!(opts.paths.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_ignores_unknown_options() {
+        let opts = LsOptions::parse(&["-xyz".to_string()]).unwrap();
+        // Should not panic, just ignores unknown
+        assert!(!opts.all);
+
+        let opts = LsOptions::parse(&["--unknown-option".to_string()]).unwrap();
+        assert!(!opts.all);
+    }
+
+    // =========================================================================
+    // LsOptions predicates
+    // =========================================================================
+
+    #[test]
+    fn test_show_hidden() {
+        let mut opts = LsOptions::default();
+        assert!(!opts.show_hidden());
+
+        opts.all = true;
+        assert!(opts.show_hidden());
+
+        opts.all = false;
+        opts.almost_all = true;
+        assert!(opts.show_hidden());
+
+        opts.all = true;
+        opts.almost_all = true;
+        assert!(opts.show_hidden());
+    }
+
+    #[test]
+    fn test_show_dot_entries() {
+        let mut opts = LsOptions::default();
+        assert!(!opts.show_dot_entries());
+
+        opts.all = true;
+        assert!(opts.show_dot_entries());
+
+        // -A should NOT show . and ..
+        opts.all = false;
+        opts.almost_all = true;
+        assert!(!opts.show_dot_entries());
+
+        // -a with -A should NOT show . and .. (almost_all overrides)
+        opts.all = true;
+        opts.almost_all = true;
+        assert!(!opts.show_dot_entries());
+    }
+
+    // =========================================================================
+    // format_permissions tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_permissions_regular_file() {
+        // Regular file with rwxr-xr-x (0100755)
+        let mode = 0o100755;
+        assert_eq!(format_permissions(mode), "-rwxr-xr-x");
+    }
+
+    #[test]
+    fn test_format_permissions_directory() {
+        // Directory with rwxr-xr-x (0040755)
+        let mode = 0o040755;
+        assert_eq!(format_permissions(mode), "drwxr-xr-x");
+    }
+
+    #[test]
+    fn test_format_permissions_symlink() {
+        // Symlink with rwxrwxrwx (0120777)
+        let mode = 0o120777;
+        assert_eq!(format_permissions(mode), "lrwxrwxrwx");
+    }
+
+    #[test]
+    fn test_format_permissions_readonly() {
+        // Regular file with r--r--r-- (0100444)
+        let mode = 0o100444;
+        assert_eq!(format_permissions(mode), "-r--r--r--");
+    }
+
+    #[test]
+    fn test_format_permissions_no_perms() {
+        // Regular file with no permissions (0100000)
+        let mode = 0o100000;
+        assert_eq!(format_permissions(mode), "----------");
+    }
+
+    #[test]
+    fn test_format_permissions_all_perms() {
+        // Directory with rwxrwxrwx (0040777)
+        let mode = 0o040777;
+        assert_eq!(format_permissions(mode), "drwxrwxrwx");
+    }
+
+    #[test]
+    fn test_format_permissions_special_types() {
+        // FIFO (0010644)
+        assert_eq!(format_permissions(0o010644), "prw-r--r--");
+        // Char device (0020644)
+        assert_eq!(format_permissions(0o020644), "crw-r--r--");
+        // Block device (0060644)
+        assert_eq!(format_permissions(0o060644), "brw-r--r--");
+        // Socket (0140755)
+        assert_eq!(format_permissions(0o140755), "srwxr-xr-x");
+    }
+
+    // =========================================================================
+    // format_time tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_time_none() {
+        assert_eq!(format_time(None), "?");
+    }
+
+    #[test]
+    fn test_format_time_old_shows_year() {
+        // Very old timestamp (1980) should show year
+        let ts_1980 = 315532800; // Jan 1, 1980
+        let result = format_time(Some(ts_1980));
+        assert!(result.parse::<u64>().is_ok(), "Old date should show year, got: {}", result);
+        assert!(result.starts_with("19") || result.starts_with("20"));
+    }
+
+    #[test]
+    fn test_format_time_recent_shows_time() {
+        // Current timestamp should show HH:MM
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result = format_time(Some(now));
+        assert!(result.contains(':'), "Recent date should show time HH:MM, got: {}", result);
+        assert_eq!(result.len(), 5); // "HH:MM"
+    }
+
+    #[test]
+    fn test_format_time_format_is_valid() {
+        // Test that time format is always valid
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result = format_time(Some(now));
+        // Should be either "HH:MM" or a year
+        assert!(
+            result.contains(':') || result.parse::<u64>().is_ok(),
+            "Invalid format: {}", result
+        );
+    }
+
+    // =========================================================================
+    // sort_entries tests
+    // =========================================================================
+
+    fn make_entry(name: &str, modified: Option<u64>) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            file_type: nexus_api::FileType::File,
+            is_hidden: name.starts_with('.'),
+            is_symlink: false,
+            symlink_target: None,
+            size: 0,
+            modified,
+            accessed: None,
+            created: None,
+            permissions: 0o100644,
+            uid: None,
+            gid: None,
+            owner: None,
+            group: None,
+            nlink: Some(1),
+        }
+    }
+
+    #[test]
+    fn test_sort_entries_alphabetical() {
+        let mut entries = vec![
+            make_entry("zebra", None),
+            make_entry("apple", None),
+            make_entry("mango", None),
+        ];
+        let opts = LsOptions::default();
+        sort_entries(&mut entries, &opts);
+
+        assert_eq!(entries[0].name, "apple");
+        assert_eq!(entries[1].name, "mango");
+        assert_eq!(entries[2].name, "zebra");
+    }
+
+    #[test]
+    fn test_sort_entries_alphabetical_case_insensitive() {
+        let mut entries = vec![
+            make_entry("Zebra", None),
+            make_entry("apple", None),
+            make_entry("Mango", None),
+        ];
+        let opts = LsOptions::default();
+        sort_entries(&mut entries, &opts);
+
+        assert_eq!(entries[0].name, "apple");
+        assert_eq!(entries[1].name, "Mango");
+        assert_eq!(entries[2].name, "Zebra");
+    }
+
+    #[test]
+    fn test_sort_entries_reverse() {
+        let mut entries = vec![
+            make_entry("apple", None),
+            make_entry("zebra", None),
+            make_entry("mango", None),
+        ];
+        let mut opts = LsOptions::default();
+        opts.reverse = true;
+        sort_entries(&mut entries, &opts);
+
+        assert_eq!(entries[0].name, "zebra");
+        assert_eq!(entries[1].name, "mango");
+        assert_eq!(entries[2].name, "apple");
+    }
+
+    #[test]
+    fn test_sort_entries_by_time() {
+        let mut entries = vec![
+            make_entry("old", Some(1000)),
+            make_entry("newest", Some(3000)),
+            make_entry("middle", Some(2000)),
+        ];
+        let mut opts = LsOptions::default();
+        opts.sort_by_time = true;
+        sort_entries(&mut entries, &opts);
+
+        // Newest first by default
+        assert_eq!(entries[0].name, "newest");
+        assert_eq!(entries[1].name, "middle");
+        assert_eq!(entries[2].name, "old");
+    }
+
+    #[test]
+    fn test_sort_entries_by_time_reverse() {
+        let mut entries = vec![
+            make_entry("old", Some(1000)),
+            make_entry("newest", Some(3000)),
+            make_entry("middle", Some(2000)),
+        ];
+        let mut opts = LsOptions::default();
+        opts.sort_by_time = true;
+        opts.reverse = true;
+        sort_entries(&mut entries, &opts);
+
+        // Oldest first with reverse
+        assert_eq!(entries[0].name, "old");
+        assert_eq!(entries[1].name, "middle");
+        assert_eq!(entries[2].name, "newest");
+    }
+
+    #[test]
+    fn test_sort_entries_empty() {
+        let mut entries: Vec<FileEntry> = vec![];
+        let opts = LsOptions::default();
+        sort_entries(&mut entries, &opts);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_sort_entries_single() {
+        let mut entries = vec![make_entry("only", None)];
+        let opts = LsOptions::default();
+        sort_entries(&mut entries, &opts);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "only");
+    }
+}
+
