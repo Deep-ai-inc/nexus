@@ -156,6 +156,10 @@ fn head_file(path: &PathBuf, count: usize) -> anyhow::Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    // -------------------------------------------------------------------------
+    // HeadOptions::parse tests
+    // -------------------------------------------------------------------------
+
     #[test]
     fn test_parse_dash_number() {
         let opts = HeadOptions::parse(&["-5".to_string()]);
@@ -172,5 +176,128 @@ mod tests {
     fn test_parse_n_attached() {
         let opts = HeadOptions::parse(&["-n10".to_string()]);
         assert_eq!(opts.count, 10);
+    }
+
+    #[test]
+    fn test_parse_default() {
+        let opts = HeadOptions::parse(&[]);
+        assert_eq!(opts.count, 10);
+        assert!(opts.files.is_empty());
+    }
+
+    #[test]
+    fn test_parse_with_files() {
+        let opts = HeadOptions::parse(&["file1.txt".to_string(), "file2.txt".to_string()]);
+        assert_eq!(opts.files.len(), 2);
+        assert_eq!(opts.files[0], PathBuf::from("file1.txt"));
+    }
+
+    #[test]
+    fn test_parse_mixed() {
+        let opts = HeadOptions::parse(&["-n".to_string(), "5".to_string(), "file.txt".to_string()]);
+        assert_eq!(opts.count, 5);
+        assert_eq!(opts.files.len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // head_value tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_head_value_list() {
+        let list = Value::List(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(5),
+        ]);
+        let result = head_value(list, 3);
+        if let Value::List(items) = result {
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[0], Value::Int(1));
+            assert_eq!(items[2], Value::Int(3));
+        } else {
+            panic!("Expected list");
+        }
+    }
+
+    #[test]
+    fn test_head_value_list_more_than_available() {
+        let list = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let result = head_value(list, 10);
+        if let Value::List(items) = result {
+            assert_eq!(items.len(), 2);
+        } else {
+            panic!("Expected list");
+        }
+    }
+
+    #[test]
+    fn test_head_value_table() {
+        let table = Value::table(
+            vec!["col1"],
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+            ],
+        );
+        let result = head_value(table, 2);
+        if let Value::Table { rows, .. } = result {
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("Expected table");
+        }
+    }
+
+    #[test]
+    fn test_head_value_record() {
+        let record = Value::Record(vec![
+            ("a".to_string(), Value::Int(1)),
+            ("b".to_string(), Value::Int(2)),
+            ("c".to_string(), Value::Int(3)),
+        ]);
+        let result = head_value(record, 2);
+        if let Value::Record(entries) = result {
+            assert_eq!(entries.len(), 2);
+        } else {
+            panic!("Expected record");
+        }
+    }
+
+    #[test]
+    fn test_head_value_string() {
+        let s = Value::String("line1\nline2\nline3\nline4".to_string());
+        let result = head_value(s, 2);
+        if let Value::String(text) = result {
+            assert_eq!(text, "line1\nline2");
+        } else {
+            panic!("Expected string");
+        }
+    }
+
+    #[test]
+    fn test_head_value_bytes() {
+        let bytes = Value::Bytes(b"line1\nline2\nline3".to_vec());
+        let result = head_value(bytes, 2);
+        if let Value::String(text) = result {
+            assert_eq!(text, "line1\nline2");
+        } else {
+            panic!("Expected string");
+        }
+    }
+
+    #[test]
+    fn test_head_value_scalar_passthrough() {
+        let int = Value::Int(42);
+        let result = head_value(int, 5);
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn test_head_command_name() {
+        let cmd = HeadCommand;
+        assert_eq!(cmd.name(), "head");
     }
 }

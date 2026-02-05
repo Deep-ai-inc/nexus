@@ -1,0 +1,94 @@
+Missed Opportunities: Richer Structured Output for Builtin Commands
+====================================================================
+
+HIGH-VALUE MISSED OPPORTUNITIES
+--------------------------------
+
+1. `wc` — returns plain text like "5 10 50"
+   Should return a Record or Table with {lines, words, bytes, filename}. When given
+   multiple files, a table with per-file rows + a totals row would be far more
+   readable than raw text.
+
+2. `cat` — raw Value::String for text files
+   The biggest volume command with the least enhancement. Could detect file language
+   and emit syntax-highlighted output with line numbers (similar to bat). File
+   metadata header (name, size, encoding) would also help.
+
+3. `date` — plain text string
+   Could return a Record with {timestamp, formatted, timezone, year, month, day,
+   hour, minute, second}. Piping to `get timezone` or `get timestamp` would then
+   work naturally with the structured data pipeline.
+
+4. `head` / `tail` — plain text lines with no context
+   No indication of which file, how many total lines exist, or that output was
+   truncated. A small header/footer with file info and a "showing 10 of 482 lines"
+   indicator would add useful context.
+
+5. `uniq -c` — plain text "  5 some line"
+   Should return List<Record<count, line>> so it renders as a sortable two-column
+   table. Count could even get a visual bar/sparkline.
+
+6. `wc`, `uniq -c`, `nl` — all reinvent tabular formatting in plain text
+   All three commands manually format columns with spaces. All three should emit
+   structured Table or Record values and let the rendering system handle alignment
+   and formatting.
+
+7. `to-json` — plain uncolored JSON text
+   Given that from-json already produces rich structured rendering, the reverse
+   direction (to-json) outputting flat monochrome text is inconsistent. Syntax-
+   highlighted JSON output would be a natural fit.
+
+8. `which` / `type` — just a path string
+   Could return a Record with {path, kind, size, modified, permissions} — especially
+   for `type`, which already distinguishes builtins/aliases/functions/externals but
+   formats it as prose.
+
+9. `umask` — opaque octal string "0022"
+   Could return a Record like {octal: "0022", owner: "rwx", group: "r-x",
+   other: "r-x"} with a visual permission matrix, similar to how `ls -l` already
+   renders permissions richly.
+
+10. `times` — plain text timing
+    Should return Record<{real, user, sys}> with DisplayFormat::Duration. Could
+    render with proportional bars showing user vs sys breakdown.
+
+
+MEDIUM-VALUE OPPORTUNITIES
+---------------------------
+
+11. `seq` with large ranges
+    `seq 1 1000000` emits a million lines. Could detect large ranges and return a
+    lazy Range { start, end, step } domain value that renders compactly but expands
+    when piped.
+
+12. `chars` / `bytes` — extremely verbose for what they are
+    `echo hello | chars` produces 5 separate lines. Could render as a compact grid
+    or table with index, character, and codepoint columns — much more useful for
+    inspection.
+
+13. `cmp` — prose text like "files differ: byte 42, line 3"
+    Could return a Record with {differ: bool, byte_offset, line, col} and for binary
+    files, a side-by-side hex view using a domain type.
+
+14. `df` — already a table, but no usage bars
+    The data includes percentage used but doesn't render visual usage bars. Adding
+    DisplayFormat::Percentage with a bar visualization (like htop does) would make
+    disk usage scannable at a glance.
+
+15. Shell builtins `export` / `set` / `alias` / `readonly` / `trap`
+    All emit plain name=value text. These could return Table values with name/value
+    columns, making them sortable and filterable through the pipeline.
+
+
+PATTERN SUMMARY
+----------------
+
+The common theme across almost all of these: commands that predate the structured
+value system and still format their own output as strings, rather than returning
+typed values and letting the rendering layer handle presentation. The infrastructure
+(Value::Record, Value::Table, DomainValue, DisplayFormat) is already there — it's
+just a matter of migrating these commands to use it.
+
+The highest-leverage changes would be `wc`, `cat` (syntax highlighting), `date`,
+`head`/`tail`, and the shell builtins (`export`/`set`/`alias`), since those are
+among the most frequently used commands.

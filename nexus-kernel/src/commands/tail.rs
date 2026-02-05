@@ -148,8 +148,54 @@ fn tail_file(path: &PathBuf, count: usize) -> anyhow::Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    // -------------------------------------------------------------------------
+    // TailOptions::parse tests
+    // -------------------------------------------------------------------------
+
     #[test]
-    fn test_tail_list() {
+    fn test_parse_dash_number() {
+        let opts = TailOptions::parse(&["-5".to_string()]);
+        assert_eq!(opts.count, 5);
+    }
+
+    #[test]
+    fn test_parse_n_separate() {
+        let opts = TailOptions::parse(&["-n".to_string(), "3".to_string()]);
+        assert_eq!(opts.count, 3);
+    }
+
+    #[test]
+    fn test_parse_n_attached() {
+        let opts = TailOptions::parse(&["-n7".to_string()]);
+        assert_eq!(opts.count, 7);
+    }
+
+    #[test]
+    fn test_parse_default() {
+        let opts = TailOptions::parse(&[]);
+        assert_eq!(opts.count, 10);
+        assert!(opts.files.is_empty());
+    }
+
+    #[test]
+    fn test_parse_with_files() {
+        let opts = TailOptions::parse(&["file1.txt".to_string(), "file2.txt".to_string()]);
+        assert_eq!(opts.files.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_mixed() {
+        let opts = TailOptions::parse(&["-n".to_string(), "20".to_string(), "log.txt".to_string()]);
+        assert_eq!(opts.count, 20);
+        assert_eq!(opts.files.len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // tail_value tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_tail_value_list() {
         let list = Value::List(vec![
             Value::Int(1),
             Value::Int(2),
@@ -160,17 +206,93 @@ mod tests {
         let result = tail_value(list, 3);
         if let Value::List(items) = result {
             assert_eq!(items.len(), 3);
+            assert_eq!(items[0], Value::Int(3));
+            assert_eq!(items[2], Value::Int(5));
         } else {
             panic!("Expected list");
         }
     }
 
     #[test]
-    fn test_parse_options() {
-        let opts = TailOptions::parse(&["-5".to_string()]);
-        assert_eq!(opts.count, 5);
+    fn test_tail_value_list_more_than_available() {
+        let list = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let result = tail_value(list, 10);
+        if let Value::List(items) = result {
+            assert_eq!(items.len(), 2);
+        } else {
+            panic!("Expected list");
+        }
+    }
 
-        let opts = TailOptions::parse(&["-n".to_string(), "3".to_string()]);
-        assert_eq!(opts.count, 3);
+    #[test]
+    fn test_tail_value_table() {
+        let table = Value::table(
+            vec!["col1"],
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+            ],
+        );
+        let result = tail_value(table, 2);
+        if let Value::Table { rows, .. } = result {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::Int(2));
+            assert_eq!(rows[1][0], Value::Int(3));
+        } else {
+            panic!("Expected table");
+        }
+    }
+
+    #[test]
+    fn test_tail_value_record() {
+        let record = Value::Record(vec![
+            ("a".to_string(), Value::Int(1)),
+            ("b".to_string(), Value::Int(2)),
+            ("c".to_string(), Value::Int(3)),
+        ]);
+        let result = tail_value(record, 2);
+        if let Value::Record(entries) = result {
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].0, "b");
+            assert_eq!(entries[1].0, "c");
+        } else {
+            panic!("Expected record");
+        }
+    }
+
+    #[test]
+    fn test_tail_value_string() {
+        let s = Value::String("line1\nline2\nline3\nline4".to_string());
+        let result = tail_value(s, 2);
+        if let Value::String(text) = result {
+            assert_eq!(text, "line3\nline4");
+        } else {
+            panic!("Expected string");
+        }
+    }
+
+    #[test]
+    fn test_tail_value_bytes() {
+        let bytes = Value::Bytes(b"line1\nline2\nline3".to_vec());
+        let result = tail_value(bytes, 2);
+        if let Value::String(text) = result {
+            assert_eq!(text, "line2\nline3");
+        } else {
+            panic!("Expected string");
+        }
+    }
+
+    #[test]
+    fn test_tail_value_scalar_passthrough() {
+        let int = Value::Int(42);
+        let result = tail_value(int, 5);
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn test_tail_command_name() {
+        let cmd = TailCommand;
+        assert_eq!(cmd.name(), "tail");
     }
 }

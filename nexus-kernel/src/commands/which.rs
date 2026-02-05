@@ -157,8 +157,94 @@ impl NexusCommand for TypeCommand {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use tempfile::tempdir;
+
+    // -------------------------------------------------------------------------
+    // is_executable tests (Unix)
+    // -------------------------------------------------------------------------
+
+    #[cfg(unix)]
     #[test]
-    fn test_is_executable() {
-        // This would need actual files to test properly
+    fn test_is_executable_with_exec_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test_exec");
+
+        // Create file and set executable permission
+        File::create(&file_path).unwrap();
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(is_executable(&file_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_without_exec_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test_no_exec");
+
+        // Create file with no execute permission
+        File::create(&file_path).unwrap();
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(!is_executable(&file_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_nonexistent() {
+        let path = PathBuf::from("/nonexistent/path/to/file");
+        assert!(!is_executable(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_group_exec() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test_group_exec");
+
+        // Create file with group execute permission
+        File::create(&file_path).unwrap();
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o010)).unwrap();
+
+        assert!(is_executable(&file_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_executable_other_exec() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test_other_exec");
+
+        // Create file with other execute permission
+        File::create(&file_path).unwrap();
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o001)).unwrap();
+
+        assert!(is_executable(&file_path));
+    }
+
+    // -------------------------------------------------------------------------
+    // TypeCommand builtin detection tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_type_command_name() {
+        let cmd = TypeCommand;
+        assert_eq!(cmd.name(), "type");
+    }
+
+    #[test]
+    fn test_which_command_name() {
+        let cmd = WhichCommand;
+        assert_eq!(cmd.name(), "which");
     }
 }

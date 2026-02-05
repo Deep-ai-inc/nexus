@@ -3214,3 +3214,221 @@ impl ScrollColumn {
         snapshot.primitives_mut().pop_clip();
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // unicode_display_width tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_unicode_display_width_ascii() {
+        assert_eq!(unicode_display_width("hello"), 5.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_empty() {
+        assert_eq!(unicode_display_width(""), 0.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_cjk() {
+        // CJK characters are double-width
+        assert_eq!(unicode_display_width("中文"), 4.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_mixed() {
+        // "a中b" = 1 + 2 + 1 = 4
+        assert_eq!(unicode_display_width("a中b"), 4.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_emoji() {
+        // Many emojis are double-width
+        let width = unicode_display_width("😀");
+        assert!(width >= 1.0); // At least 1, could be 2 depending on implementation
+    }
+
+    // -------------------------------------------------------------------------
+    // unicode_col_x tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_unicode_col_x_ascii() {
+        assert_eq!(unicode_col_x("hello", 0), 0.0);
+        assert_eq!(unicode_col_x("hello", 3), 3.0);
+        assert_eq!(unicode_col_x("hello", 5), 5.0);
+    }
+
+    #[test]
+    fn test_unicode_col_x_cjk() {
+        // Each CJK char is 2 wide
+        assert_eq!(unicode_col_x("中文字", 0), 0.0);
+        assert_eq!(unicode_col_x("中文字", 1), 2.0);
+        assert_eq!(unicode_col_x("中文字", 2), 4.0);
+    }
+
+    #[test]
+    fn test_unicode_col_x_mixed() {
+        // "a中b" = positions: a=0, 中=1, b=3
+        assert_eq!(unicode_col_x("a中b", 0), 0.0);
+        assert_eq!(unicode_col_x("a中b", 1), 1.0);
+        assert_eq!(unicode_col_x("a中b", 2), 3.0);
+    }
+
+    #[test]
+    fn test_unicode_col_x_beyond_length() {
+        // Asking for column beyond string length returns full width
+        assert_eq!(unicode_col_x("ab", 10), 2.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // hash_text tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_hash_text_same_input_same_hash() {
+        let h1 = hash_text("hello world");
+        let h2 = hash_text("hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_text_different_input_different_hash() {
+        let h1 = hash_text("hello");
+        let h2 = hash_text("world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_text_empty() {
+        let h = hash_text("");
+        // Just verify it doesn't panic and returns something
+        assert!(h > 0 || h == 0); // Always true, but tests the call
+    }
+
+    // -------------------------------------------------------------------------
+    // Length tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_length_flex_shrink() {
+        assert_eq!(Length::Shrink.flex(), 0.0);
+    }
+
+    #[test]
+    fn test_length_flex_fill() {
+        assert_eq!(Length::Fill.flex(), 1.0);
+    }
+
+    #[test]
+    fn test_length_flex_fill_portion() {
+        assert_eq!(Length::FillPortion(3).flex(), 3.0);
+    }
+
+    #[test]
+    fn test_length_flex_fixed() {
+        assert_eq!(Length::Fixed(100.0).flex(), 0.0);
+    }
+
+    #[test]
+    fn test_length_is_flex_shrink() {
+        assert!(!Length::Shrink.is_flex());
+    }
+
+    #[test]
+    fn test_length_is_flex_fill() {
+        assert!(Length::Fill.is_flex());
+    }
+
+    #[test]
+    fn test_length_is_flex_fill_portion() {
+        assert!(Length::FillPortion(2).is_flex());
+    }
+
+    #[test]
+    fn test_length_is_flex_fixed() {
+        assert!(!Length::Fixed(50.0).is_flex());
+    }
+
+    // -------------------------------------------------------------------------
+    // Padding tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_padding_new() {
+        let p = Padding::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(p.top, 1.0);
+        assert_eq!(p.right, 2.0);
+        assert_eq!(p.bottom, 3.0);
+        assert_eq!(p.left, 4.0);
+    }
+
+    #[test]
+    fn test_padding_all() {
+        let p = Padding::all(10.0);
+        assert_eq!(p.top, 10.0);
+        assert_eq!(p.right, 10.0);
+        assert_eq!(p.bottom, 10.0);
+        assert_eq!(p.left, 10.0);
+    }
+
+    #[test]
+    fn test_padding_symmetric() {
+        let p = Padding::symmetric(5.0, 10.0);
+        assert_eq!(p.left, 5.0);
+        assert_eq!(p.right, 5.0);
+        assert_eq!(p.top, 10.0);
+        assert_eq!(p.bottom, 10.0);
+    }
+
+    #[test]
+    fn test_padding_horizontal() {
+        let p = Padding::new(1.0, 20.0, 3.0, 10.0);
+        assert_eq!(p.horizontal(), 30.0);
+    }
+
+    #[test]
+    fn test_padding_vertical() {
+        let p = Padding::new(15.0, 2.0, 25.0, 4.0);
+        assert_eq!(p.vertical(), 40.0);
+    }
+
+    #[test]
+    fn test_padding_default() {
+        let p = Padding::default();
+        assert_eq!(p.top, 0.0);
+        assert_eq!(p.right, 0.0);
+        assert_eq!(p.bottom, 0.0);
+        assert_eq!(p.left, 0.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Alignment/CrossAxisAlignment default tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_alignment_default() {
+        let a = Alignment::default();
+        assert_eq!(a, Alignment::Start);
+    }
+
+    #[test]
+    fn test_cross_axis_alignment_default() {
+        let a = CrossAxisAlignment::default();
+        assert_eq!(a, CrossAxisAlignment::Start);
+    }
+
+    #[test]
+    fn test_length_default() {
+        let l = Length::default();
+        assert_eq!(l, Length::Shrink);
+    }
+}

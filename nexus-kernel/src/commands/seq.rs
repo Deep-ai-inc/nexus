@@ -151,6 +151,150 @@ fn format_number(n: f64, opts: &SeqOptions, width: usize) -> Value {
 mod tests {
     use super::*;
 
+    // -------------------------------------------------------------------------
+    // SeqOptions::parse tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_single_arg() {
+        let opts = SeqOptions::parse(&["5".to_string()]);
+        assert_eq!(opts.first, 1.0);
+        assert_eq!(opts.increment, 1.0);
+        assert_eq!(opts.last, 5.0);
+    }
+
+    #[test]
+    fn test_parse_two_args() {
+        let opts = SeqOptions::parse(&["3".to_string(), "7".to_string()]);
+        assert_eq!(opts.first, 3.0);
+        assert_eq!(opts.increment, 1.0);
+        assert_eq!(opts.last, 7.0);
+    }
+
+    #[test]
+    fn test_parse_three_args() {
+        let opts = SeqOptions::parse(&["1".to_string(), "2".to_string(), "10".to_string()]);
+        assert_eq!(opts.first, 1.0);
+        assert_eq!(opts.increment, 2.0);
+        assert_eq!(opts.last, 10.0);
+    }
+
+    #[test]
+    fn test_parse_separator_separate() {
+        let opts = SeqOptions::parse(&["-s".to_string(), ",".to_string(), "5".to_string()]);
+        assert_eq!(opts.separator, ",");
+        assert_eq!(opts.last, 5.0);
+    }
+
+    #[test]
+    fn test_parse_separator_attached() {
+        let opts = SeqOptions::parse(&["-s:".to_string(), "3".to_string()]);
+        assert_eq!(opts.separator, ":");
+    }
+
+    #[test]
+    fn test_parse_equal_width() {
+        let opts = SeqOptions::parse(&["-w".to_string(), "1".to_string(), "10".to_string()]);
+        assert!(opts.equal_width);
+    }
+
+    #[test]
+    fn test_parse_format_separate() {
+        let opts = SeqOptions::parse(&["-f".to_string(), "%03d".to_string(), "5".to_string()]);
+        assert_eq!(opts.format, Some("%03d".to_string()));
+    }
+
+    #[test]
+    fn test_parse_format_attached() {
+        let opts = SeqOptions::parse(&["-f%g".to_string(), "5".to_string()]);
+        assert_eq!(opts.format, Some("%g".to_string()));
+    }
+
+    #[test]
+    fn test_parse_negative_numbers() {
+        let opts = SeqOptions::parse(&["-5".to_string(), "-1".to_string()]);
+        assert_eq!(opts.first, -5.0);
+        assert_eq!(opts.last, -1.0);
+    }
+
+    // -------------------------------------------------------------------------
+    // format_number tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_format_number_integer() {
+        let opts = SeqOptions {
+            first: 1.0,
+            increment: 1.0,
+            last: 5.0,
+            separator: "\n".to_string(),
+            format: None,
+            equal_width: false,
+        };
+        let result = format_number(3.0, &opts, 0);
+        assert_eq!(result, Value::Int(3));
+    }
+
+    #[test]
+    fn test_format_number_float() {
+        let opts = SeqOptions {
+            first: 1.0,
+            increment: 0.5,
+            last: 5.0,
+            separator: "\n".to_string(),
+            format: None,
+            equal_width: false,
+        };
+        let result = format_number(2.5, &opts, 0);
+        assert_eq!(result, Value::Float(2.5));
+    }
+
+    #[test]
+    fn test_format_number_equal_width() {
+        let opts = SeqOptions {
+            first: 1.0,
+            increment: 1.0,
+            last: 10.0,
+            separator: "\n".to_string(),
+            format: None,
+            equal_width: true,
+        };
+        let result = format_number(1.0, &opts, 2);
+        assert_eq!(result.to_text(), "01");
+    }
+
+    #[test]
+    fn test_format_number_with_format_g() {
+        let opts = SeqOptions {
+            first: 1.0,
+            increment: 1.0,
+            last: 5.0,
+            separator: "\n".to_string(),
+            format: Some("num: %g".to_string()),
+            equal_width: false,
+        };
+        let result = format_number(3.0, &opts, 0);
+        assert_eq!(result.to_text(), "num: 3");
+    }
+
+    #[test]
+    fn test_format_number_with_format_d() {
+        let opts = SeqOptions {
+            first: 1.0,
+            increment: 1.0,
+            last: 5.0,
+            separator: "\n".to_string(),
+            format: Some("item %d".to_string()),
+            equal_width: false,
+        };
+        let result = format_number(2.0, &opts, 0);
+        assert_eq!(result.to_text(), "item 2");
+    }
+
+    // -------------------------------------------------------------------------
+    // seq generation tests
+    // -------------------------------------------------------------------------
+
     #[test]
     fn test_seq_simple() {
         let opts = SeqOptions {
@@ -173,25 +317,8 @@ mod tests {
     }
 
     #[test]
-    fn test_seq_with_increment() {
-        let opts = SeqOptions::parse(&["1".to_string(), "2".to_string(), "10".to_string()]);
-        assert_eq!(opts.first, 1.0);
-        assert_eq!(opts.increment, 2.0);
-        assert_eq!(opts.last, 10.0);
-    }
-
-    #[test]
-    fn test_seq_equal_width() {
-        let opts = SeqOptions {
-            first: 1.0,
-            increment: 1.0,
-            last: 10.0,
-            separator: "\n".to_string(),
-            format: None,
-            equal_width: true,
-        };
-
-        let result = format_number(1.0, &opts, 2);
-        assert_eq!(result.to_text(), "01");
+    fn test_seq_command_name() {
+        let cmd = SeqCommand;
+        assert_eq!(cmd.name(), "seq");
     }
 }

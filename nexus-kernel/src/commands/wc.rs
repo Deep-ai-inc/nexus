@@ -287,6 +287,76 @@ fn format_counts_record(
 mod tests {
     use super::*;
 
+    // -------------------------------------------------------------------------
+    // WcOptions::parse tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_no_args() {
+        let opts = WcOptions::parse(&[]);
+        // Default: lines, words, bytes (not chars)
+        assert!(opts.lines);
+        assert!(opts.words);
+        assert!(!opts.chars);
+        assert!(opts.bytes);
+        assert!(opts.files.is_empty());
+    }
+
+    #[test]
+    fn test_parse_short_flags_combined() {
+        let opts = WcOptions::parse(&["-lwc".to_string()]);
+        assert!(opts.lines);
+        assert!(opts.words);
+        assert!(opts.bytes); // -c is bytes
+        assert!(!opts.chars);
+    }
+
+    #[test]
+    fn test_parse_short_flags_individual() {
+        let opts = WcOptions::parse(&["-l".to_string(), "-w".to_string()]);
+        assert!(opts.lines);
+        assert!(opts.words);
+        assert!(!opts.bytes);
+        assert!(!opts.chars);
+    }
+
+    #[test]
+    fn test_parse_long_flags() {
+        let opts = WcOptions::parse(&["--lines".to_string(), "--chars".to_string()]);
+        assert!(opts.lines);
+        assert!(!opts.words);
+        assert!(opts.chars);
+        assert!(!opts.bytes);
+    }
+
+    #[test]
+    fn test_parse_chars_flag() {
+        let opts = WcOptions::parse(&["-m".to_string()]);
+        assert!(opts.chars);
+        assert!(!opts.bytes);
+    }
+
+    #[test]
+    fn test_parse_with_files() {
+        let opts = WcOptions::parse(&["-l".to_string(), "file1.txt".to_string(), "file2.txt".to_string()]);
+        assert!(opts.lines);
+        assert_eq!(opts.files.len(), 2);
+        assert_eq!(opts.files[0], PathBuf::from("file1.txt"));
+        assert_eq!(opts.files[1], PathBuf::from("file2.txt"));
+    }
+
+    #[test]
+    fn test_parse_ignores_unknown_flags() {
+        let opts = WcOptions::parse(&["-xyz".to_string()]);
+        // Unknown flags in combination are ignored
+        assert!(!opts.lines);
+        assert!(!opts.words);
+    }
+
+    // -------------------------------------------------------------------------
+    // count_string tests
+    // -------------------------------------------------------------------------
+
     #[test]
     fn test_count_lines() {
         let opts = WcOptions {
@@ -314,6 +384,122 @@ mod tests {
     }
 
     #[test]
+    fn test_count_chars() {
+        let opts = WcOptions {
+            lines: false,
+            words: false,
+            chars: true,
+            bytes: false,
+            files: vec![],
+        };
+        let counts = count_string("héllo", &opts);
+        assert_eq!(counts.2, 5); // 5 characters
+    }
+
+    #[test]
+    fn test_count_bytes() {
+        let opts = WcOptions {
+            lines: false,
+            words: false,
+            chars: false,
+            bytes: true,
+            files: vec![],
+        };
+        let counts = count_string("héllo", &opts);
+        assert_eq!(counts.3, 6); // 6 bytes (é is 2 bytes in UTF-8)
+    }
+
+    #[test]
+    fn test_count_all() {
+        let opts = WcOptions {
+            lines: true,
+            words: true,
+            chars: true,
+            bytes: true,
+            files: vec![],
+        };
+        let counts = count_string("hello world\n", &opts);
+        assert_eq!(counts.0, 1); // 1 line
+        assert_eq!(counts.1, 2); // 2 words
+        assert_eq!(counts.2, 12); // 12 chars
+        assert_eq!(counts.3, 12); // 12 bytes
+    }
+
+    #[test]
+    fn test_count_empty_string() {
+        let opts = WcOptions {
+            lines: true,
+            words: true,
+            chars: true,
+            bytes: true,
+            files: vec![],
+        };
+        let counts = count_string("", &opts);
+        assert_eq!(counts.0, 0);
+        assert_eq!(counts.1, 0);
+        assert_eq!(counts.2, 0);
+        assert_eq!(counts.3, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // format_counts tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_format_counts_single_metric() {
+        let opts = WcOptions {
+            lines: true,
+            words: false,
+            chars: false,
+            bytes: false,
+            files: vec![],
+        };
+        let result = format_counts(&(10, 0, 0, 0), &opts);
+        assert_eq!(result, Value::Int(10));
+    }
+
+    #[test]
+    fn test_format_counts_multiple_metrics() {
+        let opts = WcOptions {
+            lines: true,
+            words: true,
+            chars: false,
+            bytes: false,
+            files: vec![],
+        };
+        let result = format_counts(&(10, 20, 0, 0), &opts);
+        if let Value::Record(fields) = result {
+            assert_eq!(fields.len(), 2);
+            assert!(fields.iter().any(|(k, v)| k == "lines" && *v == Value::Int(10)));
+            assert!(fields.iter().any(|(k, v)| k == "words" && *v == Value::Int(20)));
+        } else {
+            panic!("Expected Record");
+        }
+    }
+
+    #[test]
+    fn test_format_counts_record_with_filename() {
+        let opts = WcOptions {
+            lines: true,
+            words: false,
+            chars: false,
+            bytes: false,
+            files: vec![],
+        };
+        let result = format_counts_record(&(10, 0, 0, 0), &opts, Some("test.txt"));
+        if let Value::Record(fields) = result {
+            assert_eq!(fields.len(), 2);
+            assert!(fields.iter().any(|(k, _)| k == "file"));
+        } else {
+            panic!("Expected Record with filename");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // wc_value tests
+    // -------------------------------------------------------------------------
+
+    #[test]
     fn test_wc_list() {
         let opts = WcOptions {
             lines: true,
@@ -325,5 +511,73 @@ mod tests {
         let list = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
         let result = wc_value(list, &opts);
         assert_eq!(result, Value::Int(3));
+    }
+
+    #[test]
+    fn test_wc_table() {
+        let opts = WcOptions {
+            lines: true,
+            words: false,
+            chars: false,
+            bytes: false,
+            files: vec![],
+        };
+        let table = Value::table(
+            vec!["col1", "col2"],
+            vec![
+                vec![Value::Int(1), Value::Int(2)],
+                vec![Value::Int(3), Value::Int(4)],
+            ],
+        );
+        let result = wc_value(table, &opts);
+        assert_eq!(result, Value::Int(2)); // 2 rows
+    }
+
+    #[test]
+    fn test_wc_string() {
+        let opts = WcOptions {
+            lines: true,
+            words: true,
+            chars: false,
+            bytes: false,
+            files: vec![],
+        };
+        let result = wc_value(Value::String("hello world\nfoo bar\n".to_string()), &opts);
+        if let Value::Record(fields) = result {
+            assert!(fields.iter().any(|(k, v)| k == "lines" && *v == Value::Int(2)));
+            assert!(fields.iter().any(|(k, v)| k == "words" && *v == Value::Int(4)));
+        } else {
+            panic!("Expected Record");
+        }
+    }
+
+    #[test]
+    fn test_wc_bytes() {
+        let opts = WcOptions {
+            lines: false,
+            words: false,
+            chars: false,
+            bytes: true,
+            files: vec![],
+        };
+        let result = wc_value(Value::Bytes(vec![1, 2, 3, 4, 5]), &opts);
+        assert_eq!(result, Value::Int(5));
+    }
+
+    #[test]
+    fn test_wc_record() {
+        let opts = WcOptions {
+            lines: true,
+            words: false,
+            chars: false,
+            bytes: false,
+            files: vec![],
+        };
+        let record = Value::Record(vec![
+            ("key1".to_string(), Value::String("val1".to_string())),
+            ("key2".to_string(), Value::String("val2".to_string())),
+        ]);
+        let result = wc_value(record, &opts);
+        assert_eq!(result, Value::Int(2)); // 2 entries
     }
 }
