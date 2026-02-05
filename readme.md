@@ -146,11 +146,60 @@ Data flow:
 - Interactive table rendering (click to sort/filter)
 - Semantic actions (right-click context menus)
 
+## Reactive Streaming Pipelines — `watch`
+
+`watch` is a shell keyword that re-executes a typed pipeline on an interval, streaming live updates to the UI.
+
+```bash
+watch ps aux | sort -r --by %cpu | head 5   # live top-5 by CPU, structured table
+watch -n 1 df                                # 1s disk usage refresh
+watch -n 500ms ps aux | sort -r --by %mem | head 10   # 500ms memory monitor
+watch docker ps                              # external commands work too (raw text)
+watch -n 1 -- ls -la                         # -- separates watch flags from command
+```
+
+This is not Unix `watch`. Unix `watch` reruns a string and repaints characters. Nexus `watch` operates inside the typed execution engine:
+
+- **Typed value graph** — `watch ps aux | sort -r --by %cpu | head 5` flows `Table<Process>` between stages, not bytes. The UI renders a native table with sortable, clickable columns.
+- **Zero-copy structured handoff** — Native stages pass `Value` objects directly. No serialize/deserialize round-trip.
+- **Coalesced streaming** — `StreamingUpdate(coalesce=true)` replaces the previous state atomically. The UI re-renders a structured widget, not a screen repaint.
+- **Pipeline-aware** — The kernel knows the semantics of each stage. External commands (`watch docker ps`) fall back to stdout capture with ANSI preservation.
+
+Interval syntax: bare number = seconds (`-n 1`), suffix = explicit (`-n 500ms`, `-n 2s`). Default is 2 seconds. Cancel with Ctrl+C.
+
 ## Quick Start
 
 ```bash
 cargo build --release
 cargo run -p nexus-ui --release
+```
+
+## Development
+
+### Tests
+
+```bash
+cargo test                              # run all tests
+cargo test -p nexus-kernel              # run kernel tests only
+cargo test -p nexus-kernel -- watch     # run tests matching "watch"
+```
+
+### Code Coverage
+
+We use `cargo-llvm-cov` for code coverage. It uses native LLVM instrumentation built into the Rust compiler — fast and accurate on Apple Silicon.
+
+```bash
+# Install (one-time)
+cargo install cargo-llvm-cov
+
+# Run tests with coverage and open HTML report
+cargo llvm-cov --open
+
+# Coverage for a specific package
+cargo llvm-cov -p nexus-kernel --open
+
+# Generate lcov report (for CI integration)
+cargo llvm-cov --lcov --output-path lcov.info
 ```
 
 ### Strata Demo
