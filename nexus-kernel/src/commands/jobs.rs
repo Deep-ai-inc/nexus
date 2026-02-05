@@ -341,15 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn test_job_state_display() {
-        let state = JobState::Running;
-        assert!(matches!(state, JobState::Running));
-
-        let state = JobState::Done(0);
-        assert!(matches!(state, JobState::Done(0)));
-    }
-
-    #[test]
     fn test_jobs_command_name() {
         let cmd = JobsCommand;
         assert_eq!(cmd.name(), "jobs");
