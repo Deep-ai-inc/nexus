@@ -259,6 +259,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scroll_state_new_defaults() {
+        let state = ScrollState::new();
+        assert_eq!(state.offset, 0.0);
+        assert_eq!(state.grab_offset, 0.0);
+    }
+
+    #[test]
+    fn scroll_state_with_ids() {
+        let id = SourceId::new();
+        let thumb_id = SourceId::new();
+        let state = ScrollState::with_ids(id, thumb_id);
+        assert_eq!(state.id(), id);
+        assert_eq!(state.thumb_id(), thumb_id);
+    }
+
+    #[test]
+    fn scroll_state_default() {
+        let state: ScrollState = Default::default();
+        assert_eq!(state.offset, 0.0);
+    }
+
+    #[test]
     fn scroll_by_clamps() {
         let mut state = ScrollState::new();
         state.max.set(100.0);
@@ -279,5 +301,44 @@ mod tests {
         state.grab_offset = 42.0;
         state.end_drag();
         assert_eq!(state.grab_offset, 0.0);
+    }
+
+    #[test]
+    fn apply_scroll_by() {
+        let mut state = ScrollState::new();
+        state.max.set(100.0);
+        state.apply(ScrollAction::ScrollBy(-30.0));
+        assert_eq!(state.offset, 30.0);
+    }
+
+    #[test]
+    fn apply_drag_end() {
+        let mut state = ScrollState::new();
+        state.grab_offset = 10.0;
+        state.apply(ScrollAction::DragEnd);
+        assert_eq!(state.grab_offset, 0.0);
+    }
+
+    #[test]
+    fn contains_uses_bounds() {
+        let state = ScrollState::new();
+        state.bounds.set(Rect::new(0.0, 0.0, 100.0, 100.0));
+
+        assert!(state.contains(Point::new(50.0, 50.0)));
+        assert!(!state.contains(Point::new(150.0, 50.0)));
+    }
+
+    #[test]
+    fn scroll_action_debug() {
+        // Ensure ScrollAction variants can be debug printed
+        let actions = [
+            ScrollAction::ScrollBy(10.0),
+            ScrollAction::DragStart(50.0),
+            ScrollAction::DragMove(60.0),
+            ScrollAction::DragEnd,
+        ];
+        for action in actions {
+            let _ = format!("{:?}", action);
+        }
     }
 }

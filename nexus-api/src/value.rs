@@ -1786,3 +1786,696 @@ impl Value {
 pub fn columns_from_strings(names: &[&str]) -> Vec<TableColumn> {
     names.iter().map(|&s| TableColumn::new(s)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =========================================================================
+    // Value primitive tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_unit_to_text() {
+        assert_eq!(Value::Unit.to_text(), "");
+    }
+
+    #[test]
+    fn test_value_bool_to_text() {
+        assert_eq!(Value::Bool(true).to_text(), "true");
+        assert_eq!(Value::Bool(false).to_text(), "false");
+    }
+
+    #[test]
+    fn test_value_int_to_text() {
+        assert_eq!(Value::Int(42).to_text(), "42");
+        assert_eq!(Value::Int(-100).to_text(), "-100");
+        assert_eq!(Value::Int(0).to_text(), "0");
+    }
+
+    #[test]
+    fn test_value_float_to_text() {
+        assert_eq!(Value::Float(3.14).to_text(), "3.14");
+        assert_eq!(Value::Float(-2.5).to_text(), "-2.5");
+    }
+
+    #[test]
+    fn test_value_string_to_text() {
+        assert_eq!(Value::String("hello".to_string()).to_text(), "hello");
+        assert_eq!(Value::String("".to_string()).to_text(), "");
+    }
+
+    #[test]
+    fn test_value_bytes_to_text() {
+        assert_eq!(Value::Bytes(b"hello".to_vec()).to_text(), "hello");
+        // Invalid UTF-8 should be handled lossy
+        assert_eq!(Value::Bytes(vec![0xFF, 0xFE]).to_text(), "\u{FFFD}\u{FFFD}");
+    }
+
+    #[test]
+    fn test_value_path_to_text() {
+        assert_eq!(Value::Path(PathBuf::from("/tmp/test.txt")).to_text(), "/tmp/test.txt");
+    }
+
+    #[test]
+    fn test_value_list_to_text() {
+        let list = Value::List(vec![
+            Value::String("one".to_string()),
+            Value::String("two".to_string()),
+            Value::String("three".to_string()),
+        ]);
+        assert_eq!(list.to_text(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn test_value_record_to_text() {
+        let record = Value::Record(vec![
+            ("name".to_string(), Value::String("Alice".to_string())),
+            ("age".to_string(), Value::Int(30)),
+        ]);
+        assert_eq!(record.to_text(), "name: Alice\nage: 30\n");
+    }
+
+    #[test]
+    fn test_value_error_to_text() {
+        let err = Value::Error { code: 1, message: "not found".to_string() };
+        assert_eq!(err.to_text(), "error: not found");
+    }
+
+    // =========================================================================
+    // Value type_name tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_type_names() {
+        assert_eq!(Value::Unit.type_name(), "unit");
+        assert_eq!(Value::Bool(true).type_name(), "bool");
+        assert_eq!(Value::Int(0).type_name(), "int");
+        assert_eq!(Value::Float(0.0).type_name(), "float");
+        assert_eq!(Value::String("".into()).type_name(), "string");
+        assert_eq!(Value::Bytes(vec![]).type_name(), "bytes");
+        assert_eq!(Value::List(vec![]).type_name(), "list");
+        assert_eq!(Value::Record(vec![]).type_name(), "record");
+        assert_eq!(Value::Path(PathBuf::new()).type_name(), "path");
+    }
+
+    // =========================================================================
+    // Value conversions (From trait)
+    // =========================================================================
+
+    #[test]
+    fn test_value_from_bool() {
+        let v: Value = true.into();
+        assert_eq!(v, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_value_from_i64() {
+        let v: Value = 42i64.into();
+        assert_eq!(v, Value::Int(42));
+    }
+
+    #[test]
+    fn test_value_from_i32() {
+        let v: Value = 42i32.into();
+        assert_eq!(v, Value::Int(42));
+    }
+
+    #[test]
+    fn test_value_from_f64() {
+        let v: Value = 3.14f64.into();
+        assert_eq!(v, Value::Float(3.14));
+    }
+
+    #[test]
+    fn test_value_from_string() {
+        let v: Value = String::from("hello").into();
+        assert_eq!(v, Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_value_from_str() {
+        let v: Value = "hello".into();
+        assert_eq!(v, Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn test_value_from_pathbuf() {
+        let v: Value = PathBuf::from("/tmp").into();
+        assert_eq!(v, Value::Path(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn test_value_from_vec() {
+        let v: Value = vec!["a", "b", "c"].into();
+        assert_eq!(v, Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ]));
+    }
+
+    // =========================================================================
+    // format_size tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_size_bytes() {
+        assert_eq!(format_size(0), "0B");
+        assert_eq!(format_size(100), "100B");
+        assert_eq!(format_size(1023), "1023B");
+    }
+
+    #[test]
+    fn test_format_size_kilobytes() {
+        assert_eq!(format_size(1024), "1.0K");
+        assert_eq!(format_size(2048), "2.0K");
+        assert_eq!(format_size(1536), "1.5K");
+    }
+
+    #[test]
+    fn test_format_size_megabytes() {
+        assert_eq!(format_size(1024 * 1024), "1.0M");
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0M");
+    }
+
+    #[test]
+    fn test_format_size_gigabytes() {
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0G");
+        assert_eq!(format_size(10 * 1024 * 1024 * 1024), "10.0G");
+    }
+
+    // =========================================================================
+    // format_duration tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_duration_seconds() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(30), "30s");
+        assert_eq!(format_duration(59), "59s");
+    }
+
+    #[test]
+    fn test_format_duration_minutes() {
+        assert_eq!(format_duration(60), "1m");
+        assert_eq!(format_duration(90), "1m 30s");
+        assert_eq!(format_duration(3599), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_duration_hours() {
+        assert_eq!(format_duration(3600), "1h");
+        assert_eq!(format_duration(3660), "1h 1m");
+        assert_eq!(format_duration(7200), "2h");
+    }
+
+    #[test]
+    fn test_format_duration_days() {
+        assert_eq!(format_duration(86400), "1d");
+        assert_eq!(format_duration(90000), "1d 1h");
+        assert_eq!(format_duration(172800), "2d");
+    }
+
+    // =========================================================================
+    // detect_mime_type tests
+    // =========================================================================
+
+    #[test]
+    fn test_detect_mime_type_png() {
+        let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        assert_eq!(detect_mime_type(&png_header), "image/png");
+    }
+
+    #[test]
+    fn test_detect_mime_type_jpeg() {
+        let jpeg_header = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(detect_mime_type(&jpeg_header), "image/jpeg");
+    }
+
+    #[test]
+    fn test_detect_mime_type_gif() {
+        assert_eq!(detect_mime_type(b"GIF87a123456"), "image/gif");
+        assert_eq!(detect_mime_type(b"GIF89a123456"), "image/gif");
+    }
+
+    #[test]
+    fn test_detect_mime_type_pdf() {
+        assert_eq!(detect_mime_type(b"%PDF-1.4 test"), "application/pdf");
+    }
+
+    #[test]
+    fn test_detect_mime_type_text() {
+        assert_eq!(detect_mime_type(b"Hello, world!"), "text/plain");
+    }
+
+    #[test]
+    fn test_detect_mime_type_json() {
+        assert_eq!(detect_mime_type(b"{\"key\": \"value\"}"), "application/json");
+        assert_eq!(detect_mime_type(b"[1, 2, 3, 4, 5]"), "application/json");
+    }
+
+    #[test]
+    fn test_detect_mime_type_html() {
+        assert_eq!(detect_mime_type(b"<!DOCTYPE html><html>"), "text/html");
+        assert_eq!(detect_mime_type(b"<html><head></head>"), "text/html");
+    }
+
+    #[test]
+    fn test_detect_mime_type_short_data() {
+        assert_eq!(detect_mime_type(b"short"), "application/octet-stream");
+    }
+
+    // =========================================================================
+    // mime_from_extension tests
+    // =========================================================================
+
+    #[test]
+    fn test_mime_from_extension_images() {
+        assert_eq!(mime_from_extension("png"), "image/png");
+        assert_eq!(mime_from_extension("PNG"), "image/png");
+        assert_eq!(mime_from_extension("jpg"), "image/jpeg");
+        assert_eq!(mime_from_extension("jpeg"), "image/jpeg");
+        assert_eq!(mime_from_extension("gif"), "image/gif");
+        assert_eq!(mime_from_extension("webp"), "image/webp");
+        assert_eq!(mime_from_extension("svg"), "image/svg+xml");
+    }
+
+    #[test]
+    fn test_mime_from_extension_audio() {
+        assert_eq!(mime_from_extension("mp3"), "audio/mpeg");
+        assert_eq!(mime_from_extension("wav"), "audio/wav");
+        assert_eq!(mime_from_extension("ogg"), "audio/ogg");
+        assert_eq!(mime_from_extension("flac"), "audio/flac");
+    }
+
+    #[test]
+    fn test_mime_from_extension_video() {
+        assert_eq!(mime_from_extension("mp4"), "video/mp4");
+        assert_eq!(mime_from_extension("webm"), "video/webm");
+        assert_eq!(mime_from_extension("mkv"), "video/x-matroska");
+    }
+
+    #[test]
+    fn test_mime_from_extension_documents() {
+        assert_eq!(mime_from_extension("pdf"), "application/pdf");
+        assert_eq!(mime_from_extension("txt"), "text/plain");
+        assert_eq!(mime_from_extension("html"), "text/html");
+        assert_eq!(mime_from_extension("json"), "application/json");
+        assert_eq!(mime_from_extension("md"), "text/markdown");
+    }
+
+    #[test]
+    fn test_mime_from_extension_code() {
+        assert_eq!(mime_from_extension("rs"), "text/x-rust");
+        assert_eq!(mime_from_extension("py"), "text/x-python");
+        assert_eq!(mime_from_extension("sh"), "text/x-shellscript");
+    }
+
+    #[test]
+    fn test_mime_from_extension_unknown() {
+        assert_eq!(mime_from_extension("xyz"), "application/octet-stream");
+        assert_eq!(mime_from_extension("unknown"), "application/octet-stream");
+    }
+
+    // =========================================================================
+    // TableColumn tests
+    // =========================================================================
+
+    #[test]
+    fn test_table_column_new() {
+        let col = TableColumn::new("name");
+        assert_eq!(col.name, "name");
+        assert!(col.format.is_none());
+    }
+
+    #[test]
+    fn test_table_column_with_format() {
+        let col = TableColumn::with_format("size", DisplayFormat::HumanBytes);
+        assert_eq!(col.name, "size");
+        assert_eq!(col.format, Some(DisplayFormat::HumanBytes));
+    }
+
+    #[test]
+    fn test_table_column_from_str() {
+        let col: TableColumn = "name".into();
+        assert_eq!(col.name, "name");
+    }
+
+    #[test]
+    fn test_columns_from_strings() {
+        let cols = columns_from_strings(&["a", "b", "c"]);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "a");
+        assert_eq!(cols[1].name, "b");
+        assert_eq!(cols[2].name, "c");
+    }
+
+    // =========================================================================
+    // Value::table tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_table_creation() {
+        let table = Value::table(
+            vec!["name", "age"],
+            vec![
+                vec![Value::String("Alice".into()), Value::Int(30)],
+                vec![Value::String("Bob".into()), Value::Int(25)],
+            ],
+        );
+
+        if let Value::Table { columns, rows } = table {
+            assert_eq!(columns.len(), 2);
+            assert_eq!(columns[0].name, "name");
+            assert_eq!(columns[1].name, "age");
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("Expected Table value");
+        }
+    }
+
+    #[test]
+    fn test_value_table_to_text() {
+        let table = Value::table(
+            vec!["name", "score"],
+            vec![
+                vec![Value::String("Alice".into()), Value::Int(100)],
+            ],
+        );
+        let text = table.to_text();
+        assert!(text.contains("name\tscore"));
+        assert!(text.contains("Alice\t100"));
+    }
+
+    // =========================================================================
+    // format_value_for_display tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_value_human_bytes() {
+        assert_eq!(format_value_for_display(&Value::Int(1024), DisplayFormat::HumanBytes), "1.0K");
+        assert_eq!(format_value_for_display(&Value::Int(0), DisplayFormat::HumanBytes), "0B");
+    }
+
+    #[test]
+    fn test_format_value_percentage() {
+        assert_eq!(format_value_for_display(&Value::Float(50.5), DisplayFormat::Percentage), "50.5%");
+        assert_eq!(format_value_for_display(&Value::Int(75), DisplayFormat::Percentage), "75%");
+    }
+
+    #[test]
+    fn test_format_value_duration() {
+        assert_eq!(format_value_for_display(&Value::Int(3661), DisplayFormat::Duration), "1h 1m");
+    }
+
+    #[test]
+    fn test_format_value_octal() {
+        assert_eq!(format_value_for_display(&Value::Int(0o755), DisplayFormat::Octal), "755");
+        assert_eq!(format_value_for_display(&Value::Int(0o644), DisplayFormat::Octal), "644");
+    }
+
+    #[test]
+    fn test_format_value_bar_percentage() {
+        let result = format_value_for_display(&Value::Float(50.0), DisplayFormat::BarPercentage);
+        assert!(result.contains("▓"));
+        assert!(result.contains("░"));
+        assert!(result.contains("50%"));
+    }
+
+    // =========================================================================
+    // Media value tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_media_creation() {
+        let data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let media = Value::media(data.clone());
+
+        if let Value::Media { data: d, content_type, .. } = media {
+            assert_eq!(d, data);
+            assert_eq!(content_type, "image/png");
+        } else {
+            panic!("Expected Media value");
+        }
+    }
+
+    #[test]
+    fn test_value_media_with_type() {
+        let media = Value::media_with_type(vec![1, 2, 3], "application/custom");
+
+        if let Value::Media { content_type, .. } = media {
+            assert_eq!(content_type, "application/custom");
+        } else {
+            panic!("Expected Media value");
+        }
+    }
+
+    #[test]
+    fn test_value_is_media() {
+        let media = Value::media(vec![0; 12]);
+        assert!(media.is_media());
+        assert!(!Value::String("test".into()).is_media());
+    }
+
+    #[test]
+    fn test_value_is_image() {
+        let png_data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let media = Value::media(png_data);
+        assert!(media.is_image());
+
+        let text = Value::media_with_type(vec![0; 12], "text/plain");
+        assert!(!text.is_image());
+    }
+
+    #[test]
+    fn test_value_as_media() {
+        let media = Value::media_with_type(vec![1, 2, 3], "image/png");
+        let (data, content_type, _metadata) = media.as_media().unwrap();
+        assert_eq!(data, &[1, 2, 3]);
+        assert_eq!(content_type, "image/png");
+
+        assert!(Value::String("test".into()).as_media().is_none());
+    }
+
+    // =========================================================================
+    // Value::to_bytes tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_to_bytes_bytes() {
+        let v = Value::Bytes(vec![1, 2, 3]);
+        assert_eq!(v.to_bytes(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_value_to_bytes_media() {
+        let v = Value::media_with_type(vec![4, 5, 6], "application/octet-stream");
+        assert_eq!(v.to_bytes(), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn test_value_to_bytes_string() {
+        let v = Value::String("hello".into());
+        assert_eq!(v.to_bytes(), b"hello".to_vec());
+    }
+
+    // =========================================================================
+    // Value::byte_len tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_byte_len() {
+        assert_eq!(Value::Bytes(vec![1, 2, 3]).byte_len(), 3);
+        assert_eq!(Value::String("hello".into()).byte_len(), 5);
+        assert_eq!(Value::media_with_type(vec![0; 100], "x").byte_len(), 100);
+    }
+
+    // =========================================================================
+    // MediaMetadata tests
+    // =========================================================================
+
+    #[test]
+    fn test_media_metadata_builder() {
+        let meta = MediaMetadata::new()
+            .with_dimensions(1920, 1080)
+            .with_duration(120.5)
+            .with_filename("video.mp4")
+            .with_size(1024 * 1024);
+
+        assert_eq!(meta.width, Some(1920));
+        assert_eq!(meta.height, Some(1080));
+        assert_eq!(meta.duration_secs, Some(120.5));
+        assert_eq!(meta.filename, Some("video.mp4".to_string()));
+        assert_eq!(meta.size, Some(1024 * 1024));
+    }
+
+    // =========================================================================
+    // DomainValue tests
+    // =========================================================================
+
+    #[test]
+    fn test_domain_value_type_names() {
+        let file_op = DomainValue::FileOp(FileOpInfo {
+            op_type: FileOpKind::Copy,
+            phase: FileOpPhase::Executing,
+            sources: vec![],
+            dest: None,
+            total_bytes: None,
+            bytes_processed: 0,
+            files_total: None,
+            files_processed: 0,
+            current_file: None,
+            start_time_ms: 0,
+            errors: vec![],
+        });
+        assert_eq!(file_op.type_name(), "file-op");
+
+        let net_event = DomainValue::NetEvent(NetEventInfo {
+            event_type: NetEventType::PingResponse,
+            host: "localhost".into(),
+            ip: Some("127.0.0.1".into()),
+            rtt_ms: Some(1.5),
+            ttl: Some(64),
+            seq: Some(1),
+            success: true,
+            message: None,
+        });
+        assert_eq!(net_event.type_name(), "net-event");
+    }
+
+    #[test]
+    fn test_net_event_get_field() {
+        let evt = NetEventInfo {
+            event_type: NetEventType::PingResponse,
+            host: "example.com".into(),
+            ip: Some("93.184.216.34".into()),
+            rtt_ms: Some(25.5),
+            ttl: Some(56),
+            seq: Some(1),
+            success: true,
+            message: None,
+        };
+
+        assert_eq!(evt.get_field("host"), Some(Value::String("example.com".into())));
+        assert_eq!(evt.get_field("rtt_ms"), Some(Value::Float(25.5)));
+        assert_eq!(evt.get_field("ttl"), Some(Value::Int(56)));
+        assert_eq!(evt.get_field("success"), Some(Value::Bool(true)));
+        assert_eq!(evt.get_field("nonexistent"), None);
+    }
+
+    // =========================================================================
+    // Value::get_field tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_get_field_record() {
+        let record = Value::Record(vec![
+            ("name".into(), Value::String("Alice".into())),
+            ("age".into(), Value::Int(30)),
+        ]);
+
+        assert_eq!(record.get_field("name"), Some(Value::String("Alice".into())));
+        assert_eq!(record.get_field("age"), Some(Value::Int(30)));
+        assert_eq!(record.get_field("missing"), None);
+    }
+
+    #[test]
+    fn test_value_get_field_structured() {
+        let mut data = IndexMap::new();
+        data.insert("key".to_string(), Value::String("value".into()));
+        let structured = Value::Structured { kind: None, data };
+
+        assert_eq!(structured.get_field("key"), Some(Value::String("value".into())));
+        assert_eq!(structured.get_field("missing"), None);
+    }
+
+    // =========================================================================
+    // Value::is_typed tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_is_typed() {
+        assert!(!Value::String("test".into()).is_typed());
+        assert!(!Value::Int(42).is_typed());
+
+        let structured = Value::Structured { kind: None, data: IndexMap::new() };
+        assert!(structured.is_typed());
+    }
+
+    // =========================================================================
+    // Display trait test
+    // =========================================================================
+
+    #[test]
+    fn test_value_display() {
+        let v = Value::String("hello".into());
+        assert_eq!(format!("{}", v), "hello");
+
+        let v = Value::Int(42);
+        assert_eq!(format!("{}", v), "42");
+    }
+
+    // =========================================================================
+    // ProcessStatus enum coverage
+    // =========================================================================
+
+    #[test]
+    fn test_process_status_debug() {
+        // Just ensure all variants can be formatted
+        let statuses = [
+            ProcessStatus::Running,
+            ProcessStatus::Sleeping,
+            ProcessStatus::DiskSleep,
+            ProcessStatus::Stopped,
+            ProcessStatus::Zombie,
+            ProcessStatus::Idle,
+            ProcessStatus::Dead,
+            ProcessStatus::TracingStop,
+            ProcessStatus::Unknown,
+        ];
+        for status in statuses {
+            let _ = format!("{:?}", status);
+        }
+    }
+
+    // =========================================================================
+    // GitChangeType enum coverage
+    // =========================================================================
+
+    #[test]
+    fn test_git_change_type_debug() {
+        let types = [
+            GitChangeType::Added,
+            GitChangeType::Modified,
+            GitChangeType::Deleted,
+            GitChangeType::Renamed,
+            GitChangeType::Copied,
+            GitChangeType::Unmerged,
+        ];
+        for t in types {
+            let _ = format!("{:?}", t);
+        }
+    }
+
+    // =========================================================================
+    // FileType enum coverage
+    // =========================================================================
+
+    #[test]
+    fn test_file_type_debug() {
+        let types = [
+            FileType::File,
+            FileType::Directory,
+            FileType::Symlink,
+            FileType::BlockDevice,
+            FileType::CharDevice,
+            FileType::Fifo,
+            FileType::Socket,
+            FileType::Unknown,
+        ];
+        for t in types {
+            let _ = format!("{:?}", t);
+        }
+    }
+}

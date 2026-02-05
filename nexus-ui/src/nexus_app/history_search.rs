@@ -146,3 +146,183 @@ fn scroll_to_index(scroll: &mut ScrollState, index: usize, item_height: f32, vie
         scroll.offset = item_bottom - viewport_height;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_history_search_widget_new() {
+        let widget = HistorySearchWidget::new();
+        assert!(!widget.active);
+        assert!(widget.query.is_empty());
+        assert!(widget.results.is_empty());
+        assert_eq!(widget.index, 0);
+        assert!(widget.hovered.get().is_none());
+    }
+
+    #[test]
+    fn test_history_search_is_active() {
+        let mut widget = HistorySearchWidget::new();
+        assert!(!widget.is_active());
+        widget.active = true;
+        assert!(widget.is_active());
+    }
+
+    #[test]
+    fn test_history_search_toggle_activates() {
+        let mut widget = HistorySearchWidget::new();
+        assert!(!widget.active);
+
+        widget.toggle();
+        assert!(widget.active);
+        assert!(widget.query.is_empty());
+    }
+
+    #[test]
+    fn test_history_search_toggle_cycles_results() {
+        let mut widget = HistorySearchWidget::new();
+        widget.active = true;
+        widget.results = vec!["cmd1".to_string(), "cmd2".to_string(), "cmd3".to_string()];
+        widget.index = 0;
+
+        widget.toggle();
+        assert_eq!(widget.index, 1);
+
+        widget.toggle();
+        assert_eq!(widget.index, 2);
+
+        // Wraps around
+        widget.toggle();
+        assert_eq!(widget.index, 0);
+    }
+
+    #[test]
+    fn test_history_search_toggle_with_empty_results() {
+        let mut widget = HistorySearchWidget::new();
+        widget.active = true;
+        widget.results = vec![];
+        widget.index = 0;
+
+        // Should not crash with empty results
+        widget.toggle();
+        assert_eq!(widget.index, 0);
+    }
+
+    #[test]
+    fn test_history_search_accept_with_result() {
+        let mut widget = HistorySearchWidget::new();
+        widget.active = true;
+        widget.results = vec!["ls -la".to_string(), "echo hello".to_string()];
+        widget.index = 1;
+
+        let output = widget.accept();
+        if let HistorySearchOutput::Accepted { text } = output {
+            assert_eq!(text, "echo hello");
+        } else {
+            panic!("Expected HistorySearchOutput::Accepted");
+        }
+
+        // Widget should be closed
+        assert!(!widget.active);
+        assert!(widget.results.is_empty());
+    }
+
+    #[test]
+    fn test_history_search_accept_without_result() {
+        let mut widget = HistorySearchWidget::new();
+        widget.active = true;
+        widget.results = vec![];
+
+        let output = widget.accept();
+        assert!(matches!(output, HistorySearchOutput::Dismissed));
+    }
+
+    #[test]
+    fn test_history_search_dismiss() {
+        let mut widget = HistorySearchWidget::new();
+        widget.active = true;
+        widget.query = "test".to_string();
+        widget.results = vec!["cmd1".to_string()];
+
+        let output = widget.dismiss();
+        assert!(matches!(output, HistorySearchOutput::Dismissed));
+        assert!(!widget.active);
+        assert!(widget.query.is_empty());
+        assert!(widget.results.is_empty());
+    }
+
+    #[test]
+    fn test_history_search_select_valid() {
+        let mut widget = HistorySearchWidget::new();
+        widget.results = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        widget.index = 0;
+
+        widget.select(2);
+        assert_eq!(widget.index, 2);
+    }
+
+    #[test]
+    fn test_history_search_select_invalid() {
+        let mut widget = HistorySearchWidget::new();
+        widget.results = vec!["a".to_string()];
+        widget.index = 0;
+
+        // Selecting out-of-bounds index should not change anything
+        widget.select(5);
+        assert_eq!(widget.index, 0);
+    }
+
+    #[test]
+    fn test_history_search_accept_index_valid() {
+        let mut widget = HistorySearchWidget::new();
+        widget.active = true;
+        widget.results = vec!["first".to_string(), "second".to_string()];
+
+        let output = widget.accept_index(0);
+        if let HistorySearchOutput::Accepted { text } = output {
+            assert_eq!(text, "first");
+        } else {
+            panic!("Expected HistorySearchOutput::Accepted");
+        }
+
+        assert!(!widget.active);
+    }
+
+    #[test]
+    fn test_history_search_accept_index_invalid() {
+        let mut widget = HistorySearchWidget::new();
+        widget.active = true;
+        widget.results = vec!["only".to_string()];
+
+        let output = widget.accept_index(10);
+        assert!(matches!(output, HistorySearchOutput::Dismissed));
+    }
+
+    #[test]
+    fn test_history_search_scroll_to_index_no_scroll() {
+        let mut scroll = ScrollState::new();
+        scroll.offset = 0.0;
+        scroll_to_index(&mut scroll, 0, 30.0, 300.0);
+        assert_eq!(scroll.offset, 0.0);
+    }
+
+    #[test]
+    fn test_history_search_scroll_to_index_scroll_down() {
+        let mut scroll = ScrollState::new();
+        scroll.offset = 0.0;
+        // Item at index 15 (top = 450, bottom = 480) is below viewport (300px)
+        scroll_to_index(&mut scroll, 15, 30.0, 300.0);
+        // Should scroll so item bottom is at viewport bottom
+        assert_eq!(scroll.offset, 15.0 * 30.0 + 30.0 - 300.0);
+    }
+
+    #[test]
+    fn test_history_search_scroll_to_index_scroll_up() {
+        let mut scroll = ScrollState::new();
+        scroll.offset = 400.0;
+        // Item at index 5 (top = 150) is above scroll offset
+        scroll_to_index(&mut scroll, 5, 30.0, 300.0);
+        assert_eq!(scroll.offset, 5.0 * 30.0);
+    }
+}

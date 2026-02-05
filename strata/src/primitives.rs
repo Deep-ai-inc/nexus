@@ -400,6 +400,82 @@ impl Color {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // Point tests
+    // =========================================================================
+
+    #[test]
+    fn point_new() {
+        let p = Point::new(10.0, 20.0);
+        assert_eq!(p.x, 10.0);
+        assert_eq!(p.y, 20.0);
+    }
+
+    #[test]
+    fn point_origin() {
+        assert_eq!(Point::ORIGIN, Point::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn point_from_tuple() {
+        let p: Point = (5.0, 10.0).into();
+        assert_eq!(p, Point::new(5.0, 10.0));
+    }
+
+    #[test]
+    fn point_add() {
+        let a = Point::new(10.0, 20.0);
+        let b = Point::new(5.0, 15.0);
+        let result = a + b;
+        assert_eq!(result, Point::new(15.0, 35.0));
+    }
+
+    #[test]
+    fn point_sub() {
+        let a = Point::new(10.0, 20.0);
+        let b = Point::new(5.0, 15.0);
+        let result = a - b;
+        assert_eq!(result, Point::new(5.0, 5.0));
+    }
+
+    #[test]
+    fn point_default() {
+        let p: Point = Default::default();
+        assert_eq!(p, Point::ORIGIN);
+    }
+
+    // =========================================================================
+    // Size tests
+    // =========================================================================
+
+    #[test]
+    fn size_new() {
+        let s = Size::new(100.0, 50.0);
+        assert_eq!(s.width, 100.0);
+        assert_eq!(s.height, 50.0);
+    }
+
+    #[test]
+    fn size_zero() {
+        assert_eq!(Size::ZERO, Size::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn size_from_tuple() {
+        let s: Size = (200.0, 100.0).into();
+        assert_eq!(s, Size::new(200.0, 100.0));
+    }
+
+    #[test]
+    fn size_default() {
+        let s: Size = Default::default();
+        assert_eq!(s, Size::ZERO);
+    }
+
+    // =========================================================================
+    // Rect tests
+    // =========================================================================
+
     #[test]
     fn rect_contains() {
         let rect = Rect::new(10.0, 20.0, 100.0, 50.0);
@@ -411,6 +487,66 @@ mod tests {
         assert!(!rect.contains(Point::new(110.0, 70.0))); // Bottom-right corner (exclusive)
         assert!(!rect.contains(Point::new(5.0, 40.0))); // Left of rect
         assert!(!rect.contains(Point::new(50.0, 80.0))); // Below rect
+    }
+
+    #[test]
+    fn rect_contains_xy() {
+        let rect = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert!(rect.contains_xy(50.0, 40.0));
+        assert!(!rect.contains_xy(5.0, 40.0));
+    }
+
+    #[test]
+    fn rect_zero() {
+        let r = Rect::ZERO;
+        assert_eq!(r.x, 0.0);
+        assert_eq!(r.y, 0.0);
+        assert_eq!(r.width, 0.0);
+        assert_eq!(r.height, 0.0);
+    }
+
+    #[test]
+    fn rect_from_origin_size() {
+        let r = Rect::from_origin_size(Point::new(10.0, 20.0), Size::new(100.0, 50.0));
+        assert_eq!(r, Rect::new(10.0, 20.0, 100.0, 50.0));
+    }
+
+    #[test]
+    fn rect_origin_and_size() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert_eq!(r.origin(), Point::new(10.0, 20.0));
+        assert_eq!(r.size(), Size::new(100.0, 50.0));
+    }
+
+    #[test]
+    fn rect_right_bottom() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        assert_eq!(r.right(), 110.0);
+        assert_eq!(r.bottom(), 70.0);
+    }
+
+    #[test]
+    fn rect_center() {
+        let r = Rect::new(0.0, 0.0, 100.0, 50.0);
+        assert_eq!(r.center(), Point::new(50.0, 25.0));
+    }
+
+    #[test]
+    fn rect_union() {
+        let a = Rect::new(0.0, 0.0, 50.0, 50.0);
+        let b = Rect::new(25.0, 25.0, 50.0, 50.0);
+        let union = a.union(&b);
+        assert_eq!(union, Rect::new(0.0, 0.0, 75.0, 75.0));
+    }
+
+    #[test]
+    fn rect_intersects() {
+        let a = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let b = Rect::new(50.0, 50.0, 100.0, 100.0);
+        let c = Rect::new(200.0, 200.0, 50.0, 50.0);
+
+        assert!(a.intersects(&b));
+        assert!(!a.intersects(&c));
     }
 
     #[test]
@@ -426,17 +562,21 @@ mod tests {
     }
 
     #[test]
-    fn color_pack_unpack() {
-        let color = Color::rgba(0.5, 0.25, 0.75, 1.0);
-        let packed = color.pack();
-        let unpacked = Color::unpack(packed);
-
-        // Allow small floating point differences
-        assert!((color.r - unpacked.r).abs() < 0.01);
-        assert!((color.g - unpacked.g).abs() < 0.01);
-        assert!((color.b - unpacked.b).abs() < 0.01);
-        assert!((color.a - unpacked.a).abs() < 0.01);
+    fn rect_translate() {
+        let r = Rect::new(10.0, 20.0, 100.0, 50.0);
+        let translated = r.translate(Point::new(5.0, -10.0));
+        assert_eq!(translated, Rect::new(15.0, 10.0, 100.0, 50.0));
     }
+
+    #[test]
+    fn rect_default() {
+        let r: Rect = Default::default();
+        assert_eq!(r, Rect::ZERO);
+    }
+
+    // =========================================================================
+    // Constraints tests
+    // =========================================================================
 
     #[test]
     fn constraints_constrain() {
@@ -459,5 +599,137 @@ mod tests {
             constraints.constrain(Size::new(500.0, 500.0)),
             Size::new(200.0, 100.0)
         );
+    }
+
+    #[test]
+    fn constraints_unbounded() {
+        let c = Constraints::UNBOUNDED;
+        assert_eq!(c.min_width, 0.0);
+        assert_eq!(c.min_height, 0.0);
+        assert!(c.max_width.is_infinite());
+        assert!(c.max_height.is_infinite());
+    }
+
+    #[test]
+    fn constraints_tight() {
+        let c = Constraints::tight(Size::new(100.0, 50.0));
+        assert_eq!(c.min_width, 100.0);
+        assert_eq!(c.max_width, 100.0);
+        assert_eq!(c.min_height, 50.0);
+        assert_eq!(c.max_height, 50.0);
+    }
+
+    #[test]
+    fn constraints_loose() {
+        let c = Constraints::loose(Size::new(100.0, 50.0));
+        assert_eq!(c.min_width, 0.0);
+        assert_eq!(c.max_width, 100.0);
+        assert_eq!(c.min_height, 0.0);
+        assert_eq!(c.max_height, 50.0);
+    }
+
+    #[test]
+    fn constraints_max_width() {
+        let c = Constraints::max_width(500.0);
+        assert_eq!(c.min_width, 0.0);
+        assert_eq!(c.max_width, 500.0);
+        assert_eq!(c.min_height, 0.0);
+        assert!(c.max_height.is_infinite());
+    }
+
+    #[test]
+    fn constraints_is_satisfied_by() {
+        let c = Constraints {
+            min_width: 50.0,
+            max_width: 200.0,
+            min_height: 30.0,
+            max_height: 100.0,
+        };
+
+        assert!(c.is_satisfied_by(Size::new(100.0, 50.0)));
+        assert!(c.is_satisfied_by(Size::new(50.0, 30.0))); // Exactly at min
+        assert!(c.is_satisfied_by(Size::new(200.0, 100.0))); // Exactly at max
+        assert!(!c.is_satisfied_by(Size::new(49.0, 50.0))); // Below min width
+        assert!(!c.is_satisfied_by(Size::new(100.0, 29.0))); // Below min height
+        assert!(!c.is_satisfied_by(Size::new(201.0, 50.0))); // Above max width
+    }
+
+    #[test]
+    fn constraints_default() {
+        let c: Constraints = Default::default();
+        assert_eq!(c.min_width, Constraints::UNBOUNDED.min_width);
+        assert_eq!(c.max_width, Constraints::UNBOUNDED.max_width);
+    }
+
+    // =========================================================================
+    // Color tests
+    // =========================================================================
+
+    #[test]
+    fn color_constants() {
+        assert_eq!(Color::BLACK, Color::rgba(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(Color::WHITE, Color::rgba(1.0, 1.0, 1.0, 1.0));
+        assert_eq!(Color::RED, Color::rgba(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(Color::GREEN, Color::rgba(0.0, 1.0, 0.0, 1.0));
+        assert_eq!(Color::BLUE, Color::rgba(0.0, 0.0, 1.0, 1.0));
+        assert_eq!(Color::TRANSPARENT, Color::rgba(0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn color_rgb() {
+        let c = Color::rgb(0.5, 0.25, 0.75);
+        assert_eq!(c.r, 0.5);
+        assert_eq!(c.g, 0.25);
+        assert_eq!(c.b, 0.75);
+        assert_eq!(c.a, 1.0);
+    }
+
+    #[test]
+    fn color_rgb8() {
+        let c = Color::rgb8(255, 128, 0);
+        assert!((c.r - 1.0).abs() < 0.01);
+        assert!((c.g - 0.5).abs() < 0.01);
+        assert!((c.b - 0.0).abs() < 0.01);
+        assert_eq!(c.a, 1.0);
+    }
+
+    #[test]
+    fn color_rgba8() {
+        let c = Color::rgba8(255, 128, 64, 128);
+        assert!((c.r - 1.0).abs() < 0.01);
+        assert!((c.g - 0.5).abs() < 0.01);
+        assert!((c.b - 0.25).abs() < 0.01);
+        assert!((c.a - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn color_pack_unpack() {
+        let color = Color::rgba(0.5, 0.25, 0.75, 1.0);
+        let packed = color.pack();
+        let unpacked = Color::unpack(packed);
+
+        // Allow small floating point differences
+        assert!((color.r - unpacked.r).abs() < 0.01);
+        assert!((color.g - unpacked.g).abs() < 0.01);
+        assert!((color.b - unpacked.b).abs() < 0.01);
+        assert!((color.a - unpacked.a).abs() < 0.01);
+    }
+
+    #[test]
+    fn color_with_alpha() {
+        let c = Color::RED.with_alpha(0.5);
+        assert_eq!(c.r, 1.0);
+        assert_eq!(c.g, 0.0);
+        assert_eq!(c.b, 0.0);
+        assert_eq!(c.a, 0.5);
+    }
+
+    #[test]
+    fn color_default() {
+        let c: Color = Default::default();
+        assert_eq!(c.r, 0.0);
+        assert_eq!(c.g, 0.0);
+        assert_eq!(c.b, 0.0);
+        assert_eq!(c.a, 0.0);
     }
 }

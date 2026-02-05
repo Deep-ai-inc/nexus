@@ -85,3 +85,96 @@ pub fn shell_quote(path: &std::path::Path) -> String {
         s.into_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_nexus_temp_dir() {
+        let temp_dir = nexus_temp_dir();
+        assert!(temp_dir.ends_with("nexus-drag"));
+    }
+
+    #[test]
+    fn test_is_nexus_temp_file_true() {
+        let temp_dir = nexus_temp_dir();
+        let path = temp_dir.join("test.txt");
+        assert!(is_nexus_temp_file(&path));
+    }
+
+    #[test]
+    fn test_is_nexus_temp_file_false() {
+        let path = Path::new("/some/other/path/file.txt");
+        assert!(!is_nexus_temp_file(path));
+    }
+
+    #[test]
+    fn test_is_nexus_temp_file_nested() {
+        let temp_dir = nexus_temp_dir();
+        let path = temp_dir.join("subdir/nested.txt");
+        assert!(is_nexus_temp_file(&path));
+    }
+
+    #[test]
+    fn test_read_temp_file_content_not_nexus_file() {
+        let path = Path::new("/some/random/file.txt");
+        assert!(read_temp_file_content(path).is_none());
+    }
+
+    #[test]
+    fn test_shell_quote_simple_path() {
+        let path = Path::new("/simple/path/file.txt");
+        assert_eq!(shell_quote(path), "/simple/path/file.txt");
+    }
+
+    #[test]
+    fn test_shell_quote_with_spaces() {
+        let path = Path::new("/path/with spaces/file.txt");
+        assert_eq!(shell_quote(path), "'/path/with spaces/file.txt'");
+    }
+
+    #[test]
+    fn test_shell_quote_with_special_chars() {
+        let path = Path::new("/path/with$dollar");
+        assert_eq!(shell_quote(path), "'/path/with$dollar'");
+    }
+
+    #[test]
+    fn test_shell_quote_with_single_quote() {
+        let path = Path::new("/path/it's/file.txt");
+        assert_eq!(shell_quote(path), "'/path/it'\\''s/file.txt'");
+    }
+
+    #[test]
+    fn test_shell_quote_with_backtick() {
+        let path = Path::new("/path/with`backtick");
+        assert_eq!(shell_quote(path), "'/path/with`backtick'");
+    }
+
+    #[test]
+    fn test_shell_quote_with_asterisk() {
+        let path = Path::new("/path/*wild");
+        assert_eq!(shell_quote(path), "'/path/*wild'");
+    }
+
+    #[test]
+    fn test_shell_quote_with_question_mark() {
+        let path = Path::new("/path/what?");
+        assert_eq!(shell_quote(path), "'/path/what?'");
+    }
+
+    #[test]
+    fn test_drop_zone_equality() {
+        use super::super::message::DropZone;
+        use nexus_api::BlockId;
+
+        assert_eq!(DropZone::InputBar, DropZone::InputBar);
+        assert_eq!(DropZone::AgentPanel, DropZone::AgentPanel);
+        assert_eq!(DropZone::Empty, DropZone::Empty);
+        assert_eq!(DropZone::ShellBlock(BlockId(1)), DropZone::ShellBlock(BlockId(1)));
+        assert_ne!(DropZone::ShellBlock(BlockId(1)), DropZone::ShellBlock(BlockId(2)));
+        assert_ne!(DropZone::InputBar, DropZone::AgentPanel);
+    }
+}

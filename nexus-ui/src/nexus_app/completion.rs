@@ -145,3 +145,183 @@ fn scroll_to_index(scroll: &mut ScrollState, index: usize, item_height: f32, vie
         scroll.offset = item_bottom - viewport_height;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_kernel::CompletionKind;
+
+    fn make_completion(text: &str) -> Completion {
+        Completion {
+            text: text.to_string(),
+            display: text.to_string(),
+            kind: CompletionKind::File,
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn test_completion_widget_new() {
+        let widget = CompletionWidget::new();
+        assert!(widget.completions.is_empty());
+        assert!(widget.index.is_none());
+        assert_eq!(widget.anchor, 0);
+        assert!(widget.hovered.get().is_none());
+    }
+
+    #[test]
+    fn test_completion_widget_is_active_when_empty() {
+        let widget = CompletionWidget::new();
+        assert!(!widget.is_active());
+    }
+
+    #[test]
+    fn test_completion_widget_is_active_with_completions() {
+        let mut widget = CompletionWidget::new();
+        widget.completions.push(make_completion("test"));
+        assert!(widget.is_active());
+    }
+
+    #[test]
+    fn test_completion_widget_navigate_empty() {
+        let mut widget = CompletionWidget::new();
+        // Navigating with no completions should do nothing
+        let output = widget.navigate(1);
+        assert!(matches!(output, CompletionOutput::None));
+    }
+
+    #[test]
+    fn test_completion_widget_navigate_down() {
+        let mut widget = CompletionWidget::new();
+        widget.completions = vec![
+            make_completion("a"),
+            make_completion("b"),
+            make_completion("c"),
+        ];
+        widget.index = Some(0);
+
+        widget.navigate(1);
+        assert_eq!(widget.index, Some(1));
+
+        widget.navigate(1);
+        assert_eq!(widget.index, Some(2));
+    }
+
+    #[test]
+    fn test_completion_widget_navigate_wraps() {
+        let mut widget = CompletionWidget::new();
+        widget.completions = vec![
+            make_completion("a"),
+            make_completion("b"),
+        ];
+        widget.index = Some(1);
+
+        // Navigate down from last item should wrap to first
+        widget.navigate(1);
+        assert_eq!(widget.index, Some(0));
+
+        // Navigate up from first item should wrap to last
+        widget.navigate(-1);
+        assert_eq!(widget.index, Some(1));
+    }
+
+    #[test]
+    fn test_completion_widget_accept_no_selection() {
+        let mut widget = CompletionWidget::new();
+        widget.index = None;
+        let output = widget.accept("test", 4);
+        assert!(matches!(output, CompletionOutput::Dismissed));
+    }
+
+    #[test]
+    fn test_completion_widget_accept_invalid_index() {
+        let mut widget = CompletionWidget::new();
+        widget.index = Some(5); // Out of bounds
+        let output = widget.accept("test", 4);
+        assert!(matches!(output, CompletionOutput::Dismissed));
+    }
+
+    #[test]
+    fn test_completion_widget_accept_valid() {
+        let mut widget = CompletionWidget::new();
+        widget.completions = vec![make_completion("hello")];
+        widget.index = Some(0);
+        widget.anchor = 0;
+
+        let output = widget.accept("h", 1);
+        if let CompletionOutput::Accepted { text, cursor } = output {
+            assert_eq!(text, "hello");
+            assert_eq!(cursor, 5);
+        } else {
+            panic!("Expected CompletionOutput::Accepted");
+        }
+
+        // After accepting, completions should be cleared
+        assert!(widget.completions.is_empty());
+        assert!(widget.index.is_none());
+    }
+
+    #[test]
+    fn test_completion_widget_dismiss() {
+        let mut widget = CompletionWidget::new();
+        widget.completions = vec![make_completion("test")];
+        widget.index = Some(0);
+
+        let output = widget.dismiss();
+        assert!(matches!(output, CompletionOutput::Dismissed));
+        assert!(widget.completions.is_empty());
+        assert!(widget.index.is_none());
+    }
+
+    #[test]
+    fn test_completion_widget_select_valid() {
+        let mut widget = CompletionWidget::new();
+        widget.completions = vec![
+            make_completion("foo"),
+            make_completion("bar"),
+        ];
+        widget.anchor = 0;
+
+        let output = widget.select(1, "b", 1);
+        if let CompletionOutput::Accepted { text, cursor } = output {
+            assert_eq!(text, "bar");
+            assert_eq!(cursor, 3);
+        } else {
+            panic!("Expected CompletionOutput::Accepted");
+        }
+    }
+
+    #[test]
+    fn test_completion_widget_select_invalid() {
+        let mut widget = CompletionWidget::new();
+        let output = widget.select(0, "test", 4);
+        assert!(matches!(output, CompletionOutput::Dismissed));
+    }
+
+    #[test]
+    fn test_scroll_to_index_no_scroll_needed() {
+        let mut scroll = ScrollState::new();
+        scroll.offset = 0.0;
+        scroll_to_index(&mut scroll, 0, 26.0, 300.0);
+        assert_eq!(scroll.offset, 0.0);
+    }
+
+    #[test]
+    fn test_scroll_to_index_scroll_down() {
+        let mut scroll = ScrollState::new();
+        scroll.offset = 0.0;
+        // Item at index 15 (top = 390, bottom = 416) is below viewport (300px)
+        scroll_to_index(&mut scroll, 15, 26.0, 300.0);
+        // Should scroll so item bottom is at viewport bottom
+        assert_eq!(scroll.offset, 15.0 * 26.0 + 26.0 - 300.0);
+    }
+
+    #[test]
+    fn test_scroll_to_index_scroll_up() {
+        let mut scroll = ScrollState::new();
+        scroll.offset = 300.0;
+        // Item at index 5 (top = 130) is above scroll offset
+        scroll_to_index(&mut scroll, 5, 26.0, 300.0);
+        assert_eq!(scroll.offset, 5.0 * 26.0);
+    }
+}

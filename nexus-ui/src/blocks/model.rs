@@ -369,3 +369,448 @@ pub enum ProcSort {
     Pid,
     Command,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== TableSort tests ==========
+
+    #[test]
+    fn test_table_sort_new_defaults() {
+        let sort = TableSort::new();
+        assert_eq!(sort.column, None);
+        // Default::default() for bool is false
+        assert!(!sort.ascending);
+    }
+
+    #[test]
+    fn test_table_sort_toggle_sets_column() {
+        let mut sort = TableSort::new();
+        sort.toggle(2);
+        assert_eq!(sort.column, Some(2));
+        assert!(sort.ascending);
+    }
+
+    #[test]
+    fn test_table_sort_toggle_same_column_reverses() {
+        let mut sort = TableSort::new();
+        sort.toggle(1);
+        assert!(sort.ascending);
+        sort.toggle(1);
+        assert!(!sort.ascending);
+        sort.toggle(1);
+        assert!(sort.ascending);
+    }
+
+    #[test]
+    fn test_table_sort_toggle_different_column_resets() {
+        let mut sort = TableSort::new();
+        sort.toggle(0);
+        sort.toggle(0); // Now descending
+        assert!(!sort.ascending);
+        sort.toggle(3); // Switch to different column
+        assert_eq!(sort.column, Some(3));
+        assert!(sort.ascending); // Reset to ascending
+    }
+
+    #[test]
+    fn test_table_sort_default_trait() {
+        let sort: TableSort = Default::default();
+        assert_eq!(sort.column, None);
+        // Default::default() for bool is false
+        assert!(!sort.ascending);
+    }
+
+    #[test]
+    fn test_table_sort_clone() {
+        let mut sort = TableSort::new();
+        sort.toggle(5);
+        let cloned = sort.clone();
+        assert_eq!(cloned.column, Some(5));
+        assert!(cloned.ascending);
+    }
+
+    #[test]
+    fn test_table_sort_partial_eq() {
+        let sort1 = TableSort { column: Some(1), ascending: true };
+        let sort2 = TableSort { column: Some(1), ascending: true };
+        let sort3 = TableSort { column: Some(1), ascending: false };
+        assert_eq!(sort1, sort2);
+        assert_ne!(sort1, sort3);
+    }
+
+    // ========== FileTreeState tests ==========
+
+    #[test]
+    fn test_file_tree_state_default() {
+        let tree = FileTreeState::default();
+        assert!(tree.expanded.is_empty());
+        assert!(tree.children.is_empty());
+    }
+
+    #[test]
+    fn test_file_tree_is_expanded() {
+        let mut tree = FileTreeState::default();
+        let path = PathBuf::from("/test/path");
+        assert!(!tree.is_expanded(&path));
+        tree.expanded.insert(path.clone());
+        assert!(tree.is_expanded(&path));
+    }
+
+    #[test]
+    fn test_file_tree_toggle_expand() {
+        let mut tree = FileTreeState::default();
+        let path = PathBuf::from("/test/dir");
+
+        // Toggle to expand
+        let result = tree.toggle(path.clone());
+        assert!(result); // Now expanded
+        assert!(tree.is_expanded(&path));
+    }
+
+    #[test]
+    fn test_file_tree_toggle_collapse() {
+        let mut tree = FileTreeState::default();
+        let path = PathBuf::from("/test/dir");
+
+        tree.toggle(path.clone()); // Expand
+        let result = tree.toggle(path.clone()); // Collapse
+        assert!(!result); // Now collapsed
+        assert!(!tree.is_expanded(&path));
+    }
+
+    #[test]
+    fn test_file_tree_set_and_get_children() {
+        let mut tree = FileTreeState::default();
+        let path = PathBuf::from("/test/dir");
+        let entries = vec![
+            FileEntry {
+                name: "file1.txt".to_string(),
+                path: PathBuf::from("/test/dir/file1.txt"),
+                file_type: nexus_api::FileType::File,
+                size: 100,
+                permissions: 0o644,
+                modified: None,
+                accessed: None,
+                created: None,
+                is_hidden: false,
+                is_symlink: false,
+                symlink_target: None,
+                uid: None,
+                gid: None,
+                owner: None,
+                group: None,
+                nlink: None,
+            },
+        ];
+
+        tree.set_children(path.clone(), entries.clone());
+        let retrieved = tree.get_children(&path);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().len(), 1);
+        assert_eq!(retrieved.unwrap()[0].name, "file1.txt");
+    }
+
+    #[test]
+    fn test_file_tree_get_children_none() {
+        let tree = FileTreeState::default();
+        let path = PathBuf::from("/nonexistent");
+        assert!(tree.get_children(&path).is_none());
+    }
+
+    #[test]
+    fn test_file_tree_collapse_subtree() {
+        let mut tree = FileTreeState::default();
+        let root = PathBuf::from("/root");
+        let child = PathBuf::from("/root/child");
+        let grandchild = PathBuf::from("/root/child/grandchild");
+        let unrelated = PathBuf::from("/other");
+
+        // Expand all
+        tree.toggle(root.clone());
+        tree.toggle(child.clone());
+        tree.toggle(grandchild.clone());
+        tree.toggle(unrelated.clone());
+
+        // Add children entries
+        tree.set_children(root.clone(), vec![]);
+        tree.set_children(child.clone(), vec![]);
+        tree.set_children(grandchild.clone(), vec![]);
+
+        // Collapse root - should remove root and all descendants
+        tree.toggle(root.clone());
+
+        assert!(!tree.is_expanded(&root));
+        assert!(!tree.is_expanded(&child));
+        assert!(!tree.is_expanded(&grandchild));
+        assert!(tree.is_expanded(&unrelated)); // Unrelated path still expanded
+
+        assert!(tree.get_children(&root).is_none());
+        assert!(tree.get_children(&child).is_none());
+    }
+
+    // ========== VisualJob tests ==========
+
+    #[test]
+    fn test_visual_job_new() {
+        let job = VisualJob::new(1, "sleep 100".to_string(), VisualJobState::Running);
+        assert_eq!(job.id, 1);
+        assert_eq!(job.command, "sleep 100");
+        assert_eq!(job.state, VisualJobState::Running);
+    }
+
+    #[test]
+    fn test_visual_job_display_name_short() {
+        let job = VisualJob::new(1, "ls -la".to_string(), VisualJobState::Running);
+        assert_eq!(job.display_name(), "ls -la");
+    }
+
+    #[test]
+    fn test_visual_job_display_name_truncates_long() {
+        let job = VisualJob::new(1, "this is a very long command that exceeds twenty chars".to_string(), VisualJobState::Running);
+        let name = job.display_name();
+        assert_eq!(name.len(), 20); // 17 chars + "..."
+        assert!(name.ends_with("..."));
+    }
+
+    #[test]
+    fn test_visual_job_display_name_exactly_20() {
+        let job = VisualJob::new(1, "12345678901234567890".to_string(), VisualJobState::Running);
+        assert_eq!(job.display_name(), "12345678901234567890");
+    }
+
+    #[test]
+    fn test_visual_job_icon_running() {
+        let job = VisualJob::new(1, "cmd".to_string(), VisualJobState::Running);
+        assert_eq!(job.icon(), "●");
+    }
+
+    #[test]
+    fn test_visual_job_icon_stopped() {
+        let job = VisualJob::new(1, "cmd".to_string(), VisualJobState::Stopped);
+        assert_eq!(job.icon(), "⏸");
+    }
+
+    #[test]
+    fn test_visual_job_state_eq() {
+        assert_eq!(VisualJobState::Running, VisualJobState::Running);
+        assert_eq!(VisualJobState::Stopped, VisualJobState::Stopped);
+        assert_ne!(VisualJobState::Running, VisualJobState::Stopped);
+    }
+
+    // ========== InputMode tests ==========
+
+    #[test]
+    fn test_input_mode_default_is_shell() {
+        let mode: InputMode = Default::default();
+        assert_eq!(mode, InputMode::Shell);
+    }
+
+    #[test]
+    fn test_input_mode_variants() {
+        assert_eq!(InputMode::Shell, InputMode::Shell);
+        assert_eq!(InputMode::Agent, InputMode::Agent);
+        assert_ne!(InputMode::Shell, InputMode::Agent);
+    }
+
+    #[test]
+    fn test_input_mode_clone() {
+        let mode = InputMode::Agent;
+        let cloned = mode;
+        assert_eq!(cloned, InputMode::Agent);
+    }
+
+    // ========== Focus tests ==========
+
+    #[test]
+    fn test_focus_input() {
+        let focus = Focus::Input;
+        assert_eq!(focus, Focus::Input);
+    }
+
+    #[test]
+    fn test_focus_block() {
+        let focus = Focus::Block(BlockId(42));
+        if let Focus::Block(id) = focus {
+            assert_eq!(id.0, 42);
+        } else {
+            panic!("Expected Focus::Block");
+        }
+    }
+
+    #[test]
+    fn test_focus_agent_input() {
+        let focus = Focus::AgentInput;
+        assert_eq!(focus, Focus::AgentInput);
+    }
+
+    #[test]
+    fn test_focus_ne() {
+        assert_ne!(Focus::Input, Focus::AgentInput);
+        assert_ne!(Focus::Input, Focus::Block(BlockId(1)));
+        assert_ne!(Focus::Block(BlockId(1)), Focus::Block(BlockId(2)));
+    }
+
+    #[test]
+    fn test_focus_clone() {
+        let focus = Focus::Block(BlockId(5));
+        let cloned = focus;
+        assert_eq!(cloned, Focus::Block(BlockId(5)));
+    }
+
+    // ========== ProcSort tests ==========
+
+    #[test]
+    fn test_proc_sort_variants() {
+        assert_eq!(ProcSort::Cpu, ProcSort::Cpu);
+        assert_eq!(ProcSort::Mem, ProcSort::Mem);
+        assert_eq!(ProcSort::Pid, ProcSort::Pid);
+        assert_eq!(ProcSort::Command, ProcSort::Command);
+    }
+
+    #[test]
+    fn test_proc_sort_ne() {
+        assert_ne!(ProcSort::Cpu, ProcSort::Mem);
+        assert_ne!(ProcSort::Pid, ProcSort::Command);
+    }
+
+    #[test]
+    fn test_proc_sort_clone() {
+        let sort = ProcSort::Cpu;
+        let cloned = sort;
+        assert_eq!(cloned, ProcSort::Cpu);
+    }
+
+    #[test]
+    fn test_proc_sort_debug() {
+        let debug_str = format!("{:?}", ProcSort::Cpu);
+        assert_eq!(debug_str, "Cpu");
+    }
+
+    // ========== PtyEvent tests ==========
+
+    #[test]
+    fn test_pty_event_output() {
+        let event = PtyEvent::Output(vec![65, 66, 67]);
+        if let PtyEvent::Output(data) = event {
+            assert_eq!(data, vec![65, 66, 67]);
+        } else {
+            panic!("Expected PtyEvent::Output");
+        }
+    }
+
+    #[test]
+    fn test_pty_event_exited() {
+        let event = PtyEvent::Exited(0);
+        if let PtyEvent::Exited(code) = event {
+            assert_eq!(code, 0);
+        } else {
+            panic!("Expected PtyEvent::Exited");
+        }
+    }
+
+    #[test]
+    fn test_pty_event_clone() {
+        let event = PtyEvent::Exited(1);
+        let cloned = event.clone();
+        if let PtyEvent::Exited(code) = cloned {
+            assert_eq!(code, 1);
+        }
+    }
+
+    // ========== UnifiedBlock tests ==========
+
+    #[test]
+    fn test_unified_block_shell_id() {
+        let block = Block::new(BlockId(123), "ls".to_string());
+        let unified = UnifiedBlock::Shell(block);
+        assert_eq!(unified.id(), BlockId(123));
+    }
+
+    // ========== Block tests ==========
+
+    #[test]
+    fn test_block_new() {
+        let block = Block::new(BlockId(1), "echo hello".to_string());
+        assert_eq!(block.id, BlockId(1));
+        assert_eq!(block.command, "echo hello");
+        assert!(block.is_running());
+        assert!(!block.collapsed);
+        assert!(block.native_output.is_none());
+    }
+
+    #[test]
+    fn test_block_is_running() {
+        let mut block = Block::new(BlockId(1), "cmd".to_string());
+        assert!(block.is_running());
+        block.state = BlockState::Success;
+        assert!(!block.is_running());
+    }
+
+    #[test]
+    fn test_block_ensure_file_tree() {
+        let mut block = Block::new(BlockId(1), "ls".to_string());
+        assert!(block.file_tree.is_none());
+
+        let tree = block.ensure_file_tree();
+        tree.toggle(PathBuf::from("/test"));
+
+        assert!(block.file_tree.is_some());
+        assert!(block.file_tree().unwrap().is_expanded(Path::new("/test")));
+    }
+
+    #[test]
+    fn test_block_file_tree_accessor() {
+        let block = Block::new(BlockId(1), "ls".to_string());
+        assert!(block.file_tree().is_none());
+    }
+
+    #[test]
+    fn test_block_partial_eq_different_ids() {
+        let block1 = Block::new(BlockId(1), "ls".to_string());
+        let block2 = Block::new(BlockId(2), "ls".to_string());
+        assert_ne!(block1, block2);
+    }
+
+    #[test]
+    fn test_block_partial_eq_running_always_ne() {
+        let block1 = Block::new(BlockId(1), "ls".to_string());
+        let block2 = Block::new(BlockId(1), "ls".to_string());
+        // Running blocks always return false for eq
+        assert_ne!(block1, block2);
+    }
+
+    #[test]
+    fn test_block_partial_eq_finished_same_version() {
+        let mut block1 = Block::new(BlockId(1), "ls".to_string());
+        let mut block2 = Block::new(BlockId(1), "ls".to_string());
+        block1.state = BlockState::Success;
+        block2.state = BlockState::Success;
+        block1.version = 5;
+        block2.version = 5;
+        assert_eq!(block1, block2);
+    }
+
+    #[test]
+    fn test_block_partial_eq_different_version() {
+        let mut block1 = Block::new(BlockId(1), "ls".to_string());
+        let mut block2 = Block::new(BlockId(1), "ls".to_string());
+        block1.state = BlockState::Success;
+        block2.state = BlockState::Success;
+        block1.version = 1;
+        block2.version = 2;
+        assert_ne!(block1, block2);
+    }
+
+    #[test]
+    fn test_block_partial_eq_different_collapsed() {
+        let mut block1 = Block::new(BlockId(1), "ls".to_string());
+        let mut block2 = Block::new(BlockId(1), "ls".to_string());
+        block1.state = BlockState::Success;
+        block2.state = BlockState::Success;
+        block1.collapsed = true;
+        block2.collapsed = false;
+        assert_ne!(block1, block2);
+    }
+}

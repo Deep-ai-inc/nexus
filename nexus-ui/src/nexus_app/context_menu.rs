@@ -127,3 +127,159 @@ pub fn render_context_menu(snapshot: &mut LayoutSnapshot, menu: &ContextMenuStat
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_context_menu_item_label_copy() {
+        assert_eq!(ContextMenuItem::Copy.label(), "Copy");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_paste() {
+        assert_eq!(ContextMenuItem::Paste.label(), "Paste");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_select_all() {
+        assert_eq!(ContextMenuItem::SelectAll.label(), "Select All");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_clear() {
+        assert_eq!(ContextMenuItem::Clear.label(), "Clear");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_copy_command() {
+        assert_eq!(ContextMenuItem::CopyCommand.label(), "Copy Command");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_copy_output() {
+        assert_eq!(ContextMenuItem::CopyOutput.label(), "Copy Output");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_copy_as_json() {
+        assert_eq!(ContextMenuItem::CopyAsJson.label(), "Copy as JSON");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_copy_as_tsv() {
+        assert_eq!(ContextMenuItem::CopyAsTsv.label(), "Copy as TSV");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_rerun() {
+        assert_eq!(ContextMenuItem::Rerun.label(), "Rerun");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_quick_look() {
+        let item = ContextMenuItem::QuickLook(PathBuf::from("/test"));
+        assert_eq!(item.label(), "Quick Look");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_open() {
+        let item = ContextMenuItem::Open(PathBuf::from("/test"));
+        assert_eq!(item.label(), "Open");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_copy_path() {
+        let item = ContextMenuItem::CopyPath(PathBuf::from("/test"));
+        assert_eq!(item.label(), "Copy Path");
+    }
+
+    #[test]
+    fn test_context_menu_item_label_reveal_in_finder() {
+        let item = ContextMenuItem::RevealInFinder(PathBuf::from("/test"));
+        assert_eq!(item.label(), "Reveal in Finder");
+    }
+
+    #[test]
+    fn test_context_menu_item_shortcut_copy() {
+        assert_eq!(ContextMenuItem::Copy.shortcut(), "\u{2318}C");
+    }
+
+    #[test]
+    fn test_context_menu_item_shortcut_paste() {
+        assert_eq!(ContextMenuItem::Paste.shortcut(), "\u{2318}V");
+    }
+
+    #[test]
+    fn test_context_menu_item_shortcut_select_all() {
+        assert_eq!(ContextMenuItem::SelectAll.shortcut(), "\u{2318}A");
+    }
+
+    #[test]
+    fn test_context_menu_item_shortcut_quick_look() {
+        let item = ContextMenuItem::QuickLook(PathBuf::from("/test"));
+        assert_eq!(item.shortcut(), "Space");
+    }
+
+    #[test]
+    fn test_context_menu_item_shortcut_other_items_empty() {
+        assert_eq!(ContextMenuItem::Clear.shortcut(), "");
+        assert_eq!(ContextMenuItem::CopyCommand.shortcut(), "");
+        assert_eq!(ContextMenuItem::CopyOutput.shortcut(), "");
+        assert_eq!(ContextMenuItem::Rerun.shortcut(), "");
+    }
+
+    #[test]
+    fn test_context_menu_item_clone() {
+        let item = ContextMenuItem::Copy;
+        let cloned = item.clone();
+        assert_eq!(cloned, ContextMenuItem::Copy);
+    }
+
+    #[test]
+    fn test_context_menu_item_partial_eq() {
+        assert_eq!(ContextMenuItem::Copy, ContextMenuItem::Copy);
+        assert_ne!(ContextMenuItem::Copy, ContextMenuItem::Paste);
+
+        let path1 = PathBuf::from("/test1");
+        let path2 = PathBuf::from("/test2");
+        assert_eq!(ContextMenuItem::Open(path1.clone()), ContextMenuItem::Open(path1.clone()));
+        assert_ne!(ContextMenuItem::Open(path1), ContextMenuItem::Open(path2));
+    }
+
+    #[test]
+    fn test_context_target_block() {
+        let target = ContextTarget::Block(BlockId(42));
+        if let ContextTarget::Block(id) = target {
+            assert_eq!(id.0, 42);
+        } else {
+            panic!("Expected ContextTarget::Block");
+        }
+    }
+
+    #[test]
+    fn test_context_target_agent_block() {
+        let target = ContextTarget::AgentBlock(BlockId(123));
+        if let ContextTarget::AgentBlock(id) = target {
+            assert_eq!(id.0, 123);
+        } else {
+            panic!("Expected ContextTarget::AgentBlock");
+        }
+    }
+
+    #[test]
+    fn test_context_target_input() {
+        let target = ContextTarget::Input;
+        assert!(matches!(target, ContextTarget::Input));
+    }
+
+    #[test]
+    fn test_context_target_clone() {
+        let target = ContextTarget::Block(BlockId(5));
+        let cloned = target.clone();
+        if let ContextTarget::Block(id) = cloned {
+            assert_eq!(id.0, 5);
+        }
+    }
+}
