@@ -81,11 +81,30 @@ fn build_command(node: &Node, source: &str) -> Result<Option<Command>, ShellErro
     match node.kind() {
         "command" => {
             let cmd = build_simple_command(node, source)?;
-            Ok(Some(Command::Simple(cmd)))
+            if cmd.name == "watch" {
+                match parse_watch_args(&cmd.args) {
+                    Some((interval_ms, source_cmd)) => {
+                        Ok(Some(Command::Watch(WatchStatement {
+                            interval_ms,
+                            pipeline: Pipeline {
+                                commands: vec![Command::Simple(source_cmd)],
+                                background: false,
+                            },
+                        })))
+                    }
+                    None => Err(ShellError::Parse("watch: missing command".into())),
+                }
+            } else {
+                Ok(Some(Command::Simple(cmd)))
+            }
         }
         "pipeline" => {
             let pipeline = build_pipeline(node, source)?;
-            Ok(Some(Command::Pipeline(pipeline)))
+            if let Some(watch) = try_extract_watch(&pipeline) {
+                Ok(Some(Command::Watch(watch)))
+            } else {
+                Ok(Some(Command::Pipeline(pipeline)))
+            }
         }
         "list" => {
             let list = build_list(node, source)?;
@@ -764,6 +783,127 @@ fn extract_variable_name(node: &Node, source: &str) -> String {
         .to_string()
 }
 
+/// If the first command in a pipeline is `watch`, extract a WatchStatement.
+fn try_extract_watch(pipeline: &Pipeline) -> Option<WatchStatement> {
+    let first = pipeline.commands.first()?;
+
+    match first {
+        // Case 1: build_command already converted the first node to Command::Watch
+        // (e.g., `watch ps | sort` → pipeline has [Watch(ps), Simple(sort)])
+        // Merge the remaining pipeline commands into the watch's inner pipeline.
+        Command::Watch(watch) => {
+            if pipeline.commands.len() == 1 {
+                return Some(watch.clone());
+            }
+            let mut commands = watch.pipeline.commands.clone();
+            commands.extend(pipeline.commands[1..].iter().cloned());
+            Some(WatchStatement {
+                interval_ms: watch.interval_ms,
+                pipeline: Pipeline {
+                    commands,
+                    background: pipeline.background,
+                },
+            })
+        }
+        // Case 2: first command is a Simple with name "watch"
+        // (fallback in case build_command didn't transform it)
+        Command::Simple(simple) if simple.name == "watch" => {
+            let (interval_ms, mut new_first) = parse_watch_args(&simple.args)?;
+            new_first.redirects.extend(simple.redirects.clone());
+
+            let mut commands = vec![Command::Simple(new_first)];
+            commands.extend(pipeline.commands[1..].iter().cloned());
+
+            Some(WatchStatement {
+                interval_ms,
+                pipeline: Pipeline {
+                    commands,
+                    background: pipeline.background,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse watch arguments: [-n interval] [--] command [args...]
+/// Returns (interval_ms, SimpleCommand) or None if no command found.
+fn parse_watch_args(args: &[Word]) -> Option<(u64, SimpleCommand)> {
+    let mut interval_ms: u64 = 2000;
+    let mut i = 0;
+    let mut flags_done = false;
+
+    while i < args.len() && !flags_done {
+        let s = match &args[i] {
+            Word::Literal(s) => s.as_str(),
+            _ => {
+                break; // Non-literal = start of command
+            }
+        };
+
+        if s == "--" {
+            i += 1;
+            flags_done = true;
+        } else if s == "-n" {
+            // -n <val>
+            if i + 1 < args.len() {
+                if let Word::Literal(val) = &args[i + 1] {
+                    interval_ms = parse_interval(val);
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if let Some(val) = s.strip_prefix("-n") {
+            // -n<val> (no space)
+            interval_ms = parse_interval(val);
+            i += 1;
+        } else if s.starts_with('-') {
+            // Unknown flag — skip
+            i += 1;
+        } else {
+            break; // First non-flag word = command name
+        }
+    }
+
+    if i >= args.len() {
+        return None; // No command name found
+    }
+
+    // First non-flag word is the command name
+    let cmd_name = match &args[i] {
+        Word::Literal(s) => s.clone(),
+        Word::Variable(v) => format!("${}", v),
+        Word::CommandSubstitution(c) => c.clone(),
+    };
+    i += 1;
+
+    // Rest are command args
+    let cmd_args = args[i..].to_vec();
+
+    Some((
+        interval_ms,
+        SimpleCommand {
+            name: cmd_name,
+            args: cmd_args,
+            redirects: Vec::new(),
+            env_assignments: Vec::new(),
+        },
+    ))
+}
+
+/// Parse an interval string: bare number = seconds, "Nms" = milliseconds, "Ns" = seconds.
+fn parse_interval(s: &str) -> u64 {
+    if let Some(ms) = s.strip_suffix("ms") {
+        ms.parse::<u64>().unwrap_or(2000)
+    } else if let Some(secs) = s.strip_suffix('s') {
+        secs.parse::<f64>().map(|v| (v * 1000.0) as u64).unwrap_or(2000)
+    } else {
+        // Bare number = seconds
+        s.parse::<f64>().map(|v| (v * 1000.0) as u64).unwrap_or(2000)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1131,124 @@ mod tests {
         } else {
             panic!("Expected Assignment");
         }
+    }
+
+    #[test]
+    fn test_watch_simple() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("watch ps").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Watch(watch) = &ast.commands[0] {
+            assert_eq!(watch.interval_ms, 2000); // default
+            assert_eq!(watch.pipeline.commands.len(), 1);
+            if let Command::Simple(cmd) = &watch.pipeline.commands[0] {
+                assert_eq!(cmd.name, "ps");
+            } else {
+                panic!("Expected simple command in watch pipeline");
+            }
+        } else {
+            panic!("Expected Watch command, got {:?}", ast.commands[0]);
+        }
+    }
+
+    #[test]
+    fn test_watch_with_interval() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("watch -n 1 ps").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Watch(watch) = &ast.commands[0] {
+            assert_eq!(watch.interval_ms, 1000);
+            if let Command::Simple(cmd) = &watch.pipeline.commands[0] {
+                assert_eq!(cmd.name, "ps");
+            } else {
+                panic!("Expected simple command");
+            }
+        } else {
+            panic!("Expected Watch command");
+        }
+    }
+
+    #[test]
+    fn test_watch_with_ms_interval() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("watch -n 500ms df").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Watch(watch) = &ast.commands[0] {
+            assert_eq!(watch.interval_ms, 500);
+            if let Command::Simple(cmd) = &watch.pipeline.commands[0] {
+                assert_eq!(cmd.name, "df");
+            } else {
+                panic!("Expected simple command");
+            }
+        } else {
+            panic!("Expected Watch command");
+        }
+    }
+
+    #[test]
+    fn test_watch_with_double_dash() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("watch -n 1 -- ls -la").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Watch(watch) = &ast.commands[0] {
+            assert_eq!(watch.interval_ms, 1000);
+            if let Command::Simple(cmd) = &watch.pipeline.commands[0] {
+                assert_eq!(cmd.name, "ls");
+                assert_eq!(cmd.args.len(), 1);
+                assert_eq!(cmd.args[0].as_literal(), Some("-la"));
+            } else {
+                panic!("Expected simple command");
+            }
+        } else {
+            panic!("Expected Watch command");
+        }
+    }
+
+    #[test]
+    fn test_watch_pipeline() {
+        let mut parser = Parser::new().unwrap();
+        let ast = parser.parse("watch ps | sort --by cpu | head 5").unwrap();
+
+        assert_eq!(ast.commands.len(), 1);
+        if let Command::Watch(watch) = &ast.commands[0] {
+            assert_eq!(watch.interval_ms, 2000);
+            assert_eq!(watch.pipeline.commands.len(), 3);
+            if let Command::Simple(cmd) = &watch.pipeline.commands[0] {
+                assert_eq!(cmd.name, "ps");
+            } else {
+                panic!("Expected simple command for ps");
+            }
+            if let Command::Simple(cmd) = &watch.pipeline.commands[1] {
+                assert_eq!(cmd.name, "sort");
+            } else {
+                panic!("Expected simple command for sort");
+            }
+            if let Command::Simple(cmd) = &watch.pipeline.commands[2] {
+                assert_eq!(cmd.name, "head");
+            } else {
+                panic!("Expected simple command for head");
+            }
+        } else {
+            panic!("Expected Watch command");
+        }
+    }
+
+    #[test]
+    fn test_watch_no_command_error() {
+        let mut parser = Parser::new().unwrap();
+        let result = parser.parse("watch");
+        assert!(result.is_err(), "watch with no args should fail");
+    }
+
+    #[test]
+    fn test_watch_only_flags_error() {
+        let mut parser = Parser::new().unwrap();
+        let result = parser.parse("watch -n 1");
+        assert!(result.is_err(), "watch -n 1 with no command should fail");
     }
 
 }

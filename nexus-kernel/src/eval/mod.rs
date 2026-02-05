@@ -103,6 +103,7 @@ fn execute_command(
         Command::For(for_stmt) => execute_for(state, for_stmt, events, commands, block_id),
         Command::Function(func_def) => execute_function_def(state, func_def),
         Command::Case(case_stmt) => execute_case(state, case_stmt, events, commands, block_id),
+        Command::Watch(watch) => execute_watch(state, watch, events, commands, block_id),
     }
 }
 
@@ -978,6 +979,202 @@ fn execute_case(
     }
 
     Ok(last_exit)
+}
+
+/// Execute a watch statement: re-run a pipeline on an interval.
+fn execute_watch(
+    state: &mut ShellState,
+    watch: &WatchStatement,
+    events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
+    external_block_id: Option<BlockId>,
+) -> anyhow::Result<i32> {
+    use crate::commands::{register_cancel, unregister_cancel};
+    use std::sync::atomic::Ordering;
+
+    let block_id = get_or_create_block_id(external_block_id);
+
+    // Build display string
+    let cmd_str = format!(
+        "watch -n {} {}",
+        if watch.interval_ms % 1000 == 0 {
+            format!("{}", watch.interval_ms / 1000)
+        } else {
+            format!("{}ms", watch.interval_ms)
+        },
+        pipeline_display_string(&watch.pipeline)
+    );
+
+    if external_block_id.is_none() {
+        let _ = events.send(ShellEvent::CommandStarted {
+            block_id,
+            command: cmd_str,
+            cwd: state.cwd.clone(),
+        });
+    }
+
+    // Register cancel token
+    let cancel = register_cancel(block_id);
+
+    // Execute pipeline once for initial render
+    match execute_pipeline_for_value(state, &watch.pipeline, events, commands, block_id) {
+        Ok(Some(value)) => {
+            state.store_output(block_id, "watch".into(), value.clone());
+            let _ = events.send(ShellEvent::CommandOutput {
+                block_id,
+                value,
+            });
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let _ = events.send(ShellEvent::StderrChunk {
+                block_id,
+                data: format!("watch: {}\n", e).into_bytes(),
+            });
+        }
+    }
+
+    // Refresh loop (fixed-delay)
+    let mut seq: u64 = 0;
+    while !cancel.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(watch.interval_ms));
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        match execute_pipeline_for_value(state, &watch.pipeline, events, commands, block_id) {
+            Ok(Some(value)) => {
+                seq += 1;
+                let _ = events.send(ShellEvent::StreamingUpdate {
+                    block_id,
+                    seq,
+                    update: value,
+                    coalesce: true,
+                });
+            }
+            Ok(None) => {
+                // No output this tick, skip
+            }
+            Err(e) => {
+                let _ = events.send(ShellEvent::StderrChunk {
+                    block_id,
+                    data: format!("watch: {}\n", e).into_bytes(),
+                });
+                // Continue to next tick
+            }
+        }
+    }
+
+    unregister_cancel(block_id);
+    let _ = events.send(ShellEvent::CommandFinished {
+        block_id,
+        exit_code: 0,
+        duration_ms: 0,
+    });
+
+    Ok(0)
+}
+
+/// Execute a pipeline and return the final Value (if any).
+/// Used by watch to capture output without emitting CommandStarted/Finished.
+fn execute_pipeline_for_value(
+    state: &mut ShellState,
+    pipeline: &Pipeline,
+    events: &Sender<ShellEvent>,
+    commands: &CommandRegistry,
+    block_id: BlockId,
+) -> anyhow::Result<Option<Value>> {
+    let mut current_value: Option<Value> = None;
+
+    for cmd in &pipeline.commands {
+        let Command::Simple(simple) = cmd else {
+            continue;
+        };
+
+        let name = expand::expand_word_to_string(&Word::Literal(simple.name.clone()), state);
+        let args: Vec<String> = simple
+            .args
+            .iter()
+            .flat_map(|w| expand::expand_word_to_strings(w, state))
+            .collect();
+
+        // Check for builtins that return structured output
+        if let Some(value) = builtins::try_builtin_value(&name, &args, state) {
+            current_value = if matches!(value, Value::Unit) {
+                None
+            } else {
+                Some(value)
+            };
+            continue;
+        }
+
+        if let Some(native_cmd) = commands.get(&name) {
+            // Native command
+            let mut ctx = CommandContext {
+                state,
+                events,
+                block_id,
+                stdin: current_value.take(),
+            };
+
+            match native_cmd.execute(&args, &mut ctx) {
+                Ok(value) => {
+                    current_value = if matches!(value, Value::Unit) {
+                        None
+                    } else {
+                        Some(value)
+                    };
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        } else {
+            // External command: spawn process, capture stdout as String
+            let input_text = current_value.take().map(|v| v.to_text());
+            let output = process::spawn_capture_stdout(
+                &name,
+                &args,
+                input_text,
+                state,
+            );
+            match output {
+                Ok(text) => {
+                    current_value = if text.is_empty() {
+                        None
+                    } else {
+                        Some(Value::String(text))
+                    };
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok(current_value)
+}
+
+/// Build a display string for a pipeline.
+fn pipeline_display_string(pipeline: &Pipeline) -> String {
+    pipeline
+        .commands
+        .iter()
+        .filter_map(|cmd| {
+            if let Command::Simple(s) = cmd {
+                let args_str = s.args.iter().filter_map(|w| w.as_literal()).collect::<Vec<_>>().join(" ");
+                if args_str.is_empty() {
+                    Some(s.name.clone())
+                } else {
+                    Some(format!("{} {}", s.name, args_str))
+                }
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Check if a word matches a shell pattern (glob-style).

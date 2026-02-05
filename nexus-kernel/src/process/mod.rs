@@ -528,3 +528,43 @@ pub fn spawn_with_stdin(
 
     Ok(exit_code)
 }
+
+/// Spawn an external command and capture its stdout as a String.
+/// Used by `watch` to get output without emitting streaming events.
+pub fn spawn_capture_stdout(
+    name: &str,
+    args: &[String],
+    stdin_text: Option<String>,
+    state: &ShellState,
+) -> anyhow::Result<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(name);
+    cmd.args(args)
+        .current_dir(&state.cwd)
+        .stdin(if stdin_text.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for (key, value) in &state.env {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd.spawn()?;
+
+    if let Some(text) = stdin_text {
+        if let Some(mut stdin) = child.stdin.take() {
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(text.as_bytes());
+            });
+        }
+    }
+
+    let output = child.wait_with_output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}

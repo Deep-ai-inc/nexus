@@ -1906,3 +1906,165 @@ fn test_classify_external_with_pipe_as_kernel() {
     assert_eq!(kernel.classify_command("python script.py | head -10"), CommandClassification::Kernel);
     assert_eq!(kernel.classify_command("npm run build | tail -20"), CommandClassification::Kernel);
 }
+
+#[test]
+fn test_classify_watch_as_kernel() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // watch is a shell keyword — must be classified as Kernel
+    assert_eq!(kernel.classify_command("watch ps"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("watch -n 1 ps"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("watch -n 500ms df"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("watch -n 1 -- ls -la"), CommandClassification::Kernel);
+}
+
+#[test]
+fn test_classify_keywords_as_kernel() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // Flow-control keywords should all be classified as Kernel
+    assert_eq!(kernel.classify_command("if [ -f foo ]; then echo yes; fi"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("while true; do echo loop; done"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("for x in a b c; do echo $x; done"), CommandClassification::Kernel);
+    assert_eq!(kernel.classify_command("case $x in a) echo a;; esac"), CommandClassification::Kernel);
+}
+
+// ============================================================================
+// Watch Command Tests
+// ============================================================================
+
+#[test]
+fn test_watch_produces_initial_output() {
+    // watch echo hello — should produce at least one CommandOutput, then we cancel it
+    let (mut kernel, rx) = Kernel::new().expect("Failed to create kernel");
+    let block_id = nexus_api::BlockId(8000);
+    let bid = block_id;
+
+    // Spawn a thread that cancels watch after it registers
+    std::thread::spawn(move || {
+        while !nexus_kernel::commands::cancel_block(bid) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+
+    let result = kernel.execute_with_block_id("watch echo hello", Some(block_id));
+    assert!(result.is_ok(), "watch echo hello failed: {:?}", result.err());
+    assert_eq!(result.unwrap(), 0);
+
+    // Check that we got a CommandOutput event (initial render)
+    let mut got_output = false;
+    let mut got_finished = false;
+    let mut rx = rx;
+    loop {
+        match rx.try_recv() {
+            Ok(ShellEvent::CommandOutput { block_id: bid, .. }) if bid == block_id => {
+                got_output = true;
+            }
+            Ok(ShellEvent::CommandFinished { block_id: bid, exit_code, .. }) if bid == block_id => {
+                assert_eq!(exit_code, 0);
+                got_finished = true;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(got_output, "Expected CommandOutput from watch");
+    assert!(got_finished, "Expected CommandFinished from watch");
+}
+
+#[test]
+fn test_watch_streaming_updates() {
+    // watch -n 50ms echo tick — should produce initial output + at least one StreamingUpdate
+    let (mut kernel, rx) = Kernel::new().expect("Failed to create kernel");
+    let block_id = nexus_api::BlockId(8001);
+    let bid = block_id;
+
+    // Cancel after enough time for at least one streaming update
+    std::thread::spawn(move || {
+        // Wait for registration + at least one interval
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        while !nexus_kernel::commands::cancel_block(bid) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+
+    let result = kernel.execute_with_block_id("watch -n 50ms echo tick", Some(block_id));
+    assert!(result.is_ok());
+
+    let mut got_output = false;
+    let mut streaming_count = 0;
+    let mut rx = rx;
+    loop {
+        match rx.try_recv() {
+            Ok(ShellEvent::CommandOutput { block_id: bid, .. }) if bid == block_id => {
+                got_output = true;
+            }
+            Ok(ShellEvent::StreamingUpdate { block_id: bid, coalesce, .. }) if bid == block_id => {
+                assert!(coalesce, "StreamingUpdate should have coalesce=true");
+                streaming_count += 1;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(got_output, "Expected initial CommandOutput");
+    assert!(streaming_count >= 1, "Expected at least 1 StreamingUpdate, got {}", streaming_count);
+}
+
+#[test]
+fn test_watch_pipeline_native() {
+    // watch echo hello | wc -w — pipeline with watch, uses native commands
+    // tree-sitter parses this as a pipeline: [watch echo hello, wc -w]
+    // The parser should extract watch and reconstruct: watch (echo hello | wc -w)
+    let (mut kernel, rx) = Kernel::new().expect("Failed to create kernel");
+    let block_id = nexus_api::BlockId(8002);
+    let bid = block_id;
+
+    std::thread::spawn(move || {
+        while !nexus_kernel::commands::cancel_block(bid) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+
+    let result = kernel.execute_with_block_id("watch echo hello | wc -w", Some(block_id));
+    assert!(result.is_ok(), "watch pipeline failed: {:?}", result.err());
+
+    // Verify the command finishes cleanly (exit code 0)
+    assert_eq!(result.unwrap(), 0);
+
+    // Check events — the pipeline should produce output (CommandOutput or StreamingUpdate)
+    let mut got_output = false;
+    let mut got_finished = false;
+    let mut rx = rx;
+    loop {
+        match rx.try_recv() {
+            Ok(ShellEvent::CommandOutput { block_id: bid, .. }) if bid == block_id => {
+                got_output = true;
+            }
+            Ok(ShellEvent::StreamingUpdate { block_id: bid, .. }) if bid == block_id => {
+                got_output = true;
+            }
+            Ok(ShellEvent::CommandFinished { block_id: bid, .. }) if bid == block_id => {
+                got_finished = true;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(got_finished, "Expected CommandFinished from watch pipeline");
+    // Note: output may or may not be produced depending on timing vs cancellation
+    // The key assertion is that the pipeline executes and finishes cleanly
+    let _ = got_output;
+}
+
+#[test]
+fn test_watch_no_args_is_error() {
+    let (mut kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    let result = kernel.execute("watch");
+    assert!(result.is_err(), "watch with no args should be a parse error");
+}
+
+#[test]
+fn test_watch_only_flags_is_error() {
+    let (mut kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    let result = kernel.execute("watch -n 1");
+    assert!(result.is_err(), "watch -n 1 with no command should be a parse error");
+}

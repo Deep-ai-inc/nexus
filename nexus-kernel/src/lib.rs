@@ -26,6 +26,15 @@ pub use parser::Parser;
 pub use persistence::{HistoryEntry, Store};
 pub use state::{ShellState, TrapAction};
 
+/// Check if a word is a shell keyword that tree-sitter parses as a statement
+/// (flow-control and pipeline modifiers handled by the kernel's parser/evaluator).
+fn is_shell_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "if" | "while" | "until" | "for" | "case" | "function" | "watch"
+    )
+}
+
 /// Classification of how a command should be executed.
 ///
 /// The UI uses this to decide whether to route through the kernel
@@ -109,8 +118,9 @@ impl Kernel {
         let first_word = command.split_whitespace().next().unwrap_or("");
         let is_native = self.commands.contains(first_word);
         let is_shell_builtin = is_builtin(first_word);
+        let is_keyword = is_shell_keyword(first_word);
 
-        if has_pipe || is_native || is_shell_builtin {
+        if has_pipe || is_native || is_shell_builtin || is_keyword {
             CommandClassification::Kernel
         } else {
             CommandClassification::Pty

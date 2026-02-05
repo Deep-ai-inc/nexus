@@ -19,6 +19,7 @@ pub enum Command {
     For(ForStatement),
     Function(FunctionDef),
     Case(CaseStatement),
+    Watch(WatchStatement),
 }
 
 /// A simple command: name, arguments, redirections.
@@ -143,4 +144,11 @@ pub struct CaseStatement {
 pub struct CaseItem {
     pub patterns: Vec<String>,
     pub commands: Vec<Command>,
+}
+
+/// A watch statement: watch [-n interval] pipeline
+#[derive(Debug, Clone)]
+pub struct WatchStatement {
+    pub interval_ms: u64,
+    pub pipeline: Pipeline,
 }
