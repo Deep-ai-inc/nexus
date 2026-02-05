@@ -348,14 +348,16 @@ impl Widget for AgentBlockWidget<'_> {
             .corner_radius(4.0)
             .width(Length::Fill);
 
-        // Query line (Claude Code style: > prefix)
+        // Query line (Claude Code style: > prefix with subtle badge)
         let query_source = source_ids::agent_query(block.id);
-        content = content.push(
-            Row::new()
-                .spacing(6.0)
-                .push(TextElement::new(">").color(colors::TEXT_MUTED).source(query_source))
-                .push(TextElement::new(&block.query).color(colors::TEXT_PRIMARY).source(query_source)),
-        );
+        let query_badge = Row::new()
+            .padding_custom(Padding::new(2.0, 8.0, 2.0, 8.0))
+            .background(Color::rgba(1.0, 1.0, 1.0, 0.06))
+            .corner_radius(4.0)
+            .spacing(6.0)
+            .push(TextElement::new(">").color(colors::TEXT_MUTED).source(query_source))
+            .push(TextElement::new(&block.query).color(colors::TEXT_PRIMARY).source(query_source));
+        content = content.push(query_badge);
 
         // Thinking section
         if !block.thinking.is_empty() {
@@ -410,10 +412,16 @@ impl Widget for AgentBlockWidget<'_> {
             content = content.push(build_question_dialog(question, block.id, self.question_input, q_source));
         }
 
-        // Response text
+        // Response text (Claude Code style: bullet prefix)
         if !block.response.is_empty() {
             let response_source = source_ids::agent_response(block.id);
-            content = content.push(build_response_text(&block.response, response_source));
+            content = content.push(
+                Row::new()
+                    .spacing(6.0)
+                    .cross_align(CrossAxisAlignment::Start)
+                    .push(TextElement::new("\u{25CF}").color(colors::TEXT_MUTED)) // ●
+                    .push(build_response_text(&block.response, response_source)),
+            );
         }
 
         // Status footer
@@ -885,8 +893,48 @@ fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId, source_id: Sour
     let mut col = Column::new().spacing(2.0);
     col = col.push(header);
 
-    // Collapsed: show "... +N lines (click to expand)" style summary
+    // Collapsed: show first few lines with tree chars, then "… +N lines" summary
     if tool.collapsed {
+        col = col.push(build_collapsed_preview(tool, source_id));
+    } else {
+        col = col.push(build_tool_body(tool, source_id));
+    }
+
+    col
+}
+
+/// Build a collapsed preview showing first few lines + summary.
+fn build_collapsed_preview(tool: &ToolInvocation, source_id: SourceId) -> Column {
+    let mut col = Column::new().spacing(1.0);
+
+    let output = tool.output.as_deref().unwrap_or("");
+    let lines: Vec<&str> = output.lines().collect();
+    let preview_count = 2; // Show first 2 lines
+
+    // Show first few lines with tree character prefix
+    for (i, line) in lines.iter().take(preview_count).enumerate() {
+        let is_last = i == preview_count - 1 && lines.len() <= preview_count;
+        let prefix = if is_last { "└" } else { "├" };
+        col = col.push(
+            Row::new()
+                .fixed_spacer(16.0)
+                .spacing(4.0)
+                .push(TextElement::new(prefix).color(colors::TEXT_MUTED))
+                .push(TextElement::new(truncate_str(line, 80)).color(colors::TOOL_OUTPUT).source(source_id)),
+        );
+    }
+
+    // Show remaining lines summary with expand hint
+    let remaining = lines.len().saturating_sub(preview_count);
+    if remaining > 0 {
+        col = col.push(
+            Row::new()
+                .fixed_spacer(16.0)
+                .spacing(4.0)
+                .push(TextElement::new(format!("… +{} lines (ctrl+o to expand)", remaining)).color(colors::TEXT_MUTED).source(source_id)),
+        );
+    } else if lines.is_empty() {
+        // No output - show summary from tool_collapsed_summary
         if let Some(summary) = tool_collapsed_summary(tool) {
             col = col.push(
                 Row::new()
@@ -895,8 +943,6 @@ fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId, source_id: Sour
                     .push(TextElement::new(format!("… {}", summary)).color(colors::TEXT_MUTED).source(source_id)),
             );
         }
-    } else {
-        col = col.push(build_tool_body(tool, source_id));
     }
 
     col
