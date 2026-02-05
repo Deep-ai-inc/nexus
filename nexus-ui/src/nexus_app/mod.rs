@@ -23,6 +23,8 @@ pub(crate) mod file_drop;
 mod state_policy;
 mod state_update;
 mod state_view;
+#[cfg(test)]
+mod tests;
 
 pub use message::{NexusMessage, InputMsg, ShellMsg, AgentMsg, SelectionMsg, ContextMenuMsg, DragMsg};
 use context_menu::render_context_menu;
