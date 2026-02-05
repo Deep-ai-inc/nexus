@@ -348,13 +348,13 @@ impl Widget for AgentBlockWidget<'_> {
             .corner_radius(4.0)
             .width(Length::Fill);
 
-        // Query line
+        // Query line (Claude Code style: > prefix)
         let query_source = source_ids::agent_query(block.id);
         content = content.push(
             Row::new()
-                .spacing(4.0)
-                .push(TextElement::new("? ").color(colors::TEXT_PURPLE).source(query_source))
-                .push(TextElement::new(&block.query).color(colors::TEXT_QUERY).source(query_source)),
+                .spacing(6.0)
+                .push(TextElement::new(">").color(colors::TEXT_MUTED).source(query_source))
+                .push(TextElement::new(&block.query).color(colors::TEXT_PRIMARY).source(query_source)),
         );
 
         // Thinking section
@@ -553,55 +553,52 @@ fn tool_header_label(tool: &ToolInvocation) -> String {
     }
 }
 
-/// Generate a smart summary for collapsed tool output.
+/// Generate a smart summary for collapsed tool output (Claude Code style: +N lines).
 fn tool_collapsed_summary(tool: &ToolInvocation) -> Option<String> {
     let output = tool.output.as_deref()?;
 
     match tool.name.as_str() {
         "Read" => {
             let lines = output.lines().count();
-            Some(format!("Read {} lines", lines))
+            Some(format!("+{} lines", lines))
         }
-        "Edit" => Some("Applied edits".to_string()),
+        "Edit" => Some("applied".to_string()),
         "Write" => {
             let lines = tool.parameters.get("content")
                 .map(|c| c.lines().count())
                 .unwrap_or(0);
-            Some(format!("Wrote {} lines", lines))
+            Some(format!("+{} lines", lines))
         }
         "Bash" => {
             let lines = output.lines().count();
             if lines == 0 {
                 Some("(no output)".to_string())
             } else if lines == 1 {
-                Some(truncate_str(output.trim(), 80))
+                Some(truncate_str(output.trim(), 60))
             } else {
-                Some(format!("{} lines", lines))
+                Some(format!("+{} lines", lines))
             }
         }
         "Grep" => {
             let lines = output.lines().count();
-            Some(format!("Found {} results", lines))
+            Some(format!("+{} results", lines))
         }
         "Glob" => {
             let files = output.lines().count();
-            Some(format!("Found {} files", files))
+            Some(format!("+{} files", files))
         }
         "Task" => {
-            let desc = tool.parameters.get("description")
-                .map(|d| truncate_str(d, 40))
-                .unwrap_or_else(|| "Done".to_string());
             let chars = output.len();
             if chars >= 1000 {
-                Some(format!("{} ({:.1}k chars)", desc, chars as f64 / 1000.0))
+                Some(format!("+{:.1}k chars", chars as f64 / 1000.0))
             } else {
-                Some(format!("{} ({} chars)", desc, chars))
+                Some(format!("+{} chars", chars))
             }
         }
         _ => {
             let lines = output.lines().count();
             if lines > 0 {
-                Some(format!("{} lines", lines))
+                Some(format!("+{} lines", lines))
             } else {
                 None
             }
@@ -862,23 +859,22 @@ fn build_generic_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column
     col
 }
 
-/// Build a tool invocation widget.
+/// Build a tool invocation widget (Claude Code style).
 fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId, source_id: SourceId) -> Column {
     let (status_icon, status_color) = match tool.status {
         ToolStatus::Pending => ("\u{25CF}", colors::TOOL_PENDING),   // ●
         ToolStatus::Running => ("\u{25CF}", colors::RUNNING),        // ●
-        ToolStatus::Success => ("\u{25CF}", colors::TOOL_ACTION),    // ●
+        ToolStatus::Success => ("\u{25CF}", colors::SUCCESS),        // ● green
         ToolStatus::Error   => ("\u{25CF}", colors::ERROR),          // ●
     };
 
-    let collapse_icon = if tool.collapsed { "\u{25B6} " } else { "\u{25BC} " };
     let header_label = tool_header_label(tool);
 
+    // Header: just status dot + tool name (clickable to toggle)
     let mut header = Row::new()
         .id(toggle_id)
         .spacing(4.0)
         .cross_align(CrossAxisAlignment::Center)
-        .push(TextElement::new(collapse_icon).color(colors::TEXT_MUTED))
         .push(TextElement::new(status_icon).color(status_color))
         .push(TextElement::new(&header_label).color(colors::TOOL_ACTION).source(source_id));
 
@@ -889,20 +885,17 @@ fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId, source_id: Sour
     let mut col = Column::new().spacing(2.0);
     col = col.push(header);
 
-    // Collapsed summary line
+    // Collapsed: show "... +N lines (click to expand)" style summary
     if tool.collapsed {
         if let Some(summary) = tool_collapsed_summary(tool) {
             col = col.push(
                 Row::new()
-                    .fixed_spacer(20.0)
+                    .fixed_spacer(16.0)
                     .spacing(4.0)
-                    .push(TextElement::new("\u{2514}").color(colors::TOOL_RESULT))
-                    .push(TextElement::new(&summary).color(colors::TOOL_SUMMARY).source(source_id)),
+                    .push(TextElement::new(format!("… {}", summary)).color(colors::TEXT_MUTED).source(source_id)),
             );
         }
-    }
-
-    if !tool.collapsed {
+    } else {
         col = col.push(build_tool_body(tool, source_id));
     }
 
@@ -2695,19 +2688,19 @@ mod tests {
     #[test]
     fn test_tool_collapsed_summary_read() {
         let tool = make_tool_with_output("Read", &[], "line1\nline2\nline3");
-        assert_eq!(tool_collapsed_summary(&tool), Some("Read 3 lines".to_string()));
+        assert_eq!(tool_collapsed_summary(&tool), Some("+3 lines".to_string()));
     }
 
     #[test]
     fn test_tool_collapsed_summary_edit() {
         let tool = make_tool_with_output("Edit", &[], "anything");
-        assert_eq!(tool_collapsed_summary(&tool), Some("Applied edits".to_string()));
+        assert_eq!(tool_collapsed_summary(&tool), Some("applied".to_string()));
     }
 
     #[test]
     fn test_tool_collapsed_summary_write() {
         let tool = make_tool_with_output("Write", &[("content", "a\nb\nc\nd")], "success");
-        assert_eq!(tool_collapsed_summary(&tool), Some("Wrote 4 lines".to_string()));
+        assert_eq!(tool_collapsed_summary(&tool), Some("+4 lines".to_string()));
     }
 
     #[test]

@@ -152,3 +152,162 @@ pub struct WatchStatement {
     pub interval_ms: u64,
     pub pipeline: Pipeline,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // Word tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_word_as_literal_with_literal() {
+        let word = Word::Literal("hello".to_string());
+        assert_eq!(word.as_literal(), Some("hello"));
+    }
+
+    #[test]
+    fn test_word_as_literal_with_variable() {
+        let word = Word::Variable("HOME".to_string());
+        assert_eq!(word.as_literal(), None);
+    }
+
+    #[test]
+    fn test_word_as_literal_with_command_substitution() {
+        let word = Word::CommandSubstitution("echo hello".to_string());
+        assert_eq!(word.as_literal(), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // ListOperator tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_list_operator_equality() {
+        assert_eq!(ListOperator::And, ListOperator::And);
+        assert_eq!(ListOperator::Or, ListOperator::Or);
+        assert_eq!(ListOperator::Semi, ListOperator::Semi);
+        assert_eq!(ListOperator::Background, ListOperator::Background);
+        assert_ne!(ListOperator::And, ListOperator::Or);
+    }
+
+    // -------------------------------------------------------------------------
+    // RedirectOp tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_redirect_op_equality() {
+        assert_eq!(RedirectOp::Write, RedirectOp::Write);
+        assert_eq!(RedirectOp::Append, RedirectOp::Append);
+        assert_eq!(RedirectOp::Read, RedirectOp::Read);
+        assert_ne!(RedirectOp::Write, RedirectOp::Append);
+    }
+
+    // -------------------------------------------------------------------------
+    // Debug trait tests (ensure Clone/Debug derive works)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_simple_command_debug() {
+        let cmd = SimpleCommand {
+            name: "ls".to_string(),
+            args: vec![Word::Literal("-la".to_string())],
+            redirects: vec![],
+            env_assignments: vec![],
+        };
+        let debug_str = format!("{:?}", cmd);
+        assert!(debug_str.contains("ls"));
+    }
+
+    #[test]
+    fn test_pipeline_debug() {
+        let pipeline = Pipeline {
+            commands: vec![],
+            background: false,
+        };
+        let debug_str = format!("{:?}", pipeline);
+        assert!(debug_str.contains("background"));
+    }
+
+    #[test]
+    fn test_redirect_debug() {
+        let redirect = Redirect {
+            fd: 1,
+            op: RedirectOp::Write,
+            target: "output.txt".to_string(),
+        };
+        let debug_str = format!("{:?}", redirect);
+        assert!(debug_str.contains("output.txt"));
+    }
+
+    #[test]
+    fn test_assignment_debug() {
+        let assignment = Assignment {
+            name: "PATH".to_string(),
+            value: Word::Literal("/usr/bin".to_string()),
+        };
+        let debug_str = format!("{:?}", assignment);
+        assert!(debug_str.contains("PATH"));
+    }
+
+    #[test]
+    fn test_for_statement_debug() {
+        let for_stmt = ForStatement {
+            variable: "i".to_string(),
+            items: vec![Word::Literal("1".to_string())],
+            body: vec![],
+        };
+        let debug_str = format!("{:?}", for_stmt);
+        assert!(debug_str.contains("variable"));
+    }
+
+    #[test]
+    fn test_case_statement_debug() {
+        let case_stmt = CaseStatement {
+            word: Word::Variable("x".to_string()),
+            cases: vec![CaseItem {
+                patterns: vec!["*.txt".to_string()],
+                commands: vec![],
+            }],
+        };
+        let debug_str = format!("{:?}", case_stmt);
+        assert!(debug_str.contains("patterns"));
+    }
+
+    #[test]
+    fn test_watch_statement_debug() {
+        let watch = WatchStatement {
+            interval_ms: 2000,
+            pipeline: Pipeline {
+                commands: vec![],
+                background: false,
+            },
+        };
+        let debug_str = format!("{:?}", watch);
+        assert!(debug_str.contains("interval_ms"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Clone trait tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_word_clone() {
+        let word = Word::Literal("hello".to_string());
+        let cloned = word.clone();
+        assert_eq!(word.as_literal(), cloned.as_literal());
+    }
+
+    #[test]
+    fn test_simple_command_clone() {
+        let cmd = SimpleCommand {
+            name: "echo".to_string(),
+            args: vec![Word::Literal("hello".to_string())],
+            redirects: vec![],
+            env_assignments: vec![],
+        };
+        let cloned = cmd.clone();
+        assert_eq!(cmd.name, cloned.name);
+    }
+}

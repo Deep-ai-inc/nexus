@@ -88,3 +88,125 @@ impl ScrollModel {
         self.state.sync_from_snapshot(snapshot);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scroll_model_new() {
+        let model = ScrollModel::new();
+        assert_eq!(model.state.offset, 0.0);
+        assert_eq!(model.target, ScrollTarget::Bottom);
+        assert!(model.pending_offset.get().is_none());
+    }
+
+    #[test]
+    fn test_hint_bottom_when_at_bottom() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::Bottom;
+        assert!(model.hint_bottom());
+    }
+
+    #[test]
+    fn test_hint_bottom_when_not_at_bottom() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::None;
+        assert!(!model.hint_bottom());
+    }
+
+    #[test]
+    fn test_hint_bottom_when_at_block() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::Block(BlockId(42));
+        assert!(!model.hint_bottom());
+    }
+
+    #[test]
+    fn test_snap_to_bottom() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::None;
+        model.snap_to_bottom();
+        assert_eq!(model.target, ScrollTarget::Bottom);
+    }
+
+    #[test]
+    fn test_scroll_to_block() {
+        let mut model = ScrollModel::new();
+        let block_id = BlockId(123);
+        model.scroll_to_block(block_id);
+        assert_eq!(model.target, ScrollTarget::Block(block_id));
+    }
+
+    #[test]
+    fn test_reset() {
+        let mut model = ScrollModel::new();
+        model.state.offset = 500.0;
+        model.target = ScrollTarget::None;
+        model.reset();
+        assert_eq!(model.state.offset, 0.0);
+        assert_eq!(model.target, ScrollTarget::Bottom);
+    }
+
+    #[test]
+    fn test_apply_user_scroll_breaks_bottom_lock() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::Bottom;
+        model.state.max.set(1000.0);
+
+        model.apply_user_scroll(ScrollAction::ScrollBy(100.0));
+
+        // Should break the bottom lock
+        assert_eq!(model.target, ScrollTarget::None);
+    }
+
+    #[test]
+    fn test_apply_user_scroll_when_not_at_bottom() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::None;
+        model.state.offset = 500.0;
+        model.state.max.set(1000.0);
+
+        model.apply_user_scroll(ScrollAction::ScrollBy(-100.0));
+
+        // Target should remain None
+        assert_eq!(model.target, ScrollTarget::None);
+        // Offset should change
+        assert_eq!(model.state.offset, 600.0);
+    }
+
+    #[test]
+    fn test_apply_pending_with_pending_offset() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::Block(BlockId(1));
+        model.pending_offset.set(Some(300.0));
+
+        model.apply_pending();
+
+        assert_eq!(model.state.offset, 300.0);
+        assert_eq!(model.target, ScrollTarget::None);
+        assert!(model.pending_offset.get().is_none());
+    }
+
+    #[test]
+    fn test_apply_pending_without_pending_offset() {
+        let mut model = ScrollModel::new();
+        model.state.offset = 100.0;
+        model.target = ScrollTarget::Bottom;
+
+        model.apply_pending();
+
+        // Nothing should change
+        assert_eq!(model.state.offset, 100.0);
+        assert_eq!(model.target, ScrollTarget::Bottom);
+    }
+
+    #[test]
+    fn test_scroll_target_equality() {
+        assert_eq!(ScrollTarget::Bottom, ScrollTarget::Bottom);
+        assert_eq!(ScrollTarget::None, ScrollTarget::None);
+        assert_eq!(ScrollTarget::Block(BlockId(1)), ScrollTarget::Block(BlockId(1)));
+        assert_ne!(ScrollTarget::Bottom, ScrollTarget::None);
+        assert_ne!(ScrollTarget::Block(BlockId(1)), ScrollTarget::Block(BlockId(2)));
+    }
+}
