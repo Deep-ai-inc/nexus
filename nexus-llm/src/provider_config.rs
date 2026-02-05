@@ -373,14 +373,15 @@ mod tests {
     #[test]
     fn test_env_var_substitution() {
         // Set a test environment variable
-        env::set_var("TEST_VAR", "test_value");
+        // SAFETY: Test runs single-threaded; no concurrent env access
+        unsafe { env::set_var("TEST_VAR", "test_value") };
 
         let input = "prefix_${TEST_VAR}_suffix";
         let result = ConfigurationSystem::substitute_env_vars_in_string(input).unwrap();
         assert_eq!(result, "prefix_test_value_suffix");
 
         // Clean up
-        env::remove_var("TEST_VAR");
+        unsafe { env::remove_var("TEST_VAR") };
     }
 
     #[test]
@@ -402,8 +403,11 @@ mod tests {
     #[test]
     fn test_json_value_substitution() {
         // Set test environment variables
-        env::set_var("TEST_API_KEY", "secret_key");
-        env::set_var("TEST_URL", "https://api.example.com");
+        // SAFETY: Test runs single-threaded; no concurrent env access
+        unsafe {
+            env::set_var("TEST_API_KEY", "secret_key");
+            env::set_var("TEST_URL", "https://api.example.com");
+        }
 
         let input = serde_json::json!({
             "api_key": "${TEST_API_KEY}",
@@ -423,7 +427,9 @@ mod tests {
         assert_eq!(result["array"][1], "static_value");
 
         // Clean up
-        env::remove_var("TEST_API_KEY");
-        env::remove_var("TEST_URL");
+        unsafe {
+            env::remove_var("TEST_API_KEY");
+            env::remove_var("TEST_URL");
+        }
     }
 }

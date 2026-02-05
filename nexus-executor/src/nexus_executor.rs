@@ -29,6 +29,19 @@ pub trait KernelLike: Send {
     fn get_last_output_text(&self) -> Option<String>;
 }
 
+/// Parse the command line to extract the command name.
+fn parse_command_name(command_line: &str) -> Option<&str> {
+    let trimmed = command_line.trim();
+
+    // Skip variable assignments at the start
+    let cmd_start = trimmed
+        .split_whitespace()
+        .find(|word| !word.contains('='))?;
+
+    // Handle paths - extract the binary name
+    cmd_start.rsplit('/').next()
+}
+
 impl<K: KernelLike> NexusCommandExecutor<K> {
     /// Create a new NexusCommandExecutor with a kernel instance.
     pub fn new(kernel: Arc<Mutex<K>>) -> Self {
@@ -36,19 +49,6 @@ impl<K: KernelLike> NexusCommandExecutor<K> {
             kernel,
             fallback: DefaultCommandExecutor,
         }
-    }
-
-    /// Parse the command line to extract the command name.
-    fn parse_command_name(command_line: &str) -> Option<&str> {
-        let trimmed = command_line.trim();
-
-        // Skip variable assignments at the start
-        let cmd_start = trimmed
-            .split_whitespace()
-            .find(|word| !word.contains('='))?;
-
-        // Handle paths - extract the binary name
-        cmd_start.rsplit('/').next()
     }
 
     /// Check if this command should be routed through the kernel.
@@ -64,7 +64,7 @@ impl<K: KernelLike> NexusCommandExecutor<K> {
         }
 
         // Check if the command is known to the kernel
-        if let Some(cmd_name) = Self::parse_command_name(command_line) {
+        if let Some(cmd_name) = parse_command_name(command_line) {
             if let Ok(kernel) = self.kernel.lock() {
                 return kernel.has_command(cmd_name);
             }
@@ -311,10 +311,10 @@ mod tests {
 
     #[test]
     fn test_parse_command_name() {
-        assert_eq!(NexusCommandExecutor::<()>::parse_command_name("ls -la"), Some("ls"));
-        assert_eq!(NexusCommandExecutor::<()>::parse_command_name("/bin/ls"), Some("ls"));
-        assert_eq!(NexusCommandExecutor::<()>::parse_command_name("VAR=val cmd"), Some("cmd"));
-        assert_eq!(NexusCommandExecutor::<()>::parse_command_name("  cat file.txt"), Some("cat"));
+        assert_eq!(parse_command_name("ls -la"), Some("ls"));
+        assert_eq!(parse_command_name("/bin/ls"), Some("ls"));
+        assert_eq!(parse_command_name("VAR=val cmd"), Some("cmd"));
+        assert_eq!(parse_command_name("  cat file.txt"), Some("cat"));
     }
 
     #[test]
