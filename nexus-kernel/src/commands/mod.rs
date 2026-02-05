@@ -116,3 +116,72 @@ pub trait NexusCommand: Send + Sync {
     /// Execute the command with the given arguments.
     fn execute(&self, args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value>;
 }
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn test_register_cancel_creates_flag() {
+        let block_id = BlockId(10001);
+        let flag = register_cancel(block_id);
+        assert!(!flag.load(Ordering::Relaxed));
+        // Cleanup
+        unregister_cancel(block_id);
+    }
+
+    #[test]
+    fn test_cancel_block_sets_flag() {
+        let block_id = BlockId(10002);
+        let flag = register_cancel(block_id);
+
+        assert!(!flag.load(Ordering::Relaxed));
+        let found = cancel_block(block_id);
+        assert!(found);
+        assert!(flag.load(Ordering::Relaxed));
+
+        // Cleanup
+        unregister_cancel(block_id);
+    }
+
+    #[test]
+    fn test_cancel_block_returns_false_for_unregistered() {
+        let block_id = BlockId(99999);
+        let found = cancel_block(block_id);
+        assert!(!found);
+    }
+
+    #[test]
+    fn test_unregister_cancel_removes_block() {
+        let block_id = BlockId(10003);
+        let _flag = register_cancel(block_id);
+
+        // Block should be found
+        assert!(cancel_block(block_id));
+
+        // Unregister
+        unregister_cancel(block_id);
+
+        // Block should no longer be found
+        assert!(!cancel_block(block_id));
+    }
+
+    #[test]
+    fn test_multiple_blocks_independent() {
+        let block_a = BlockId(10004);
+        let block_b = BlockId(10005);
+
+        let flag_a = register_cancel(block_a);
+        let flag_b = register_cancel(block_b);
+
+        // Cancel only block A
+        cancel_block(block_a);
+
+        assert!(flag_a.load(Ordering::Relaxed));
+        assert!(!flag_b.load(Ordering::Relaxed));
+
+        // Cleanup
+        unregister_cancel(block_a);
+        unregister_cancel(block_b);
+    }
+}
