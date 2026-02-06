@@ -1404,10 +1404,28 @@ impl LayoutSnapshot {
     ///
     /// Only available in debug builds. Call this from containers during layout
     /// when `ctx.is_debug()` returns true.
+    ///
+    /// Applies a "staircase inset" based on depth: each nested container's
+    /// debug rect is inset by 1 pixel per depth level, creating an onion-layer
+    /// effect that makes hierarchy visible even when containers share exact bounds.
     #[cfg(debug_assertions)]
     pub fn push_debug_rect(&mut self, rect: Rect, label: impl Into<String>, depth: u32, is_overflow: bool) {
+        // Staircase inset: 1 pixel per depth level
+        let inset = depth as f32;
+        let inset_rect = if rect.width > inset * 2.0 && rect.height > inset * 2.0 {
+            Rect::new(
+                rect.x + inset,
+                rect.y + inset,
+                rect.width - inset * 2.0,
+                rect.height - inset * 2.0,
+            )
+        } else {
+            // Container too small for inset, use original bounds
+            rect
+        };
+
         self.debug_rects.push(DebugRect {
-            rect,
+            rect: inset_rect,
             label: label.into(),
             depth,
             is_overflow,
@@ -1468,11 +1486,29 @@ impl LayoutSnapshot {
     ///
     /// Call at the start of a container's layout method.
     /// Pushes a debug rect and increments depth.
+    ///
+    /// Applies a "staircase inset" based on depth: each nested container's
+    /// debug rect is inset by 1 pixel per depth level, creating an onion-layer
+    /// effect that makes hierarchy visible even when containers share exact bounds.
     #[cfg(debug_assertions)]
     pub fn debug_enter(&mut self, name: &str, rect: Rect) {
         if self.debug_enabled {
+            // Staircase inset: 1 pixel per depth level
+            let inset = self.debug_depth as f32;
+            let inset_rect = if rect.width > inset * 2.0 && rect.height > inset * 2.0 {
+                Rect::new(
+                    rect.x + inset,
+                    rect.y + inset,
+                    rect.width - inset * 2.0,
+                    rect.height - inset * 2.0,
+                )
+            } else {
+                // Container too small for inset, use original bounds
+                rect
+            };
+
             self.debug_rects.push(DebugRect {
-                rect,
+                rect: inset_rect,
                 label: name.to_string(),
                 depth: self.debug_depth,
                 is_overflow: false,
