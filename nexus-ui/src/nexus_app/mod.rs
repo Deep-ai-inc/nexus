@@ -125,6 +125,10 @@ pub struct NexusState {
     last_frame: Cell<Instant>,
     fps_smooth: Cell<f32>,
     pub context: NexusContext,
+
+    /// Debug mode for layout visualization (toggle with Cmd+Shift+D).
+    #[cfg(debug_assertions)]
+    pub debug_layout: bool,
 }
 
 // =========================================================================
@@ -192,7 +196,21 @@ impl Component for NexusState {
 
         main_col = self.layout_overlays_and_input(main_col, cursor_visible);
 
-        main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
+        // Use constraint-based layout for debug visualization support
+        #[cfg(debug_assertions)]
+        {
+            use strata::layout::{LayoutContext, LayoutConstraints};
+            use strata::primitives::Point;
+
+            let mut ctx = LayoutContext::new(snapshot).with_debug(self.debug_layout);
+            let constraints = LayoutConstraints::tight(vw, vh);
+            main_col.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
+        }
 
         self.sync_scroll_states(snapshot);
 
@@ -253,6 +271,52 @@ impl Component for NexusState {
             colors::TEXT_MUTED,
             14.0,
         );
+
+        // Debug layout overlay (Cmd+Shift+D to toggle)
+        #[cfg(debug_assertions)]
+        if self.debug_layout && snapshot.has_debug_rects() {
+            // Collect debug rect data first (to avoid borrow conflict)
+            let debug_data: Vec<_> = snapshot.debug_rects()
+                .iter()
+                .map(|r| (r.rect, r.label.clone(), r.color()))
+                .collect();
+            let count = debug_data.len();
+
+            let p = snapshot.overlay_primitives_mut();
+            for (rect, label, color) in debug_data {
+                // Draw semi-transparent colored outline
+                p.add_border(rect, 0.0, 1.0, color);
+
+                // Draw label at top-left of rect (if large enough)
+                if rect.width > 40.0 && rect.height > 16.0 {
+                    p.add_text(
+                        label,
+                        strata::primitives::Point::new(rect.x + 2.0, rect.y + 2.0),
+                        color,
+                        10.0,
+                    );
+                }
+            }
+
+            // Draw legend in top-left corner
+            p.add_rounded_rect(
+                Rect::new(4.0, 24.0, 180.0, 40.0),
+                4.0,
+                strata::primitives::Color::rgba(0.0, 0.0, 0.0, 0.8),
+            );
+            p.add_text(
+                format!("Debug Layout: {} elements", count),
+                strata::primitives::Point::new(8.0, 28.0),
+                strata::primitives::Color::rgba(1.0, 1.0, 1.0, 0.9),
+                12.0,
+            );
+            p.add_text(
+                "Cmd+Shift+D to toggle".to_string(),
+                strata::primitives::Point::new(8.0, 44.0),
+                strata::primitives::Color::rgba(0.7, 0.7, 0.7, 0.9),
+                10.0,
+            );
+        }
     }
 
     fn on_key(&self, event: KeyEvent) -> Option<NexusMessage> {
@@ -442,6 +506,8 @@ impl RootComponent for NexusState {
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             context,
+            #[cfg(debug_assertions)]
+            debug_layout: false,
         };
 
         (state, Command::none())

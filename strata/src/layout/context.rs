@@ -114,6 +114,8 @@ impl<'a> LayoutContext<'a> {
     #[cfg(debug_assertions)]
     pub fn with_debug(mut self, enabled: bool) -> Self {
         self.debug_enabled = enabled;
+        // Also set on snapshot so legacy layout() methods can participate
+        self.snapshot.set_debug_enabled(enabled);
         self
     }
 
@@ -307,6 +309,42 @@ impl<'a> LayoutContext<'a> {
     #[inline(always)]
     pub fn is_debug(&self) -> bool {
         false
+    }
+
+    /// Push a debug rectangle for layout visualization.
+    ///
+    /// Call this from containers during layout when debug mode is enabled.
+    /// The rectangle will be rendered as a semi-transparent overlay.
+    ///
+    /// # Arguments
+    /// * `rect` - The bounds of this layout element
+    /// * `is_overflow` - Whether this element exceeded its constraints
+    #[cfg(debug_assertions)]
+    pub fn push_debug_rect(&mut self, rect: crate::primitives::Rect, is_overflow: bool) {
+        if self.debug_enabled {
+            self.snapshot.push_debug_rect(
+                rect,
+                self.current_name.to_string(),
+                self.depth,
+                is_overflow,
+            );
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    pub fn push_debug_rect(&mut self, _rect: crate::primitives::Rect, _is_overflow: bool) {}
+
+    /// Get the current depth in the layout tree (debug builds only).
+    #[cfg(debug_assertions)]
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    pub fn depth(&self) -> u32 {
+        0
     }
 }
 

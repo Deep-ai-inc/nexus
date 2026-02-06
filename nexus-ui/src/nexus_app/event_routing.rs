@@ -50,6 +50,16 @@ pub(super) fn on_key(state: &NexusState, event: KeyEvent) -> Option<NexusMessage
     // These are intercepted regardless of focus — they control the GUI, not
     // the terminal.
     if modifiers.meta {
+        // Cmd+Shift+D: Toggle debug layout visualization (debug builds only)
+        #[cfg(debug_assertions)]
+        if modifiers.shift {
+            if let Key::Character(c) = key {
+                if c == "d" || c == "D" {
+                    return Some(NexusMessage::ToggleDebugLayout);
+                }
+            }
+        }
+
         if let Some(msg) = route_cmd_shortcut(state, key) {
             return Some(msg);
         }

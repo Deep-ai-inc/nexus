@@ -241,6 +241,11 @@ impl NexusState {
                 // Zoom stubs — shortcuts wired, rendering deferred
                 Command::none()
             }
+            #[cfg(debug_assertions)]
+            NexusMessage::ToggleDebugLayout => {
+                self.debug_layout = !self.debug_layout;
+                Command::none()
+            }
         }
     }
 }

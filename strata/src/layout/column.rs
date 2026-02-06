@@ -366,6 +366,9 @@ impl Column {
     ///
     /// This is where the actual layout math happens - ONCE per frame.
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
+        // Debug tracking for layout visualization
+        snapshot.debug_enter("Column", bounds);
+
         // Available space after padding
         let content_x = bounds.x + self.padding.left;
         let content_y = bounds.y + self.padding.top;
@@ -785,6 +788,8 @@ impl Column {
         if clips {
             snapshot.primitives_mut().pop_clip();
         }
+
+        snapshot.debug_exit();
     }
 
     // =========================================================================
@@ -854,6 +859,7 @@ impl Column {
         ctx.log_layout(constraints, size);
 
         // Perform actual layout using legacy method
+        // (debug rects are pushed inside layout() via snapshot.debug_enter())
         let bounds = Rect::new(origin.x, origin.y, size.width, size.height);
         self.layout(ctx.snapshot, bounds);
 

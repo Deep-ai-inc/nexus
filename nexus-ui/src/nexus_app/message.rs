@@ -55,6 +55,10 @@ pub enum NexusMessage {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+
+    /// Toggle debug layout visualization (Cmd+Shift+D in debug builds).
+    #[cfg(debug_assertions)]
+    ToggleDebugLayout,
 }
 
 /// File drop messages (from OS → Nexus).

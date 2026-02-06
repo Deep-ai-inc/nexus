@@ -103,6 +103,51 @@ impl ScrollTrackInfo {
     }
 }
 
+// =========================================================================
+// Debug Visualization (compiled out in release)
+// =========================================================================
+
+/// A debug rectangle for layout visualization.
+///
+/// These are only populated when debug mode is enabled in the LayoutContext.
+/// Used to visualize container bounds, constraint stress, and layout hierarchy.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone)]
+pub struct DebugRect {
+    /// The bounds of this layout element.
+    pub rect: Rect,
+    /// Human-readable path/name (e.g., "Column > Row > Text").
+    pub label: String,
+    /// Depth in the layout tree (for color coding).
+    pub depth: u32,
+    /// Whether this element's size exceeded its constraints (overflow).
+    pub is_overflow: bool,
+}
+
+#[cfg(debug_assertions)]
+impl DebugRect {
+    /// Get a color based on depth (cycles through a palette).
+    pub fn color(&self) -> Color {
+        const PALETTE: &[(f32, f32, f32)] = &[
+            (0.8, 0.2, 0.2), // Red
+            (0.2, 0.8, 0.2), // Green
+            (0.2, 0.2, 0.8), // Blue
+            (0.8, 0.8, 0.2), // Yellow
+            (0.8, 0.2, 0.8), // Magenta
+            (0.2, 0.8, 0.8), // Cyan
+            (0.9, 0.5, 0.2), // Orange
+            (0.5, 0.2, 0.9), // Purple
+        ];
+        let (r, g, b) = PALETTE[self.depth as usize % PALETTE.len()];
+        if self.is_overflow {
+            // Bright red for overflow
+            Color::rgba(1.0, 0.0, 0.0, 0.5)
+        } else {
+            Color::rgba(r, g, b, 0.3)
+        }
+    }
+}
+
 /// A decoration primitive for non-text rendering.
 ///
 /// These are rendered via the ubershader along with glyphs.
@@ -683,6 +728,20 @@ pub struct LayoutSnapshot {
 
     /// Cursor hints for widgets. Set during layout, queried by mouse_interaction().
     cursor_hints: HashMap<SourceId, CursorIcon>,
+
+    /// Debug rectangles for layout visualization (debug builds only).
+    /// Populated when LayoutContext has debug mode enabled.
+    #[cfg(debug_assertions)]
+    debug_rects: Vec<DebugRect>,
+
+    /// Debug mode enabled flag (debug builds only).
+    /// Set by LayoutContext when debug is enabled, read by legacy layout methods.
+    #[cfg(debug_assertions)]
+    debug_enabled: bool,
+
+    /// Current debug depth for nested layouts (debug builds only).
+    #[cfg(debug_assertions)]
+    debug_depth: u32,
 }
 
 impl Default for LayoutSnapshot {
@@ -706,6 +765,12 @@ impl LayoutSnapshot {
             scroll_limits: HashMap::new(),
             scroll_tracks: HashMap::new(),
             cursor_hints: HashMap::new(),
+            #[cfg(debug_assertions)]
+            debug_rects: Vec::new(),
+            #[cfg(debug_assertions)]
+            debug_enabled: false,
+            #[cfg(debug_assertions)]
+            debug_depth: 0,
         }
     }
 
@@ -721,6 +786,12 @@ impl LayoutSnapshot {
         self.scroll_limits.clear();
         self.scroll_tracks.clear();
         self.cursor_hints.clear();
+        #[cfg(debug_assertions)]
+        {
+            self.debug_rects.clear();
+            self.debug_enabled = false;
+            self.debug_depth = 0;
+        }
     }
 
     /// Get read-only access to the primitive batch.
@@ -1324,6 +1395,105 @@ impl LayoutSnapshot {
 
         rects
     }
+
+    // =========================================================================
+    // Debug Visualization (compiled out in release)
+    // =========================================================================
+
+    /// Push a debug rectangle for layout visualization.
+    ///
+    /// Only available in debug builds. Call this from containers during layout
+    /// when `ctx.is_debug()` returns true.
+    #[cfg(debug_assertions)]
+    pub fn push_debug_rect(&mut self, rect: Rect, label: impl Into<String>, depth: u32, is_overflow: bool) {
+        self.debug_rects.push(DebugRect {
+            rect,
+            label: label.into(),
+            depth,
+            is_overflow,
+        });
+    }
+
+    /// Get debug rectangles for rendering the layout overlay.
+    ///
+    /// Returns an empty slice in release builds.
+    #[cfg(debug_assertions)]
+    pub fn debug_rects(&self) -> &[DebugRect] {
+        &self.debug_rects
+    }
+
+    /// Get debug rectangles (release stub - always returns empty).
+    #[cfg(not(debug_assertions))]
+    pub fn debug_rects(&self) -> &[()] {
+        &[]
+    }
+
+    /// Check if there are any debug rectangles to render.
+    #[cfg(debug_assertions)]
+    pub fn has_debug_rects(&self) -> bool {
+        !self.debug_rects.is_empty()
+    }
+
+    /// Check if there are any debug rectangles (release stub - always false).
+    #[cfg(not(debug_assertions))]
+    pub fn has_debug_rects(&self) -> bool {
+        false
+    }
+
+    /// Enable debug mode for legacy layout methods.
+    ///
+    /// Call this once before layout to enable debug rect collection
+    /// in the legacy `layout()` methods.
+    #[cfg(debug_assertions)]
+    pub fn set_debug_enabled(&mut self, enabled: bool) {
+        self.debug_enabled = enabled;
+        self.debug_depth = 0;
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn set_debug_enabled(&mut self, _enabled: bool) {}
+
+    /// Check if debug mode is enabled.
+    #[cfg(debug_assertions)]
+    pub fn is_debug_enabled(&self) -> bool {
+        self.debug_enabled
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn is_debug_enabled(&self) -> bool {
+        false
+    }
+
+    /// Enter a debug scope (for legacy layout methods).
+    ///
+    /// Call at the start of a container's layout method.
+    /// Pushes a debug rect and increments depth.
+    #[cfg(debug_assertions)]
+    pub fn debug_enter(&mut self, name: &str, rect: Rect) {
+        if self.debug_enabled {
+            self.debug_rects.push(DebugRect {
+                rect,
+                label: name.to_string(),
+                depth: self.debug_depth,
+                is_overflow: false,
+            });
+            self.debug_depth += 1;
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn debug_enter(&mut self, _name: &str, _rect: Rect) {}
+
+    /// Exit a debug scope (for legacy layout methods).
+    #[cfg(debug_assertions)]
+    pub fn debug_exit(&mut self) {
+        if self.debug_enabled && self.debug_depth > 0 {
+            self.debug_depth -= 1;
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn debug_exit(&mut self) {}
 }
 
 /// Axis-aligned distance from a point to a rect. Returns `(dy, dx)`, both >= 0.

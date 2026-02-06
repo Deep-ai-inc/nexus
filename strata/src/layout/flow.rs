@@ -235,6 +235,7 @@ impl FlowContainer {
         ctx.log_layout(constraints, size);
 
         // Always render children (snapshot is cleared each frame)
+        // (debug rects are pushed inside layout_impl() via snapshot.debug_enter())
         self.layout_impl(ctx.snapshot, origin.x, origin.y, size.width);
 
         ctx.exit();
@@ -243,6 +244,10 @@ impl FlowContainer {
 
     /// Internal implementation shared by both old and new APIs.
     fn layout_impl(&self, snapshot: &mut LayoutSnapshot, x: f32, y: f32, available_width: f32) {
+        // Debug tracking for layout visualization
+        let height = self.height_for_width(available_width);
+        snapshot.debug_enter("FlowContainer", crate::primitives::Rect::new(x, y, available_width, height));
+
         let content_x = x + self.padding.left;
         let content_y = y + self.padding.top;
         let max_width = available_width - self.padding.horizontal();
@@ -271,6 +276,8 @@ impl FlowContainer {
             line_x += size.width + self.spacing;
             line_height = line_height.max(size.height);
         }
+
+        snapshot.debug_exit();
     }
 }
 
