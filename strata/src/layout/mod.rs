@@ -13,11 +13,14 @@
 //! This avoids the "immediate mode trap" where widgets compute layout every frame.
 
 pub mod constraints;
-pub mod containers;
 pub mod context;
 pub mod elements;
 pub mod length;
 pub mod primitives;
+
+// containers must come before child (child imports container types)
+pub mod containers;
+pub mod child;
 
 // Re-export core types
 pub use constraints::LayoutConstraints;
@@ -27,6 +30,9 @@ pub use length::{Length, Alignment, CrossAxisAlignment, Padding, CHAR_WIDTH, LIN
 // Re-export elements
 pub use elements::{TextElement, TerminalElement, ImageElement, ButtonElement};
 
+// Re-export child types (LayoutChild, Widget)
+pub use child::{LayoutChild, Widget};
+
 // Re-export containers
-pub use containers::{Column, Row, ScrollColumn, LayoutChild, Widget, TextInputElement, TableElement, TableColumn, TableCell};
+pub use containers::{Column, Row, ScrollColumn, FlowContainer, TextInputElement, TableElement, TableColumn, TableCell};
 pub use primitives::{LineStyle, PrimitiveBatch};
