@@ -89,7 +89,7 @@ pub use widgets::{TextWidget, TerminalWidget};
 pub use layout::{
     Column, Row, ScrollColumn, LayoutChild, Widget, Padding, Alignment, CrossAxisAlignment, Length, LineStyle, PrimitiveBatch,
 };
-pub use layout::containers::{TextElement, TerminalElement, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell, VirtualTableElement, VirtualCell};
+pub use layout::{TextElement, TerminalElement, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell, VirtualTableElement, VirtualCell};
 pub use gpu::{ImageHandle, ImageStore};
 pub use text_input_state::{TextInputState, TextInputAction, TextInputMouseAction};
 pub use scroll_state::{ScrollState, ScrollAction};

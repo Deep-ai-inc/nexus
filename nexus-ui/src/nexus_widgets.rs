@@ -19,9 +19,9 @@ use crate::nexus_app::drag_state::DragPayload;
 use crate::nexus_app::shell::{AnchorEntry, ClickAction, register_anchor, register_tree_toggle, value_to_anchor_action, semantic_text_for_value};
 use crate::nexus_app::source_ids;
 use strata::gpu::ImageHandle;
-use strata::layout::containers::{
+use strata::layout::{
     ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutChild, Length, Padding, Row,
-    ScrollColumn, TerminalElement, TextElement, Widget,
+    ScrollColumn, TerminalElement, TextElement, TextInputElement, VirtualTableElement, VirtualCell, Widget,
 };
 use strata::layout_snapshot::{CursorIcon, RunStyle, TextRun, UnderlineStyle};
 use strata::primitives::Color;
@@ -1063,7 +1063,7 @@ fn build_question_dialog(
         dialog = dialog.push(
             Row::new().spacing(8.0).width(Length::Fill)
                 .push(
-                    strata::layout::containers::TextInputElement::from_state(input)
+                    TextInputElement::from_state(input)
                         .placeholder("Type your answer and press Enter...")
                         .background(Color::rgb(0.08, 0.08, 0.12))
                         .border_color(Color::rgb(0.3, 0.3, 0.4))
@@ -1625,7 +1625,7 @@ fn render_native_value(
             }).collect();
 
             // Build VirtualTableElement — lightweight, no wrapping
-            let mut table = strata::layout::containers::VirtualTableElement::new(source_id);
+            let mut table = VirtualTableElement::new(source_id);
 
             // Add column headers with sort support
             for (i, col) in columns.iter().enumerate() {
@@ -1645,7 +1645,7 @@ fn render_native_value(
             // Build lightweight VirtualCell rows — no wrapping, no line splitting
             let mut anchor_idx = 0usize;
             for (_row_idx, row) in rows.iter().enumerate() {
-                let cells: Vec<strata::layout::containers::VirtualCell> = row.iter().enumerate().map(|(col_idx, cell)| {
+                let cells: Vec<VirtualCell> = row.iter().enumerate().map(|(col_idx, cell)| {
                     let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
                         format_value_for_display(cell, fmt)
                     } else {
@@ -1667,7 +1667,7 @@ fn render_native_value(
                     } else {
                         None
                     };
-                    strata::layout::containers::VirtualCell {
+                    VirtualCell {
                         text,
                         color: value_text_color(cell),
                         widget_id,

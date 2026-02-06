@@ -13,7 +13,7 @@ use crate::content_address::SourceId;
 use crate::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
-use crate::layout::containers::Padding;
+use crate::layout::Padding;
 use crate::layout_snapshot::{HitResult, LayoutSnapshot};
 use crate::primitives::Rect;
 

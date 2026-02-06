@@ -9,6 +9,7 @@ use crate::gpu::ImageHandle;
 use crate::layout_snapshot::CursorIcon;
 use crate::primitives::{Color, Size};
 
+use super::constraints::LayoutConstraints;
 use super::length::{Padding, CHAR_WIDTH, LINE_HEIGHT, BASE_FONT_SIZE};
 
 // =========================================================================
@@ -162,6 +163,16 @@ impl TextElement {
     pub(crate) fn font_size(&self) -> f32 {
         self.size.unwrap_or(BASE_FONT_SIZE)
     }
+
+    /// Layout with constraints - returns the size this element will occupy.
+    ///
+    /// For text, we simply measure and constrain to bounds. Text does not
+    /// expand to fill space (unlike containers), so we always return the
+    /// intrinsic size clamped to constraints.
+    #[inline]
+    pub fn layout_constrained(&self, constraints: &LayoutConstraints) -> Size {
+        constraints.constrain(self.estimate_size(CHAR_WIDTH, LINE_HEIGHT))
+    }
 }
 
 // =========================================================================
@@ -224,6 +235,15 @@ impl TerminalElement {
             self.cols as f32 * self.cell_width,
             self.rows as f32 * self.cell_height,
         )
+    }
+
+    /// Layout with constraints - returns the size this element will occupy.
+    ///
+    /// Terminals have fixed size based on grid dimensions, so we constrain
+    /// to bounds but don't expand.
+    #[inline]
+    pub fn layout_constrained(&self, constraints: &LayoutConstraints) -> Size {
+        constraints.constrain(self.size())
     }
 }
 
@@ -289,6 +309,14 @@ impl ImageElement {
 
     pub(crate) fn size(&self) -> Size {
         Size::new(self.width, self.height)
+    }
+
+    /// Layout with constraints - returns the size this element will occupy.
+    ///
+    /// Images have fixed display size, so we constrain to bounds but don't expand.
+    #[inline]
+    pub fn layout_constrained(&self, constraints: &LayoutConstraints) -> Size {
+        constraints.constrain(self.size())
     }
 }
 
@@ -358,5 +386,108 @@ impl ButtonElement {
             char_count * CHAR_WIDTH + self.padding.horizontal(),
             LINE_HEIGHT + self.padding.vertical(),
         )
+    }
+
+    /// Layout with constraints - returns the size this element will occupy.
+    ///
+    /// Buttons have intrinsic size based on label, so we constrain to bounds
+    /// but don't expand.
+    #[inline]
+    pub fn layout_constrained(&self, constraints: &LayoutConstraints) -> Size {
+        constraints.constrain(self.estimate_size())
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unicode_display_width_ascii() {
+        assert_eq!(unicode_display_width("hello"), 5.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_empty() {
+        assert_eq!(unicode_display_width(""), 0.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_cjk() {
+        // CJK characters are double-width
+        assert_eq!(unicode_display_width("中文"), 4.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_mixed() {
+        // "a中b" = 1 + 2 + 1 = 4
+        assert_eq!(unicode_display_width("a中b"), 4.0);
+    }
+
+    #[test]
+    fn test_unicode_display_width_emoji() {
+        // Many emojis are double-width
+        let width = unicode_display_width("😀");
+        assert!(width >= 1.0); // At least 1, could be 2 depending on implementation
+    }
+
+    #[test]
+    fn test_hash_text_same_input_same_hash() {
+        let h1 = hash_text("hello world");
+        let h2 = hash_text("hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_text_different_input_different_hash() {
+        let h1 = hash_text("hello");
+        let h2 = hash_text("world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_text_empty() {
+        let h = hash_text("");
+        // Just verify it doesn't panic and returns something
+        assert!(h > 0 || h == 0); // Always true, but tests the call
+    }
+
+    // layout_constrained tests
+
+    #[test]
+    fn test_text_element_layout_constrained_unconstrained() {
+        let text = TextElement::new("Hello");
+        let constraints = LayoutConstraints::UNBOUNDED;
+        let size = text.layout_constrained(&constraints);
+        // Should return intrinsic size
+        assert!(size.width > 0.0);
+        assert!(size.height > 0.0);
+    }
+
+    #[test]
+    fn test_text_element_layout_constrained_clamped() {
+        let text = TextElement::new("This is a very long text that should be clamped");
+        let constraints = LayoutConstraints::loose(50.0, 100.0);
+        let size = text.layout_constrained(&constraints);
+        // Width should be clamped to max
+        assert!(size.width <= 50.0);
+    }
+
+    #[test]
+    fn test_button_element_layout_constrained() {
+        use crate::content_address::SourceId;
+        let button = ButtonElement::new(SourceId::named("test"), "Click Me");
+        let constraints = LayoutConstraints::loose(200.0, 50.0);
+        let size = button.layout_constrained(&constraints);
+        // Should be within bounds
+        assert!(size.width <= 200.0);
+        assert!(size.height <= 50.0);
+        // Should have non-zero size
+        assert!(size.width > 0.0);
+        assert!(size.height > 0.0);
     }
 }

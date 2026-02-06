@@ -3,7 +3,7 @@
 //! Uses pulldown-cmark for proper CommonMark + GFM parsing.
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, HeadingLevel};
-use strata::layout::containers::{Column, FlowContainer, Length, Padding, Row, TextElement};
+use strata::layout::{Column, FlowContainer, Length, Padding, Row, TextElement};
 use strata::content_address::SourceId;
 
 use crate::nexus_app::colors;

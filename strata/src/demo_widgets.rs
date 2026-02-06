@@ -5,7 +5,7 @@
 //! allocation. Use `.push(MyWidget { ... })` on any container.
 
 use crate::content_address::SourceId;
-use crate::layout::containers::{
+use crate::layout::{
     ButtonElement, Column, LayoutChild, Length, Padding, Row, TextElement, TerminalElement, Widget,
 };
 use crate::primitives::Color;
@@ -92,7 +92,7 @@ impl Widget for ShellBlock {
 
         let header = Row::new()
             .spacing(8.0)
-            .cross_align(crate::layout::containers::CrossAxisAlignment::Center)
+            .cross_align(crate::layout::CrossAxisAlignment::Center)
             .push(
                 TextElement::new(format!("{} $ {}", self.status_icon, self.cmd))
                     .color(self.status_color),
@@ -210,7 +210,7 @@ impl Widget for AgentBlock {
         // Status footer
         content = content.fixed_spacer(4.0).push(
             Row::new()
-                .cross_align(crate::layout::containers::CrossAxisAlignment::Center)
+                .cross_align(crate::layout::CrossAxisAlignment::Center)
                 .push(TextElement::new(self.status_text).color(self.status_color))
                 .spacer(1.0)
                 .push(
@@ -299,7 +299,7 @@ impl Widget for InputBar {
             .corner_radius(6.0)
             .border(colors::BORDER_INPUT, 1.0)
             .width(Length::Fill)
-            .cross_align(crate::layout::containers::CrossAxisAlignment::Center)
+            .cross_align(crate::layout::CrossAxisAlignment::Center)
             .push(TextElement::new(self.cwd).color(colors::TEXT_PATH))
             .push(
                 Column::new()

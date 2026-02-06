@@ -16,11 +16,12 @@ use super::elements::{TextElement, TerminalElement, ImageElement, ButtonElement}
 use super::length::{Length, CHAR_WIDTH, LINE_HEIGHT};
 
 // Import container types from their respective modules
-use super::containers::{
-    Column, Row, ScrollColumn,
-    TextInputElement, TableElement, VirtualTableElement,
-};
 use super::flow::FlowContainer;
+use super::scroll_column::ScrollColumn;
+use super::row::Row;
+use super::column::Column;
+use super::text_input::TextInputElement;
+use super::table::{TableElement, VirtualTableElement};
 
 // =========================================================================
 // LayoutChild Enum
@@ -79,6 +80,21 @@ pub enum LayoutChild {
 
     /// A flow container (wrapping inline layout, like CSS flex-wrap).
     Flow(FlowContainer),
+}
+
+// =========================================================================
+// Helper Functions
+// =========================================================================
+
+/// Hash a Length value for cache keys.
+#[inline]
+fn hash_length(len: &Length) -> u64 {
+    match len {
+        Length::Shrink => 0,
+        Length::Fill => 1,
+        Length::FillPortion(n) => 2u64.wrapping_add(*n as u64),
+        Length::Fixed(f) => 3u64.wrapping_add(f.to_bits() as u64),
+    }
 }
 
 // =========================================================================
@@ -182,6 +198,87 @@ impl LayoutChild {
             LayoutChild::Spacer { flex } => Length::FillPortion((*flex * 100.0) as u16),
             LayoutChild::FixedSpacer { size } => Length::Fixed(*size),
             _ => Length::Shrink,
+        }
+    }
+
+    /// Compute a content hash for cache keys.
+    ///
+    /// This hash captures all properties that affect the child's measured size.
+    /// Used by FlowContainer for cache key generation.
+    pub(crate) fn content_hash(&self) -> u64 {
+        match self {
+            LayoutChild::Text(t) => {
+                // TextElement already has a cache_key computed from text content
+                // Also factor in font size which affects measured size
+                let size_bits = t.size.unwrap_or(0.0).to_bits() as u64;
+                t.cache_key.wrapping_mul(31).wrapping_add(size_bits)
+            }
+            LayoutChild::Image(img) => {
+                // Image size is determined by width and height
+                let w = img.width.to_bits() as u64;
+                let h = img.height.to_bits() as u64;
+                w.wrapping_mul(31).wrapping_add(h)
+            }
+            LayoutChild::Button(btn) => {
+                // Button size is determined by label and padding
+                let p = btn.padding.horizontal().to_bits() as u64;
+                btn.cache_key.wrapping_mul(31).wrapping_add(p)
+            }
+            LayoutChild::Terminal(t) => {
+                // Terminal size is cols * rows * cell dimensions
+                let cols = t.cols as u64;
+                let rows = t.rows as u64;
+                let cw = t.cell_width.to_bits() as u64;
+                let ch = t.cell_height.to_bits() as u64;
+                cols.wrapping_mul(31)
+                    .wrapping_add(rows)
+                    .wrapping_mul(31)
+                    .wrapping_add(cw)
+                    .wrapping_mul(31)
+                    .wrapping_add(ch)
+            }
+            LayoutChild::Spacer { flex } => {
+                // Spacer identity is its flex factor
+                (*flex * 1000.0) as u64
+            }
+            LayoutChild::FixedSpacer { size } => {
+                // Fixed spacer identity is its size
+                size.to_bits() as u64
+            }
+            // Nested containers: delegate to their content_hash() methods (recursive)
+            LayoutChild::Column(c) => c.content_hash(),
+            LayoutChild::Row(r) => r.content_hash(),
+            LayoutChild::ScrollColumn(s) => s.content_hash(),
+            LayoutChild::TextInput(t) => {
+                // Text input size depends on configured dimensions
+                // Hash the Length variants using their flex factor (0 for fixed/shrink)
+                let w_hash = hash_length(&t.width);
+                let h_hash = hash_length(&t.height);
+                4u64.wrapping_mul(0x9e3779b9)
+                    .wrapping_add(w_hash)
+                    .wrapping_add(h_hash)
+            }
+            LayoutChild::Table(t) => {
+                // Table hash: number of columns and rows
+                let cols = t.columns.len() as u64;
+                let rows = t.rows.len() as u64;
+                5u64.wrapping_mul(0x9e3779b9)
+                    .wrapping_add(cols.wrapping_mul(31))
+                    .wrapping_add(rows)
+            }
+            LayoutChild::VirtualTable(t) => {
+                // Virtual table: column count and row count
+                let cols = t.columns.len() as u64;
+                let rows = t.rows.len() as u64;
+                6u64.wrapping_mul(0x9e3779b9)
+                    .wrapping_add(cols.wrapping_mul(31))
+                    .wrapping_add(rows)
+            }
+            LayoutChild::Flow(f) => {
+                // Nested flow: use its content hash
+                7u64.wrapping_mul(0x9e3779b9)
+                    .wrapping_add(f.content_hash())
+            }
         }
     }
 }
