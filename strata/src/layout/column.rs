@@ -11,10 +11,10 @@ use super::base::{Chrome, render_chrome};
 use super::child::LayoutChild;
 use super::constraints::LayoutConstraints;
 use super::context::LayoutContext;
-use super::text_input::{TextInputElement, render_text_input, render_text_input_multiline};
-use super::table::{TableElement, VirtualTableElement, render_table, render_virtual_table};
 use super::elements::{TextElement, TerminalElement, ImageElement, ButtonElement};
-use super::length::{Length, Padding, Alignment, CrossAxisAlignment, CHAR_WIDTH, LINE_HEIGHT, BASE_FONT_SIZE};
+use super::text_input::TextInputElement;
+use super::table::{TableElement, VirtualTableElement};
+use super::length::{Length, Padding, Alignment, CrossAxisAlignment, CHAR_WIDTH, LINE_HEIGHT};
 use super::row::Row;
 use super::scroll_column::ScrollColumn;
 
@@ -375,432 +375,38 @@ impl Column {
         }
     }
 
-    /// Compute layout and flush to snapshot.
+    // =========================================================================
+    // Legacy Bridge (temporary shim for Row/ScrollColumn migration)
+    // =========================================================================
+
+    /// Legacy layout method - shim for backwards compatibility.
     ///
-    /// This is where the actual layout math happens - ONCE per frame.
-    #[deprecated(since = "0.2.0", note = "use layout_with_constraints() instead")]
-    #[allow(deprecated)] // Internal recursive calls to child.layout()
+    /// Creates a temporary context and delegates to layout_with_constraints.
+    /// Will be removed once Row and ScrollColumn are migrated.
+    #[doc(hidden)]
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
-        // Debug tracking for layout visualization
-        snapshot.debug_enter("Column", bounds);
-
-        // Available space after padding
-        let content_x = bounds.x + self.padding.left;
-        let content_y = bounds.y + self.padding.top;
-        let content_width = bounds.width - self.padding.horizontal();
-
-        // Draw chrome (shadow → background → border)
-        let chrome = self.chrome();
-        let has_chrome = chrome.has_visible_chrome();
-        render_chrome(snapshot, bounds, &chrome);
-
-        // =====================================================================
-        // Measurement pass: compute child heights and flex factors
-        // Also tracks max cross-axis width for overflow detection.
-        // =====================================================================
-        let mut total_fixed_height = 0.0;
-        let mut total_flex = 0.0;
-        let mut max_child_cross: f32 = 0.0;
-        let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
-
-        for child in &self.children {
-            max_child_cross = max_child_cross.max(child.measure_cross(true));
-            match child {
-                LayoutChild::Text(t) => {
-                    let h = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).height;
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::Terminal(t) => {
-                    let h = t.size().height;
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::Column(c) => {
-                    match c.height {
-                        Length::Fixed(px) => {
-                            child_heights.push(px);
-                            total_fixed_height += px;
-                        }
-                        Length::Fill | Length::FillPortion(_) => {
-                            child_heights.push(0.0);
-                            total_flex += c.height.flex();
-                        }
-                        Length::Shrink => {
-                            let h = c.measure().height;
-                            child_heights.push(h);
-                            total_fixed_height += h;
-                        }
-                    }
-                }
-                LayoutChild::Row(r) => {
-                    match r.height {
-                        Length::Fixed(px) => {
-                            child_heights.push(px);
-                            total_fixed_height += px;
-                        }
-                        Length::Fill | Length::FillPortion(_) => {
-                            child_heights.push(0.0);
-                            total_flex += r.height.flex();
-                        }
-                        Length::Shrink => {
-                            // Use height_for_width to account for FlowContainer wrapping
-                            let h = r.height_for_width(content_width);
-                            child_heights.push(h);
-                            total_fixed_height += h;
-                        }
-                    }
-                }
-                LayoutChild::ScrollColumn(s) => {
-                    match s.height {
-                        Length::Fixed(px) => {
-                            child_heights.push(px);
-                            total_fixed_height += px;
-                        }
-                        Length::Fill | Length::FillPortion(_) => {
-                            child_heights.push(0.0);
-                            total_flex += s.height.flex();
-                        }
-                        Length::Shrink => {
-                            let h = s.measure().height;
-                            child_heights.push(h);
-                            total_fixed_height += h;
-                        }
-                    }
-                }
-                LayoutChild::Image(img) => {
-                    let h = img.height;
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::Button(btn) => {
-                    let h = btn.estimate_size().height;
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::TextInput(input) => {
-                    let h = LINE_HEIGHT + input.padding.vertical();
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::Table(table) => {
-                    let h = table.estimate_size().height;
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::VirtualTable(table) => {
-                    let h = table.estimate_size().height;
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::Flow(flow) => {
-                    // FlowContainer height depends on available width
-                    let h = flow.height_for_width(content_width);
-                    child_heights.push(h);
-                    total_fixed_height += h;
-                }
-                LayoutChild::Spacer { flex } => {
-                    child_heights.push(0.0);
-                    total_flex += flex;
-                }
-                LayoutChild::FixedSpacer { size } => {
-                    child_heights.push(*size);
-                    total_fixed_height += size;
-                }
-            }
-        }
-
-        // Add spacing to fixed height
-        if !self.children.is_empty() {
-            total_fixed_height += self.spacing * (self.children.len() - 1) as f32;
-        }
-
-        // Overflow detection (replaces previous self.measure() call)
-        let content_w = max_child_cross + self.padding.horizontal();
-        let content_h = total_fixed_height + self.padding.vertical();
-        let content_overflows = bounds.width < content_w || bounds.height < content_h;
-        let clips = has_chrome || content_overflows;
-        if clips {
-            snapshot.primitives_mut().push_clip(bounds);
-        }
-
-        let available_flex = (bounds.height - self.padding.vertical() - total_fixed_height).max(0.0);
-
-        // Compute total consumed height (flex children consume available_flex)
-        let total_flex_consumed = if total_flex > 0.0 { available_flex } else { 0.0 };
-        let used_height = total_fixed_height + total_flex_consumed;
-        let free_space = (bounds.height - self.padding.vertical() - used_height).max(0.0);
-
-        // =====================================================================
-        // Main axis alignment: compute starting y and extra per-gap spacing
-        // =====================================================================
-        let n = self.children.len();
-        let (mut y, alignment_gap) = match self.alignment {
-            Alignment::Start => (content_y, 0.0),
-            Alignment::End => (content_y + free_space, 0.0),
-            Alignment::Center => (content_y + free_space / 2.0, 0.0),
-            Alignment::SpaceBetween => {
-                if n > 1 {
-                    (content_y, free_space / (n - 1) as f32)
-                } else {
-                    (content_y, 0.0)
-                }
-            }
-            Alignment::SpaceAround => {
-                if n > 0 {
-                    let space = free_space / n as f32;
-                    (content_y + space / 2.0, space)
-                } else {
-                    (content_y, 0.0)
-                }
-            }
-        };
-
-        // =====================================================================
-        // Position pass: place children and flush to snapshot
-        // =====================================================================
-        for (i, child) in self.children.into_iter().enumerate() {
-            let mut height = child_heights[i];
-
-            // Helper: resolve cross-axis x position for a child of given width
-            let cross_x = |child_width: f32| -> f32 {
-                match self.cross_alignment {
-                    CrossAxisAlignment::Start | CrossAxisAlignment::Stretch => content_x,
-                    CrossAxisAlignment::End => content_x + content_width - child_width,
-                    CrossAxisAlignment::Center => content_x + (content_width - child_width) / 2.0,
-                }
-            };
-
-            match child {
-                LayoutChild::Text(t) => {
-                    let fs = t.font_size();
-                    let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
-                    let x = cross_x(size.width);
-
-                    use crate::layout_snapshot::{SourceLayout, TextLayout};
-                    if let Some(source_id) = t.source_id {
-                        let scale = fs / BASE_FONT_SIZE;
-                        let mut text_layout = TextLayout::simple(
-                            t.text.clone(),
-                            t.color.pack(),
-                            x, y,
-                            CHAR_WIDTH * scale, LINE_HEIGHT * scale,
-                        );
-                        // Expand hit-box to full content width — in Column, text
-                        // owns the entire line so this is safe (no sibling conflicts).
-                        text_layout.bounds.width = text_layout.bounds.width.max(content_width);
-                        snapshot.register_source(source_id, SourceLayout::text(text_layout));
-                    }
-
-                    // Register widget if this text is clickable
-                    if let Some(widget_id) = t.widget_id {
-                        let text_rect = Rect::new(x, y, size.width, size.height);
-                        snapshot.register_widget(widget_id, text_rect);
-                        if let Some(cursor) = t.cursor_hint {
-                            snapshot.set_cursor_hint(widget_id, cursor);
-                        }
-                    }
-
-                    snapshot.primitives_mut().add_text_cached_styled(
-                        t.text,
-                        crate::primitives::Point::new(x, y),
-                        t.color,
-                        fs,
-                        t.cache_key,
-                        t.bold,
-                        t.italic,
-                    );
-
-                    y += height + self.spacing + alignment_gap;
-                }
-                LayoutChild::Terminal(t) => {
-                    let size = t.size();
-                    let x = cross_x(size.width);
-
-                    use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
-                    let rows_content: Vec<GridRow> = t.row_content.into_iter()
-                        .map(|runs| GridRow { runs })
-                        .collect();
-                    let mut grid_layout = GridLayout::with_rows(
-                        Rect::new(x, y, size.width.max(content_width), size.height),
-                        t.cell_width, t.cell_height,
-                        t.cols, t.rows,
-                        rows_content,
-                    );
-                    grid_layout.clip_rect = snapshot.current_clip();
-                    snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
-
-                    y += height + self.spacing + alignment_gap;
-                }
-                LayoutChild::Image(img) => {
-                    let x = cross_x(img.width);
-                    let img_rect = Rect::new(x, y, img.width, img.height);
-                    snapshot.primitives_mut().add_image(
-                        img_rect,
-                        img.handle,
-                        img.corner_radius,
-                        img.tint,
-                    );
-                    if let Some(id) = img.widget_id {
-                        snapshot.register_widget(id, img_rect);
-                        if let Some(cursor) = img.cursor_hint {
-                            snapshot.set_cursor_hint(id, cursor);
-                        }
-                    }
-                    y += height + self.spacing + alignment_gap;
-                }
-                LayoutChild::Button(btn) => {
-                    let size = btn.estimate_size();
-                    let bx = cross_x(size.width);
-                    let btn_rect = Rect::new(bx, y, size.width, size.height);
-                    snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
-                    snapshot.primitives_mut().add_text_cached(
-                        btn.label,
-                        crate::primitives::Point::new(bx + btn.padding.left, y + btn.padding.top),
-                        btn.text_color,
-                        BASE_FONT_SIZE,
-                        btn.cache_key,
-                    );
-                    snapshot.register_widget(btn.id, btn_rect);
-                    snapshot.set_cursor_hint(btn.id, CursorIcon::Pointer);
-                    y += height + self.spacing + alignment_gap;
-                }
-                LayoutChild::TextInput(input) => {
-                    let h = if input.multiline {
-                        input.estimate_size().height
-                    } else {
-                        LINE_HEIGHT + input.padding.vertical()
-                    };
-                    let w = match input.width {
-                        Length::Fixed(px) => px,
-                        Length::Fill | Length::FillPortion(_) => content_width,
-                        Length::Shrink => input.estimate_size().width.min(content_width),
-                    };
-                    let ix = cross_x(w);
-                    if input.multiline {
-                        render_text_input_multiline(snapshot, input, ix, y, w, h);
-                    } else {
-                        render_text_input(snapshot, input, ix, y, w, h);
-                    }
-                    y += h + self.spacing + alignment_gap;
-                }
-                LayoutChild::Table(table) => {
-                    let size = table.estimate_size();
-                    let w = size.width.min(content_width);
-                    let tx = cross_x(w);
-                    render_table(snapshot, table, tx, y, w, size.height);
-                    y += size.height + self.spacing + alignment_gap;
-                }
-                LayoutChild::VirtualTable(table) => {
-                    let size = table.estimate_size();
-                    let w = size.width.min(content_width);
-                    let tx = cross_x(w);
-                    render_virtual_table(snapshot, table, tx, y, w, size.height);
-                    y += size.height + self.spacing + alignment_gap;
-                }
-                LayoutChild::Flow(flow) => {
-                    let w = match flow.width {
-                        Length::Fixed(px) => px,
-                        Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
-                    };
-                    let h = flow.height_for_width(w);
-                    let fx = cross_x(w);
-                    flow.layout(snapshot, fx, y, w);
-                    y += h + self.spacing + alignment_gap;
-                }
-                LayoutChild::Column(nested) => {
-                    // Resolve flex height for Fill children
-                    if nested.height.is_flex() && total_flex > 0.0 {
-                        height = (nested.height.flex() / total_flex) * available_flex;
-                    }
-                    // Resolve width
-                    let w = match nested.width {
-                        Length::Fixed(px) => px,
-                        Length::Fill | Length::FillPortion(_) => content_width,
-                        Length::Shrink => nested.measure().width.min(content_width),
-                    };
-                    let x = cross_x(w);
-                    let nested_bounds = Rect::new(x, y, w, height);
-                    nested.layout(snapshot, nested_bounds);
-                    y += height + self.spacing + alignment_gap;
-                }
-                LayoutChild::Row(nested) => {
-                    // Resolve flex height for Fill children
-                    if nested.height.is_flex() && total_flex > 0.0 {
-                        height = (nested.height.flex() / total_flex) * available_flex;
-                    }
-                    // Give Rows the full content width so their children's
-                    // hit-boxes can expand to fill the line (same as Column text).
-                    let w = match nested.width {
-                        Length::Fixed(px) => px,
-                        Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
-                    };
-                    let x = cross_x(w);
-                    let nested_bounds = Rect::new(x, y, w, height);
-                    nested.layout(snapshot, nested_bounds);
-                    y += height + self.spacing + alignment_gap;
-                }
-                LayoutChild::ScrollColumn(nested) => {
-                    // Resolve flex height for Fill children
-                    if nested.height.is_flex() && total_flex > 0.0 {
-                        height = (nested.height.flex() / total_flex) * available_flex;
-                    }
-                    // Resolve width
-                    let w = match nested.width {
-                        Length::Fixed(px) => px,
-                        Length::Fill | Length::FillPortion(_) => content_width,
-                        Length::Shrink => nested.measure().width.min(content_width),
-                    };
-                    let x = cross_x(w);
-                    let nested_bounds = Rect::new(x, y, w, height);
-                    nested.layout(snapshot, nested_bounds);
-                    y += height + self.spacing + alignment_gap;
-                }
-                LayoutChild::Spacer { flex } => {
-                    if total_flex > 0.0 {
-                        let space = (flex / total_flex) * available_flex;
-                        y += space;
-                    }
-                    y += alignment_gap;
-                }
-                LayoutChild::FixedSpacer { size } => {
-                    y += size + alignment_gap;
-                }
-            }
-        }
-
-        // Register widget ID for hit-testing and overlay anchoring
-        if let Some(id) = self.id {
-            snapshot.register_widget(id, bounds);
-            if let Some(cursor) = self.cursor_hint {
-                snapshot.set_cursor_hint(id, cursor);
-            }
-        }
-
-        if clips {
-            snapshot.primitives_mut().pop_clip();
-        }
-
-        snapshot.debug_exit();
+        let mut ctx = LayoutContext::new(snapshot);
+        let constraints = LayoutConstraints::tight(bounds.width, bounds.height);
+        let origin = Point::new(bounds.x, bounds.y);
+        self.layout_with_constraints(&mut ctx, constraints, origin);
     }
 
     // =========================================================================
-    // Constraint-based Layout API (Phase 4)
+    // Constraint-based Layout API
     // =========================================================================
 
-    /// Layout with constraints - the new constraint-based API.
+    /// Layout with constraints - the native constraint-based API.
     ///
-    /// Takes constraints (min/max bounds) and returns the actual size used.
-    /// This uses the shared `distribute_flex` function for consistent flex math.
+    /// This is the primary layout method. It computes child positions and
+    /// delegates rendering to `LayoutChild::perform_layout`.
     ///
     /// # Arguments
-    /// * `ctx` - Layout context with scratch buffers and snapshot
+    /// * `ctx` - Layout context with snapshot and debug state
     /// * `constraints` - Min/max bounds for this column
     /// * `origin` - Top-left position to place this column
     ///
     /// # Returns
     /// The actual size consumed by this column.
-    #[allow(deprecated)] // Calls deprecated layout() internally as bridge
     pub fn layout_with_constraints(
         self,
         ctx: &mut LayoutContext,
@@ -849,15 +455,213 @@ impl Column {
         };
 
         let size = constraints.constrain(Size::new(width, height));
+        let bounds = Rect::new(origin.x, origin.y, size.width, size.height);
+
+        // Debug tracking
+        ctx.snapshot.debug_enter("Column", bounds);
         ctx.log_layout(constraints, size);
 
-        // Perform actual layout using legacy method
-        // (debug rects are pushed inside layout() via snapshot.debug_enter())
-        let bounds = Rect::new(origin.x, origin.y, size.width, size.height);
-        self.layout(ctx.snapshot, bounds);
+        // Content area after padding
+        let content_x = bounds.x + self.padding.left;
+        let content_y = bounds.y + self.padding.top;
+        let content_width = bounds.width - self.padding.horizontal();
+        let content_height = bounds.height - self.padding.vertical();
 
+        // Draw chrome (shadow → background → border)
+        let chrome = self.chrome();
+        let has_chrome = chrome.has_visible_chrome();
+        render_chrome(ctx.snapshot, bounds, &chrome);
+
+        // =====================================================================
+        // Measurement pass: compute child heights and flex factors
+        // =====================================================================
+        let mut total_fixed_height = 0.0;
+        let mut total_flex = 0.0;
+        let mut max_child_cross: f32 = 0.0;
+        let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
+
+        for child in &self.children {
+            max_child_cross = max_child_cross.max(child.measure_cross(true));
+            let (h, flex) = measure_child_height(child, content_width);
+            child_heights.push(h);
+            if flex > 0.0 {
+                total_flex += flex;
+            } else {
+                total_fixed_height += h;
+            }
+        }
+
+        // Add spacing
+        if !self.children.is_empty() {
+            total_fixed_height += self.spacing * (self.children.len() - 1) as f32;
+        }
+
+        // Overflow detection
+        let content_overflows = bounds.width < max_child_cross + self.padding.horizontal()
+            || bounds.height < total_fixed_height + self.padding.vertical();
+        let clips = has_chrome || content_overflows;
+        if clips {
+            ctx.snapshot.primitives_mut().push_clip(bounds);
+        }
+
+        let available_flex = (content_height - total_fixed_height).max(0.0);
+        let total_flex_consumed = if total_flex > 0.0 { available_flex } else { 0.0 };
+        let free_space = (content_height - total_fixed_height - total_flex_consumed).max(0.0);
+
+        // =====================================================================
+        // Main axis alignment
+        // =====================================================================
+        let n = self.children.len();
+        let (mut y, alignment_gap) = match self.alignment {
+            Alignment::Start => (content_y, 0.0),
+            Alignment::End => (content_y + free_space, 0.0),
+            Alignment::Center => (content_y + free_space / 2.0, 0.0),
+            Alignment::SpaceBetween => {
+                if n > 1 { (content_y, free_space / (n - 1) as f32) } else { (content_y, 0.0) }
+            }
+            Alignment::SpaceAround => {
+                if n > 0 {
+                    let space = free_space / n as f32;
+                    (content_y + space / 2.0, space)
+                } else {
+                    (content_y, 0.0)
+                }
+            }
+        };
+
+        // Helper: resolve cross-axis x position
+        let cross_x = |child_width: f32| -> f32 {
+            match self.cross_alignment {
+                CrossAxisAlignment::Start | CrossAxisAlignment::Stretch => content_x,
+                CrossAxisAlignment::End => content_x + content_width - child_width,
+                CrossAxisAlignment::Center => content_x + (content_width - child_width) / 2.0,
+            }
+        };
+
+        // =====================================================================
+        // Position pass: place children using perform_layout
+        // =====================================================================
+        for (i, child) in self.children.into_iter().enumerate() {
+            let mut child_height = child_heights[i];
+
+            // Resolve flex height
+            if child.flex_factor(true) > 0.0 && total_flex > 0.0 {
+                child_height = (child.flex_factor(true) / total_flex) * available_flex;
+            }
+
+            // Compute child width based on its sizing mode
+            let child_width = compute_child_width(&child, content_width);
+            let x = cross_x(child_width);
+
+            // Skip spacers (no rendering needed)
+            match &child {
+                LayoutChild::Spacer { .. } => {
+                    y += child_height + alignment_gap;
+                    continue;
+                }
+                LayoutChild::FixedSpacer { size } => {
+                    y += size + alignment_gap;
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Create constraints for child
+            let child_constraints = LayoutConstraints::tight(child_width, child_height);
+            let child_origin = Point::new(x, y);
+
+            // Perform layout
+            child.perform_layout(ctx, child_constraints, child_origin);
+
+            y += child_height + self.spacing + alignment_gap;
+        }
+
+        // Register widget ID
+        if let Some(id) = self.id {
+            ctx.snapshot.register_widget(id, bounds);
+            if let Some(cursor) = self.cursor_hint {
+                ctx.snapshot.set_cursor_hint(id, cursor);
+            }
+        }
+
+        if clips {
+            ctx.snapshot.primitives_mut().pop_clip();
+        }
+
+        ctx.snapshot.debug_exit();
         ctx.exit();
         size
+    }
+}
+
+// =========================================================================
+// Layout Helpers
+// =========================================================================
+
+/// Measure child height and flex factor for the measurement pass.
+fn measure_child_height(child: &LayoutChild, content_width: f32) -> (f32, f32) {
+    match child {
+        LayoutChild::Text(t) => (t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).height, 0.0),
+        LayoutChild::Terminal(t) => (t.size().height, 0.0),
+        LayoutChild::Image(img) => (img.height, 0.0),
+        LayoutChild::Button(btn) => (btn.estimate_size().height, 0.0),
+        LayoutChild::TextInput(input) => (LINE_HEIGHT + input.padding.vertical(), 0.0),
+        LayoutChild::Table(table) => (table.estimate_size().height, 0.0),
+        LayoutChild::VirtualTable(table) => (table.estimate_size().height, 0.0),
+        LayoutChild::Flow(flow) => (flow.height_for_width(content_width), 0.0),
+        LayoutChild::Column(c) => match c.height {
+            Length::Fixed(px) => (px, 0.0),
+            Length::Fill | Length::FillPortion(_) => (0.0, c.height.flex()),
+            Length::Shrink => (c.measure().height, 0.0),
+        },
+        LayoutChild::Row(r) => match r.height {
+            Length::Fixed(px) => (px, 0.0),
+            Length::Fill | Length::FillPortion(_) => (0.0, r.height.flex()),
+            Length::Shrink => (r.height_for_width(content_width), 0.0),
+        },
+        LayoutChild::ScrollColumn(s) => match s.height {
+            Length::Fixed(px) => (px, 0.0),
+            Length::Fill | Length::FillPortion(_) => (0.0, s.height.flex()),
+            Length::Shrink => (s.measure().height, 0.0),
+        },
+        LayoutChild::Spacer { flex } => (0.0, *flex),
+        LayoutChild::FixedSpacer { size } => (*size, 0.0),
+    }
+}
+
+/// Compute child width based on its sizing mode.
+fn compute_child_width(child: &LayoutChild, content_width: f32) -> f32 {
+    match child {
+        LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).width,
+        LayoutChild::Terminal(t) => t.size().width,
+        LayoutChild::Image(img) => img.width,
+        LayoutChild::Button(btn) => btn.estimate_size().width,
+        LayoutChild::TextInput(input) => match input.width {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => input.estimate_size().width.min(content_width),
+        },
+        LayoutChild::Table(table) => table.estimate_size().width.min(content_width),
+        LayoutChild::VirtualTable(table) => table.estimate_size().width.min(content_width),
+        LayoutChild::Flow(flow) => match flow.width {
+            Length::Fixed(px) => px,
+            _ => content_width,
+        },
+        LayoutChild::Column(c) => match c.width {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => c.measure().width.min(content_width),
+        },
+        LayoutChild::Row(r) => match r.width {
+            Length::Fixed(px) => px,
+            _ => content_width,
+        },
+        LayoutChild::ScrollColumn(s) => match s.width {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => s.measure().width.min(content_width),
+        },
+        LayoutChild::Spacer { .. } | LayoutChild::FixedSpacer { .. } => 0.0,
     }
 }
 

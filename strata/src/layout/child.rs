@@ -7,21 +7,24 @@
 //! The recursive container types (Column, Row, ScrollColumn) are boxed to
 //! break the size recursion that would otherwise make the enum infinitely sized.
 
-use crate::primitives::Size;
+use crate::layout_snapshot::{CursorIcon, GridLayout, GridRow, LayoutSnapshot, SourceLayout, TextLayout};
+use crate::primitives::{Point, Rect, Size};
 
 // Import element types from elements module
 use super::elements::{TextElement, TerminalElement, ImageElement, ButtonElement};
 
 // Import length types
-use super::length::{Length, CHAR_WIDTH, LINE_HEIGHT};
+use super::length::{Length, CHAR_WIDTH, LINE_HEIGHT, BASE_FONT_SIZE};
 
 // Import container types from their respective modules
+use super::constraints::LayoutConstraints;
+use super::context::LayoutContext;
 use super::flow::FlowContainer;
 use super::scroll_column::ScrollColumn;
 use super::row::Row;
 use super::column::Column;
-use super::text_input::TextInputElement;
-use super::table::{TableElement, VirtualTableElement};
+use super::text_input::{TextInputElement, render_text_input, render_text_input_multiline};
+use super::table::{TableElement, VirtualTableElement, render_table, render_virtual_table};
 
 // =========================================================================
 // LayoutChild Enum
@@ -280,6 +283,186 @@ impl LayoutChild {
                     .wrapping_add(f.content_hash())
             }
         }
+    }
+
+    /// Layout this child with constraints and render to snapshot.
+    ///
+    /// This is the unified dispatch method that replaces the deprecated
+    /// per-container layout logic. Containers call this instead of matching
+    /// on child type and calling `.layout()` directly.
+    ///
+    /// # Arguments
+    /// * `ctx` - Layout context with snapshot and debug state
+    /// * `constraints` - Available space constraints
+    /// * `origin` - Top-left position to place this child
+    ///
+    /// # Returns
+    /// The actual size consumed by this child.
+    pub fn perform_layout(
+        self,
+        ctx: &mut LayoutContext,
+        constraints: LayoutConstraints,
+        origin: Point,
+    ) -> Size {
+        match self {
+            // Containers: delegate to layout_with_constraints
+            LayoutChild::Column(c) => c.layout_with_constraints(ctx, constraints, origin),
+            LayoutChild::Row(r) => r.layout_with_constraints(ctx, constraints, origin),
+            LayoutChild::ScrollColumn(s) => s.layout_with_constraints(ctx, constraints, origin),
+            LayoutChild::Flow(f) => f.layout_with_constraints(ctx, constraints, origin),
+
+            // Leaf elements: render directly
+            LayoutChild::Text(t) => {
+                render_text(ctx.snapshot, &t, origin, constraints.max_width);
+                t.estimate_size(CHAR_WIDTH, LINE_HEIGHT)
+            }
+            LayoutChild::Terminal(t) => {
+                let size = t.size();
+                render_terminal(ctx.snapshot, t, origin);
+                size
+            }
+            LayoutChild::Image(img) => {
+                render_image(ctx.snapshot, &img, origin);
+                Size::new(img.width, img.height)
+            }
+            LayoutChild::Button(btn) => {
+                let size = btn.estimate_size();
+                render_button(ctx.snapshot, &btn, origin, size);
+                size
+            }
+            LayoutChild::TextInput(input) => {
+                let size = compute_text_input_size(&input, constraints.max_width);
+                render_text_input_child(ctx.snapshot, input, origin, size);
+                size
+            }
+            LayoutChild::Table(table) => {
+                let size = table.estimate_size();
+                let w = size.width.min(constraints.max_width);
+                render_table(ctx.snapshot, table, origin.x, origin.y, w, size.height);
+                Size::new(w, size.height)
+            }
+            LayoutChild::VirtualTable(table) => {
+                let size = table.estimate_size();
+                let w = size.width.min(constraints.max_width);
+                render_virtual_table(ctx.snapshot, table, origin.x, origin.y, w, size.height);
+                Size::new(w, size.height)
+            }
+            LayoutChild::Spacer { .. } => Size::ZERO,
+            LayoutChild::FixedSpacer { size } => Size::new(0.0, size),
+        }
+    }
+}
+
+// =========================================================================
+// Child Rendering Helpers
+// =========================================================================
+
+/// Render a text element at the given origin.
+fn render_text(snapshot: &mut LayoutSnapshot, t: &TextElement, origin: Point, max_width: f32) {
+    let fs = t.font_size();
+    let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
+
+    if let Some(source_id) = t.source_id {
+        let scale = fs / BASE_FONT_SIZE;
+        let mut text_layout = TextLayout::simple(
+            t.text.clone(),
+            t.color.pack(),
+            origin.x, origin.y,
+            CHAR_WIDTH * scale, LINE_HEIGHT * scale,
+        );
+        // Expand hit-box to max width for better click targets
+        text_layout.bounds.width = text_layout.bounds.width.max(max_width);
+        snapshot.register_source(source_id, SourceLayout::text(text_layout));
+    }
+
+    if let Some(widget_id) = t.widget_id {
+        let text_rect = Rect::new(origin.x, origin.y, size.width, size.height);
+        snapshot.register_widget(widget_id, text_rect);
+        if let Some(cursor) = t.cursor_hint {
+            snapshot.set_cursor_hint(widget_id, cursor);
+        }
+    }
+
+    snapshot.primitives_mut().add_text_cached_styled(
+        t.text.clone(),
+        origin,
+        t.color,
+        fs,
+        t.cache_key,
+        t.bold,
+        t.italic,
+    );
+}
+
+/// Render a terminal element at the given origin.
+fn render_terminal(snapshot: &mut LayoutSnapshot, t: TerminalElement, origin: Point) {
+    let size = t.size();
+    let rows_content: Vec<GridRow> = t.row_content.into_iter()
+        .map(|runs| GridRow { runs })
+        .collect();
+    let mut grid_layout = GridLayout::with_rows(
+        Rect::new(origin.x, origin.y, size.width, size.height),
+        t.cell_width, t.cell_height,
+        t.cols, t.rows,
+        rows_content,
+    );
+    grid_layout.clip_rect = snapshot.current_clip();
+    snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
+}
+
+/// Render an image element at the given origin.
+fn render_image(snapshot: &mut LayoutSnapshot, img: &ImageElement, origin: Point) {
+    let img_rect = Rect::new(origin.x, origin.y, img.width, img.height);
+    snapshot.primitives_mut().add_image(
+        img_rect,
+        img.handle.clone(),
+        img.corner_radius,
+        img.tint,
+    );
+    if let Some(id) = img.widget_id {
+        snapshot.register_widget(id, img_rect);
+        if let Some(cursor) = img.cursor_hint {
+            snapshot.set_cursor_hint(id, cursor);
+        }
+    }
+}
+
+/// Render a button element at the given origin.
+fn render_button(snapshot: &mut LayoutSnapshot, btn: &ButtonElement, origin: Point, size: Size) {
+    let btn_rect = Rect::new(origin.x, origin.y, size.width, size.height);
+    snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
+    snapshot.primitives_mut().add_text_cached(
+        btn.label.clone(),
+        Point::new(origin.x + btn.padding.left, origin.y + btn.padding.top),
+        btn.text_color,
+        BASE_FONT_SIZE,
+        btn.cache_key,
+    );
+    snapshot.register_widget(btn.id, btn_rect);
+    snapshot.set_cursor_hint(btn.id, CursorIcon::Pointer);
+}
+
+/// Compute text input size based on constraints.
+fn compute_text_input_size(input: &TextInputElement, max_width: f32) -> Size {
+    let h = if input.multiline {
+        input.estimate_size().height
+    } else {
+        LINE_HEIGHT + input.padding.vertical()
+    };
+    let w = match input.width {
+        Length::Fixed(px) => px,
+        Length::Fill | Length::FillPortion(_) => max_width,
+        Length::Shrink => input.estimate_size().width.min(max_width),
+    };
+    Size::new(w, h)
+}
+
+/// Render a text input element at the given origin.
+fn render_text_input_child(snapshot: &mut LayoutSnapshot, input: TextInputElement, origin: Point, size: Size) {
+    if input.multiline {
+        render_text_input_multiline(snapshot, input, origin.x, origin.y, size.width, size.height);
+    } else {
+        render_text_input(snapshot, input, origin.x, origin.y, size.width, size.height);
     }
 }
 
