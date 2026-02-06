@@ -365,6 +365,8 @@ impl Column {
     /// Compute layout and flush to snapshot.
     ///
     /// This is where the actual layout math happens - ONCE per frame.
+    #[deprecated(since = "0.2.0", note = "use layout_with_constraints() instead")]
+    #[allow(deprecated)] // Internal recursive calls to child.layout()
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
         // Debug tracking for layout visualization
         snapshot.debug_enter("Column", bounds);
@@ -808,6 +810,7 @@ impl Column {
     ///
     /// # Returns
     /// The actual size consumed by this column.
+    #[allow(deprecated)] // Calls deprecated layout() internally as bridge
     pub fn layout_with_constraints(
         self,
         ctx: &mut LayoutContext,

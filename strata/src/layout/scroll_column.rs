@@ -311,6 +311,8 @@ impl ScrollColumn {
     ///
     /// Implements virtualization: only children intersecting the viewport
     /// are laid out. A scrollbar thumb is drawn when content overflows.
+    #[deprecated(since = "0.2.0", note = "use layout_with_constraints() instead")]
+    #[allow(deprecated)] // Internal recursive calls to child.layout()
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
         // Debug tracking for layout visualization
         snapshot.debug_enter("ScrollColumn", bounds);
@@ -615,6 +617,7 @@ impl ScrollColumn {
     ///
     /// # Returns
     /// The actual size consumed by this scroll column.
+    #[allow(deprecated)] // Calls deprecated layout() internally as bridge
     pub fn layout_with_constraints(
         self,
         ctx: &mut LayoutContext,

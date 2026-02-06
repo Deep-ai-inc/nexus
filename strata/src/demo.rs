@@ -574,6 +574,7 @@ impl StrataApp for DemoApp {
         Command::none()
     }
 
+    #[allow(deprecated)] // Demo uses deprecated layout() for demonstration
     fn view(state: &Self::State, snapshot: &mut LayoutSnapshot) {
         // FPS calculation (exponential moving average)
         let now = Instant::now();

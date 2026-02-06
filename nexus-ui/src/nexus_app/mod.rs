@@ -197,19 +197,17 @@ impl Component for NexusState {
         main_col = self.layout_overlays_and_input(main_col, cursor_visible);
 
         // Use constraint-based layout for debug visualization support
-        #[cfg(debug_assertions)]
         {
             use strata::layout::{LayoutContext, LayoutConstraints};
             use strata::primitives::Point;
 
+            #[cfg(debug_assertions)]
             let mut ctx = LayoutContext::new(snapshot).with_debug(self.debug_layout);
+            #[cfg(not(debug_assertions))]
+            let mut ctx = LayoutContext::new(snapshot);
+
             let constraints = LayoutConstraints::tight(vw, vh);
             main_col.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
-        }
-
-        #[cfg(not(debug_assertions))]
-        {
-            main_col.layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
         }
 
         self.sync_scroll_states(snapshot);

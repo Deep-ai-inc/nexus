@@ -155,6 +155,7 @@ impl FlowContainer {
     ///
     /// This is the original API. For new code, prefer `layout_with_constraints()`
     /// which provides better introspection and constraint propagation.
+    #[deprecated(since = "0.2.0", note = "use layout_with_constraints() instead")]
     pub fn layout(&self, snapshot: &mut LayoutSnapshot, x: f32, y: f32, available_width: f32) {
         self.layout_impl(snapshot, x, y, available_width);
     }
@@ -292,6 +293,7 @@ impl Default for FlowContainer {
 // =========================================================================
 
 /// Render a single child in a flow container.
+#[allow(deprecated)] // Nested Flow containers use deprecated layout()
 fn render_flow_child(
     snapshot: &mut LayoutSnapshot,
     child: &LayoutChild,
