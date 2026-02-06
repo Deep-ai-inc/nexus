@@ -156,6 +156,10 @@ pub(crate) fn extract_block_text(
 
             // If the block has native output, convert it to text
             if let Some(ref value) = block.native_output {
+                // Format tables as markdown
+                if let nexus_api::Value::Table { columns, rows } = value {
+                    return Some(format_table_as_markdown(columns, rows));
+                }
                 return Some(value.to_text());
             }
 
@@ -327,20 +331,9 @@ fn extract_source_text(
         let table_id = source_ids::table(block.id);
         if table_id == source_id {
             if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
-                let mut lines: Vec<String> = Vec::new();
-                for col in columns {
-                    lines.push(col.name.clone());
-                }
-                for row in rows {
-                    for cell in row {
-                        let text = cell.to_text();
-                        for l in text.lines() {
-                            lines.push(l.to_string());
-                        }
-                    }
-                }
-                let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-                return Some(extract_multi_item_range(&line_refs, is_start, is_end, start, end));
+                // Tables have one item per cell in the UI, but markdown has one line per row.
+                // Rather than complex mapping, copy the full table as markdown when selected.
+                return Some(format_table_as_markdown(columns, rows));
             }
         }
     }
@@ -482,6 +475,44 @@ fn extract_multi_item_range(
         }
     }
     parts.join("\n")
+}
+
+/// Format a table as a markdown table.
+fn format_table_as_markdown(columns: &[nexus_api::TableColumn], rows: &[Vec<nexus_api::Value>]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Header row
+    let header: String = columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    lines.push(format!("| {} |", header));
+
+    // Separator row
+    let separator: String = columns
+        .iter()
+        .map(|_| "---")
+        .collect::<Vec<_>>()
+        .join(" | ");
+    lines.push(format!("| {} |", separator));
+
+    // Data rows
+    for row in rows {
+        let cells: String = row
+            .iter()
+            .map(|cell| {
+                // Escape pipes in cell content and replace newlines
+                cell.to_text()
+                    .replace('|', "\\|")
+                    .replace('\n', " ")
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        lines.push(format!("| {} |", cells));
+    }
+
+    lines.join("\n")
 }
 
 /// Gather all visible text from a tool invocation for copy/selection extraction.

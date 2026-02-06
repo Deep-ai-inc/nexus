@@ -12,8 +12,17 @@
 //!
 //! This avoids the "immediate mode trap" where widgets compute layout every frame.
 
+pub mod constraints;
 pub mod containers;
+pub mod context;
+pub mod length;
 pub mod primitives;
 
-pub use containers::{Column, Row, ScrollColumn, LayoutChild, Widget, Padding, Alignment, CrossAxisAlignment, Length, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell};
+// Re-export core types
+pub use constraints::LayoutConstraints;
+pub use context::{LayoutContext, FlexAllocation};
+pub use length::{Length, Alignment, CrossAxisAlignment, Padding, CHAR_WIDTH, LINE_HEIGHT, BASE_FONT_SIZE};
+
+// Re-export containers
+pub use containers::{Column, Row, ScrollColumn, LayoutChild, Widget, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell};
 pub use primitives::{LineStyle, PrimitiveBatch};

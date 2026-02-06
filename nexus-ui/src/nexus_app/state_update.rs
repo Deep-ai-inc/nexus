@@ -644,6 +644,33 @@ impl NexusState {
         self.transient.dismiss_context_menu();
         match item {
             ContextMenuItem::Copy => {
+                // First try to copy the selected text (respects user's selection)
+                if let Some(text) = self
+                    .selection
+                    .extract_selected_text(&self.shell.blocks, &self.agent.blocks)
+                {
+                    Self::set_clipboard_text(&text);
+                    return Command::none();
+                }
+                // Fall back to input selection if in input context
+                if matches!(target, Some(ContextTarget::Input)) {
+                    if let Some((sel_start, sel_end)) = self.input.text_input.selection {
+                        let start = sel_start.min(sel_end);
+                        let end = sel_start.max(sel_end);
+                        if start != end {
+                            let selected: String = self.input.text_input.text
+                                .chars()
+                                .skip(start)
+                                .take(end - start)
+                                .collect();
+                            if !selected.is_empty() {
+                                Self::set_clipboard_text(&selected);
+                                return Command::none();
+                            }
+                        }
+                    }
+                }
+                // Fall back to entire block text only if no selection
                 if let Some(text) = target.and_then(|t| {
                     selection::extract_block_text(
                         &self.shell.blocks,
