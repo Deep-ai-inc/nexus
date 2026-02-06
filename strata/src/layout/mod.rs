@@ -12,6 +12,7 @@
 //!
 //! This avoids the "immediate mode trap" where widgets compute layout every frame.
 
+pub mod base;
 pub mod cache;
 pub mod constraints;
 pub mod context;
@@ -30,6 +31,7 @@ pub mod table;           // TableElement, VirtualTableElement
 pub mod child;           // LayoutChild enum (central switchboard)
 
 // Re-export core types
+pub use base::{Chrome, render_chrome};
 pub use cache::{LayoutCache, LayoutCacheKey};
 pub use constraints::LayoutConstraints;
 pub use context::{LayoutContext, FlexAllocation};

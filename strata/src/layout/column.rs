@@ -7,6 +7,7 @@ use crate::content_address::SourceId;
 use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
 use crate::primitives::{Color, Point, Rect, Size};
 
+use super::base::{Chrome, render_chrome};
 use super::child::LayoutChild;
 use super::constraints::LayoutConstraints;
 use super::context::LayoutContext;
@@ -362,6 +363,18 @@ impl Column {
         total_height + self.padding.vertical()
     }
 
+    /// Extract chrome (visual decorations) for this container.
+    #[inline]
+    fn chrome(&self) -> Chrome {
+        Chrome {
+            background: self.background,
+            corner_radius: self.corner_radius,
+            border_color: self.border_color,
+            border_width: self.border_width,
+            shadow: self.shadow,
+        }
+    }
+
     /// Compute layout and flush to snapshot.
     ///
     /// This is where the actual layout math happens - ONCE per frame.
@@ -376,33 +389,10 @@ impl Column {
         let content_y = bounds.y + self.padding.top;
         let content_width = bounds.width - self.padding.horizontal();
 
-        // Draw shadow → background → border (correct z-order)
-        // These are drawn OUTSIDE the clip rect (they ARE the container chrome).
-        if let Some((blur, color)) = self.shadow {
-            snapshot.primitives_mut().add_shadow(
-                Rect::new(bounds.x + 4.0, bounds.y + 4.0, bounds.width, bounds.height),
-                self.corner_radius,
-                blur,
-                color,
-            );
-        }
-        if let Some(bg) = self.background {
-            if self.corner_radius > 0.0 {
-                snapshot.primitives_mut().add_rounded_rect(bounds, self.corner_radius, bg);
-            } else {
-                snapshot.primitives_mut().add_solid_rect(bounds, bg);
-            }
-        }
-        if let Some(border_color) = self.border_color {
-            snapshot.primitives_mut().add_border(
-                bounds,
-                self.corner_radius,
-                self.border_width,
-                border_color,
-            );
-        }
-
-        let has_chrome = self.background.is_some() || self.border_color.is_some();
+        // Draw chrome (shadow → background → border)
+        let chrome = self.chrome();
+        let has_chrome = chrome.has_visible_chrome();
+        render_chrome(snapshot, bounds, &chrome);
 
         // =====================================================================
         // Measurement pass: compute child heights and flex factors

@@ -8,6 +8,7 @@ use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
 use crate::primitives::{Color, Point, Rect, Size};
 use crate::scroll_state::ScrollState;
 
+use super::base::{Chrome, render_chrome};
 use super::child::LayoutChild;
 use super::column::Column;
 use super::constraints::LayoutConstraints;
@@ -307,6 +308,19 @@ impl ScrollColumn {
         hash
     }
 
+    /// Extract chrome (visual decorations) for this container.
+    /// Note: ScrollColumn does not support shadow.
+    #[inline]
+    fn chrome(&self) -> Chrome {
+        Chrome {
+            background: self.background,
+            corner_radius: self.corner_radius,
+            border_color: self.border_color,
+            border_width: self.border_width,
+            shadow: None, // ScrollColumn does not support shadow
+        }
+    }
+
     /// Compute layout and flush to snapshot.
     ///
     /// Implements virtualization: only children intersecting the viewport
@@ -321,22 +335,8 @@ impl ScrollColumn {
         let full_content_width = bounds.width - self.padding.horizontal();
         let viewport_h = bounds.height;
 
-        // Draw chrome outside clip
-        if let Some(bg) = self.background {
-            if self.corner_radius > 0.0 {
-                snapshot.primitives_mut().add_rounded_rect(bounds, self.corner_radius, bg);
-            } else {
-                snapshot.primitives_mut().add_solid_rect(bounds, bg);
-            }
-        }
-        if let Some(border_color) = self.border_color {
-            snapshot.primitives_mut().add_border(
-                bounds,
-                self.corner_radius,
-                self.border_width,
-                border_color,
-            );
-        }
+        // Draw chrome (background → border, no shadow for ScrollColumn)
+        render_chrome(snapshot, bounds, &self.chrome());
 
         // Push clip to viewport bounds
         snapshot.primitives_mut().push_clip(bounds);
