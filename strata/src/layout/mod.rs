@@ -15,6 +15,7 @@
 pub mod constraints;
 pub mod containers;
 pub mod context;
+pub mod elements;
 pub mod length;
 pub mod primitives;
 
@@ -23,6 +24,9 @@ pub use constraints::LayoutConstraints;
 pub use context::{LayoutContext, FlexAllocation};
 pub use length::{Length, Alignment, CrossAxisAlignment, Padding, CHAR_WIDTH, LINE_HEIGHT, BASE_FONT_SIZE};
 
+// Re-export elements
+pub use elements::{TextElement, TerminalElement, ImageElement, ButtonElement};
+
 // Re-export containers
-pub use containers::{Column, Row, ScrollColumn, LayoutChild, Widget, ImageElement, ButtonElement, TextInputElement, TableElement, TableColumn, TableCell};
+pub use containers::{Column, Row, ScrollColumn, LayoutChild, Widget, TextInputElement, TableElement, TableColumn, TableCell};
 pub use primitives::{LineStyle, PrimitiveBatch};
