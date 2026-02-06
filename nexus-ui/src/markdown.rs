@@ -3,10 +3,36 @@
 //! Uses pulldown-cmark for proper CommonMark + GFM parsing.
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, HeadingLevel};
-use strata::layout::containers::{Column, Length, Padding, Row, TextElement};
+use strata::layout::containers::{Column, FlowContainer, Length, Padding, Row, TextElement};
 use strata::content_address::SourceId;
 
 use crate::nexus_app::colors;
+
+/// Split text into words for flow layout.
+/// Each word includes any trailing whitespace so spacing is preserved.
+fn split_into_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current_word = String::new();
+
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            // Add whitespace to current word, then finish the word
+            current_word.push(ch);
+            if !current_word.is_empty() {
+                words.push(std::mem::take(&mut current_word));
+            }
+        } else {
+            current_word.push(ch);
+        }
+    }
+
+    // Don't forget the last word if there's no trailing whitespace
+    if !current_word.is_empty() {
+        words.push(current_word);
+    }
+
+    words
+}
 
 /// Render markdown text to a strata Column layout.
 pub fn render(text: &str, source_id: SourceId) -> Column {
@@ -78,7 +104,7 @@ impl MarkdownRenderer {
     fn new(source_id: SourceId) -> Self {
         Self {
             source_id,
-            column: Column::new().spacing(2.0),
+            column: Column::new().spacing(2.0).width(Length::Fill),
             style_stack: Vec::new(),
             list_stack: Vec::new(),
             blockquote_level: 0,
@@ -315,13 +341,13 @@ impl MarkdownRenderer {
             return;
         }
 
-        let row = self.build_inline_row(content);
+        let flow = self.build_inline_flow(content);
 
         if self.blockquote_level > 0 {
-            let bq_row = self.wrap_in_blockquote(row);
+            let bq_row = self.wrap_in_blockquote_flow(flow);
             self.column = std::mem::take(&mut self.column).push(bq_row);
         } else {
-            self.column = std::mem::take(&mut self.column).push(row);
+            self.column = std::mem::take(&mut self.column).push(flow);
         }
     }
 
@@ -374,12 +400,12 @@ impl MarkdownRenderer {
             "  \u{00B7} ".to_string()
         };
 
-        // Build row with marker and content
-        let mut row = Row::new().spacing(0.0);
-        row = row.push(TextElement::new(&marker).color(colors::TEXT_MUTED).source(self.source_id));
-
-        // Add content spans
-        row = self.add_inline_spans_to_row(row, content);
+        // Build a row with marker, then flow content that can wrap
+        // The marker stays fixed on the left, content flows to the right
+        let flow = self.build_inline_flow(content);
+        let row = Row::new().spacing(0.0)
+            .push(TextElement::new(&marker).color(colors::TEXT_MUTED).source(self.source_id))
+            .push(flow);
 
         if self.blockquote_level > 0 {
             let bq_row = self.wrap_in_blockquote(row);
@@ -389,40 +415,60 @@ impl MarkdownRenderer {
         }
     }
 
-    /// Build a row from inline content spans
-    fn build_inline_row(&self, content: Vec<InlineSpan>) -> Row {
-        let row = Row::new().spacing(0.0);
-        self.add_inline_spans_to_row(row, content)
-    }
+    /// Build a FlowContainer from inline content spans for text wrapping.
+    /// Splits text at word boundaries so each word can wrap independently.
+    fn build_inline_flow(&self, content: Vec<InlineSpan>) -> FlowContainer {
+        let mut flow = FlowContainer::new()
+            .spacing(0.0)
+            .source(self.source_id)
+            .width(Length::Fill);
 
-    /// Add inline spans to an existing row
-    fn add_inline_spans_to_row(&self, mut row: Row, content: Vec<InlineSpan>) -> Row {
         for span in content {
-            let mut elem = TextElement::new(&span.text).source(self.source_id);
+            // Split text at word boundaries for proper wrapping
+            // Keep whitespace attached to the preceding word for natural spacing
+            let words = split_into_words(&span.text);
 
-            if span.is_code {
-                elem = elem.color(colors::TOOL_ACTION);
-            } else if span.is_link {
-                elem = elem.color(colors::TEXT_PATH);
-            } else if span.strikethrough {
-                elem = elem.color(colors::TEXT_MUTED);
-            } else {
-                elem = elem.color(colors::TEXT_PRIMARY);
-            }
+            for word in words {
+                if word.is_empty() {
+                    continue;
+                }
 
-            if span.bold {
-                elem = elem.bold();
-            }
-            if span.italic {
-                elem = elem.italic();
-            }
+                let mut elem = TextElement::new(&word).source(self.source_id);
 
-            row = row.push(elem);
+                if span.is_code {
+                    elem = elem.color(colors::TOOL_ACTION);
+                } else if span.is_link {
+                    elem = elem.color(colors::TEXT_PATH);
+                } else if span.strikethrough {
+                    elem = elem.color(colors::TEXT_MUTED);
+                } else {
+                    elem = elem.color(colors::TEXT_PRIMARY);
+                }
+
+                if span.bold {
+                    elem = elem.bold();
+                }
+                if span.italic {
+                    elem = elem.italic();
+                }
+
+                flow = flow.push(elem);
+            }
         }
-        row
+        flow
     }
 
     fn wrap_in_blockquote(&self, inner: Row) -> Row {
+        let mut bq_row = Row::new();
+        for _ in 0..self.blockquote_level {
+            bq_row = bq_row
+                .push(Column::new().width(Length::Fixed(3.0)).height(Length::Fixed(16.0)).background(colors::TEXT_MUTED))
+                .fixed_spacer(8.0);
+        }
+        bq_row.push(inner)
+    }
+
+    fn wrap_in_blockquote_flow(&self, inner: FlowContainer) -> Row {
         let mut bq_row = Row::new();
         for _ in 0..self.blockquote_level {
             bq_row = bq_row

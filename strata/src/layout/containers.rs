@@ -177,6 +177,9 @@ pub enum LayoutChild {
 
     /// A fixed-size spacer.
     FixedSpacer { size: f32 },
+
+    /// A flow container (wrapping inline layout, like CSS flex-wrap).
+    Flow(FlowContainer),
 }
 
 impl LayoutChild {
@@ -193,6 +196,7 @@ impl LayoutChild {
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
+            LayoutChild::Flow(f) => f.measure(),
             LayoutChild::Spacer { .. } => return 0.0,
             LayoutChild::FixedSpacer { size } => return *size,
         };
@@ -212,6 +216,7 @@ impl LayoutChild {
             LayoutChild::Column(c) => c.measure(),
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
+            LayoutChild::Flow(f) => f.measure(),
             LayoutChild::Spacer { .. } => return 0.0,
             LayoutChild::FixedSpacer { .. } => return 0.0,
         };
@@ -236,6 +241,9 @@ impl LayoutChild {
             }
             LayoutChild::TextInput(t) => {
                 if is_column { 0.0 } else { t.width.flex() }
+            }
+            LayoutChild::Flow(f) => {
+                if is_column { 0.0 } else { f.width.flex() }
             }
             _ => 0.0,
         }
@@ -277,6 +285,9 @@ impl From<TableElement> for LayoutChild {
 
 impl From<VirtualTableElement> for LayoutChild {
     fn from(v: VirtualTableElement) -> Self { Self::VirtualTable(v) }
+}
+impl From<FlowContainer> for LayoutChild {
+    fn from(v: FlowContainer) -> Self { Self::Flow(v) }
 }
 
 // =========================================================================
@@ -1678,6 +1689,39 @@ impl Column {
         Size::new(intrinsic_width, intrinsic_height)
     }
 
+    /// Calculate the height of this Column for a given available width.
+    /// This is needed because FlowContainer and Row children have width-dependent heights.
+    pub fn height_for_width(&self, available_width: f32) -> f32 {
+        if let Length::Fixed(px) = self.height {
+            return px;
+        }
+
+        let content_width = available_width - self.padding.horizontal();
+        let mut total_height = 0.0f32;
+
+        for child in &self.children {
+            // Skip flex children in measurement (they fill remaining space)
+            if child.flex_factor(true) > 0.0 {
+                continue;
+            }
+
+            let h = match child {
+                LayoutChild::Flow(f) => f.height_for_width(content_width),
+                LayoutChild::Row(r) => r.height_for_width(content_width),
+                LayoutChild::Column(c) => c.height_for_width(content_width),
+                _ => child.measure_main(true),
+            };
+            total_height += h;
+        }
+
+        // Spacing between all children (flex children still occupy a slot)
+        if self.children.len() > 1 {
+            total_height += self.spacing * (self.children.len() - 1) as f32;
+        }
+
+        total_height + self.padding.vertical()
+    }
+
     /// Compute layout and flush to snapshot.
     ///
     /// This is where the actual layout math happens - ONCE per frame.
@@ -1765,7 +1809,8 @@ impl Column {
                             total_flex += r.height.flex();
                         }
                         Length::Shrink => {
-                            let h = r.measure().height;
+                            // Use height_for_width to account for FlowContainer wrapping
+                            let h = r.height_for_width(content_width);
                             child_heights.push(h);
                             total_fixed_height += h;
                         }
@@ -1810,6 +1855,12 @@ impl Column {
                 }
                 LayoutChild::VirtualTable(table) => {
                     let h = table.estimate_size().height;
+                    child_heights.push(h);
+                    total_fixed_height += h;
+                }
+                LayoutChild::Flow(flow) => {
+                    // FlowContainer height depends on available width
+                    let h = flow.height_for_width(content_width);
                     child_heights.push(h);
                     total_fixed_height += h;
                 }
@@ -2011,6 +2062,16 @@ impl Column {
                     let tx = cross_x(w);
                     render_virtual_table(snapshot, table, tx, y, w, size.height);
                     y += size.height + self.spacing + alignment_gap;
+                }
+                LayoutChild::Flow(flow) => {
+                    let w = match flow.width {
+                        Length::Fixed(px) => px,
+                        Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
+                    };
+                    let h = flow.height_for_width(w);
+                    let fx = cross_x(w);
+                    flow.layout(snapshot, fx, y, w);
+                    y += h + self.spacing + alignment_gap;
                 }
                 LayoutChild::Column(nested) => {
                     // Resolve flex height for Fill children
@@ -2343,6 +2404,104 @@ impl Row {
         Size::new(intrinsic_width, intrinsic_height)
     }
 
+    /// Calculate the height of this Row for a given available width.
+    /// This is needed because FlowContainer children have width-dependent heights.
+    pub fn height_for_width(&self, available_width: f32) -> f32 {
+        if let Length::Fixed(px) = self.height {
+            return px;
+        }
+
+        // Calculate fixed widths and flex factor (mirrors measurement pass logic)
+        let mut total_fixed_width = 0.0f32;
+        let mut total_flex = 0.0f32;
+
+        for child in &self.children {
+            match child {
+                LayoutChild::Flow(flow) => {
+                    match flow.width {
+                        Length::Fill | Length::FillPortion(_) => {
+                            total_flex += flow.width.flex();
+                        }
+                        Length::Fixed(px) => total_fixed_width += px,
+                        Length::Shrink => total_fixed_width += flow.measure().width,
+                    }
+                }
+                LayoutChild::Column(c) => {
+                    match c.width {
+                        Length::Fill | Length::FillPortion(_) => total_flex += c.width.flex(),
+                        Length::Fixed(px) => total_fixed_width += px,
+                        Length::Shrink => total_fixed_width += c.measure().width,
+                    }
+                }
+                LayoutChild::Row(r) => {
+                    match r.width {
+                        Length::Fill | Length::FillPortion(_) => total_flex += r.width.flex(),
+                        Length::Fixed(px) => total_fixed_width += px,
+                        Length::Shrink => total_fixed_width += r.measure().width,
+                    }
+                }
+                LayoutChild::Spacer { flex } => total_flex += flex,
+                LayoutChild::FixedSpacer { size } => total_fixed_width += size,
+                _ => total_fixed_width += child.measure_main(false),
+            }
+        }
+
+        // Add spacing
+        if self.children.len() > 1 {
+            total_fixed_width += self.spacing * (self.children.len() - 1) as f32;
+        }
+
+        let content_width = available_width - self.padding.horizontal();
+        let available_flex = (content_width - total_fixed_width).max(0.0);
+
+        // Calculate max child height, using height_for_width for width-dependent containers
+        let mut max_height = 0.0f32;
+        for child in &self.children {
+            let h = match child {
+                LayoutChild::Flow(flow) => {
+                    let flow_width = if flow.width.is_flex() && total_flex > 0.0 {
+                        (flow.width.flex() / total_flex) * available_flex
+                    } else {
+                        match flow.width {
+                            Length::Fixed(px) => px,
+                            Length::Shrink => flow.measure().width,
+                            _ => available_flex,
+                        }
+                    };
+                    flow.height_for_width(flow_width)
+                }
+                LayoutChild::Column(col) => {
+                    let col_width = if col.width.is_flex() && total_flex > 0.0 {
+                        (col.width.flex() / total_flex) * available_flex
+                    } else {
+                        match col.width {
+                            Length::Fixed(px) => px,
+                            Length::Shrink => col.measure().width,
+                            _ => content_width, // Fill takes remaining width
+                        }
+                    };
+                    col.height_for_width(col_width)
+                }
+                LayoutChild::Row(row) => {
+                    let row_width = if row.width.is_flex() && total_flex > 0.0 {
+                        (row.width.flex() / total_flex) * available_flex
+                    } else {
+                        match row.width {
+                            Length::Fixed(px) => px,
+                            Length::Shrink => row.measure().width,
+                            _ => content_width,
+                        }
+                    };
+                    row.height_for_width(row_width)
+                }
+                _ => child.measure_cross(false),
+            };
+            max_height = max_height.max(h);
+        }
+
+        max_height + self.padding.vertical()
+    }
+
     /// Compute layout and flush to snapshot.
     pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
         // Available space after padding
@@ -2487,6 +2646,23 @@ impl Row {
                     child_widths.push(w);
                     total_fixed_width += w;
                 }
+                LayoutChild::Flow(flow) => {
+                    match flow.width {
+                        Length::Fill | Length::FillPortion(_) => {
+                            child_widths.push(0.0);
+                            total_flex += flow.width.flex();
+                        }
+                        Length::Fixed(px) => {
+                            child_widths.push(px);
+                            total_fixed_width += px;
+                        }
+                        Length::Shrink => {
+                            let w = flow.measure().width;
+                            child_widths.push(w);
+                            total_fixed_width += w;
+                        }
+                    }
+                }
                 LayoutChild::Spacer { flex } => {
                     child_widths.push(0.0);
                     total_flex += flex;
@@ -2503,6 +2679,43 @@ impl Row {
             total_fixed_width += self.spacing * (self.children.len() - 1) as f32;
         }
 
+        let available_flex = (bounds.width - self.padding.horizontal() - total_fixed_width).max(0.0);
+
+        // Recalculate max_child_cross for width-dependent children now that we know their widths.
+        // FlowContainer/Column/Row heights can depend on available width for wrapping.
+        for (i, child) in self.children.iter().enumerate() {
+            let child_height = match child {
+                LayoutChild::Flow(flow) => {
+                    let flow_width = if flow.width.is_flex() && total_flex > 0.0 {
+                        (flow.width.flex() / total_flex) * available_flex
+                    } else {
+                        child_widths[i]
+                    };
+                    Some(flow.height_for_width(flow_width))
+                }
+                LayoutChild::Column(col) => {
+                    let col_width = if col.width.is_flex() && total_flex > 0.0 {
+                        (col.width.flex() / total_flex) * available_flex
+                    } else {
+                        child_widths[i]
+                    };
+                    Some(col.height_for_width(col_width))
+                }
+                LayoutChild::Row(row) => {
+                    let row_width = if row.width.is_flex() && total_flex > 0.0 {
+                        (row.width.flex() / total_flex) * available_flex
+                    } else {
+                        child_widths[i]
+                    };
+                    Some(row.height_for_width(row_width))
+                }
+                _ => None,
+            };
+            if let Some(h) = child_height {
+                max_child_cross = max_child_cross.max(h);
+            }
+        }
+
         // Overflow detection (replaces previous self.measure() call)
         let content_w = total_fixed_width + self.padding.horizontal();
         let content_h = max_child_cross + self.padding.vertical();
@@ -2511,8 +2724,6 @@ impl Row {
         if clips {
             snapshot.primitives_mut().push_clip(bounds);
         }
-
-        let available_flex = (bounds.width - self.padding.horizontal() - total_fixed_width).max(0.0);
 
         // Compute total consumed width (flex children consume available_flex)
         let total_flex_consumed = if total_flex > 0.0 { available_flex } else { 0.0 };
@@ -2689,6 +2900,16 @@ impl Row {
                     render_virtual_table(snapshot, table, x, ty, size.width, size.height);
                     x += width + self.spacing + alignment_gap;
                 }
+                LayoutChild::Flow(flow) => {
+                    // Resolve flex width for Fill children
+                    if flow.width.is_flex() && total_flex > 0.0 {
+                        width = (flow.width.flex() / total_flex) * available_flex;
+                    }
+                    let h = flow.height_for_width(width);
+                    let fy = cross_y(h);
+                    flow.layout(snapshot, x, fy, width);
+                    x += width + self.spacing + alignment_gap;
+                }
                 LayoutChild::Column(nested) => {
                     // Resolve flex width for Fill children
                     if nested.width.is_flex() && total_flex > 0.0 {
@@ -2761,6 +2982,244 @@ impl Row {
         if clips {
             snapshot.primitives_mut().pop_clip();
         }
+    }
+}
+
+// =========================================================================
+// FlowContainer
+// =========================================================================
+
+/// A flow container that wraps children like CSS `flex-wrap: wrap`.
+///
+/// Children are laid out horizontally until they exceed the container width,
+/// then wrap to the next line. Supports any element type (text, images, etc.).
+/// Reflows automatically on container resize.
+pub struct FlowContainer {
+    /// Child elements.
+    children: Vec<LayoutChild>,
+    /// Source ID for hit-testing.
+    source_id: Option<SourceId>,
+    /// Horizontal spacing between items.
+    spacing: f32,
+    /// Vertical spacing between lines.
+    line_spacing: f32,
+    /// Padding around content.
+    padding: Padding,
+    /// Width sizing mode.
+    pub(crate) width: Length,
+}
+
+impl FlowContainer {
+    /// Create a new flow container.
+    pub fn new() -> Self {
+        Self {
+            children: Vec::new(),
+            source_id: None,
+            spacing: 0.0,
+            line_spacing: 2.0,
+            padding: Padding::default(),
+            width: Length::Fill,
+        }
+    }
+
+    /// Set the source ID for hit-testing.
+    pub fn source(mut self, source_id: SourceId) -> Self {
+        self.source_id = Some(source_id);
+        self
+    }
+
+    /// Set horizontal spacing between items.
+    pub fn spacing(mut self, spacing: f32) -> Self {
+        self.spacing = spacing;
+        self
+    }
+
+    /// Set vertical spacing between wrapped lines.
+    pub fn line_spacing(mut self, spacing: f32) -> Self {
+        self.line_spacing = spacing;
+        self
+    }
+
+    /// Set padding around content.
+    pub fn padding(mut self, padding: f32) -> Self {
+        self.padding = Padding::all(padding);
+        self
+    }
+
+    /// Set custom padding.
+    pub fn padding_custom(mut self, padding: Padding) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    /// Set the width sizing mode.
+    pub fn width(mut self, width: Length) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Add a text element.
+    pub fn text(mut self, element: TextElement) -> Self {
+        self.children.push(LayoutChild::Text(element));
+        self
+    }
+
+    /// Add any child element.
+    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+        self.children.push(child.into());
+        self
+    }
+
+    /// Measure intrinsic size (assumes single line for estimation).
+    pub fn measure(&self) -> Size {
+        let mut width = 0.0f32;
+        let mut max_height = 0.0f32;
+
+        for child in &self.children {
+            let size = child_size(child);
+            width += size.width + self.spacing;
+            max_height = max_height.max(size.height);
+        }
+
+        Size::new(
+            width + self.padding.horizontal(),
+            max_height + self.padding.vertical(),
+        )
+    }
+
+    /// Layout and render into the snapshot.
+    pub fn layout(&self, snapshot: &mut LayoutSnapshot, x: f32, y: f32, available_width: f32) {
+        let content_x = x + self.padding.left;
+        let content_y = y + self.padding.top;
+        let max_width = available_width - self.padding.horizontal();
+
+        let mut line_x = 0.0f32;
+        let mut line_y = 0.0f32;
+        let mut line_height = 0.0f32;
+
+        for child in &self.children {
+            let size = child_size(child);
+
+            // Check if we need to wrap to next line
+            if line_x > 0.0 && line_x + size.width > max_width {
+                line_y += line_height + self.line_spacing;
+                line_x = 0.0;
+                line_height = 0.0;
+            }
+
+            // Render the child at current position
+            let child_x = content_x + line_x;
+            let child_y = content_y + line_y;
+
+            render_flow_child(snapshot, child, child_x, child_y, size.width, size.height, self.source_id);
+
+            // Advance position
+            line_x += size.width + self.spacing;
+            line_height = line_height.max(size.height);
+        }
+    }
+
+    /// Calculate the total height needed for a given width.
+    pub fn height_for_width(&self, available_width: f32) -> f32 {
+        let max_width = available_width - self.padding.horizontal();
+
+        let mut line_x = 0.0f32;
+        let mut line_y = 0.0f32;
+        let mut line_height = 0.0f32;
+
+        for child in &self.children {
+            let size = child_size(child);
+
+            if line_x > 0.0 && line_x + size.width > max_width {
+                line_y += line_height + self.line_spacing;
+                line_x = 0.0;
+                line_height = 0.0;
+            }
+
+            line_x += size.width + self.spacing;
+            line_height = line_height.max(size.height);
+        }
+
+        line_y + line_height + self.padding.vertical()
+    }
+}
+
+impl Default for FlowContainer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Get the size of a LayoutChild.
+fn child_size(child: &LayoutChild) -> Size {
+    match child {
+        LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT),
+        LayoutChild::Terminal(t) => t.size(),
+        LayoutChild::Image(img) => img.size(),
+        LayoutChild::Button(b) => b.estimate_size(),
+        LayoutChild::Column(c) => c.measure(),
+        LayoutChild::Row(r) => r.measure(),
+        LayoutChild::Flow(f) => f.measure(),
+        _ => Size::new(0.0, 0.0),
+    }
+}
+
+/// Render a single child in a flow container.
+fn render_flow_child(
+    snapshot: &mut LayoutSnapshot,
+    child: &LayoutChild,
+    x: f32, y: f32, w: f32, h: f32,
+    source_id: Option<SourceId>,
+) {
+    match child {
+        LayoutChild::Text(t) => {
+            let fs = t.font_size();
+            snapshot.primitives_mut().add_text_cached_styled(
+                &t.text,
+                crate::primitives::Point::new(x, y),
+                t.color,
+                fs,
+                t.cache_key,
+                t.bold,
+                t.italic,
+            );
+            if let Some(sid) = t.source_id.or(source_id) {
+                use crate::layout_snapshot::{SourceLayout, TextLayout};
+                let scale = fs / BASE_FONT_SIZE;
+                let text_layout = TextLayout::simple(
+                    t.text.clone(),
+                    t.color.pack(),
+                    x, y,
+                    CHAR_WIDTH * scale, LINE_HEIGHT * scale,
+                );
+                snapshot.register_source(sid, SourceLayout::text(text_layout));
+            }
+        }
+        LayoutChild::Image(img) => {
+            let img_rect = Rect::new(x, y, img.width, img.height);
+            snapshot.primitives_mut().add_image(img_rect, img.handle.clone(), img.corner_radius, img.tint);
+        }
+        LayoutChild::Button(btn) => {
+            let btn_rect = Rect::new(x, y, w, h);
+            snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
+            let text_x = x + (w - unicode_display_width(&btn.label) * CHAR_WIDTH) / 2.0;
+            let text_y = y + (h - LINE_HEIGHT) / 2.0;
+            snapshot.primitives_mut().add_text_cached(
+                btn.label.clone(),
+                crate::primitives::Point::new(text_x, text_y),
+                btn.text_color,
+                BASE_FONT_SIZE,
+                btn.cache_key,
+            );
+            snapshot.register_widget(btn.id, btn_rect);
+        }
+        // Note: Column/Row/ScrollColumn are not supported inside FlowContainer
+        // because their layout methods consume self. FlowContainer is designed
+        // for inline elements (text, images, buttons) that can be reflowed.
+        LayoutChild::Flow(nested) => {
+            nested.layout(snapshot, x, y, w);
+        }
+        _ => {}
     }
 }
 
@@ -3019,11 +3478,19 @@ impl ScrollColumn {
         // Push clip to viewport bounds
         snapshot.primitives_mut().push_clip(bounds);
 
-        // Measure all children to compute total content height
+        // Reserve space for scrollbar (we'll check if we need it after measuring).
+        const SCROLLBAR_GUTTER: f32 = 24.0;
+
+        // First pass: measure heights assuming no scrollbar
         let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
         let mut total_content_height = self.padding.vertical();
         for child in &self.children {
-            let h = child.measure_main(true);
+            let h = match child {
+                LayoutChild::Flow(f) => f.height_for_width(full_content_width),
+                LayoutChild::Row(r) => r.height_for_width(full_content_width),
+                LayoutChild::Column(c) => c.height_for_width(full_content_width),
+                _ => child.measure_main(true),
+            };
             child_heights.push(h);
             total_content_height += h;
         }
@@ -3031,11 +3498,27 @@ impl ScrollColumn {
             total_content_height += self.spacing * (self.children.len() - 1) as f32;
         }
 
-        // Reserve space for scrollbar when content overflows, so child content
-        // doesn't extend into the scrollbar hit region (which would block clicks).
-        const SCROLLBAR_GUTTER: f32 = 24.0;
         let overflows = total_content_height > viewport_h;
         let content_width = if overflows { full_content_width - SCROLLBAR_GUTTER } else { full_content_width };
+
+        // If we overflow, re-measure width-dependent children with the reduced width
+        if overflows {
+            child_heights.clear();
+            total_content_height = self.padding.vertical();
+            for child in &self.children {
+                let h = match child {
+                    LayoutChild::Flow(f) => f.height_for_width(content_width),
+                    LayoutChild::Row(r) => r.height_for_width(content_width),
+                    LayoutChild::Column(c) => c.height_for_width(content_width),
+                    _ => child.measure_main(true),
+                };
+                child_heights.push(h);
+                total_content_height += h;
+            }
+            if self.children.len() > 1 {
+                total_content_height += self.spacing * (self.children.len() - 1) as f32;
+            }
+        }
 
         // Register container widget for hit-testing (wheel events route here).
         // When overflowing, exclude the gutter so this doesn't compete with the
@@ -3169,6 +3652,13 @@ impl ScrollColumn {
                         let size = table.estimate_size();
                         let w = size.width.min(content_width);
                         render_virtual_table(snapshot, table, content_x, screen_y, w, size.height);
+                    }
+                    LayoutChild::Flow(flow) => {
+                        let w = match flow.width {
+                            Length::Fixed(px) => px,
+                            Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
+                        };
+                        flow.layout(snapshot, content_x, screen_y, w);
                     }
                     LayoutChild::Column(nested) => {
                         let w = match nested.width {
@@ -3454,5 +3944,252 @@ mod tests {
     fn test_length_default() {
         let l = Length::default();
         assert_eq!(l, Length::Shrink);
+    }
+
+    // -------------------------------------------------------------------------
+    // FlowContainer tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_flow_container_measure_single_line() {
+        // Single text element should measure as single line
+        let flow = FlowContainer::new()
+            .push(TextElement::new("hello"));
+
+        let size = flow.measure();
+        // "hello" = 5 chars * CHAR_WIDTH
+        assert_eq!(size.width, 5.0 * CHAR_WIDTH);
+        assert_eq!(size.height, LINE_HEIGHT);
+    }
+
+    #[test]
+    fn test_flow_container_measure_multiple_words() {
+        // Multiple words measured as single line (measure doesn't wrap)
+        let flow = FlowContainer::new()
+            .push(TextElement::new("hello "))
+            .push(TextElement::new("world"));
+
+        let size = flow.measure();
+        // "hello " (6) + "world" (5) = 11 chars
+        assert_eq!(size.width, 11.0 * CHAR_WIDTH);
+        assert_eq!(size.height, LINE_HEIGHT);
+    }
+
+    #[test]
+    fn test_flow_container_height_for_width_no_wrap() {
+        // Wide enough container - no wrapping needed
+        let flow = FlowContainer::new()
+            .push(TextElement::new("hello "))
+            .push(TextElement::new("world"));
+
+        // 11 chars * CHAR_WIDTH = 92.4, give it 100px
+        let height = flow.height_for_width(100.0);
+        assert_eq!(height, LINE_HEIGHT);
+    }
+
+    #[test]
+    fn test_flow_container_height_for_width_with_wrap() {
+        // Narrow container - should wrap to 2 lines
+        let flow = FlowContainer::new()
+            .push(TextElement::new("hello "))  // 6 chars = 50.4px
+            .push(TextElement::new("world"));   // 5 chars = 42px
+
+        // Give it 60px width - "hello " fits, "world" wraps
+        let height = flow.height_for_width(60.0);
+        println!("height_for_width(60.0) = {}, LINE_HEIGHT = {}", height, LINE_HEIGHT);
+        // Should be more than single line (wrapping occurred)
+        assert!(height > LINE_HEIGHT, "Expected wrapping to occur");
+        // Should be approximately 2 lines
+        assert!(height >= LINE_HEIGHT * 2.0 - 1.0 && height <= LINE_HEIGHT * 2.0 + 5.0,
+            "Expected ~2 lines height, got {}", height);
+    }
+
+    #[test]
+    fn test_flow_container_height_for_width_many_words() {
+        // Multiple words that require multiple lines
+        let flow = FlowContainer::new()
+            .push(TextElement::new("one "))    // 4 chars
+            .push(TextElement::new("two "))    // 4 chars
+            .push(TextElement::new("three "))  // 6 chars
+            .push(TextElement::new("four "))   // 5 chars
+            .push(TextElement::new("five"));   // 4 chars
+
+        // Total: 23 chars = 193.2px
+        // With 80px width (~9.5 chars per line):
+        // Line 1: "one two " (8 chars = 67.2px) - fits
+        // Line 2: "three " (6 chars = 50.4px) - fits
+        // Line 3: "four " (5 chars = 42px) - fits
+        // Line 4: "five" (4 chars = 33.6px) - fits
+        let height = flow.height_for_width(80.0);
+        println!("CHAR_WIDTH={}, height={}, LINE_HEIGHT={}", CHAR_WIDTH, height, LINE_HEIGHT);
+        // Should be multiple lines
+        assert!(height > LINE_HEIGHT, "Expected multiple lines, got single line height");
+    }
+
+    #[test]
+    fn test_flow_container_child_size() {
+        let text = TextElement::new("test");
+        let child = LayoutChild::Text(text);
+        let size = child_size(&child);
+        assert_eq!(size.width, 4.0 * CHAR_WIDTH);
+        assert_eq!(size.height, LINE_HEIGHT);
+    }
+
+    #[test]
+    fn test_column_height_for_width_with_flow() {
+        // Column containing a FlowContainer
+        let flow = FlowContainer::new()
+            .width(Length::Fill)
+            .push(TextElement::new("hello "))
+            .push(TextElement::new("world"));
+
+        let col = Column::new()
+            .push(flow);
+
+        // Wide - no wrap
+        let height_wide = col.height_for_width(200.0);
+        assert_eq!(height_wide, LINE_HEIGHT);
+
+        // Narrow - should wrap
+        let height_narrow = col.height_for_width(60.0);
+        assert_eq!(height_narrow, LINE_HEIGHT * 2.0);
+    }
+
+    #[test]
+    fn test_row_height_for_width_with_nested_column_flow() {
+        // This mimics the markdown rendering structure:
+        // Row [ bullet, Column [ FlowContainer ] ]
+        let flow = FlowContainer::new()
+            .width(Length::Fill)
+            .push(TextElement::new("hello "))
+            .push(TextElement::new("world"));
+
+        let inner_col = Column::new()
+            .width(Length::Fill)
+            .push(flow);
+
+        let row = Row::new()
+            .push(TextElement::new("* "))  // 2 chars bullet
+            .push(inner_col);
+
+        // Wide - no wrap needed
+        let height_wide = row.height_for_width(200.0);
+        println!("height_wide = {}", height_wide);
+        assert_eq!(height_wide, LINE_HEIGHT);
+
+        // Narrow - should wrap the flow content
+        // 60px total, minus bullet (2 chars = 16.8px) = ~43px for flow
+        // "hello " (50.4px) won't fit, wraps
+        let height_narrow = row.height_for_width(60.0);
+        println!("height_narrow = {}", height_narrow);
+        assert!(height_narrow > LINE_HEIGHT, "Expected wrapped height > single line");
+    }
+
+    #[test]
+    fn test_agent_widget_markdown_structure() {
+        // This test mimics the exact structure from nexus_widgets.rs:
+        // Row {
+        //   TextElement("●"),      // bullet
+        //   Column {               // from markdown::render
+        //     FlowContainer {      // paragraph
+        //       TextElement("word1 "),
+        //       TextElement("word2 "),
+        //       TextElement("word3"),
+        //     }
+        //   }
+        // }
+
+        // Create a FlowContainer with multiple words (simulating a paragraph)
+        let flow = FlowContainer::new()
+            .width(Length::Fill)
+            .push(TextElement::new("This "))
+            .push(TextElement::new("is "))
+            .push(TextElement::new("a "))
+            .push(TextElement::new("test "))
+            .push(TextElement::new("paragraph "))
+            .push(TextElement::new("that "))
+            .push(TextElement::new("should "))
+            .push(TextElement::new("wrap "))
+            .push(TextElement::new("to "))
+            .push(TextElement::new("multiple "))
+            .push(TextElement::new("lines."));
+
+        // markdown::render returns a Column
+        let markdown_column = Column::new()
+            .width(Length::Fill)
+            .spacing(2.0)
+            .push(flow);
+
+        // Agent widget wraps in Row with bullet (exactly like nexus_widgets.rs)
+        let agent_row = Row::new()
+            .spacing(6.0)
+            .cross_align(CrossAxisAlignment::Start)
+            .push(TextElement::new("\u{25CF}").color(Color::WHITE))  // ● bullet (1 char)
+            .push(markdown_column);
+
+        // Test with different widths
+        let wide_height = agent_row.height_for_width(800.0);
+        let medium_height = agent_row.height_for_width(300.0);
+        let narrow_height = agent_row.height_for_width(150.0);
+
+        println!("Agent widget heights:");
+        println!("  wide (800px): {}", wide_height);
+        println!("  medium (300px): {}", medium_height);
+        println!("  narrow (150px): {}", narrow_height);
+        println!("  LINE_HEIGHT: {}", LINE_HEIGHT);
+
+        // Wide should fit on one line
+        assert_eq!(wide_height, LINE_HEIGHT, "Wide layout should be single line");
+
+        // Medium should require some wrapping
+        assert!(medium_height > LINE_HEIGHT, "Medium layout should wrap");
+
+        // Narrow should require more wrapping
+        assert!(narrow_height > medium_height, "Narrow layout should wrap more than medium");
+    }
+
+    #[test]
+    fn test_flow_wrapping_logic_directly() {
+        // Test the actual wrapping math
+        let word1_width = 6.0 * CHAR_WIDTH;  // "hello "
+        let word2_width = 5.0 * CHAR_WIDTH;  // "world"
+        let max_width: f32 = 60.0;
+
+        // Simulating FlowContainer logic:
+        let mut line_x: f32 = 0.0;
+        let mut line_y: f32 = 0.0;
+        let mut line_height: f32 = 0.0;
+        let line_spacing: f32 = 0.0;
+
+        // First word
+        let size1 = Size::new(word1_width, LINE_HEIGHT);
+        if line_x > 0.0 && line_x + size1.width > max_width {
+            line_y += line_height + line_spacing;
+            line_x = 0.0;
+            line_height = 0.0;
+        }
+        line_x += size1.width;
+        line_height = line_height.max(size1.height);
+        println!("After word1: line_x={}, line_y={}, line_height={}", line_x, line_y, line_height);
+
+        // Second word
+        let size2 = Size::new(word2_width, LINE_HEIGHT);
+        if line_x > 0.0 && line_x + size2.width > max_width {
+            line_y += line_height + line_spacing;
+            line_x = 0.0;
+            line_height = 0.0;
+            println!("WRAPPED! line_y now = {}", line_y);
+        }
+        line_x += size2.width;
+        line_height = line_height.max(size2.height);
+        println!("After word2: line_x={}, line_y={}, line_height={}", line_x, line_y, line_height);
+
+        let total_height = line_y + line_height;
+        println!("Total height = {}", total_height);
+
+        // Check: word1 (50.4) + word2 (42) = 92.4 > 60, so should wrap
+        assert!(word1_width + word2_width > max_width, "Words should exceed max_width");
+        assert!(line_y > 0.0, "Should have wrapped to a new line");
+        assert_eq!(total_height, LINE_HEIGHT * 2.0, "Should be 2 lines");
     }
 }
