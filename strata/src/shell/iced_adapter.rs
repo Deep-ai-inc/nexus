@@ -1323,9 +1323,9 @@ impl PipelineWrapper {
         }
         for prim in &overlays.text_runs {
             let start = pipeline.instance_count();
-            pipeline.add_text(
+            pipeline.add_text_styled(
                 &prim.text, prim.position.x * scale, prim.position.y * scale, prim.color,
-                prim.font_size * scale, &mut font_system,
+                prim.font_size * scale, prim.bold, prim.italic, &mut font_system,
             );
             maybe_clip(pipeline, start, &prim.clip_rect, scale);
         }

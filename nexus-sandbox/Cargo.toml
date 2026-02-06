@@ -1,9 +1,0 @@
-[package]
-name = "nexus-sandbox"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-serde.workspace = true
-thiserror.workspace = true
-tempfile = "3.13"

@@ -33,63 +33,25 @@ pub fn run(port: u16) -> ! {
 
         eprintln!("[mcp-proxy] recv: {}", &line[..line.len().min(200)]);
 
-        let msg: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[mcp-proxy] JSON parse error: {e}");
+        let (id, method, msg) = match parse_request(&line) {
+            Some((id, method, msg)) => (id, method, msg),
+            None => {
+                // Either invalid JSON or notification (no id)
+                eprintln!("[mcp-proxy] skipping line (parse error or notification)");
                 continue;
             }
         };
 
-        let id = msg.get("id").cloned();
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-
-        // Notifications (no id) — ignore silently
-        if id.is_none() {
-            eprintln!("[mcp-proxy] notification (no id): {method}");
-            continue;
-        }
-        let id = id.unwrap();
-
-        match method {
+        match method.as_str() {
             "initialize" => {
                 eprintln!("[mcp-proxy] -> initialize");
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": { "tools": {} },
-                        "serverInfo": {
-                            "name": "nexus_perm",
-                            "version": "0.1.0"
-                        }
-                    }
-                });
+                let resp = build_initialize_response(&id);
                 write_response(&mut out, &resp);
             }
 
             "tools/list" => {
                 eprintln!("[mcp-proxy] -> tools/list");
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "tools": [{
-                            "name": "permission_prompt",
-                            "description": "Prompt the user for permission to execute a tool",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "tool_name": { "type": "string" },
-                                    "input": { "type": "object" },
-                                    "tool_use_id": { "type": "string" }
-                                },
-                                "required": ["tool_name", "input"]
-                            }
-                        }]
-                    }
-                });
+                let resp = build_tools_list_response(&id);
                 write_response(&mut out, &resp);
             }
 
@@ -115,44 +77,16 @@ pub fn run(port: u16) -> ! {
                     }
                 };
 
-                // CLI schema (zod discriminated union):
-                //   Allow: {"behavior": "allow", "updatedInput": {<original tool input>}}
-                //   Deny:  {"behavior": "deny", "message": "reason"}
-                let result_text = if ui_resp.allow {
-                    // Use updatedInput from UI if provided (e.g. AskUserQuestion with answers),
-                    // otherwise use the original tool input.
-                    let updated = ui_resp.updated_input.unwrap_or(tool_input);
-                    serde_json::json!({ "behavior": "allow", "updatedInput": updated })
-                } else {
-                    serde_json::json!({ "behavior": "deny", "message": "User denied permission" })
-                };
-
+                let result_text = build_permission_result(ui_resp.allow, tool_input, ui_resp.updated_input);
                 eprintln!("[mcp-proxy] <- response: {}", result_text);
 
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": result_text.to_string()
-                        }]
-                    }
-                });
+                let resp = build_tools_call_response(&id, &result_text);
                 write_response(&mut out, &resp);
             }
 
             _ => {
                 eprintln!("[mcp-proxy] unknown method: {method}");
-                // Unknown method — return error
-                let resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {
-                        "code": -32601,
-                        "message": format!("Unknown method: {method}")
-                    }
-                });
+                let resp = build_error_response(&id, &method);
                 write_response(&mut out, &resp);
             }
         }
@@ -184,8 +118,7 @@ fn ask_ui(port: u16, args: &serde_json::Value) -> io::Result<UiResponse> {
 
     let resp: serde_json::Value =
         serde_json::from_str(response.trim()).unwrap_or(serde_json::json!({"allow": false}));
-    let allow = resp.get("allow").and_then(|v| v.as_bool()).unwrap_or(false);
-    let updated_input = resp.get("updatedInput").cloned();
+    let (allow, updated_input) = parse_ui_response(&resp);
     Ok(UiResponse { allow, updated_input })
 }
 
@@ -194,4 +127,350 @@ fn write_response(out: &mut impl Write, resp: &serde_json::Value) {
     let s = serde_json::to_string(resp).unwrap();
     let _ = writeln!(out, "{s}");
     let _ = out.flush();
+}
+
+// ============================================================================
+// Pure functions extracted for testability
+// ============================================================================
+
+/// Build the JSON-RPC response for `initialize`.
+fn build_initialize_response(id: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": { "tools": {} },
+            "serverInfo": {
+                "name": "nexus_perm",
+                "version": "0.1.0"
+            }
+        }
+    })
+}
+
+/// Build the JSON-RPC response for `tools/list`.
+fn build_tools_list_response(id: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "tools": [{
+                "name": "permission_prompt",
+                "description": "Prompt the user for permission to execute a tool",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool_name": { "type": "string" },
+                        "input": { "type": "object" },
+                        "tool_use_id": { "type": "string" }
+                    },
+                    "required": ["tool_name", "input"]
+                }
+            }]
+        }
+    })
+}
+
+/// Build a JSON-RPC error response for an unknown method.
+fn build_error_response(id: &serde_json::Value, method: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!("Unknown method: {method}")
+        }
+    })
+}
+
+/// Build the permission result for a tools/call response.
+/// Returns the inner "text" content (behavior + updatedInput or message).
+fn build_permission_result(allow: bool, tool_input: serde_json::Value, updated_input: Option<serde_json::Value>) -> serde_json::Value {
+    if allow {
+        let updated = updated_input.unwrap_or(tool_input);
+        serde_json::json!({ "behavior": "allow", "updatedInput": updated })
+    } else {
+        serde_json::json!({ "behavior": "deny", "message": "User denied permission" })
+    }
+}
+
+/// Build the full JSON-RPC response for a tools/call result.
+fn build_tools_call_response(id: &serde_json::Value, result_text: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": result_text.to_string()
+            }]
+        }
+    })
+}
+
+/// Parse a JSON line into a request, extracting id and method.
+/// Returns None for notifications (no id) or parse errors.
+fn parse_request(line: &str) -> Option<(serde_json::Value, String, serde_json::Value)> {
+    let msg: serde_json::Value = serde_json::from_str(line).ok()?;
+    let id = msg.get("id").cloned()?;
+    let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    Some((id, method, msg))
+}
+
+/// Parse a UI response JSON into UiResponse fields.
+fn parse_ui_response(json: &serde_json::Value) -> (bool, Option<serde_json::Value>) {
+    let allow = json.get("allow").and_then(|v| v.as_bool()).unwrap_or(false);
+    let updated_input = json.get("updatedInput").cloned();
+    (allow, updated_input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -------------------------------------------------------------------------
+    // build_initialize_response tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_initialize_response_structure() {
+        let id = json!(1);
+        let resp = build_initialize_response(&id);
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert!(resp["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(resp["result"]["serverInfo"]["name"], "nexus_perm");
+    }
+
+    #[test]
+    fn test_initialize_response_with_string_id() {
+        let id = json!("abc-123");
+        let resp = build_initialize_response(&id);
+
+        assert_eq!(resp["id"], "abc-123");
+        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+    }
+
+    // -------------------------------------------------------------------------
+    // build_tools_list_response tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_tools_list_response_structure() {
+        let id = json!(2);
+        let resp = build_tools_list_response(&id);
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 2);
+
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "permission_prompt");
+    }
+
+    #[test]
+    fn test_tools_list_has_input_schema() {
+        let id = json!(1);
+        let resp = build_tools_list_response(&id);
+
+        let schema = &resp["result"]["tools"][0]["inputSchema"];
+        assert_eq!(schema["type"], "object");
+
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("tool_name")));
+        assert!(required.contains(&json!("input")));
+    }
+
+    // -------------------------------------------------------------------------
+    // build_error_response tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_error_response_unknown_method() {
+        let id = json!(5);
+        let resp = build_error_response(&id, "foo/bar");
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 5);
+        assert_eq!(resp["error"]["code"], -32601);
+        assert!(resp["error"]["message"].as_str().unwrap().contains("foo/bar"));
+    }
+
+    #[test]
+    fn test_error_response_empty_method() {
+        let id = json!(1);
+        let resp = build_error_response(&id, "");
+
+        assert!(resp["error"]["message"].as_str().unwrap().contains("Unknown method"));
+    }
+
+    // -------------------------------------------------------------------------
+    // build_permission_result tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_permission_result_allow_no_update() {
+        let tool_input = json!({"command": "ls -la"});
+        let result = build_permission_result(true, tool_input.clone(), None);
+
+        assert_eq!(result["behavior"], "allow");
+        assert_eq!(result["updatedInput"], tool_input);
+    }
+
+    #[test]
+    fn test_permission_result_allow_with_update() {
+        let tool_input = json!({"command": "ls"});
+        let updated = json!({"command": "ls -la", "extra": true});
+        let result = build_permission_result(true, tool_input, Some(updated.clone()));
+
+        assert_eq!(result["behavior"], "allow");
+        assert_eq!(result["updatedInput"], updated);
+    }
+
+    #[test]
+    fn test_permission_result_deny() {
+        let tool_input = json!({"command": "rm -rf /"});
+        let result = build_permission_result(false, tool_input, None);
+
+        assert_eq!(result["behavior"], "deny");
+        assert_eq!(result["message"], "User denied permission");
+        assert!(result.get("updatedInput").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // build_tools_call_response tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_tools_call_response_structure() {
+        let id = json!(10);
+        let result_text = json!({"behavior": "allow", "updatedInput": {}});
+        let resp = build_tools_call_response(&id, &result_text);
+
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 10);
+
+        let content = resp["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn test_tools_call_response_text_is_stringified() {
+        let id = json!(1);
+        let result_text = json!({"behavior": "deny", "message": "nope"});
+        let resp = build_tools_call_response(&id, &result_text);
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        // The text field should be the JSON stringified
+        assert!(text.contains("deny"));
+        assert!(text.contains("nope"));
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_request tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_request_valid() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let result = parse_request(line);
+
+        assert!(result.is_some());
+        let (id, method, _) = result.unwrap();
+        assert_eq!(id, json!(1));
+        assert_eq!(method, "initialize");
+    }
+
+    #[test]
+    fn test_parse_request_string_id() {
+        let line = r#"{"jsonrpc":"2.0","id":"abc","method":"tools/list"}"#;
+        let result = parse_request(line);
+
+        assert!(result.is_some());
+        let (id, method, _) = result.unwrap();
+        assert_eq!(id, json!("abc"));
+        assert_eq!(method, "tools/list");
+    }
+
+    #[test]
+    fn test_parse_request_notification_no_id() {
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let result = parse_request(line);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_request_invalid_json() {
+        let line = "not valid json";
+        let result = parse_request(line);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_request_missing_method() {
+        let line = r#"{"jsonrpc":"2.0","id":1}"#;
+        let result = parse_request(line);
+
+        assert!(result.is_some());
+        let (_, method, _) = result.unwrap();
+        assert_eq!(method, "");
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_ui_response tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_ui_response_allow_true() {
+        let resp = json!({"allow": true});
+        let (allow, updated) = parse_ui_response(&resp);
+
+        assert!(allow);
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn test_parse_ui_response_allow_false() {
+        let resp = json!({"allow": false});
+        let (allow, updated) = parse_ui_response(&resp);
+
+        assert!(!allow);
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn test_parse_ui_response_with_updated_input() {
+        let resp = json!({
+            "allow": true,
+            "updatedInput": {"command": "ls", "extra": "value"}
+        });
+        let (allow, updated) = parse_ui_response(&resp);
+
+        assert!(allow);
+        assert!(updated.is_some());
+        assert_eq!(updated.unwrap()["command"], "ls");
+    }
+
+    #[test]
+    fn test_parse_ui_response_missing_allow_defaults_false() {
+        let resp = json!({});
+        let (allow, _) = parse_ui_response(&resp);
+
+        assert!(!allow);
+    }
+
+    #[test]
+    fn test_parse_ui_response_invalid_allow_type() {
+        let resp = json!({"allow": "yes"});
+        let (allow, _) = parse_ui_response(&resp);
+
+        // Non-boolean "allow" should default to false
+        assert!(!allow);
+    }
 }

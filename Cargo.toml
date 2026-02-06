@@ -5,13 +5,6 @@ members = [
     "nexus-term",
     "nexus-ui",
     "nexus-api",
-    # Agent crates (from code-assistant)
-    "nexus-llm",
-    "nexus-sandbox",
-    "nexus-web",
-    "nexus-executor",
-    "nexus-agent",
-    "nexus-fs",
     "strata",
 ]
 
@@ -72,12 +65,4 @@ wgpu = "23.0"  # GPU access (same version Iced uses)
 nexus-api = { path = "nexus-api" }
 nexus-kernel = { path = "nexus-kernel" }
 nexus-term = { path = "nexus-term" }
-
-# Agent crates (from code-assistant)
-nexus-llm = { path = "nexus-llm" }
-nexus-sandbox = { path = "nexus-sandbox" }
-nexus-web = { path = "nexus-web" }
-nexus-executor = { path = "nexus-executor" }
-nexus-agent = { path = "nexus-agent" }
-nexus-fs = { path = "nexus-fs" }
 strata = { path = "strata" }
