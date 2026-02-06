@@ -144,12 +144,12 @@ impl ShellWidget {
     // ---- View contributions ----
 
     /// Push a single shell block into the given scroll column.
-    pub fn push_block(
-        &self,
-        scroll: strata::ScrollColumn,
-        block: &Block,
+    pub fn push_block<'a>(
+        &'a self,
+        scroll: strata::ScrollColumn<'a>,
+        block: &'a Block,
         focus: &Focus,
-    ) -> strata::ScrollColumn {
+    ) -> strata::ScrollColumn<'a> {
         let is_focused = matches!(focus, Focus::Block(id) if *id == block.id);
         scroll.push(ShellBlockWidget {
             block,

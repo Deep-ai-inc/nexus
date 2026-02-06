@@ -35,7 +35,7 @@ fn split_into_words(text: &str) -> Vec<String> {
 }
 
 /// Render markdown text to a strata Column layout.
-pub fn render(text: &str, source_id: SourceId) -> Column {
+pub fn render(text: &str, source_id: SourceId) -> Column<'static> {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS;
@@ -50,7 +50,7 @@ pub fn render(text: &str, source_id: SourceId) -> Column {
 struct MarkdownRenderer {
     source_id: SourceId,
     /// Main column for block-level elements
-    column: Column,
+    column: Column<'static>,
     /// Stack of active styles (bold, italic, etc.)
     style_stack: Vec<Style>,
     /// Current list nesting with (ordered, start_number) for each level
@@ -136,7 +136,7 @@ impl MarkdownRenderer {
         }
     }
 
-    fn finish(self) -> Column {
+    fn finish(self) -> Column<'static> {
         self.column
     }
 
@@ -417,7 +417,7 @@ impl MarkdownRenderer {
 
     /// Build a FlowContainer from inline content spans for text wrapping.
     /// Splits text at word boundaries so each word can wrap independently.
-    fn build_inline_flow(&self, content: Vec<InlineSpan>) -> FlowContainer {
+    fn build_inline_flow(&self, content: Vec<InlineSpan>) -> FlowContainer<'static> {
         let mut flow = FlowContainer::new()
             .spacing(0.0)
             .source(self.source_id)
@@ -458,7 +458,7 @@ impl MarkdownRenderer {
         flow
     }
 
-    fn wrap_in_blockquote(&self, inner: Row) -> Row {
+    fn wrap_in_blockquote<'a>(&self, inner: Row<'a>) -> Row<'a> {
         let mut bq_row = Row::new();
         for _ in 0..self.blockquote_level {
             bq_row = bq_row
@@ -468,7 +468,7 @@ impl MarkdownRenderer {
         bq_row.push(inner)
     }
 
-    fn wrap_in_blockquote_flow(&self, inner: FlowContainer) -> Row {
+    fn wrap_in_blockquote_flow<'a>(&self, inner: FlowContainer<'a>) -> Row<'a> {
         let mut bq_row = Row::new();
         for _ in 0..self.blockquote_level {
             bq_row = bq_row

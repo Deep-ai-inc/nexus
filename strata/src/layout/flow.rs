@@ -3,6 +3,14 @@
 //! Children are laid out horizontally until they exceed the container width,
 //! then wrap to the next line. Supports text, images, and buttons.
 //! Reflows automatically on container resize.
+//!
+//! ## Lifetime Parameter
+//!
+//! The `'a` lifetime enables child elements to hold references to application
+//! state. This is used by `ScrollColumn` and `TextInputElement` for zero-cost
+//! interior mutability during layout.
+
+use std::marker::PhantomData;
 
 use crate::content_address::SourceId;
 use crate::layout_snapshot::LayoutSnapshot;
@@ -23,9 +31,14 @@ use super::length::{Length, Padding, CHAR_WIDTH, LINE_HEIGHT, BASE_FONT_SIZE};
 /// Children are laid out horizontally until they exceed the container width,
 /// then wrap to the next line. Supports any element type (text, images, etc.).
 /// Reflows automatically on container resize.
-pub struct FlowContainer {
+///
+/// ## Lifetime Parameter
+///
+/// The `'a` lifetime allows children to hold references to application state,
+/// enabling zero-cost interior mutability for types like `ScrollColumn`.
+pub struct FlowContainer<'a> {
     /// Child elements.
-    children: Vec<LayoutChild>,
+    children: Vec<LayoutChild<'a>>,
     /// Source ID for hit-testing.
     source_id: Option<SourceId>,
     /// Horizontal spacing between items.
@@ -36,9 +49,17 @@ pub struct FlowContainer {
     padding: Padding,
     /// Width sizing mode.
     pub(crate) width: Length,
+    /// Phantom data to hold the lifetime.
+    _marker: PhantomData<&'a ()>,
 }
 
-impl FlowContainer {
+impl Default for FlowContainer<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> FlowContainer<'a> {
     /// Create a new flow container.
     pub fn new() -> Self {
         Self {
@@ -48,6 +69,7 @@ impl FlowContainer {
             line_spacing: 2.0,
             padding: Padding::default(),
             width: Length::Fill,
+            _marker: PhantomData,
         }
     }
 
@@ -94,7 +116,7 @@ impl FlowContainer {
     }
 
     /// Add any child element.
-    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+    pub fn push(mut self, child: impl Into<LayoutChild<'a>>) -> Self {
         self.children.push(child.into());
         self
     }
@@ -279,12 +301,6 @@ impl FlowContainer {
         }
 
         snapshot.debug_exit();
-    }
-}
-
-impl Default for FlowContainer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -2,9 +2,18 @@
 //!
 //! Scroll state lives in app state. The container receives the current scroll
 //! offset as a parameter. Only children intersecting the viewport are rendered.
+//!
+//! ## Zero-Cost State Sync
+//!
+//! When created via `from_state(&scroll_state)`, the ScrollColumn holds a
+//! reference to the ScrollState and updates it directly during layout via
+//! interior mutability (`Cell`). This eliminates the need for manual
+//! `sync_from_snapshot` calls.
+
+use std::marker::PhantomData;
 
 use crate::content_address::SourceId;
-use crate::layout_snapshot::CursorIcon;
+use crate::layout_snapshot::{CursorIcon, ScrollTrackInfo};
 use crate::primitives::{Color, Point, Rect, Size};
 use crate::scroll_state::ScrollState;
 
@@ -44,14 +53,29 @@ fn hash_length(len: &Length) -> u64 {
 /// offset as a parameter. Wheel events flow through `on_mouse` → message →
 /// `update()` modifies offset.
 ///
+/// ## Zero-Cost State Sync
+///
+/// When created via `from_state(&scroll_state)`, the ScrollColumn holds a
+/// reference to the ScrollState and updates it directly during layout:
+/// - `max` (maximum scroll offset)
+/// - `track` (scrollbar track geometry)
+/// - `bounds` (container bounds for hit-testing)
+///
+/// This eliminates the need for manual `sync_from_snapshot` calls. The sync
+/// happens during the layout pass using interior mutability (`Cell`), which
+/// compiles to a single memory write — zero runtime overhead.
+///
 /// The ID is required (for event routing and hit-testing the scroll area).
-pub struct ScrollColumn {
+pub struct ScrollColumn<'a> {
+    /// Reference to ScrollState for zero-cost sync during layout.
+    /// When set, layout updates the state's Cells directly.
+    state_ref: Option<&'a ScrollState>,
     /// Widget ID (required for hit-testing and scroll event routing).
     id: SourceId,
     /// Scrollbar thumb widget ID (for drag interaction).
     thumb_id: SourceId,
     /// Child elements.
-    children: Vec<LayoutChild>,
+    children: Vec<LayoutChild<'a>>,
     /// Current scroll offset (from app state).
     scroll_offset: f32,
     /// Spacing between children.
@@ -73,6 +97,8 @@ pub struct ScrollColumn {
     /// Accumulated hash of all children, updated incrementally.
     /// This avoids O(N) iteration in content_hash().
     children_hash: u64,
+    /// Phantom data to hold the lifetime when state_ref is None.
+    _marker: PhantomData<&'a ()>,
 }
 
 /// FNV-1a prime for hash mixing.
@@ -80,10 +106,11 @@ const FNV_PRIME: u64 = 0x100000001b3;
 /// FNV-1a offset basis.
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 
-impl ScrollColumn {
+impl<'a> ScrollColumn<'a> {
     /// Create a new scroll column with a required ID.
     pub fn new(id: SourceId, thumb_id: SourceId) -> Self {
         Self {
+            state_ref: None,
             id,
             thumb_id,
             children: Vec::new(),
@@ -97,16 +124,33 @@ impl ScrollColumn {
             border_color: None,
             border_width: 0.0,
             children_hash: FNV_OFFSET,
+            _marker: PhantomData,
         }
     }
 
-    /// Create from a `ScrollState`, copying id, thumb_id, and offset.
+    /// Create from a `ScrollState`, storing a reference for zero-cost sync.
     ///
-    /// This pulls all state-driven fields so you only chain layout props.
-    pub fn from_state(state: &ScrollState) -> Self {
-        let mut sc = Self::new(state.id(), state.thumb_id());
-        sc.scroll_offset = state.offset;
-        sc
+    /// During layout, this ScrollColumn will update the state's `max`, `track`,
+    /// and `bounds` fields directly via interior mutability. No manual
+    /// `sync_from_snapshot` call is needed.
+    pub fn from_state(state: &'a ScrollState) -> Self {
+        Self {
+            state_ref: Some(state),
+            id: state.id(),
+            thumb_id: state.thumb_id(),
+            children: Vec::new(),
+            scroll_offset: state.offset,
+            spacing: 0.0,
+            padding: Padding::default(),
+            background: None,
+            corner_radius: 0.0,
+            width: Length::Shrink,
+            height: Length::Shrink,
+            border_color: None,
+            border_width: 0.0,
+            children_hash: FNV_OFFSET,
+            _marker: PhantomData,
+        }
     }
 
     /// Set the scroll offset (from app state).
@@ -175,17 +219,17 @@ impl ScrollColumn {
     }
 
     /// Add a nested column.
-    pub fn column(self, column: Column) -> Self {
+    pub fn column(self, column: Column<'a>) -> Self {
         self.push(column)
     }
 
     /// Add a nested row.
-    pub fn row(self, row: Row) -> Self {
+    pub fn row(self, row: Row<'a>) -> Self {
         self.push(row)
     }
 
     /// Add a nested scroll column.
-    pub fn scroll_column(self, scroll: ScrollColumn) -> Self {
+    pub fn scroll_column(self, scroll: ScrollColumn<'a>) -> Self {
         self.push(scroll)
     }
 
@@ -210,7 +254,7 @@ impl ScrollColumn {
     }
 
     /// Add a text input element.
-    pub fn text_input(self, element: TextInputElement) -> Self {
+    pub fn text_input(self, element: TextInputElement<'a>) -> Self {
         self.push(element)
     }
 
@@ -228,7 +272,7 @@ impl ScrollColumn {
     /// The child's content hash is accumulated incrementally, making
     /// `content_hash()` O(1) instead of O(N).
     #[inline(always)]
-    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+    pub fn push(mut self, child: impl Into<LayoutChild<'a>>) -> Self {
         let child = child.into();
         // Accumulate child hash incrementally
         self.children_hash = self.children_hash
@@ -511,13 +555,30 @@ impl ScrollColumn {
             ctx.snapshot.set_cursor_hint(self.thumb_id, CursorIcon::Grab);
 
             // Store track info so the app can convert mouse Y → scroll offset
-            use crate::layout_snapshot::ScrollTrackInfo;
-            ctx.snapshot.set_scroll_track(self.id, ScrollTrackInfo {
+            let track_info = ScrollTrackInfo {
                 track_y: bounds.y,
                 track_height: viewport_h,
                 thumb_height: thumb_h,
                 max_scroll,
-            });
+            };
+            ctx.snapshot.set_scroll_track(self.id, track_info);
+
+            // Sync to state_ref if present (zero-cost via Cell)
+            if let Some(state) = self.state_ref {
+                state.max.set(max_scroll);
+                state.track.set(Some(track_info));
+                state.bounds.set(bounds);
+            }
+        }
+
+        // Sync bounds even when no scrollbar is visible
+        if let Some(state) = self.state_ref {
+            state.bounds.set(bounds);
+            // Also sync max_scroll when content doesn't overflow
+            if total_content_height <= viewport_h {
+                state.max.set(0.0);
+                state.track.set(None);
+            }
         }
 
         // Pop clip
@@ -534,7 +595,7 @@ impl ScrollColumn {
 // =========================================================================
 
 /// Measure child height for scroll column measurement pass.
-fn measure_child_height_for_scroll(child: &LayoutChild, content_width: f32) -> f32 {
+fn measure_child_height_for_scroll(child: &LayoutChild<'_>, content_width: f32) -> f32 {
     match child {
         LayoutChild::Flow(f) => f.height_for_width(content_width),
         LayoutChild::Row(r) => r.height_for_width(content_width),
@@ -544,7 +605,7 @@ fn measure_child_height_for_scroll(child: &LayoutChild, content_width: f32) -> f
 }
 
 /// Compute child width based on its sizing mode for scroll column.
-fn compute_child_width_for_scroll(child: &LayoutChild, content_width: f32) -> f32 {
+fn compute_child_width_for_scroll(child: &LayoutChild<'_>, content_width: f32) -> f32 {
     match child {
         LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).width,
         LayoutChild::Terminal(t) => t.size().width,

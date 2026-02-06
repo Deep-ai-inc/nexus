@@ -2,6 +2,14 @@
 //!
 //! Children flow top to bottom. Supports flex sizing, spacing, padding,
 //! and alignment on both axes.
+//!
+//! ## Lifetime Parameter
+//!
+//! The `'a` lifetime enables child elements to hold references to application
+//! state. This is used by `ScrollColumn` and `TextInputElement` for zero-cost
+//! interior mutability during layout.
+
+use std::marker::PhantomData;
 
 use crate::content_address::SourceId;
 use crate::layout_snapshot::CursorIcon;
@@ -38,11 +46,16 @@ fn hash_length(len: &Length) -> u64 {
 // =========================================================================
 
 /// A vertical layout container (children flow top to bottom).
-pub struct Column {
+///
+/// ## Lifetime Parameter
+///
+/// The `'a` lifetime allows children to hold references to application state,
+/// enabling zero-cost interior mutability for types like `ScrollColumn`.
+pub struct Column<'a> {
     /// Widget ID for hit-testing and overlay anchoring.
     id: Option<SourceId>,
     /// Child elements.
-    children: Vec<LayoutChild>,
+    children: Vec<LayoutChild<'a>>,
     /// Spacing between children.
     spacing: f32,
     /// Padding around all children.
@@ -70,9 +83,11 @@ pub struct Column {
     /// Accumulated hash of all children, updated incrementally.
     /// This avoids O(N) iteration in content_hash().
     children_hash: u64,
+    /// Phantom data to hold the lifetime.
+    _marker: PhantomData<&'a ()>,
 }
 
-impl Default for Column {
+impl Default for Column<'_> {
     fn default() -> Self {
         Self::new()
     }
@@ -83,7 +98,7 @@ const FNV_PRIME: u64 = 0x100000001b3;
 /// FNV-1a offset basis.
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 
-impl Column {
+impl<'a> Column<'a> {
     /// Create a new column.
     pub fn new() -> Self {
         Self {
@@ -102,6 +117,7 @@ impl Column {
             shadow: None,
             cursor_hint: None,
             children_hash: FNV_OFFSET,
+            _marker: PhantomData,
         }
     }
 
@@ -189,17 +205,17 @@ impl Column {
     }
 
     /// Add a nested column.
-    pub fn column(self, column: Column) -> Self {
+    pub fn column(self, column: Column<'a>) -> Self {
         self.push(column)
     }
 
     /// Add a nested row.
-    pub fn row(self, row: Row) -> Self {
+    pub fn row(self, row: Row<'a>) -> Self {
         self.push(row)
     }
 
     /// Add a scroll column.
-    pub fn scroll_column(self, scroll: ScrollColumn) -> Self {
+    pub fn scroll_column(self, scroll: ScrollColumn<'a>) -> Self {
         self.push(scroll)
     }
 
@@ -224,7 +240,7 @@ impl Column {
     }
 
     /// Add a text input element.
-    pub fn text_input(self, element: TextInputElement) -> Self {
+    pub fn text_input(self, element: TextInputElement<'a>) -> Self {
         self.push(element)
     }
 
@@ -245,7 +261,7 @@ impl Column {
     /// The child's content hash is accumulated incrementally, making
     /// `content_hash()` O(1) instead of O(N).
     #[inline(always)]
-    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+    pub fn push(mut self, child: impl Into<LayoutChild<'a>>) -> Self {
         let child = child.into();
         // Accumulate child hash incrementally
         self.children_hash = self.children_hash
@@ -594,7 +610,7 @@ impl Column {
 // =========================================================================
 
 /// Measure child height and flex factor for the measurement pass.
-fn measure_child_height(child: &LayoutChild, content_width: f32) -> (f32, f32) {
+fn measure_child_height(child: &LayoutChild<'_>, content_width: f32) -> (f32, f32) {
     match child {
         LayoutChild::Text(t) => (t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).height, 0.0),
         LayoutChild::Terminal(t) => (t.size().height, 0.0),
@@ -625,7 +641,7 @@ fn measure_child_height(child: &LayoutChild, content_width: f32) -> (f32, f32) {
 }
 
 /// Compute child width based on its sizing mode.
-fn compute_child_width(child: &LayoutChild, content_width: f32) -> f32 {
+fn compute_child_width(child: &LayoutChild<'_>, content_width: f32) -> f32 {
     match child {
         LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).width,
         LayoutChild::Terminal(t) => t.size().width,

@@ -6,6 +6,16 @@
 //!
 //! The recursive container types (Column, Row, ScrollColumn) are boxed to
 //! break the size recursion that would otherwise make the enum infinitely sized.
+//!
+//! ## Lifetime Parameter
+//!
+//! The `'a` lifetime represents the borrow of application state during `view()`.
+//! This enables zero-cost interior mutability: containers like `ScrollColumn`
+//! can hold references to state objects (e.g., `&'a ScrollState`) and update
+//! them directly during layout via `Cell`, eliminating manual sync calls.
+//!
+//! Since the layout tree is ephemeral (built in `view()`, used for layout,
+//! then discarded), tying its lifetime to the state borrow is safe and idiomatic.
 
 use crate::layout_snapshot::{CursorIcon, GridLayout, GridRow, LayoutSnapshot, SourceLayout, TextLayout};
 use crate::primitives::{Point, Rect, Size};
@@ -27,6 +37,20 @@ use super::text_input::{TextInputElement, render_text_input, render_text_input_m
 use super::table::{TableElement, VirtualTableElement, render_table, render_virtual_table};
 
 // =========================================================================
+// Type Alias for Clean User Code
+// =========================================================================
+
+/// A layout element - the return type of `view()`.
+///
+/// This is a type alias for `LayoutChild<'a>` that provides a cleaner API:
+/// ```ignore
+/// fn view(state: &Self::State) -> impl Into<Element<'_>> {
+///     Column::new().push(...)
+/// }
+/// ```
+pub type Element<'a> = LayoutChild<'a>;
+
+// =========================================================================
 // LayoutChild Enum
 // =========================================================================
 
@@ -36,6 +60,12 @@ use super::table::{TableElement, VirtualTableElement, render_table, render_virtu
 /// don't need to know the concrete type of their children - they just work
 /// with `LayoutChild` and call its methods for measurement and flex calculation.
 ///
+/// ## Lifetime Parameter
+///
+/// The `'a` lifetime enables containers to hold references to application state.
+/// For example, `ScrollColumn::from_state(&scroll_state)` stores `&'a ScrollState`
+/// and updates it directly during layout, eliminating manual `sync_from_snapshot` calls.
+///
 /// ## Boxing Strategy
 ///
 /// Recursive container types (Column, Row, ScrollColumn) are boxed to:
@@ -44,7 +74,7 @@ use super::table::{TableElement, VirtualTableElement, render_table, render_virtu
 /// 3. Improve cache performance when iterating Vec<LayoutChild>
 ///
 /// The one pointer indirection cost is negligible compared to layout math.
-pub enum LayoutChild {
+pub enum LayoutChild<'a> {
     /// A text element.
     Text(TextElement),
 
@@ -55,13 +85,13 @@ pub enum LayoutChild {
     Image(ImageElement),
 
     /// A nested column (boxed to break size recursion).
-    Column(Box<Column>),
+    Column(Box<Column<'a>>),
 
     /// A nested row (boxed to break size recursion).
-    Row(Box<Row>),
+    Row(Box<Row<'a>>),
 
     /// A scroll column (boxed to break size recursion).
-    ScrollColumn(Box<ScrollColumn>),
+    ScrollColumn(Box<ScrollColumn<'a>>),
 
     /// A spacer that expands to fill available space.
     Spacer { flex: f32 },
@@ -70,7 +100,7 @@ pub enum LayoutChild {
     Button(ButtonElement),
 
     /// A text input element (editable text field, registers as widget hit target).
-    TextInput(TextInputElement),
+    TextInput(TextInputElement<'a>),
 
     /// A table element (headers + rows with sortable columns).
     Table(TableElement),
@@ -82,7 +112,7 @@ pub enum LayoutChild {
     FixedSpacer { size: f32 },
 
     /// A flow container (wrapping inline layout, like CSS flex-wrap).
-    Flow(FlowContainer),
+    Flow(FlowContainer<'a>),
 }
 
 // =========================================================================
@@ -104,7 +134,7 @@ fn hash_length(len: &Length) -> u64 {
 // LayoutChild Methods
 // =========================================================================
 
-impl LayoutChild {
+impl<'a> LayoutChild<'a> {
     /// Measure this child's main axis size (height for Column parent, width for Row parent).
     pub(crate) fn measure_main(&self, is_column: bool) -> f32 {
         let size = match self {
@@ -470,48 +500,48 @@ fn render_text_input_child(snapshot: &mut LayoutSnapshot, input: TextInputElemen
 // From impls for LayoutChild — enables generic `.push()` on containers
 // =========================================================================
 
-impl From<TextElement> for LayoutChild {
+impl<'a> From<TextElement> for LayoutChild<'a> {
     fn from(v: TextElement) -> Self { Self::Text(v) }
 }
 
-impl From<TerminalElement> for LayoutChild {
+impl<'a> From<TerminalElement> for LayoutChild<'a> {
     fn from(v: TerminalElement) -> Self { Self::Terminal(v) }
 }
 
-impl From<ImageElement> for LayoutChild {
+impl<'a> From<ImageElement> for LayoutChild<'a> {
     fn from(v: ImageElement) -> Self { Self::Image(v) }
 }
 
-impl From<Column> for LayoutChild {
-    fn from(v: Column) -> Self { Self::Column(Box::new(v)) }
+impl<'a> From<Column<'a>> for LayoutChild<'a> {
+    fn from(v: Column<'a>) -> Self { Self::Column(Box::new(v)) }
 }
 
-impl From<Row> for LayoutChild {
-    fn from(v: Row) -> Self { Self::Row(Box::new(v)) }
+impl<'a> From<Row<'a>> for LayoutChild<'a> {
+    fn from(v: Row<'a>) -> Self { Self::Row(Box::new(v)) }
 }
 
-impl From<ScrollColumn> for LayoutChild {
-    fn from(v: ScrollColumn) -> Self { Self::ScrollColumn(Box::new(v)) }
+impl<'a> From<ScrollColumn<'a>> for LayoutChild<'a> {
+    fn from(v: ScrollColumn<'a>) -> Self { Self::ScrollColumn(Box::new(v)) }
 }
 
-impl From<ButtonElement> for LayoutChild {
+impl<'a> From<ButtonElement> for LayoutChild<'a> {
     fn from(v: ButtonElement) -> Self { Self::Button(v) }
 }
 
-impl From<TextInputElement> for LayoutChild {
-    fn from(v: TextInputElement) -> Self { Self::TextInput(v) }
+impl<'a> From<TextInputElement<'a>> for LayoutChild<'a> {
+    fn from(v: TextInputElement<'a>) -> Self { Self::TextInput(v) }
 }
 
-impl From<TableElement> for LayoutChild {
+impl<'a> From<TableElement> for LayoutChild<'a> {
     fn from(v: TableElement) -> Self { Self::Table(v) }
 }
 
-impl From<VirtualTableElement> for LayoutChild {
+impl<'a> From<VirtualTableElement> for LayoutChild<'a> {
     fn from(v: VirtualTableElement) -> Self { Self::VirtualTable(v) }
 }
 
-impl From<FlowContainer> for LayoutChild {
-    fn from(v: FlowContainer) -> Self { Self::Flow(v) }
+impl<'a> From<FlowContainer<'a>> for LayoutChild<'a> {
+    fn from(v: FlowContainer<'a>) -> Self { Self::Flow(v) }
 }
 
 // =========================================================================
@@ -532,9 +562,9 @@ impl From<FlowContainer> for LayoutChild {
 /// # Example
 ///
 /// ```ignore
-/// struct Card { inner: Column }
+/// struct Card<'a> { inner: Column<'a> }
 ///
-/// impl Card {
+/// impl<'a> Card<'a> {
 ///     fn new(title: &str) -> Self {
 ///         Card {
 ///             inner: Column::new()
@@ -544,31 +574,31 @@ impl From<FlowContainer> for LayoutChild {
 ///         }
 ///     }
 ///
-///     fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+///     fn push(mut self, child: impl Into<LayoutChild<'a>>) -> Self {
 ///         self.inner = self.inner.push(child);
 ///         self
 ///     }
 /// }
 ///
-/// impl Widget for Card {
-///     fn build(self) -> LayoutChild { self.inner.into() }
+/// impl<'a> Widget<'a> for Card<'a> {
+///     fn build(self) -> LayoutChild<'a> { self.inner.into() }
 /// }
 ///
 /// // Works with .push() on any container:
 /// scroll_col.push(Card::new("Settings").push(some_input))
 /// ```
-pub trait Widget {
+pub trait Widget<'a> {
     /// Consume this widget and produce a layout node.
-    fn build(self) -> LayoutChild;
+    fn build(self) -> LayoutChild<'a>;
 }
 
 /// Blanket impl: any `Widget` can be used with `.push()` on containers.
 ///
 /// This does NOT conflict with the explicit `From` impls above because
 /// built-in types (Column, Row, TextElement, etc.) do not implement `Widget`.
-impl<W: Widget> From<W> for LayoutChild {
+impl<'a, W: Widget<'a>> From<W> for LayoutChild<'a> {
     #[inline(always)]
-    fn from(w: W) -> LayoutChild {
+    fn from(w: W) -> LayoutChild<'a> {
         w.build()
     }
 }

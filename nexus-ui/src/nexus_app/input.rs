@@ -384,7 +384,7 @@ impl InputWidget {
 
 impl InputWidget {
     /// Build the overlays section (completion popup, history search bar).
-    pub fn layout_overlays(&self, mut col: Column) -> Column {
+    pub fn layout_overlays<'a>(&'a self, mut col: Column<'a>) -> Column<'a> {
         if self.completion.is_active() {
             col = col.push(CompletionPopup {
                 completions: &self.completion.completions,
@@ -408,7 +408,7 @@ impl InputWidget {
     }
 
     /// Build the attachments section (image thumbnails with remove buttons).
-    pub fn layout_attachments(&self, mut col: Column) -> Column {
+    pub fn layout_attachments<'a>(&self, mut col: Column<'a>) -> Column<'a> {
         if self.attachments.is_empty() {
             return col;
         }
@@ -443,13 +443,13 @@ impl InputWidget {
     }
 
     /// Build the input bar section.
-    pub fn layout_input_bar(
-        &self,
-        mut col: Column,
-        cwd: &str,
+    pub fn layout_input_bar<'a>(
+        &'a self,
+        mut col: Column<'a>,
+        cwd: &'a str,
         last_exit_code: Option<i32>,
         cursor_visible: bool,
-    ) -> Column {
+    ) -> Column<'a> {
         let line_count = {
             // Use visual line count (accounts for soft wrapping) based on
             // the bounds from the previous layout frame.

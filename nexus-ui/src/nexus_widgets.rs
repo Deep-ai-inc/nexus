@@ -44,8 +44,8 @@ pub struct ShellBlockWidget<'a> {
     pub(crate) click_registry: &'a RefCell<HashMap<SourceId, ClickAction>>,
 }
 
-impl Widget for ShellBlockWidget<'_> {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for ShellBlockWidget<'a> {
+    fn build(self) -> LayoutChild<'a> {
         let block = self.block;
 
         // Status icon and color
@@ -337,8 +337,8 @@ impl<'a> AgentBlockWidget<'a> {
     }
 }
 
-impl Widget for AgentBlockWidget<'_> {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for AgentBlockWidget<'a> {
+    fn build(self) -> LayoutChild<'a> {
         let block = self.block;
 
         let mut content = Column::new()
@@ -619,7 +619,7 @@ fn tool_collapsed_summary(tool: &ToolInvocation) -> Option<String> {
 // =========================================================================
 
 /// Dispatch to tool-specific body rendering.
-fn build_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     match tool.name.as_str() {
         "Edit" => build_edit_tool_body(tool, source_id),
         "Read" => build_read_tool_body(tool, source_id),
@@ -632,7 +632,7 @@ fn build_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
 }
 
 /// Edit tool: show a unified diff with colored +/- lines.
-fn build_edit_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_edit_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let old = tool.parameters.get("old_string").map(|s| s.as_str()).unwrap_or("");
     let new = tool.parameters.get("new_string").map(|s| s.as_str()).unwrap_or("");
 
@@ -683,7 +683,7 @@ fn build_edit_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
 }
 
 /// Read tool: code block with line numbers.
-fn build_read_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_read_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let mut col = Column::new().spacing(1.0);
     if let Some(ref output) = tool.output {
         let mut code_col = Column::new()
@@ -708,7 +708,7 @@ fn build_read_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
 }
 
 /// Bash tool: output in a code block with optional timeout display.
-fn build_bash_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_bash_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let mut col = Column::new().spacing(1.0);
 
     if let Some(timeout) = tool.parameters.get("timeout") {
@@ -755,7 +755,7 @@ fn build_bash_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
 }
 
 /// Grep/Glob tool: results list.
-fn build_search_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_search_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let mut col = Column::new().spacing(1.0);
     if let Some(ref output) = tool.output {
         for line in output.lines().take(30) {
@@ -781,7 +781,7 @@ fn build_search_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column 
 }
 
 /// Write tool: show content being written in green.
-fn build_write_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_write_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let mut col = Column::new().spacing(1.0);
     if let Some(content) = tool.parameters.get("content") {
         let mut code_col = Column::new()
@@ -806,7 +806,7 @@ fn build_write_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
 }
 
 /// Task tool: sub-agent display with left-border threading.
-fn build_task_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_task_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let mut col = Column::new().spacing(1.0);
     if let Some(ref output) = tool.output {
         // Use a Row: thin left border column + indented content
@@ -843,7 +843,7 @@ fn build_task_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
 }
 
 /// Generic tool: parameter dump + output (for MCP tools, TodoWrite, etc.)
-fn build_generic_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_generic_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let mut col = Column::new().spacing(2.0);
 
     // Parameters
@@ -882,7 +882,7 @@ fn build_generic_tool_body(tool: &ToolInvocation, source_id: SourceId) -> Column
 }
 
 /// Build a tool invocation widget (Claude Code style).
-fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId, source_id: SourceId) -> Column {
+fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId, source_id: SourceId) -> Column<'static> {
     let (status_icon, status_color) = match tool.status {
         ToolStatus::Pending => ("\u{25CF}", colors::TOOL_PENDING),   // ●
         ToolStatus::Running => ("\u{25CF}", colors::RUNNING),        // ●
@@ -918,7 +918,7 @@ fn build_tool_widget(tool: &ToolInvocation, toggle_id: SourceId, source_id: Sour
 }
 
 /// Build a collapsed preview showing first few lines + summary.
-fn build_collapsed_preview(tool: &ToolInvocation, source_id: SourceId) -> Column {
+fn build_collapsed_preview(tool: &ToolInvocation, source_id: SourceId) -> Column<'static> {
     let mut col = Column::new().spacing(1.0);
 
     let output = tool.output.as_deref().unwrap_or("");
@@ -969,7 +969,7 @@ fn build_permission_dialog(
     allow_id: SourceId,
     always_id: SourceId,
     source_id: SourceId,
-) -> Column {
+) -> Column<'static> {
     let code_block = Column::new()
         .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
         .background(Color::rgba(0.0, 0.0, 0.0, 0.3))
@@ -1021,7 +1021,7 @@ fn build_question_dialog(
     block_id: BlockId,
     question_input: Option<&strata::TextInputState>,
     source_id: SourceId,
-) -> Column {
+) -> Column<'static> {
     let mut dialog = Column::new()
         .padding(8.0)
         .spacing(6.0)
@@ -1088,8 +1088,8 @@ pub struct WelcomeScreen<'a> {
     pub cwd: &'a str,
 }
 
-impl Widget for WelcomeScreen<'_> {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for WelcomeScreen<'a> {
+    fn build(self) -> LayoutChild<'a> {
         // Shorten home directory
         let home = std::env::var("HOME").unwrap_or_default();
         let display_cwd = if self.cwd.starts_with(&home) {
@@ -1189,8 +1189,8 @@ impl JobBar<'_> {
     }
 }
 
-impl Widget for JobBar<'_> {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for JobBar<'a> {
+    fn build(self) -> LayoutChild<'a> {
         let mut row = Row::new().spacing(8.0);
 
         for job in self.jobs {
@@ -1233,8 +1233,8 @@ pub struct NexusInputBar<'a> {
     pub line_count: usize,
 }
 
-impl Widget for NexusInputBar<'_> {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for NexusInputBar<'a> {
+    fn build(self) -> LayoutChild<'a> {
         use crate::blocks::InputMode;
         use strata::TextInputElement;
 
@@ -1315,8 +1315,8 @@ impl CompletionPopup<'_> {
     }
 }
 
-impl Widget for CompletionPopup<'_> {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for CompletionPopup<'a> {
+    fn build(self) -> LayoutChild<'a> {
         // Scrollable list of completions, max 300px tall
         let mut scroll = ScrollColumn::from_state(self.scroll)
             .spacing(0.0)
@@ -1393,8 +1393,8 @@ impl HistorySearchBar<'_> {
     }
 }
 
-impl Widget for HistorySearchBar<'_> {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for HistorySearchBar<'a> {
+    fn build(self) -> LayoutChild<'a> {
         // History search overlay matched from old UI input.rs
         let mut container = Column::new()
             .padding(10.0)
@@ -1539,13 +1539,13 @@ fn term_color_to_strata(c: nexus_term::Color) -> Color {
 }
 
 /// Render a structured Value from a native (kernel) command into the layout.
-fn render_native_value(
-    mut parent: Column,
+fn render_native_value<'a>(
+    mut parent: Column<'a>,
     value: &Value,
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
     click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
-) -> Column {
+) -> Column<'a> {
     let block_id = block.id;
     match value {
         Value::Unit => parent,
@@ -1800,13 +1800,13 @@ fn render_native_value(
 }
 
 /// Render a domain-specific value (FileOp, Tree, DiffFile, etc.).
-fn render_domain_value(
-    mut parent: Column,
+fn render_domain_value<'a>(
+    mut parent: Column<'a>,
     domain: &nexus_api::DomainValue,
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
     click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
-) -> Column {
+) -> Column<'a> {
     use nexus_api::DomainValue;
     let block_id = block.id;
     let source_id = source_ids::native(block_id);
@@ -2144,8 +2144,8 @@ fn render_domain_value(
 
 /// Render file entries with tree expansion support.
 /// Recursively renders children for expanded directories.
-fn render_file_entries(
-    parent: &mut Column,
+fn render_file_entries<'a>(
+    parent: &mut Column<'a>,
     entries: &[&FileEntry],
     block: &Block,
     depth: usize,
@@ -2244,15 +2244,15 @@ fn render_file_entries(
     }
 }
 
-/// Get text color for a Value cell in a table.
-fn render_diff_viewer(
-    mut parent: Column,
+/// Render the diff viewer for reviewing changes.
+fn render_diff_viewer<'a>(
+    mut parent: Column<'a>,
     items: &[Value],
     scroll_line: usize,
     current_file: usize,
     collapsed_indices: &std::collections::HashSet<usize>,
     source_id: strata::SourceId,
-) -> Column {
+) -> Column<'a> {
     use nexus_api::DomainValue;
 
     // Header with keybinding hints

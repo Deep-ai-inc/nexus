@@ -27,11 +27,11 @@ use super::demo::colors;
 ///     .push(toggle_button)
 ///     .id(SourceId::named("settings_card"))
 /// ```
-pub struct Card {
-    inner: Column,
+pub struct Card<'a> {
+    inner: Column<'a>,
 }
 
-impl Card {
+impl<'a> Card<'a> {
     pub fn new(title: &str) -> Self {
         Card {
             inner: Column::new()
@@ -49,14 +49,14 @@ impl Card {
         self
     }
 
-    pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
+    pub fn push(mut self, child: impl Into<LayoutChild<'a>>) -> Self {
         self.inner = self.inner.push(child);
         self
     }
 }
 
-impl Widget for Card {
-    fn build(self) -> LayoutChild {
+impl<'a> Widget<'a> for Card<'a> {
+    fn build(self) -> LayoutChild<'a> {
         self.inner.into()
     }
 }
@@ -75,8 +75,8 @@ pub struct ShellBlock {
     pub row_count: u16,
 }
 
-impl Widget for ShellBlock {
-    fn build(self) -> LayoutChild {
+impl Widget<'static> for ShellBlock {
+    fn build(self) -> LayoutChild<'static> {
         let mut terminal = TerminalElement::new(self.terminal_source, self.cols, self.row_count)
             .cell_size(8.4, 18.0);
         for (text, color) in self.rows {
@@ -143,8 +143,8 @@ pub struct AgentBlock {
     pub status_color: Color,
 }
 
-impl Widget for AgentBlock {
-    fn build(self) -> LayoutChild {
+impl Widget<'static> for AgentBlock {
+    fn build(self) -> LayoutChild<'static> {
         let mut content = Column::new()
             .padding(12.0)
             .spacing(6.0)
@@ -237,8 +237,8 @@ pub struct PermissionDialog {
     pub always_id: SourceId,
 }
 
-impl Widget for PermissionDialog {
-    fn build(self) -> LayoutChild {
+impl Widget<'static> for PermissionDialog {
+    fn build(self) -> LayoutChild<'static> {
         let code_block = Column::new()
             .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
             .background(Color::rgba(0.0, 0.0, 0.0, 0.3))
@@ -290,8 +290,8 @@ pub struct InputBar {
     pub mode_bg: Color,
 }
 
-impl Widget for InputBar {
-    fn build(self) -> LayoutChild {
+impl Widget<'static> for InputBar {
+    fn build(self) -> LayoutChild<'static> {
         Row::new()
             .padding_custom(Padding::new(8.0, 12.0, 8.0, 12.0))
             .spacing(10.0)
@@ -347,8 +347,8 @@ impl StatusPanel {
     }
 }
 
-impl Widget for StatusPanel {
-    fn build(self) -> LayoutChild {
+impl Widget<'static> for StatusPanel {
+    fn build(self) -> LayoutChild<'static> {
         let mut row = Row::new().spacing(16.0);
         for ind in self.indicators {
             row = row.push(
@@ -391,8 +391,8 @@ pub struct JobPanel {
     pub jobs: Vec<JobPill>,
 }
 
-impl Widget for JobPanel {
-    fn build(self) -> LayoutChild {
+impl Widget<'static> for JobPanel {
+    fn build(self) -> LayoutChild<'static> {
         let mut row = Row::new().spacing(10.0);
         for job in self.jobs {
             row = row.push(

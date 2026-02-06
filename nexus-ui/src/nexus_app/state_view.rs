@@ -6,7 +6,7 @@ use super::NexusState;
 use crate::nexus_widgets::WelcomeScreen;
 
 impl NexusState {
-    pub(super) fn layout_blocks(&self, mut scroll: ScrollColumn) -> ScrollColumn {
+    pub(super) fn layout_blocks<'a>(&'a self, mut scroll: ScrollColumn<'a>) -> ScrollColumn<'a> {
         if !self.has_blocks() {
             scroll = scroll.push(WelcomeScreen { cwd: &self.cwd });
         } else {
@@ -24,11 +24,11 @@ impl NexusState {
         scroll
     }
 
-    pub(super) fn layout_overlays_and_input(
-        &self,
-        mut col: Column,
+    pub(super) fn layout_overlays_and_input<'a>(
+        &'a self,
+        mut col: Column<'a>,
         cursor_visible: bool,
-    ) -> Column {
+    ) -> Column<'a> {
         // Job bar (shell-owned data, placed in overlay area)
         if let Some(job_bar) = self.shell.view_job_bar() {
             col = col.push(job_bar);

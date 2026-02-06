@@ -2,6 +2,6 @@
 //!
 //! Run with: `cargo run -p nexus-ui --example strata_demo`
 
-fn main() -> Result<(), nexus_ui::strata::shell::Error> {
-    nexus_ui::strata::demo::run()
+fn main() -> Result<(), strata::shell::Error> {
+    strata::demo::run()
 }

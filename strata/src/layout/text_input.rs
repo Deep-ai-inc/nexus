@@ -2,6 +2,14 @@
 //!
 //! Renders single-line or multiline text inputs with cursor, selection,
 //! and focus handling. All state is external - passed in via the element.
+//!
+//! ## Lifetime Parameter
+//!
+//! The `'a` lifetime enables the element to hold references to application
+//! state. This is used for consistency with other container types that
+//! support zero-cost interior mutability.
+
+use std::marker::PhantomData;
 
 use unicode_width::UnicodeWidthChar;
 
@@ -34,7 +42,13 @@ fn unicode_col_x(text: &str, col: usize) -> f32 {
 ///
 /// Renders an editable text field with cursor and optional selection highlight.
 /// All state is external — the app passes text, cursor, selection, and focus.
-pub struct TextInputElement {
+///
+/// ## Lifetime Parameter
+///
+/// The `'a` lifetime allows the element to hold references to application state
+/// for consistency with container types. Currently unused but enables future
+/// zero-cost state sync similar to `ScrollColumn`.
+pub struct TextInputElement<'a> {
     pub id: SourceId,
     pub text: String,
     pub cursor: usize,
@@ -55,9 +69,11 @@ pub struct TextInputElement {
     pub scroll_offset: f32,
     pub cursor_visible: bool,
     pub(crate) cache_key: u64,
+    /// Phantom data to hold the lifetime.
+    _marker: PhantomData<&'a ()>,
 }
 
-impl TextInputElement {
+impl<'a> TextInputElement<'a> {
     pub fn new(id: SourceId, text: impl Into<String>) -> Self {
         let text = text.into();
         let cache_key = hash_text(&text);
@@ -82,6 +98,7 @@ impl TextInputElement {
             scroll_offset: 0.0,
             cursor_visible: true,
             cache_key,
+            _marker: PhantomData,
         }
     }
 
@@ -141,7 +158,7 @@ impl TextInputElement {
 /// Render a TextInputElement at the given position and size.
 pub(crate) fn render_text_input(
     snapshot: &mut LayoutSnapshot,
-    input: TextInputElement,
+    input: TextInputElement<'_>,
     x: f32, y: f32, w: f32, h: f32,
 ) {
     use crate::primitives::Point;
@@ -218,7 +235,7 @@ pub(crate) fn render_text_input(
 /// (virtualized).
 pub(crate) fn render_text_input_multiline(
     snapshot: &mut LayoutSnapshot,
-    input: TextInputElement,
+    input: TextInputElement<'_>,
     x: f32, y: f32, w: f32, h: f32,
 ) {
     use crate::primitives::Point;

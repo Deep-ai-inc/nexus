@@ -107,11 +107,11 @@ impl AgentWidget {
     // ---- View contributions ----
 
     /// Push a single agent block into the given scroll column.
-    pub fn push_block(
-        &self,
-        scroll: strata::ScrollColumn,
-        block: &AgentBlock,
-    ) -> strata::ScrollColumn {
+    pub fn push_block<'a>(
+        &'a self,
+        scroll: strata::ScrollColumn<'a>,
+        block: &'a AgentBlock,
+    ) -> strata::ScrollColumn<'a> {
         scroll.push(AgentBlockWidget {
             block,
             thinking_toggle_id: source_ids::agent_thinking_toggle(block.id),

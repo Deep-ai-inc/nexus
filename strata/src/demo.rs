@@ -223,7 +223,7 @@ fn hover_button(id: SourceId, label: &str, bg: Color, hovered: Option<SourceId>)
 ///
 /// Returns a concrete `Column` — no trait objects, no heap allocation.
 /// The caller pushes this into the parent container.
-fn chat_bubble(item: &ChatItem) -> Column {
+fn chat_bubble(item: &ChatItem) -> Column<'_> {
     let (role_color, text_color) = if item.role == "user" {
         (colors::SUCCESS, colors::TEXT_PRIMARY)
     } else {
@@ -656,7 +656,11 @@ impl StrataApp for DemoApp {
             // LEFT COLUMN: Chat History + Shell Block + Input Bar
             // =============================================================
             .push(
-                ScrollColumn::from_state(&state.left_scroll)
+                // Note: Using new() instead of from_state() here because the demo
+                // widgets use 'static lifetime. Use from_state() in real apps
+                // where the widget tree lifetime matches the state borrow.
+                ScrollColumn::new(state.left_scroll.id(), state.left_scroll.thumb_id())
+                    .scroll_offset(state.left_scroll.offset)
                     .spacing(16.0)
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -732,7 +736,11 @@ impl StrataApp for DemoApp {
                     ]);
                 }
 
-                ScrollColumn::from_state(&state.right_scroll)
+                // Note: Using new() instead of from_state() here because the demo
+                // widgets use 'static lifetime. Use from_state() in real apps
+                // where the widget tree lifetime matches the state borrow.
+                ScrollColumn::new(state.right_scroll.id(), state.right_scroll.thumb_id())
+                    .scroll_offset(state.right_scroll.offset)
                     .spacing(16.0)
                     .width(Length::Fixed(right_col_width))
                     .height(Length::Fill)

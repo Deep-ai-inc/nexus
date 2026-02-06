@@ -40,8 +40,8 @@ pub use length::{Length, Alignment, CrossAxisAlignment, Padding, CHAR_WIDTH, LIN
 // Re-export elements
 pub use elements::{TextElement, TerminalElement, ImageElement, ButtonElement};
 
-// Re-export child types (LayoutChild, Widget)
-pub use child::{LayoutChild, Widget};
+// Re-export child types (LayoutChild, Widget, Element)
+pub use child::{LayoutChild, Widget, Element};
 
 // Re-export containers
 pub use flow::FlowContainer;
@@ -92,7 +92,7 @@ mod integration_tests {
     /// With boxed recursion in LayoutChild, this should be stable and performant.
     #[test]
     fn test_deep_nesting_stability() {
-        fn build_nested(depth: usize) -> LayoutChild {
+        fn build_nested(depth: usize) -> LayoutChild<'static> {
             if depth == 0 {
                 TextElement::new("Leaf").into()
             } else if depth % 2 == 0 {
