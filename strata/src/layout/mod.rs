@@ -18,9 +18,10 @@ pub mod elements;
 pub mod length;
 pub mod primitives;
 
-// containers must come before child (child imports container types)
-pub mod containers;
-pub mod child;
+// Container modules (order matters for dependencies)
+pub mod containers;  // Column, Row, ScrollColumn, TextInput, Table
+pub mod flow;        // FlowContainer (extracted)
+pub mod child;       // LayoutChild enum (imports from containers and flow)
 
 // Re-export core types
 pub use constraints::LayoutConstraints;
@@ -34,5 +35,6 @@ pub use elements::{TextElement, TerminalElement, ImageElement, ButtonElement};
 pub use child::{LayoutChild, Widget};
 
 // Re-export containers
-pub use containers::{Column, Row, ScrollColumn, FlowContainer, TextInputElement, TableElement, TableColumn, TableCell};
+pub use containers::{Column, Row, ScrollColumn, TextInputElement, TableElement, TableColumn, TableCell};
+pub use flow::FlowContainer;
 pub use primitives::{LineStyle, PrimitiveBatch};

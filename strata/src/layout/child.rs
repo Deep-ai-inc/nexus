@@ -15,12 +15,12 @@ use super::elements::{TextElement, TerminalElement, ImageElement, ButtonElement}
 // Import length types
 use super::length::{Length, CHAR_WIDTH, LINE_HEIGHT};
 
-// Forward declare container types - these are still in containers.rs for now
-// Will be updated as we extract them to separate modules
+// Import container types from their respective modules
 use super::containers::{
-    Column, Row, ScrollColumn, FlowContainer,
+    Column, Row, ScrollColumn,
     TextInputElement, TableElement, VirtualTableElement,
 };
+use super::flow::FlowContainer;
 
 // =========================================================================
 // LayoutChild Enum
