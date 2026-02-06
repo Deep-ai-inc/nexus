@@ -355,6 +355,10 @@ pub struct TextElement {
     pub color: Color,
     /// Font size (if different from default).
     pub size: Option<f32>,
+    /// Bold text style.
+    pub bold: bool,
+    /// Italic text style.
+    pub italic: bool,
     /// Cache key for text shaping. Auto-computed from content by default.
     /// Override with `key()` for pre-computed keys on large strings.
     pub cache_key: u64,
@@ -586,6 +590,8 @@ impl TextElement {
             text,
             color: Color::WHITE,
             size: None,
+            bold: false,
+            italic: false,
             cache_key,
             measured_size: None,
         }
@@ -619,6 +625,18 @@ impl TextElement {
     /// Set the font size.
     pub fn size(mut self, size: f32) -> Self {
         self.size = Some(size);
+        self
+    }
+
+    /// Set bold text style.
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    /// Set italic text style.
+    pub fn italic(mut self) -> Self {
+        self.italic = true;
         self
     }
 
@@ -1897,12 +1915,14 @@ impl Column {
                         }
                     }
 
-                    snapshot.primitives_mut().add_text_cached(
+                    snapshot.primitives_mut().add_text_cached_styled(
                         t.text,
                         crate::primitives::Point::new(x, y),
                         t.color,
                         fs,
                         t.cache_key,
+                        t.bold,
+                        t.italic,
                     );
 
                     y += height + self.spacing + alignment_gap;
@@ -2574,12 +2594,14 @@ impl Row {
                         }
                     }
 
-                    snapshot.primitives_mut().add_text_cached(
+                    snapshot.primitives_mut().add_text_cached_styled(
                         t.text,
                         crate::primitives::Point::new(x, y),
                         t.color,
                         fs,
                         t.cache_key,
+                        t.bold,
+                        t.italic,
                     );
 
                     x += width + self.spacing + alignment_gap;
@@ -3069,12 +3091,14 @@ impl ScrollColumn {
                             }
                         }
 
-                        snapshot.primitives_mut().add_text_cached(
+                        snapshot.primitives_mut().add_text_cached_styled(
                             t.text,
                             crate::primitives::Point::new(content_x, screen_y),
                             t.color,
                             fs,
                             t.cache_key,
+                            t.bold,
+                            t.italic,
                         );
                     }
                     LayoutChild::Terminal(t) => {

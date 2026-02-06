@@ -112,6 +112,8 @@ pub struct TextRun {
     pub font_size: f32,
     pub cache_key: Option<u64>,
     pub clip_rect: Option<Rect>,
+    pub bold: bool,
+    pub italic: bool,
 }
 
 /// A border/outline primitive (hollow rounded rect via SDF ring).
@@ -309,6 +311,33 @@ impl PrimitiveBatch {
             font_size,
             cache_key: None,
             clip_rect,
+            bold: false,
+            italic: false,
+        });
+        self
+    }
+
+    /// Add a styled text run with bold/italic support.
+    #[inline]
+    pub fn add_text_styled(
+        &mut self,
+        text: impl Into<String>,
+        position: Point,
+        color: Color,
+        font_size: f32,
+        bold: bool,
+        italic: bool,
+    ) -> &mut Self {
+        let clip_rect = self.current_clip();
+        self.text_runs.push(TextRun {
+            text: text.into(),
+            position,
+            color,
+            font_size,
+            cache_key: None,
+            clip_rect,
+            bold,
+            italic,
         });
         self
     }
@@ -326,6 +355,21 @@ impl PrimitiveBatch {
         font_size: f32,
         cache_key: u64,
     ) -> &mut Self {
+        self.add_text_cached_styled(text, position, color, font_size, cache_key, false, false)
+    }
+
+    /// Add text with an explicit cache key and bold/italic styling.
+    #[inline]
+    pub fn add_text_cached_styled(
+        &mut self,
+        text: impl Into<String>,
+        position: Point,
+        color: Color,
+        font_size: f32,
+        cache_key: u64,
+        bold: bool,
+        italic: bool,
+    ) -> &mut Self {
         let clip_rect = self.current_clip();
         self.text_runs.push(TextRun {
             text: text.into(),
@@ -334,6 +378,8 @@ impl PrimitiveBatch {
             font_size,
             cache_key: Some(cache_key),
             clip_rect,
+            bold,
+            italic,
         });
         self
     }

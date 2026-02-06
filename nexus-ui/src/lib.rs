@@ -14,6 +14,7 @@
 // Nexus application (StrataApp implementation)
 pub mod nexus_app;
 pub mod nexus_widgets;
+pub mod markdown;
 
 // Context system (minimal dependencies)
 pub mod context;

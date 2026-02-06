@@ -420,7 +420,7 @@ impl Widget for AgentBlockWidget<'_> {
                     .spacing(6.0)
                     .cross_align(CrossAxisAlignment::Start)
                     .push(TextElement::new("\u{25CF}").color(colors::TEXT_MUTED)) // ●
-                    .push(build_response_text(&block.response, response_source)),
+                    .push(crate::markdown::render(&block.response, response_source)),
             );
         }
 
@@ -1078,69 +1078,6 @@ fn build_question_dialog(
     }
 
     dialog
-}
-
-/// Build response text with basic markdown rendering.
-fn build_response_text(response: &str, source_id: SourceId) -> Column {
-    let mut col = Column::new().spacing(2.0);
-
-    let mut in_code_block = false;
-    let mut code_lines: Vec<String> = Vec::new();
-
-    for line in response.lines() {
-        if line.starts_with("```") {
-            if in_code_block {
-                // End code block
-                let code_col = Column::new()
-                    .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
-                    .background(colors::CODE_BG)
-                    .corner_radius(4.0)
-                    .width(Length::Fill);
-                let mut code_inner = code_col;
-                for code_line in code_lines.drain(..) {
-                    code_inner = code_inner.push(TextElement::new(code_line).color(colors::CODE_TEXT).source(source_id));
-                }
-                col = col.push(code_inner);
-                in_code_block = false;
-            } else {
-                in_code_block = true;
-            }
-        } else if in_code_block {
-            code_lines.push(line.to_string());
-        } else if line.starts_with("# ") {
-            col = col.push(TextElement::new(&line[2..]).color(colors::TEXT_PRIMARY).size(16.0).source(source_id));
-        } else if line.starts_with("## ") {
-            col = col.push(TextElement::new(&line[3..]).color(colors::TEXT_PRIMARY).size(15.0).source(source_id));
-        } else if line.starts_with("**") && line.ends_with("**") && line.len() > 4 {
-            col = col.push(TextElement::new(&line[2..line.len()-2]).color(colors::TEXT_PRIMARY).source(source_id));
-        } else if line.starts_with("- ") || line.starts_with("* ") {
-            col = col.push(
-                Row::new()
-                    .push(TextElement::new("  \u{00B7} ").color(colors::TEXT_MUTED).source(source_id))
-                    .push(TextElement::new(&line[2..]).color(colors::TEXT_PRIMARY).source(source_id)),
-            );
-        } else if line.is_empty() {
-            col = col.fixed_spacer(4.0);
-        } else {
-            col = col.push(TextElement::new(line).color(colors::TEXT_PRIMARY).source(source_id));
-        }
-    }
-
-    // Handle unclosed code block
-    if in_code_block && !code_lines.is_empty() {
-        let code_col = Column::new()
-            .padding_custom(Padding::new(6.0, 12.0, 6.0, 12.0))
-            .background(colors::CODE_BG)
-            .corner_radius(4.0)
-            .width(Length::Fill);
-        let mut code_inner = code_col;
-        for code_line in code_lines {
-            code_inner = code_inner.push(TextElement::new(code_line).color(colors::CODE_TEXT).source(source_id));
-        }
-        col = col.push(code_inner);
-    }
-
-    col
 }
 
 // =========================================================================
