@@ -4,7 +4,7 @@
 //! and alignment on both axes.
 
 use crate::content_address::SourceId;
-use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
+use crate::layout_snapshot::CursorIcon;
 use crate::primitives::{Color, Point, Rect, Size};
 
 use super::base::{Chrome, render_chrome};
@@ -67,6 +67,9 @@ pub struct Column {
     shadow: Option<(f32, Color)>,
     /// Cursor hint when hovering (requires `id` to take effect).
     cursor_hint: Option<CursorIcon>,
+    /// Accumulated hash of all children, updated incrementally.
+    /// This avoids O(N) iteration in content_hash().
+    children_hash: u64,
 }
 
 impl Default for Column {
@@ -74,6 +77,11 @@ impl Default for Column {
         Self::new()
     }
 }
+
+/// FNV-1a prime for hash mixing.
+const FNV_PRIME: u64 = 0x100000001b3;
+/// FNV-1a offset basis.
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 
 impl Column {
     /// Create a new column.
@@ -93,6 +101,7 @@ impl Column {
             border_width: 0.0,
             shadow: None,
             cursor_hint: None,
+            children_hash: FNV_OFFSET,
         }
     }
 
@@ -170,73 +179,61 @@ impl Column {
     }
 
     /// Add a text element.
-    pub fn text(mut self, element: TextElement) -> Self {
-        self.children.push(LayoutChild::Text(element));
-        self
+    pub fn text(self, element: TextElement) -> Self {
+        self.push(element)
     }
 
     /// Add a terminal element.
-    pub fn terminal(mut self, element: TerminalElement) -> Self {
-        self.children.push(LayoutChild::Terminal(element));
-        self
+    pub fn terminal(self, element: TerminalElement) -> Self {
+        self.push(element)
     }
 
     /// Add a nested column.
-    pub fn column(mut self, column: Column) -> Self {
-        self.children.push(LayoutChild::Column(Box::new(column)));
-        self
+    pub fn column(self, column: Column) -> Self {
+        self.push(column)
     }
 
     /// Add a nested row.
-    pub fn row(mut self, row: Row) -> Self {
-        self.children.push(LayoutChild::Row(Box::new(row)));
-        self
+    pub fn row(self, row: Row) -> Self {
+        self.push(row)
     }
 
     /// Add a scroll column.
-    pub fn scroll_column(mut self, scroll: ScrollColumn) -> Self {
-        self.children.push(LayoutChild::ScrollColumn(Box::new(scroll)));
-        self
+    pub fn scroll_column(self, scroll: ScrollColumn) -> Self {
+        self.push(scroll)
     }
 
     /// Add a flexible spacer.
-    pub fn spacer(mut self, flex: f32) -> Self {
-        self.children.push(LayoutChild::Spacer { flex });
-        self
+    pub fn spacer(self, flex: f32) -> Self {
+        self.push(LayoutChild::Spacer { flex })
     }
 
     /// Add a fixed-size spacer.
-    pub fn fixed_spacer(mut self, size: f32) -> Self {
-        self.children.push(LayoutChild::FixedSpacer { size });
-        self
+    pub fn fixed_spacer(self, size: f32) -> Self {
+        self.push(LayoutChild::FixedSpacer { size })
     }
 
     /// Add an image element.
-    pub fn image(mut self, element: ImageElement) -> Self {
-        self.children.push(LayoutChild::Image(element));
-        self
+    pub fn image(self, element: ImageElement) -> Self {
+        self.push(element)
     }
 
     /// Add a button element.
-    pub fn button(mut self, element: ButtonElement) -> Self {
-        self.children.push(LayoutChild::Button(element));
-        self
+    pub fn button(self, element: ButtonElement) -> Self {
+        self.push(element)
     }
 
     /// Add a text input element.
-    pub fn text_input(mut self, element: TextInputElement) -> Self {
-        self.children.push(LayoutChild::TextInput(element));
-        self
+    pub fn text_input(self, element: TextInputElement) -> Self {
+        self.push(element)
     }
 
-    pub fn table(mut self, element: TableElement) -> Self {
-        self.children.push(LayoutChild::Table(element));
-        self
+    pub fn table(self, element: TableElement) -> Self {
+        self.push(element)
     }
 
-    pub fn virtual_table(mut self, element: VirtualTableElement) -> Self {
-        self.children.push(LayoutChild::VirtualTable(element));
-        self
+    pub fn virtual_table(self, element: VirtualTableElement) -> Self {
+        self.push(element)
     }
 
     /// Add any child element using `From<T> for LayoutChild`.
@@ -244,9 +241,17 @@ impl Column {
     /// This is a generic alternative to the type-specific methods above.
     /// The compiler resolves the `Into` conversion at compile time, so this
     /// generates identical code to calling `.text()`, `.button()`, etc. directly.
+    ///
+    /// The child's content hash is accumulated incrementally, making
+    /// `content_hash()` O(1) instead of O(N).
     #[inline(always)]
     pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
-        self.children.push(child.into());
+        let child = child.into();
+        // Accumulate child hash incrementally
+        self.children_hash = self.children_hash
+            .wrapping_mul(FNV_PRIME)
+            .wrapping_add(child.content_hash());
+        self.children.push(child);
         self
     }
 
@@ -293,39 +298,29 @@ impl Column {
     /// This hash captures all properties that affect layout size:
     /// - Width/height Length values
     /// - Spacing and padding
-    /// - Number of children and their content hashes (recursive)
+    /// - Number of children and their content hashes (pre-computed)
     ///
     /// Note: background, border, shadow are NOT included since
     /// they don't affect the measured size.
+    ///
+    /// This method is O(1) because child hashes are accumulated
+    /// incrementally during `push()`.
+    #[inline]
     pub fn content_hash(&self) -> u64 {
-        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+        let mut hash: u64 = FNV_OFFSET;
 
         // Mix in width/height Length settings
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= hash_length(&self.width);
-
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= hash_length(&self.height);
+        hash = hash.wrapping_mul(FNV_PRIME) ^ hash_length(&self.width);
+        hash = hash.wrapping_mul(FNV_PRIME) ^ hash_length(&self.height);
 
         // Mix in spacing and padding
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.spacing.to_bits() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.spacing.to_bits() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.padding.horizontal().to_bits() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.padding.vertical().to_bits() as u64;
 
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.padding.horizontal().to_bits() as u64;
-
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.padding.vertical().to_bits() as u64;
-
-        // Mix in child count
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.children.len() as u64;
-
-        // Mix in each child's content hash (recursive)
-        for child in &self.children {
-            hash = hash.wrapping_mul(0x100000001b3);
-            hash ^= child.content_hash();
-        }
+        // Mix in child count and pre-computed children hash
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.children.len() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.children_hash;
 
         hash
     }
@@ -376,22 +371,6 @@ impl Column {
     }
 
     // =========================================================================
-    // Legacy Bridge (temporary shim for Row/ScrollColumn migration)
-    // =========================================================================
-
-    /// Legacy layout method - shim for backwards compatibility.
-    ///
-    /// Creates a temporary context and delegates to layout_with_constraints.
-    /// Will be removed once Row and ScrollColumn are migrated.
-    #[doc(hidden)]
-    pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
-        let mut ctx = LayoutContext::new(snapshot);
-        let constraints = LayoutConstraints::tight(bounds.width, bounds.height);
-        let origin = Point::new(bounds.x, bounds.y);
-        self.layout_with_constraints(&mut ctx, constraints, origin);
-    }
-
-    // =========================================================================
     // Constraint-based Layout API
     // =========================================================================
 
@@ -399,6 +378,13 @@ impl Column {
     ///
     /// This is the primary layout method. It computes child positions and
     /// delegates rendering to `LayoutChild::perform_layout`.
+    ///
+    /// ## Caching
+    ///
+    /// When a cache is provided via `LayoutContext::with_cache()`, this method
+    /// will memoize the size calculation based on content hash and constraints.
+    /// The rendering step always runs since the snapshot is cleared each frame -
+    /// only the size calculation is cached.
     ///
     /// # Arguments
     /// * `ctx` - Layout context with snapshot and debug state
@@ -415,46 +401,55 @@ impl Column {
     ) -> Size {
         ctx.enter("Column");
 
-        // Determine our bounds from constraints
-        let width = match self.width {
-            Length::Fixed(px) => px,
-            Length::Fill | Length::FillPortion(_) => {
-                if constraints.has_bounded_width() {
-                    constraints.max_width
-                } else {
-                    self.measure().width
+        // Try to get cached size if caching is enabled
+        let content_hash = self.content_hash();
+        let size = if let Some(cached_size) = ctx.cache_get(content_hash, &constraints) {
+            cached_size
+        } else {
+            // Determine our bounds from constraints
+            let width = match self.width {
+                Length::Fixed(px) => px,
+                Length::Fill | Length::FillPortion(_) => {
+                    if constraints.has_bounded_width() {
+                        constraints.max_width
+                    } else {
+                        self.measure().width
+                    }
                 }
-            }
-            Length::Shrink => {
-                let intrinsic = self.measure().width;
-                if constraints.has_bounded_width() {
-                    intrinsic.min(constraints.max_width)
-                } else {
-                    intrinsic
+                Length::Shrink => {
+                    let intrinsic = self.measure().width;
+                    if constraints.has_bounded_width() {
+                        intrinsic.min(constraints.max_width)
+                    } else {
+                        intrinsic
+                    }
                 }
-            }
+            };
+
+            let height = match self.height {
+                Length::Fixed(px) => px,
+                Length::Fill | Length::FillPortion(_) => {
+                    if constraints.has_bounded_height() {
+                        constraints.max_height
+                    } else {
+                        self.height_for_width(width)
+                    }
+                }
+                Length::Shrink => {
+                    let intrinsic = self.height_for_width(width);
+                    if constraints.has_bounded_height() {
+                        intrinsic.min(constraints.max_height)
+                    } else {
+                        intrinsic
+                    }
+                }
+            };
+
+            let computed_size = constraints.constrain(Size::new(width, height));
+            ctx.cache_insert(content_hash, &constraints, computed_size);
+            computed_size
         };
 
-        let height = match self.height {
-            Length::Fixed(px) => px,
-            Length::Fill | Length::FillPortion(_) => {
-                if constraints.has_bounded_height() {
-                    constraints.max_height
-                } else {
-                    self.height_for_width(width)
-                }
-            }
-            Length::Shrink => {
-                let intrinsic = self.height_for_width(width);
-                if constraints.has_bounded_height() {
-                    intrinsic.min(constraints.max_height)
-                } else {
-                    intrinsic
-                }
-            }
-        };
-
-        let size = constraints.constrain(Size::new(width, height));
         let bounds = Rect::new(origin.x, origin.y, size.width, size.height);
 
         // Debug tracking
@@ -835,5 +830,74 @@ mod tests {
         // Fill should take all available space
         assert_eq!(size.width, 200.0);
         assert_eq!(size.height, 100.0);
+    }
+
+    #[test]
+    fn test_column_caching_enabled() {
+        use crate::layout_snapshot::LayoutSnapshot;
+        use crate::layout::context::LayoutContext;
+        use crate::layout::cache::LayoutCache;
+        use crate::layout::constraints::LayoutConstraints;
+        use crate::primitives::Point;
+
+        let mut snapshot = LayoutSnapshot::new();
+        let mut cache = LayoutCache::new();
+
+        let constraints = LayoutConstraints::loose(500.0, 300.0);
+
+        // First layout - cache miss
+        {
+            let col = Column::new()
+                .push(TextElement::new("Hello"))
+                .push(TextElement::new("World"));
+            let mut ctx = LayoutContext::with_cache(&mut snapshot, &mut cache);
+            let _size1 = col.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
+        }
+
+        // Second layout with same content - should be cache hit
+        {
+            let col = Column::new()
+                .push(TextElement::new("Hello"))
+                .push(TextElement::new("World"));
+            let mut ctx = LayoutContext::with_cache(&mut snapshot, &mut cache);
+            let _size2 = col.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
+        }
+
+        assert_eq!(cache.len(), 1, "Should have one cached entry");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_column_cache_stats() {
+        use crate::layout_snapshot::LayoutSnapshot;
+        use crate::layout::context::LayoutContext;
+        use crate::layout::cache::LayoutCache;
+        use crate::layout::constraints::LayoutConstraints;
+        use crate::primitives::Point;
+
+        let mut snapshot = LayoutSnapshot::new();
+        let mut cache = LayoutCache::new();
+
+        let constraints = LayoutConstraints::loose(500.0, 300.0);
+
+        // First pass - cache miss
+        {
+            let col = Column::new()
+                .push(TextElement::new("Test"));
+            let mut ctx = LayoutContext::with_cache(&mut snapshot, &mut cache);
+            col.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
+        }
+
+        // Second pass - cache hit
+        {
+            let col = Column::new()
+                .push(TextElement::new("Test"));
+            let mut ctx = LayoutContext::with_cache(&mut snapshot, &mut cache);
+            col.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
+        }
+
+        let (hits, misses) = cache.stats();
+        assert_eq!(misses, 1, "Should have one miss (first pass)");
+        assert_eq!(hits, 1, "Should have one hit (second pass)");
     }
 }

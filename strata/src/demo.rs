@@ -20,6 +20,7 @@ use crate::event_context::{
 };
 use crate::layout_snapshot::HitResult;
 use crate::primitives::{Color, Point, Rect};
+use crate::layout::{LayoutConstraints, LayoutContext};
 use crate::{
     AppConfig, ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
     ImageStore, LayoutSnapshot, Length, LineStyle, MouseResponse, Padding, Row, ScrollAction,
@@ -646,7 +647,7 @@ impl StrataApp for DemoApp {
         // =================================================================
         // MAIN LAYOUT: Row with two columns
         // =================================================================
-        Row::new()
+        let main_row = Row::new()
             .padding(16.0)
             .spacing(20.0)
             .width(Length::Fixed(vw))
@@ -793,8 +794,12 @@ impl StrataApp for DemoApp {
                     )
                     // Table
                     .push(Card::new("Table").push(table))
-            })
-            .layout(snapshot, Rect::new(0.0, 0.0, vw, vh));
+            });
+
+        // Use constraint-based layout API
+        let mut ctx = LayoutContext::new(snapshot);
+        let constraints = LayoutConstraints::tight(vw, vh);
+        main_row.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
 
         // Sync state helpers from layout snapshot
         state.left_scroll.sync_from_snapshot(snapshot);

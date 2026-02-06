@@ -4,7 +4,7 @@
 //! offset as a parameter. Only children intersecting the viewport are rendered.
 
 use crate::content_address::SourceId;
-use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
+use crate::layout_snapshot::CursorIcon;
 use crate::primitives::{Color, Point, Rect, Size};
 use crate::scroll_state::ScrollState;
 
@@ -14,10 +14,10 @@ use super::column::Column;
 use super::constraints::LayoutConstraints;
 use super::context::LayoutContext;
 use super::row::Row;
-use super::text_input::{TextInputElement, render_text_input, render_text_input_multiline};
-use super::table::{TableElement, VirtualTableElement, render_table, render_virtual_table};
 use super::elements::{TextElement, TerminalElement, ImageElement, ButtonElement};
-use super::length::{Length, Padding, CHAR_WIDTH, LINE_HEIGHT, BASE_FONT_SIZE};
+use super::text_input::TextInputElement;
+use super::table::{TableElement, VirtualTableElement};
+use super::length::{Length, Padding, CHAR_WIDTH, LINE_HEIGHT};
 
 // =========================================================================
 // Helper Functions
@@ -70,7 +70,15 @@ pub struct ScrollColumn {
     border_color: Option<Color>,
     /// Border width.
     border_width: f32,
+    /// Accumulated hash of all children, updated incrementally.
+    /// This avoids O(N) iteration in content_hash().
+    children_hash: u64,
 }
+
+/// FNV-1a prime for hash mixing.
+const FNV_PRIME: u64 = 0x100000001b3;
+/// FNV-1a offset basis.
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 
 impl ScrollColumn {
     /// Create a new scroll column with a required ID.
@@ -88,6 +96,7 @@ impl ScrollColumn {
             height: Length::Shrink,
             border_color: None,
             border_width: 0.0,
+            children_hash: FNV_OFFSET,
         }
     }
 
@@ -156,80 +165,76 @@ impl ScrollColumn {
     }
 
     /// Add a text element.
-    pub fn text(mut self, element: TextElement) -> Self {
-        self.children.push(LayoutChild::Text(element));
-        self
+    pub fn text(self, element: TextElement) -> Self {
+        self.push(element)
     }
 
     /// Add a terminal element.
-    pub fn terminal(mut self, element: TerminalElement) -> Self {
-        self.children.push(LayoutChild::Terminal(element));
-        self
+    pub fn terminal(self, element: TerminalElement) -> Self {
+        self.push(element)
     }
 
     /// Add a nested column.
-    pub fn column(mut self, column: Column) -> Self {
-        self.children.push(LayoutChild::Column(Box::new(column)));
-        self
+    pub fn column(self, column: Column) -> Self {
+        self.push(column)
     }
 
     /// Add a nested row.
-    pub fn row(mut self, row: Row) -> Self {
-        self.children.push(LayoutChild::Row(Box::new(row)));
-        self
+    pub fn row(self, row: Row) -> Self {
+        self.push(row)
     }
 
     /// Add a nested scroll column.
-    pub fn scroll_column(mut self, scroll: ScrollColumn) -> Self {
-        self.children.push(LayoutChild::ScrollColumn(Box::new(scroll)));
-        self
+    pub fn scroll_column(self, scroll: ScrollColumn) -> Self {
+        self.push(scroll)
     }
 
     /// Add a flexible spacer.
-    pub fn spacer(mut self, flex: f32) -> Self {
-        self.children.push(LayoutChild::Spacer { flex });
-        self
+    pub fn spacer(self, flex: f32) -> Self {
+        self.push(LayoutChild::Spacer { flex })
     }
 
     /// Add a fixed-size spacer.
-    pub fn fixed_spacer(mut self, size: f32) -> Self {
-        self.children.push(LayoutChild::FixedSpacer { size });
-        self
+    pub fn fixed_spacer(self, size: f32) -> Self {
+        self.push(LayoutChild::FixedSpacer { size })
     }
 
     /// Add an image element.
-    pub fn image(mut self, element: ImageElement) -> Self {
-        self.children.push(LayoutChild::Image(element));
-        self
+    pub fn image(self, element: ImageElement) -> Self {
+        self.push(element)
     }
 
     /// Add a button element.
-    pub fn button(mut self, element: ButtonElement) -> Self {
-        self.children.push(LayoutChild::Button(element));
-        self
+    pub fn button(self, element: ButtonElement) -> Self {
+        self.push(element)
     }
 
     /// Add a text input element.
-    pub fn text_input(mut self, element: TextInputElement) -> Self {
-        self.children.push(LayoutChild::TextInput(element));
-        self
+    pub fn text_input(self, element: TextInputElement) -> Self {
+        self.push(element)
     }
 
     /// Add a table element.
-    pub fn table(mut self, element: TableElement) -> Self {
-        self.children.push(LayoutChild::Table(element));
-        self
+    pub fn table(self, element: TableElement) -> Self {
+        self.push(element)
     }
 
-    pub fn virtual_table(mut self, element: VirtualTableElement) -> Self {
-        self.children.push(LayoutChild::VirtualTable(element));
-        self
+    pub fn virtual_table(self, element: VirtualTableElement) -> Self {
+        self.push(element)
     }
 
     /// Add any child element using `From<T> for LayoutChild`.
+    ///
+    /// The child's content hash is accumulated incrementally, making
+    /// `content_hash()` O(1) instead of O(N).
     #[inline(always)]
     pub fn push(mut self, child: impl Into<LayoutChild>) -> Self {
-        self.children.push(child.into());
+        let child = child.into();
+        // Accumulate child hash incrementally
+        self.children_hash = self.children_hash
+            .wrapping_mul(FNV_PRIME)
+            .wrapping_add(child.content_hash());
+        self.children.push(child);
         self
     }
 
@@ -271,39 +276,31 @@ impl ScrollColumn {
     /// This hash captures all properties that affect layout size:
     /// - Width/height Length values
     /// - Spacing and padding
-    /// - Number of children and their content hashes
+    /// - Number of children and their content hashes (pre-computed)
     ///
     /// Note: scroll_offset, background, border are NOT included since
     /// they don't affect the measured size.
+    ///
+    /// # Performance
+    ///
+    /// This is O(1) because child hashes are accumulated incrementally
+    /// during `push()`, not computed here.
+    #[inline]
     pub fn content_hash(&self) -> u64 {
-        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+        let mut hash: u64 = FNV_OFFSET;
 
         // Mix in width/height Length settings
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= hash_length(&self.width);
-
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= hash_length(&self.height);
+        hash = hash.wrapping_mul(FNV_PRIME) ^ hash_length(&self.width);
+        hash = hash.wrapping_mul(FNV_PRIME) ^ hash_length(&self.height);
 
         // Mix in spacing and padding
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.spacing.to_bits() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.spacing.to_bits() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.padding.horizontal().to_bits() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.padding.vertical().to_bits() as u64;
 
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.padding.horizontal().to_bits() as u64;
-
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.padding.vertical().to_bits() as u64;
-
-        // Mix in child count
-        hash = hash.wrapping_mul(0x100000001b3);
-        hash ^= self.children.len() as u64;
-
-        // Mix in each child's content hash
-        for child in &self.children {
-            hash = hash.wrapping_mul(0x100000001b3);
-            hash ^= child.content_hash();
-        }
+        // Mix in child count and pre-computed children hash
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.children.len() as u64;
+        hash = hash.wrapping_mul(FNV_PRIME) ^ self.children_hash;
 
         hash
     }
@@ -321,303 +318,30 @@ impl ScrollColumn {
         }
     }
 
-    /// Compute layout and flush to snapshot.
-    ///
-    /// Implements virtualization: only children intersecting the viewport
-    /// are laid out. A scrollbar thumb is drawn when content overflows.
-    #[deprecated(since = "0.2.0", note = "use layout_with_constraints() instead")]
-    #[allow(deprecated)] // Internal recursive calls to child.layout()
-    pub fn layout(self, snapshot: &mut LayoutSnapshot, bounds: Rect) {
-        // Debug tracking for layout visualization
-        snapshot.debug_enter("ScrollColumn", bounds);
-
-        let content_x = bounds.x + self.padding.left;
-        let full_content_width = bounds.width - self.padding.horizontal();
-        let viewport_h = bounds.height;
-
-        // Draw chrome (background → border, no shadow for ScrollColumn)
-        render_chrome(snapshot, bounds, &self.chrome());
-
-        // Push clip to viewport bounds
-        snapshot.primitives_mut().push_clip(bounds);
-
-        // Reserve space for scrollbar (we'll check if we need it after measuring).
-        const SCROLLBAR_GUTTER: f32 = 24.0;
-
-        // First pass: measure heights assuming no scrollbar
-        let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
-        let mut total_content_height = self.padding.vertical();
-        for child in &self.children {
-            let h = match child {
-                LayoutChild::Flow(f) => f.height_for_width(full_content_width),
-                LayoutChild::Row(r) => r.height_for_width(full_content_width),
-                LayoutChild::Column(c) => c.height_for_width(full_content_width),
-                _ => child.measure_main(true),
-            };
-            child_heights.push(h);
-            total_content_height += h;
-        }
-        if self.children.len() > 1 {
-            total_content_height += self.spacing * (self.children.len() - 1) as f32;
-        }
-
-        let overflows = total_content_height > viewport_h;
-        let content_width = if overflows { full_content_width - SCROLLBAR_GUTTER } else { full_content_width };
-
-        // If we overflow, re-measure width-dependent children with the reduced width
-        if overflows {
-            child_heights.clear();
-            total_content_height = self.padding.vertical();
-            for child in &self.children {
-                let h = match child {
-                    LayoutChild::Flow(f) => f.height_for_width(content_width),
-                    LayoutChild::Row(r) => r.height_for_width(content_width),
-                    LayoutChild::Column(c) => c.height_for_width(content_width),
-                    _ => child.measure_main(true),
-                };
-                child_heights.push(h);
-                total_content_height += h;
-            }
-            if self.children.len() > 1 {
-                total_content_height += self.spacing * (self.children.len() - 1) as f32;
-            }
-        }
-
-        // Register container widget for hit-testing (wheel events route here).
-        // When overflowing, exclude the gutter so this doesn't compete with the
-        // scrollbar thumb track widget in the HashMap-based hit test.
-        let container_hit_width = if overflows { bounds.width - SCROLLBAR_GUTTER } else { bounds.width };
-        snapshot.register_widget(self.id, Rect::new(bounds.x, bounds.y, container_hit_width, bounds.height));
-
-        // Clamp scroll offset and record max for app-side clamping
-        let max_scroll = (total_content_height - viewport_h).max(0.0);
-        snapshot.set_scroll_limit(self.id, max_scroll);
-        let offset = self.scroll_offset.clamp(0.0, max_scroll);
-
-        // Position pass with virtualization
-        let mut virtual_y = self.padding.top; // position in content space
-        let viewport_top = offset;
-        let viewport_bottom = offset + viewport_h;
-
-        for (i, child) in self.children.into_iter().enumerate() {
-            let h = child_heights[i];
-            let child_top = virtual_y;
-            let child_bottom = virtual_y + h;
-
-            // Check if child intersects the viewport
-            if child_bottom > viewport_top && child_top < viewport_bottom {
-                // Compute screen-space Y
-                let screen_y = bounds.y + child_top - offset;
-
-                match child {
-                    LayoutChild::Text(t) => {
-                        let fs = t.font_size();
-                        let size = t.estimate_size(CHAR_WIDTH, LINE_HEIGHT);
-                        use crate::layout_snapshot::{SourceLayout, TextLayout};
-                        if let Some(source_id) = t.source_id {
-                            let scale = fs / BASE_FONT_SIZE;
-                            let mut text_layout = TextLayout::simple(
-                                t.text.clone(),
-                                t.color.pack(),
-                                content_x, screen_y,
-                                CHAR_WIDTH * scale, LINE_HEIGHT * scale,
-                            );
-                            // Expand hit-box to full content width — in ScrollColumn,
-                            // text owns the entire line so this is safe.
-                            text_layout.bounds.width = text_layout.bounds.width.max(content_width);
-                            snapshot.register_source(source_id, SourceLayout::text(text_layout));
-                        }
-
-                        // Register widget if this text is clickable
-                        if let Some(widget_id) = t.widget_id {
-                            let text_rect = Rect::new(content_x, screen_y, size.width, size.height);
-                            snapshot.register_widget(widget_id, text_rect);
-                            if let Some(cursor) = t.cursor_hint {
-                                snapshot.set_cursor_hint(widget_id, cursor);
-                            }
-                        }
-
-                        snapshot.primitives_mut().add_text_cached_styled(
-                            t.text,
-                            crate::primitives::Point::new(content_x, screen_y),
-                            t.color,
-                            fs,
-                            t.cache_key,
-                            t.bold,
-                            t.italic,
-                        );
-                    }
-                    LayoutChild::Terminal(t) => {
-                        let size = t.size();
-
-                        use crate::layout_snapshot::{GridLayout, GridRow, SourceLayout};
-                        let rows_content: Vec<GridRow> = t.row_content.into_iter()
-                            .map(|runs| GridRow { runs })
-                            .collect();
-                        let mut grid_layout = GridLayout::with_rows(
-                            Rect::new(content_x, screen_y, size.width.max(content_width), size.height),
-                            t.cell_width, t.cell_height,
-                            t.cols, t.rows,
-                            rows_content,
-                        );
-                        grid_layout.clip_rect = snapshot.current_clip();
-                        snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
-                    }
-                    LayoutChild::Image(img) => {
-                        let img_rect = Rect::new(content_x, screen_y, img.width, img.height);
-                        snapshot.primitives_mut().add_image(
-                            img_rect,
-                            img.handle,
-                            img.corner_radius,
-                            img.tint,
-                        );
-                        if let Some(id) = img.widget_id {
-                            snapshot.register_widget(id, img_rect);
-                        }
-                    }
-                    LayoutChild::Button(btn) => {
-                        let size = btn.estimate_size();
-                        let btn_rect = Rect::new(content_x, screen_y, size.width, size.height);
-                        snapshot.primitives_mut().add_rounded_rect(btn_rect, btn.corner_radius, btn.background);
-                        snapshot.primitives_mut().add_text_cached(
-                            btn.label,
-                            crate::primitives::Point::new(content_x + btn.padding.left, screen_y + btn.padding.top),
-                            btn.text_color,
-                            BASE_FONT_SIZE,
-                            btn.cache_key,
-                        );
-                        snapshot.register_widget(btn.id, btn_rect);
-                        snapshot.set_cursor_hint(btn.id, CursorIcon::Pointer);
-                    }
-                    LayoutChild::TextInput(input) => {
-                        let w = match input.width {
-                            Length::Fixed(px) => px,
-                            Length::Fill | Length::FillPortion(_) => content_width,
-                            Length::Shrink => input.estimate_size().width.min(content_width),
-                        };
-                        let input_h = if input.multiline {
-                            input.estimate_size().height
-                        } else {
-                            LINE_HEIGHT + input.padding.vertical()
-                        };
-                        if input.multiline {
-                            render_text_input_multiline(snapshot, input, content_x, screen_y, w, input_h);
-                        } else {
-                            render_text_input(snapshot, input, content_x, screen_y, w, input_h);
-                        }
-                    }
-                    LayoutChild::Table(table) => {
-                        let size = table.estimate_size();
-                        let w = size.width.min(content_width);
-                        render_table(snapshot, table, content_x, screen_y, w, size.height);
-                    }
-                    LayoutChild::VirtualTable(table) => {
-                        let size = table.estimate_size();
-                        let w = size.width.min(content_width);
-                        render_virtual_table(snapshot, table, content_x, screen_y, w, size.height);
-                    }
-                    LayoutChild::Flow(flow) => {
-                        let w = match flow.width {
-                            Length::Fixed(px) => px,
-                            Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
-                        };
-                        flow.layout(snapshot, content_x, screen_y, w);
-                    }
-                    LayoutChild::Column(nested) => {
-                        let w = match nested.width {
-                            Length::Fixed(px) => px,
-                            Length::Fill | Length::FillPortion(_) => content_width,
-                            Length::Shrink => nested.measure().width.min(content_width),
-                        };
-                        nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
-                    }
-                    LayoutChild::Row(nested) => {
-                        // Give Rows the full content width so their children's
-                        // hit-boxes can expand to fill the line.
-                        let w = match nested.width {
-                            Length::Fixed(px) => px,
-                            Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
-                        };
-                        nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
-                    }
-                    LayoutChild::ScrollColumn(nested) => {
-                        let w = match nested.width {
-                            Length::Fixed(px) => px,
-                            Length::Fill | Length::FillPortion(_) => content_width,
-                            Length::Shrink => nested.measure().width.min(content_width),
-                        };
-                        nested.layout(snapshot, Rect::new(content_x, screen_y, w, h));
-                    }
-                    LayoutChild::Spacer { .. } | LayoutChild::FixedSpacer { .. } => {
-                        // Spacers have no visual representation
-                    }
-                }
-            }
-
-            virtual_y += h + self.spacing;
-        }
-
-        // Draw scrollbar thumb if content overflows
-        if total_content_height > viewport_h {
-            let thumb_h = ((viewport_h / total_content_height) * viewport_h).max(20.0);
-            let scroll_pct = if max_scroll > 0.0 { offset / max_scroll } else { 0.0 };
-            let scroll_available = viewport_h - thumb_h;
-            let thumb_y = bounds.y + scroll_pct * scroll_available;
-            let thumb_visual = Rect::new(bounds.x + bounds.width - 8.0, thumb_y, 6.0, thumb_h);
-
-            snapshot.primitives_mut().add_rounded_rect(
-                thumb_visual,
-                3.0,
-                Color::rgba(1.0, 1.0, 1.0, 0.25),
-            );
-
-            // Register the full-height track as the hit region so clicking
-            // anywhere in the scrollbar gutter initiates a drag.
-            let track_hit = Rect::new(bounds.x + bounds.width - SCROLLBAR_GUTTER, bounds.y, SCROLLBAR_GUTTER, viewport_h);
-            snapshot.register_widget(self.thumb_id, track_hit);
-            snapshot.set_cursor_hint(self.thumb_id, CursorIcon::Grab);
-
-            // Store track info so the app can convert mouse Y → scroll offset
-            use crate::layout_snapshot::ScrollTrackInfo;
-            snapshot.set_scroll_track(self.id, ScrollTrackInfo {
-                track_y: bounds.y,
-                track_height: viewport_h,
-                thumb_height: thumb_h,
-                max_scroll,
-            });
-        }
-
-        // Pop clip
-        snapshot.primitives_mut().pop_clip();
-
-        snapshot.debug_exit();
-    }
-
     // =========================================================================
-    // Constraint-based Layout API (Phase 4)
+    // Constraint-based Layout API
     // =========================================================================
 
-    /// Layout with constraints - the new constraint-based API.
+    /// Layout with constraints - the native constraint-based API.
     ///
-    /// Takes constraints (min/max bounds) and returns the actual size used.
-    /// ScrollColumn is a virtualized vertical container - it clips content
-    /// and only renders visible children.
+    /// This is the primary layout method. It computes child positions,
+    /// performs virtualization (only visible children are rendered),
+    /// and delegates rendering to `LayoutChild::perform_layout`.
     ///
     /// ## Caching
     ///
     /// When a cache is provided via `LayoutContext::with_cache()`, this method
     /// will memoize the size calculation based on content hash and constraints.
-    /// The rendering step (`layout`) always runs since the snapshot is
-    /// cleared each frame - only the size calculation is cached.
+    /// The rendering step always runs since the snapshot is cleared each frame -
+    /// only the size calculation is cached.
     ///
     /// # Arguments
-    /// * `ctx` - Layout context with scratch buffers and snapshot
+    /// * `ctx` - Layout context with snapshot and debug state
     /// * `constraints` - Min/max bounds for this scroll column
     /// * `origin` - Top-left position to place this scroll column
     ///
     /// # Returns
     /// The actual size consumed by this scroll column.
-    #[allow(deprecated)] // Calls deprecated layout() internally as bridge
     pub fn layout_with_constraints(
         self,
         ctx: &mut LayoutContext,
@@ -629,10 +353,8 @@ impl ScrollColumn {
         // Try to get cached size if caching is enabled
         let content_hash = self.content_hash();
         let size = if let Some(cached_size) = ctx.cache_get(content_hash, &constraints) {
-            // Cache hit - use cached size
             cached_size
         } else {
-            // Cache miss - compute size
             // Determine our bounds from constraints
             let width = match self.width {
                 Length::Fixed(px) => px,
@@ -659,7 +381,6 @@ impl ScrollColumn {
                     if constraints.has_bounded_height() {
                         constraints.max_height
                     } else {
-                        // ScrollColumn typically needs a bounded height
                         self.measure().height
                     }
                 }
@@ -674,22 +395,188 @@ impl ScrollColumn {
             };
 
             let computed_size = constraints.constrain(Size::new(width, height));
-
-            // Store in cache for next frame
             ctx.cache_insert(content_hash, &constraints, computed_size);
-
             computed_size
         };
 
+        let bounds = Rect::new(origin.x, origin.y, size.width, size.height);
+
+        // Debug tracking
+        ctx.snapshot.debug_enter("ScrollColumn", bounds);
         ctx.log_layout(constraints, size);
 
-        // Always render children (snapshot is cleared each frame)
-        // (debug rects are pushed inside layout() via snapshot.debug_enter())
-        let bounds = Rect::new(origin.x, origin.y, size.width, size.height);
-        self.layout(ctx.snapshot, bounds);
+        let content_x = bounds.x + self.padding.left;
+        let full_content_width = bounds.width - self.padding.horizontal();
+        let viewport_h = bounds.height;
 
+        // Draw chrome (background → border, no shadow for ScrollColumn)
+        render_chrome(ctx.snapshot, bounds, &self.chrome());
+
+        // Push clip to viewport bounds
+        ctx.snapshot.primitives_mut().push_clip(bounds);
+
+        // Reserve space for scrollbar (we'll check if we need it after measuring).
+        const SCROLLBAR_GUTTER: f32 = 24.0;
+
+        // First pass: measure heights assuming no scrollbar
+        let mut child_heights: Vec<f32> = Vec::with_capacity(self.children.len());
+        let mut total_content_height = self.padding.vertical();
+        for child in &self.children {
+            let h = measure_child_height_for_scroll(child, full_content_width);
+            child_heights.push(h);
+            total_content_height += h;
+        }
+        if self.children.len() > 1 {
+            total_content_height += self.spacing * (self.children.len() - 1) as f32;
+        }
+
+        let overflows = total_content_height > viewport_h;
+        let content_width = if overflows { full_content_width - SCROLLBAR_GUTTER } else { full_content_width };
+
+        // If we overflow, re-measure width-dependent children with the reduced width
+        if overflows {
+            child_heights.clear();
+            total_content_height = self.padding.vertical();
+            for child in &self.children {
+                let h = measure_child_height_for_scroll(child, content_width);
+                child_heights.push(h);
+                total_content_height += h;
+            }
+            if self.children.len() > 1 {
+                total_content_height += self.spacing * (self.children.len() - 1) as f32;
+            }
+        }
+
+        // Register container widget for hit-testing (wheel events route here).
+        let container_hit_width = if overflows { bounds.width - SCROLLBAR_GUTTER } else { bounds.width };
+        ctx.snapshot.register_widget(self.id, Rect::new(bounds.x, bounds.y, container_hit_width, bounds.height));
+
+        // Clamp scroll offset and record max for app-side clamping
+        let max_scroll = (total_content_height - viewport_h).max(0.0);
+        ctx.snapshot.set_scroll_limit(self.id, max_scroll);
+        let offset = self.scroll_offset.clamp(0.0, max_scroll);
+
+        // Position pass with virtualization
+        let mut virtual_y = self.padding.top;
+        let viewport_top = offset;
+        let viewport_bottom = offset + viewport_h;
+
+        for (i, child) in self.children.into_iter().enumerate() {
+            let h = child_heights[i];
+            let child_top = virtual_y;
+            let child_bottom = virtual_y + h;
+
+            // Only render children that intersect the viewport
+            if child_bottom > viewport_top && child_top < viewport_bottom {
+                let screen_y = bounds.y + child_top - offset;
+
+                // Skip spacers (no rendering needed)
+                match &child {
+                    LayoutChild::Spacer { .. } | LayoutChild::FixedSpacer { .. } => {
+                        virtual_y += h + self.spacing;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // Compute child width based on its sizing mode
+                let child_width = compute_child_width_for_scroll(&child, content_width);
+                let child_constraints = LayoutConstraints::tight(child_width, h);
+                let child_origin = Point::new(content_x, screen_y);
+
+                // Perform layout
+                child.perform_layout(ctx, child_constraints, child_origin);
+            }
+
+            virtual_y += h + self.spacing;
+        }
+
+        // Draw scrollbar thumb if content overflows
+        if total_content_height > viewport_h {
+            let thumb_h = ((viewport_h / total_content_height) * viewport_h).max(20.0);
+            let scroll_pct = if max_scroll > 0.0 { offset / max_scroll } else { 0.0 };
+            let scroll_available = viewport_h - thumb_h;
+            let thumb_y = bounds.y + scroll_pct * scroll_available;
+            let thumb_visual = Rect::new(bounds.x + bounds.width - 8.0, thumb_y, 6.0, thumb_h);
+
+            ctx.snapshot.primitives_mut().add_rounded_rect(
+                thumb_visual,
+                3.0,
+                Color::rgba(1.0, 1.0, 1.0, 0.25),
+            );
+
+            // Register the full-height track as the hit region
+            let track_hit = Rect::new(bounds.x + bounds.width - SCROLLBAR_GUTTER, bounds.y, SCROLLBAR_GUTTER, viewport_h);
+            ctx.snapshot.register_widget(self.thumb_id, track_hit);
+            ctx.snapshot.set_cursor_hint(self.thumb_id, CursorIcon::Grab);
+
+            // Store track info so the app can convert mouse Y → scroll offset
+            use crate::layout_snapshot::ScrollTrackInfo;
+            ctx.snapshot.set_scroll_track(self.id, ScrollTrackInfo {
+                track_y: bounds.y,
+                track_height: viewport_h,
+                thumb_height: thumb_h,
+                max_scroll,
+            });
+        }
+
+        // Pop clip
+        ctx.snapshot.primitives_mut().pop_clip();
+
+        ctx.snapshot.debug_exit();
         ctx.exit();
         size
+    }
+}
+
+// =========================================================================
+// Layout Helpers
+// =========================================================================
+
+/// Measure child height for scroll column measurement pass.
+fn measure_child_height_for_scroll(child: &LayoutChild, content_width: f32) -> f32 {
+    match child {
+        LayoutChild::Flow(f) => f.height_for_width(content_width),
+        LayoutChild::Row(r) => r.height_for_width(content_width),
+        LayoutChild::Column(c) => c.height_for_width(content_width),
+        _ => child.measure_main(true),
+    }
+}
+
+/// Compute child width based on its sizing mode for scroll column.
+fn compute_child_width_for_scroll(child: &LayoutChild, content_width: f32) -> f32 {
+    match child {
+        LayoutChild::Text(t) => t.estimate_size(CHAR_WIDTH, LINE_HEIGHT).width,
+        LayoutChild::Terminal(t) => t.size().width,
+        LayoutChild::Image(img) => img.width,
+        LayoutChild::Button(btn) => btn.estimate_size().width,
+        LayoutChild::TextInput(input) => match input.width {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => input.estimate_size().width.min(content_width),
+        },
+        LayoutChild::Table(table) => table.estimate_size().width.min(content_width),
+        LayoutChild::VirtualTable(table) => table.estimate_size().width.min(content_width),
+        LayoutChild::Flow(flow) => match flow.width {
+            Length::Fixed(px) => px,
+            _ => content_width,
+        },
+        LayoutChild::Column(c) => match c.width {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => c.measure().width.min(content_width),
+        },
+        LayoutChild::Row(r) => match r.width {
+            Length::Fixed(px) => px,
+            // Give Rows the full content width so hit-boxes expand
+            Length::Fill | Length::FillPortion(_) | Length::Shrink => content_width,
+        },
+        LayoutChild::ScrollColumn(s) => match s.width {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => s.measure().width.min(content_width),
+        },
+        LayoutChild::Spacer { .. } | LayoutChild::FixedSpacer { .. } => 0.0,
     }
 }
 
