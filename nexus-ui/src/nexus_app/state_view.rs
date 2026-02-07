@@ -3,7 +3,7 @@
 use strata::{Column, LayoutSnapshot, ScrollColumn};
 
 use super::NexusState;
-use crate::nexus_widgets::WelcomeScreen;
+use crate::widgets::WelcomeScreen;
 
 impl NexusState {
     pub(super) fn layout_blocks<'a>(&'a self, mut scroll: ScrollColumn<'a>) -> ScrollColumn<'a> {

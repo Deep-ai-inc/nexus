@@ -6,17 +6,16 @@
 //! # Module Organization
 //!
 //! - `nexus_app`: Main application (StrataApp implementation)
-//! - `nexus_widgets`: UI widget components
+//! - `widgets`: UI widget components
 //! - `blocks`: Block types and management
 //! - `systems`: External system integrations (PTY, kernel, agent)
 //! - `context`: Nexus context for environment info
 
 // Nexus application (StrataApp implementation)
 pub mod nexus_app;
-pub mod nexus_widgets;
 pub mod markdown;
 
-// New widget module structure (incremental migration from nexus_widgets)
+// Widget module structure
 pub mod widgets;
 
 // Context system (minimal dependencies)

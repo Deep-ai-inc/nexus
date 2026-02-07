@@ -107,6 +107,9 @@ const GLOBAL: IdSpace = IdSpace::new(0xFFFF_FFFF_FFFF_FFFF);
 pub fn mode_toggle() -> SourceId { GLOBAL.id(1) }
 pub fn remove_attachment(i: usize) -> SourceId { GLOBAL.child(2).id(i as u64) }
 pub fn ctx_menu_item(i: usize) -> SourceId { GLOBAL.child(3).id(i as u64) }
+pub fn completion_item(i: usize) -> SourceId { GLOBAL.child(4).id(i as u64) }
+pub fn history_result(i: usize) -> SourceId { GLOBAL.child(5).id(i as u64) }
+pub fn job_pill(job_id: u32) -> SourceId { GLOBAL.child(6).id(job_id as u64) }
 
 #[cfg(test)]
 mod tests {

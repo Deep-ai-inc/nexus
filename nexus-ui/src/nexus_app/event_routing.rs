@@ -7,7 +7,7 @@ use strata::layout_snapshot::HitResult;
 use strata::{MouseResponse, ScrollAction, route_mouse};
 
 use crate::blocks::Focus;
-use crate::nexus_widgets::JobBar;
+use crate::widgets::JobBar;
 
 use super::drag_state::PendingIntent;
 use super::message::{

@@ -14,7 +14,7 @@ use strata::{
     Padding, Row, TextInputAction, TextInputMouseAction, TextInputState,
 };
 
-use crate::nexus_widgets::{CompletionPopup, HistorySearchBar, NexusInputBar};
+use crate::widgets::{CompletionPopup, HistorySearchBar, NexusInputBar};
 
 use crate::blocks::InputMode;
 use super::completion::{CompletionWidget, CompletionOutput};
@@ -469,7 +469,6 @@ impl InputWidget {
                     cwd,
                     last_exit_code,
                     cursor_visible,
-                    mode_toggle_id: super::source_ids::mode_toggle(),
                     line_count,
                 }),
         );

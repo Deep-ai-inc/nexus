@@ -16,8 +16,7 @@ use strata::{ImageHandle, ImageStore, Subscription};
 use strata::content_address::SourceId;
 
 use crate::blocks::Focus;
-use crate::nexus_widgets::JobBar;
-use crate::widgets::{ShellBlockWidget, ShellBlockMessage};
+use crate::widgets::{JobBar, ShellBlockWidget, ShellBlockMessage};
 
 use super::pty_backend::PtyBackend;
 

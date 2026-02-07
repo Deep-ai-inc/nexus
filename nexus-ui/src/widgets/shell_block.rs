@@ -11,7 +11,7 @@ use crate::blocks::Block;
 use crate::nexus_app::shell::ClickAction;
 use crate::nexus_app::source_ids;
 use crate::nexus_app::colors;
-use crate::nexus_widgets::{render_native_value, term_color_to_strata};
+use super::{render_native_value, term_color_to_strata};
 use strata::content_address::SourceId;
 use strata::gpu::ImageHandle;
 use strata::layout::{

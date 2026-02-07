@@ -14,7 +14,7 @@ use strata::event_context::KeyEvent;
 
 use crate::agent_adapter::{AgentEvent, UserQuestion};
 use crate::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
-use crate::nexus_widgets::AgentBlockWidget;
+use crate::widgets::AgentBlockWidget;
 use crate::systems::{agent_subscription, spawn_agent_task};
 use crate::systems::permission_server::PermissionDecision;
 

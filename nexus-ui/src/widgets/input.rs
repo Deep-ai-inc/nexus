@@ -1,164 +1,23 @@
-//! Nexus Widget Structs for Strata
+//! Input widgets — mode toggle, prompt, completions, and history search.
 //!
-//! Production UI components that render real Nexus data (Block, AgentBlock, etc.)
-//! using Strata's layout primitives. Each widget takes references to backend
-//! data models and builds a layout tree.
+//! Contains:
+//! - NexusInputBar: Mode toggle + path + prompt + text input
+//! - CompletionPopup: Tab completion results overlay
+//! - HistorySearchBar: Ctrl+R reverse-i-search overlay
 
 use nexus_kernel::{Completion, CompletionKind};
 
 use strata::content_address::SourceId;
 use strata::layout::{
     ButtonElement, Column, CrossAxisAlignment, LayoutChild, Length, Padding, Row,
-    ScrollColumn, TextElement, Widget,
+    ScrollColumn, TextElement, TextInputElement, Widget,
 };
 use strata::primitives::Color;
 use strata::scroll_state::ScrollState;
-use crate::blocks::{VisualJob, VisualJobState};
 
+use crate::blocks::InputMode;
 use crate::nexus_app::colors;
-
-// Widget re-exports (moved to widgets/ module)
-pub use crate::widgets::ShellBlockWidget;
-pub use crate::widgets::{AgentBlockWidget, AgentBlockMessage};
-
-// =========================================================================
-// Welcome Screen — shown when no blocks exist
-// =========================================================================
-
-pub struct WelcomeScreen<'a> {
-    pub cwd: &'a str,
-}
-
-impl<'a> Widget<'a> for WelcomeScreen<'a> {
-    fn build(self) -> LayoutChild<'a> {
-        // Shorten home directory
-        let home = std::env::var("HOME").unwrap_or_default();
-        let display_cwd = if self.cwd.starts_with(&home) {
-            self.cwd.replacen(&home, "~", 1)
-        } else {
-            self.cwd.to_string()
-        };
-
-        let logo = r#" ███╗   ██╗███████╗██╗  ██╗██╗   ██╗███████╗
- ████╗  ██║██╔════╝╚██╗██╔╝██║   ██║██╔════╝
- ██╔██╗ ██║█████╗   ╚███╔╝ ██║   ██║███████╗
- ██║╚██╗██║██╔══╝   ██╔██╗ ██║   ██║╚════██║
- ██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝███████║
- ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝"#;
-
-        // Left column: logo + welcome
-        let mut logo_col = Column::new().spacing(0.0);
-        for line in logo.lines() {
-            logo_col = logo_col.push(TextElement::new(line).color(colors::WELCOME_TITLE));
-        }
-
-        let left = Column::new()
-            .spacing(4.0)
-            .width(Length::Fill)
-            .push(logo_col)
-            .fixed_spacer(8.0)
-            .push(
-                Row::new()
-                    .spacing(8.0)
-                    .push(TextElement::new("Welcome to Nexus Shell").color(colors::WELCOME_TITLE).size(16.0))
-                    .push(TextElement::new("v0.1.0").color(colors::TEXT_MUTED)),
-            )
-            .fixed_spacer(4.0)
-            .push(TextElement::new(format!("  {}", display_cwd)).color(colors::TEXT_PATH));
-
-        // Tips card
-        let tips = Column::new()
-            .padding(8.0)
-            .spacing(2.0)
-            .background(colors::CARD_BG)
-            .corner_radius(4.0)
-            .border(colors::CARD_BORDER, 1.0)
-            .width(Length::Fill)
-            .push(TextElement::new("Getting Started").color(colors::WELCOME_HEADING))
-            .fixed_spacer(8.0)
-            .push(TextElement::new("\u{2022} Type any command and press Enter").color(colors::TEXT_SECONDARY))
-            .push(TextElement::new("\u{2022} Use Tab for completions").color(colors::TEXT_SECONDARY))
-            .fixed_spacer(8.0)
-            .push(TextElement::new("\u{2022} Click [SH] to switch to AI mode").color(colors::TEXT_PURPLE))
-            .push(TextElement::new("\u{2022} Prefix with \"? \" for one-shot AI queries").color(colors::TEXT_PURPLE))
-            .fixed_spacer(8.0)
-            .push(TextElement::new("Try: ? what files are in this directory?").color(colors::TEXT_PURPLE));
-
-        // Shortcuts card
-        let shortcuts = Column::new()
-            .padding(8.0)
-            .spacing(2.0)
-            .background(colors::CARD_BG)
-            .corner_radius(4.0)
-            .border(colors::CARD_BORDER, 1.0)
-            .width(Length::Fill)
-            .push(TextElement::new("Shortcuts").color(colors::WELCOME_HEADING))
-            .fixed_spacer(8.0)
-            .push(TextElement::new("Cmd+K     Clear screen").color(colors::TEXT_SECONDARY))
-            .push(TextElement::new("Cmd++/-   Zoom in/out").color(colors::TEXT_SECONDARY))
-            .push(TextElement::new("Ctrl+R    Search history").color(colors::TEXT_SECONDARY))
-            .push(TextElement::new("Up/Down   Navigate history").color(colors::TEXT_SECONDARY));
-
-        // Right column: tips + shortcuts
-        let right = Column::new()
-            .spacing(12.0)
-            .width(Length::Fill)
-            .push(tips)
-            .push(shortcuts);
-
-        Row::new()
-            .padding(12.0)
-            .spacing(20.0)
-            .width(Length::Fill)
-            .push(left)
-            .push(right)
-            .into()
-    }
-}
-
-// =========================================================================
-// Job Bar — shows background job pills
-// =========================================================================
-
-pub struct JobBar<'a> {
-    pub jobs: &'a [VisualJob],
-}
-
-impl JobBar<'_> {
-    pub fn job_pill_id(job_id: u32) -> SourceId {
-        SourceId::named(&format!("job_{}", job_id))
-    }
-}
-
-impl<'a> Widget<'a> for JobBar<'a> {
-    fn build(self) -> LayoutChild<'a> {
-        let mut row = Row::new().spacing(8.0);
-
-        for job in self.jobs {
-            let (icon, color, bg) = match job.state {
-                VisualJobState::Running => ("\u{25CF}", Color::rgb(0.3, 0.8, 0.3), Color::rgba(0.2, 0.4, 0.2, 0.6)),
-                VisualJobState::Stopped => ("\u{23F8}", Color::rgb(0.9, 0.7, 0.2), Color::rgba(0.4, 0.35, 0.1, 0.6)),
-            };
-            let name = job.display_name();
-            let click_id = Self::job_pill_id(job.id);
-            row = row.push(
-                Row::new()
-                    .id(click_id)
-                    .padding_custom(Padding::new(2.0, 6.0, 2.0, 6.0))
-                    .background(bg)
-                    .corner_radius(12.0)
-                    .border(Color::rgba(0.5, 0.5, 0.5, 0.3), 1.0)
-                    .push(TextElement::new(format!("{} {}", icon, name)).color(color)),
-            );
-        }
-
-        Row::new()
-            .padding_custom(Padding::new(2.0, 4.0, 2.0, 4.0))
-            .width(Length::Fill)
-            .push(Row::new().spacer(1.0).push(row))
-            .into()
-    }
-}
+use crate::nexus_app::source_ids;
 
 // =========================================================================
 // Input Bar — mode toggle + path + prompt + text input
@@ -166,26 +25,24 @@ impl<'a> Widget<'a> for JobBar<'a> {
 
 pub struct NexusInputBar<'a> {
     pub input: &'a strata::TextInputState,
-    pub mode: crate::blocks::InputMode,
+    pub mode: InputMode,
     pub cwd: &'a str,
     pub last_exit_code: Option<i32>,
     pub cursor_visible: bool,
-    pub mode_toggle_id: SourceId,
     pub line_count: usize,
 }
 
 impl<'a> Widget<'a> for NexusInputBar<'a> {
     fn build(self) -> LayoutChild<'a> {
-        use crate::blocks::InputMode;
-        use strata::TextInputElement;
+        // Mode button - uses deterministic ID from source_ids
+        let mode_toggle_id = source_ids::mode_toggle();
 
-        // Mode button
         let (mode_label, mode_color, mode_bg, prompt_char) = match self.mode {
             InputMode::Shell => ("SH", Color::rgb(0.5, 0.9, 0.5), Color::rgb(0.2, 0.3, 0.2), "$"),
             InputMode::Agent => ("AI", Color::rgb(0.7, 0.7, 1.0), Color::rgb(0.25, 0.25, 0.4), "?"),
         };
 
-        let mode_btn = ButtonElement::new(self.mode_toggle_id, mode_label)
+        let mode_btn = ButtonElement::new(mode_toggle_id, mode_label)
             .background(mode_bg)
             .text_color(mode_color)
             .corner_radius(4.0);
@@ -198,12 +55,10 @@ impl<'a> Widget<'a> for NexusInputBar<'a> {
             self.cwd.to_string()
         };
 
-        // Prompt color based on exit code (rgb8 values from input.rs)
+        // Prompt color based on exit code
         let prompt_color = match self.last_exit_code {
-            // rgb8(50, 205, 50) = lime green
-            Some(0) | None => Color::rgb(0.196, 0.804, 0.196),
-            // rgb8(220, 50, 50) = bright red
-            Some(_) => Color::rgb(0.863, 0.196, 0.196),
+            Some(0) | None => Color::rgb(0.196, 0.804, 0.196), // lime green
+            Some(_) => Color::rgb(0.863, 0.196, 0.196),        // bright red
         };
 
         Row::new()
@@ -251,8 +106,9 @@ pub struct CompletionPopup<'a> {
 
 impl CompletionPopup<'_> {
     /// Generate a stable SourceId for clicking a completion item.
+    /// Uses zero-allocation IdSpace pattern.
     pub fn item_id(index: usize) -> SourceId {
-        SourceId::named(&format!("comp_item_{}", index))
+        source_ids::completion_item(index)
     }
 }
 
@@ -271,10 +127,10 @@ impl<'a> Widget<'a> for CompletionPopup<'a> {
             let is_selected = self.selected_index == Some(i);
             let is_hovered = self.hovered_index == Some(i) && !is_selected;
 
-            // Icon from CompletionKind (matches kernel's icon() method)
+            // Icon from CompletionKind
             let icon = comp.kind.icon();
 
-            // Icon colors matched from old UI input.rs completion_icon_color
+            // Icon colors matched from kernel completion types
             let icon_color = match comp.kind {
                 CompletionKind::Directory => Color::rgb(0.4, 0.7, 1.0),
                 CompletionKind::Executable | CompletionKind::NativeCommand => Color::rgb(0.4, 0.9, 0.4),
@@ -329,14 +185,14 @@ pub struct HistorySearchBar<'a> {
 
 impl HistorySearchBar<'_> {
     /// Generate a stable SourceId for clicking a history result item.
+    /// Uses zero-allocation IdSpace pattern.
     pub fn result_id(index: usize) -> SourceId {
-        SourceId::named(&format!("hist_result_{}", index))
+        source_ids::history_result(index)
     }
 }
 
 impl<'a> Widget<'a> for HistorySearchBar<'a> {
     fn build(self) -> LayoutChild<'a> {
-        // History search overlay matched from old UI input.rs
         let mut container = Column::new()
             .padding(10.0)
             .spacing(6.0)
@@ -351,7 +207,6 @@ impl<'a> Widget<'a> for HistorySearchBar<'a> {
             .cross_align(CrossAxisAlignment::Center)
             .push(TextElement::new("(reverse-i-search)").color(Color::rgb(0.6, 0.6, 0.6)))
             .push(
-                // Styled query input area
                 Row::new()
                     .padding_custom(Padding::new(4.0, 8.0, 4.0, 8.0))
                     .background(Color::rgb(0.15, 0.15, 0.18))
@@ -428,9 +283,3 @@ impl<'a> Widget<'a> for HistorySearchBar<'a> {
             .into()
     }
 }
-
-// Value rendering functions have been moved to widgets/value_renderer.rs
-pub(crate) use crate::widgets::{render_native_value, term_color_to_strata};
-
-// Tests for format_tokens are in widgets/agent_block.rs
-// Tests for format_eta are in widgets/value_renderer.rs
