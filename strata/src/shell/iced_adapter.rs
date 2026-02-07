@@ -108,6 +108,13 @@ struct WindowState<A: StrataApp> {
 
     /// Cached layout snapshot from the most recent view() call.
     cached_snapshot: RefCell<Option<Arc<LayoutSnapshot>>>,
+
+    /// Pending image uploads, shared across view() calls within a frame.
+    /// Accumulated from image_store.drain_pending(), consumed by prepare().
+    pending_images: Arc<Mutex<Vec<PendingImage>>>,
+
+    /// Pending image unloads, shared across view() calls within a frame.
+    pending_unloads: Arc<Mutex<Vec<ImageHandle>>>,
 }
 
 /// Saved window settings for spawning new windows.
@@ -188,6 +195,8 @@ fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMess
         frame: 0,
         image_store,
         cached_snapshot: RefCell::new(None),
+        pending_images: Arc::new(Mutex::new(Vec::new())),
+        pending_unloads: Arc::new(Mutex::new(Vec::new())),
     };
 
     let mut windows = HashMap::new();
@@ -428,6 +437,8 @@ fn update<A: StrataApp>(
                     frame: 0,
                     image_store,
                     cached_snapshot: RefCell::new(None),
+                    pending_images: Arc::new(Mutex::new(Vec::new())),
+                    pending_unloads: Arc::new(Mutex::new(Vec::new())),
                 });
 
                 Task::batch([open_task.discard(), command_to_task(cmd, new_id)])
@@ -490,18 +501,24 @@ fn view<A: StrataApp>(state: &MultiWindowState<A>, window_id: iced::window::Id) 
     let snapshot = Arc::new(snapshot);
     *window.cached_snapshot.borrow_mut() = Some(snapshot.clone());
 
+    // Accumulate pending images/unloads into the persistent cache.
+    // This handles iced calling view() multiple times before prepare() runs.
     let pending = window.image_store.drain_pending();
-    let pending_images = Arc::new(Mutex::new(pending));
+    if !pending.is_empty() {
+        window.pending_images.lock().unwrap().extend(pending);
+    }
     let pending_unloads = window.image_store.drain_pending_unloads();
-    let pending_image_unloads = Arc::new(Mutex::new(pending_unloads));
+    if !pending_unloads.is_empty() {
+        window.pending_unloads.lock().unwrap().extend(pending_unloads);
+    }
 
     let program = StrataShaderProgram {
         snapshot,
         selection: A::selection(&window.app).cloned(),
         background: A::background_color(&window.app),
         frame: window.frame,
-        pending_images,
-        pending_image_unloads,
+        pending_images: window.pending_images.clone(),
+        pending_image_unloads: window.pending_unloads.clone(),
         is_selecting: window.capture.is_captured(),
     };
 
