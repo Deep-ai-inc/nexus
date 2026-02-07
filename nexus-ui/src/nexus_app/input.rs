@@ -10,7 +10,7 @@ use strata::content_address::SourceId;
 use strata::event_context::{Key, KeyEvent, NamedKey};
 use strata::layout_snapshot::HitResult;
 use strata::{
-    ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, LayoutSnapshot, Length,
+    ButtonElement, Column, CrossAxisAlignment, ImageElement, LayoutSnapshot, Length,
     Padding, Row, TextInputAction, TextInputMouseAction, TextInputState,
 };
 
@@ -24,16 +24,12 @@ use super::history_search::{HistorySearchWidget, HistorySearchOutput};
 use super::message::InputMsg;
 use super::Attachment;
 
-/// Typed output from InputWidget → orchestrator.
-pub(crate) enum InputOutput {
-    /// Nothing happened.
-    None,
-    /// User submitted text. Orchestrator decides whether to run shell or agent.
-    Submit {
-        text: String,
-        is_agent: bool,
-        attachments: Vec<Value>,
-    },
+/// Submit request returned to orchestrator when user presses Enter.
+/// The orchestrator decides whether to route to shell or agent.
+pub(crate) struct SubmitRequest {
+    pub text: String,
+    pub is_agent: bool,
+    pub attachments: Vec<Value>,
 }
 
 /// Manages all input-related state: text, mode, history, attachments, and child widgets.
@@ -74,53 +70,52 @@ impl InputWidget {
         }
     }
 
-    /// Handle a message, returning commands and cross-cutting output.
-    pub fn update(&mut self, msg: InputMsg, _ctx: &mut strata::component::Ctx) -> (Command<InputMsg>, InputOutput) {
-        let output = match msg {
+    /// Handle a message. Returns `Some(SubmitRequest)` if the user submitted text.
+    pub fn update(&mut self, msg: InputMsg) -> Option<SubmitRequest> {
+        match msg {
             InputMsg::Key(event) => self.handle_key(&event),
-            InputMsg::Mouse(action) => { self.handle_mouse(action); InputOutput::None }
+            InputMsg::Mouse(action) => { self.handle_mouse(action); None }
             InputMsg::Submit(text) => self.submit(text),
-            InputMsg::ToggleMode => { self.toggle_mode(); InputOutput::None }
-            InputMsg::HistoryUp => { self.history_up(); InputOutput::None }
-            InputMsg::HistoryDown => { self.history_down(); InputOutput::None }
-            InputMsg::InsertNewline => { self.insert_newline(); InputOutput::None }
-            InputMsg::RemoveAttachment(idx) => { self.remove_attachment(idx); InputOutput::None }
+            InputMsg::ToggleMode => { self.toggle_mode(); None }
+            InputMsg::HistoryUp => { self.history_up(); None }
+            InputMsg::HistoryDown => { self.history_down(); None }
+            InputMsg::InsertNewline => { self.insert_newline(); None }
+            InputMsg::RemoveAttachment(idx) => { self.remove_attachment(idx); None }
 
-            InputMsg::TabComplete => { self.tab_complete(); InputOutput::None }
-            InputMsg::CompletionNav(delta) => { self.completion_nav(delta); InputOutput::None }
-            InputMsg::CompletionAccept => { self.completion_accept(); InputOutput::None }
-            InputMsg::CompletionDismiss => { self.completion_dismiss(); InputOutput::None }
+            InputMsg::TabComplete => { self.tab_complete(); None }
+            InputMsg::CompletionNav(delta) => { self.completion_nav(delta); None }
+            InputMsg::CompletionAccept => { self.completion_accept(); None }
+            InputMsg::CompletionDismiss => { self.completion_dismiss(); None }
             InputMsg::CompletionDismissAndForward(event) => {
                 self.completion_dismiss();
                 self.handle_key(&event)
             }
-            InputMsg::CompletionSelect(index) => { self.completion_select(index); InputOutput::None }
-            InputMsg::CompletionScroll(action) => { self.completion.apply_scroll(action); InputOutput::None }
+            InputMsg::CompletionSelect(index) => { self.completion_select(index); None }
+            InputMsg::CompletionScroll(action) => { self.completion.apply_scroll(action); None }
 
-            InputMsg::HistorySearchToggle => { self.history_search_toggle(); InputOutput::None }
+            InputMsg::HistorySearchToggle => { self.history_search_toggle(); None }
             InputMsg::HistorySearchKey(key_event) => {
                 self.history_search_key(key_event);
-                InputOutput::None
+                None
             }
-            InputMsg::HistorySearchAccept => { self.history_search_accept(); InputOutput::None }
-            InputMsg::HistorySearchDismiss => { self.history_search_dismiss(); InputOutput::None }
-            InputMsg::HistorySearchSelect(index) => { self.history_search_select(index); InputOutput::None }
-            InputMsg::HistorySearchAcceptIndex(index) => { self.history_search_accept_index(index); InputOutput::None }
-            InputMsg::HistorySearchScroll(action) => { self.history_search.apply_scroll(action); InputOutput::None }
-        };
-        (Command::none(), output)
+            InputMsg::HistorySearchAccept => { self.history_search_accept(); None }
+            InputMsg::HistorySearchDismiss => { self.history_search_dismiss(); None }
+            InputMsg::HistorySearchSelect(index) => { self.history_search_select(index); None }
+            InputMsg::HistorySearchAcceptIndex(index) => { self.history_search_accept_index(index); None }
+            InputMsg::HistorySearchScroll(action) => { self.history_search.apply_scroll(action); None }
+        }
     }
 
-    /// Handle a key event on the text input. Returns InputOutput if submit occurred.
-    pub fn handle_key(&mut self, event: &KeyEvent) -> InputOutput {
+    /// Handle a key event on the text input. Returns `Some` if submit occurred.
+    pub fn handle_key(&mut self, event: &KeyEvent) -> Option<SubmitRequest> {
         match self.text_input.handle_key(event, false) {
             TextInputAction::Submit(text) => self.process_submit(text),
-            _ => InputOutput::None,
+            _ => None,
         }
     }
 
     /// Submit text directly (bypassing key event processing).
-    pub fn submit(&mut self, text: String) -> InputOutput {
+    pub fn submit(&mut self, text: String) -> Option<SubmitRequest> {
         self.process_submit(text)
     }
 
@@ -287,10 +282,10 @@ impl InputWidget {
 
     // ---- Internal ----
 
-    fn process_submit(&mut self, submitted_text: String) -> InputOutput {
+    fn process_submit(&mut self, submitted_text: String) -> Option<SubmitRequest> {
         let text = submitted_text.trim().to_string();
         if text.is_empty() {
-            return InputOutput::None;
+            return None;
         }
 
         let is_agent = self.mode == InputMode::Agent || text.starts_with("? ");
@@ -315,11 +310,11 @@ impl InputWidget {
             Vec::new()
         };
 
-        InputOutput::Submit {
+        Some(SubmitRequest {
             text: query,
             is_agent,
             attachments,
-        }
+        })
     }
 
     fn apply_completion_output(&mut self, output: CompletionOutput) {

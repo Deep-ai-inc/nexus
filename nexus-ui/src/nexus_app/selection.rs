@@ -4,15 +4,18 @@ use std::collections::HashMap;
 
 use nexus_api::BlockId;
 
-use crate::agent_block::{AgentBlock, AgentBlockState, ToolInvocation};
+use crate::agent_block::AgentBlock;
 use crate::blocks::{Block, UnifiedBlockRef};
 use super::context_menu::ContextTarget;
-use super::message::SelectionMsg;
+use super::drag_state::PendingIntent;
+use super::message::{DragMsg, NexusMessage, SelectionMsg};
 use super::source_ids;
 use strata::Command;
+use strata::MouseResponse;
 use strata::component::Ctx;
 use strata::content_address::{ContentAddress, SourceId, SourceOrdering};
 use strata::layout_snapshot::HitResult;
+use strata::primitives::Point;
 use strata::Selection;
 
 /// Selection state and text extraction logic.
@@ -101,6 +104,24 @@ impl SelectionWidget {
             }
             None => None,
         }
+    }
+
+    /// If a left-click lands inside the current selection, start a selection drag.
+    /// Returns `None` if no selection or click is outside it.
+    pub fn route_selection_drag(
+        &self,
+        hit: &Option<HitResult>,
+        shell_blocks: &[Block],
+        agent_blocks: &[AgentBlock],
+        position: Point,
+    ) -> Option<MouseResponse<NexusMessage>> {
+        let (source, origin_addr) = self.hit_in_selection(hit, shell_blocks, agent_blocks)?;
+        let text = self.extract_selected_text(shell_blocks, agent_blocks).unwrap_or_default();
+        let intent = PendingIntent::SelectionDrag { source, text, origin_addr };
+        Some(MouseResponse::message_and_capture(
+            NexusMessage::Drag(DragMsg::Start(intent, position)),
+            source,
+        ))
     }
 
     /// Extract selected text from content blocks (not input text selection).
@@ -286,130 +307,140 @@ fn extract_source_text(
     start: &ContentAddress,
     end: &ContentAddress,
 ) -> Option<String> {
-    // Shell blocks
     for block in blocks {
-        let header_id = source_ids::shell_header(block.id);
-        if header_id == source_id {
-            let text = format!("$ {}", block.command);
-            let lines: Vec<&str> = text.lines().collect();
+        if let Some(text) = extract_shell_source(block, source_id, is_start, is_end, start, end) {
+            return Some(text);
+        }
+    }
+    for block in agent_blocks {
+        if let Some(text) = extract_agent_source(block, source_id, is_start, is_end, start, end) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Extract text from a shell block's source region.
+fn extract_shell_source(
+    block: &Block,
+    source_id: SourceId,
+    is_start: bool,
+    is_end: bool,
+    start: &ContentAddress,
+    end: &ContentAddress,
+) -> Option<String> {
+    if source_id == source_ids::shell_header(block.id) {
+        let text = format!("$ {}", block.command);
+        let lines: Vec<&str> = text.lines().collect();
+        return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+    }
+
+    if source_id == source_ids::shell_term(block.id) && block.native_output.is_none() {
+        let grid = if block.parser.is_alternate_screen() || block.is_running() {
+            block.parser.grid()
+        } else {
+            block.parser.grid_with_scrollback()
+        };
+        let cols = grid.cols() as usize;
+        if cols == 0 {
+            return Some(String::new());
+        }
+
+        let start_offset = if is_start { start.content_offset } else { 0 };
+        let total_cells = grid.content_rows() as usize * cols;
+        let end_offset = if is_end { end.content_offset } else { total_cells };
+
+        if start_offset >= end_offset {
+            return Some(String::new());
+        }
+
+        let rows: Vec<Vec<nexus_term::Cell>> = grid.rows_iter().map(|r| r.to_vec()).collect();
+        return Some(extract_grid_range(&rows, cols, start_offset, end_offset));
+    }
+
+    if source_id == source_ids::native(block.id) {
+        if let Some(ref value) = block.native_output {
+            let full_text = value.to_text();
+            let lines: Vec<&str> = full_text.lines().collect();
             return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-        }
-
-        let term_id = source_ids::shell_term(block.id);
-        if term_id == source_id && block.native_output.is_none() {
-            let grid = if block.parser.is_alternate_screen() || block.is_running() {
-                block.parser.grid()
-            } else {
-                block.parser.grid_with_scrollback()
-            };
-            let cols = grid.cols() as usize;
-            if cols == 0 {
-                return Some(String::new());
-            }
-
-            let start_offset = if is_start { start.content_offset } else { 0 };
-            let total_cells = grid.content_rows() as usize * cols;
-            let end_offset = if is_end { end.content_offset } else { total_cells };
-
-            if start_offset >= end_offset {
-                return Some(String::new());
-            }
-
-            let rows: Vec<Vec<nexus_term::Cell>> = grid.rows_iter().map(|r| r.to_vec()).collect();
-            return Some(extract_grid_range(&rows, cols, start_offset, end_offset));
-        }
-
-        let native_id = source_ids::native(block.id);
-        if native_id == source_id {
-            if let Some(ref value) = block.native_output {
-                let full_text = value.to_text();
-                let lines: Vec<&str> = full_text.lines().collect();
-                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-            }
-        }
-
-        let table_id = source_ids::table(block.id);
-        if table_id == source_id {
-            if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
-                // Tables have one item per cell in the UI, but markdown has one line per row.
-                // Rather than complex mapping, copy the full table as markdown when selected.
-                return Some(format_table_as_markdown(columns, rows));
-            }
         }
     }
 
-    // Agent blocks
-    for block in agent_blocks {
-        let query_id = source_ids::agent_query(block.id);
-        if query_id == source_id {
-            let lines: Vec<&str> = vec!["?", &block.query];
-            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-        }
-
-        let thinking_id = source_ids::agent_thinking(block.id);
-        if thinking_id == source_id {
-            let preview = if block.thinking.len() > 500 {
-                format!("{}...", &block.thinking[..500])
-            } else {
-                block.thinking.clone()
-            };
-            let lines: Vec<&str> = preview.lines().collect();
-            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-        }
-
-        for (i, tool) in block.tools.iter().enumerate() {
-            let tool_id = source_ids::agent_tool(block.id, i);
-            if tool_id == source_id {
-                let text = extract_tool_text(tool);
-                let lines: Vec<&str> = text.lines().collect();
-                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-            }
-        }
-
-        if let Some(ref perm) = block.pending_permission {
-            let perm_id = source_ids::agent_perm_text(block.id);
-            if perm_id == source_id {
-                let mut text = String::from("\u{26A0} Permission Required\n");
-                text.push_str(&perm.description);
-                text.push('\n');
-                text.push_str(&perm.action);
-                if let Some(ref dir) = perm.working_dir {
-                    text.push('\n');
-                    text.push_str(&format!("in {}", dir));
-                }
-                let lines: Vec<&str> = text.lines().collect();
-                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-            }
-        }
-
-        if let Some(ref q) = block.pending_question {
-            let q_id = source_ids::agent_question_text(block.id);
-            if q_id == source_id {
-                let mut text = String::from("\u{2753} Claude is asking:\n");
-                for question in &q.questions {
-                    text.push_str(&question.question);
-                    text.push('\n');
-                }
-                let lines: Vec<&str> = text.lines().collect();
-                return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-            }
-        }
-
-        let response_id = source_ids::agent_response(block.id);
-        if response_id == source_id {
-            if block.response.is_empty() {
-                return None;
-            }
-            let lines: Vec<&str> = block.response.lines().collect();
-            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
-        }
-
-        let footer_id = source_ids::agent_footer(block.id);
-        if footer_id == source_id {
-            let text = extract_agent_footer_text(block);
+    if source_id == source_ids::table(block.id) {
+        if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
+            let text = format_table_as_markdown(columns, rows);
             let lines: Vec<&str> = text.lines().collect();
             return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
         }
+    }
+
+    None
+}
+
+/// Extract text from an agent block's source region.
+fn extract_agent_source(
+    block: &AgentBlock,
+    source_id: SourceId,
+    is_start: bool,
+    is_end: bool,
+    start: &ContentAddress,
+    end: &ContentAddress,
+) -> Option<String> {
+    let extract = |text: String| {
+        let lines: Vec<&str> = text.lines().collect();
+        extract_multi_item_range(&lines, is_start, is_end, start, end)
+    };
+
+    if source_id == source_ids::agent_query(block.id) {
+        let lines = vec!["?", block.query.as_str()];
+        return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+    }
+
+    if source_id == source_ids::agent_thinking(block.id) {
+        let preview = if block.thinking.len() > 500 {
+            format!("{}...", &block.thinking[..500])
+        } else {
+            block.thinking.clone()
+        };
+        return Some(extract(preview));
+    }
+
+    for (i, tool) in block.tools.iter().enumerate() {
+        if source_id == source_ids::agent_tool(block.id, i) {
+            return Some(extract(tool.extract_text()));
+        }
+    }
+
+    if let Some(ref perm) = block.pending_permission {
+        if source_id == source_ids::agent_perm_text(block.id) {
+            let mut text = String::from("\u{26A0} Permission Required\n");
+            text.push_str(&perm.description);
+            text.push('\n');
+            text.push_str(&perm.action);
+            if let Some(ref dir) = perm.working_dir {
+                text.push_str(&format!("\nin {}", dir));
+            }
+            return Some(extract(text));
+        }
+    }
+
+    if let Some(ref q) = block.pending_question {
+        if source_id == source_ids::agent_question_text(block.id) {
+            let mut text = String::from("\u{2753} Claude is asking:\n");
+            for question in &q.questions {
+                text.push_str(&question.question);
+                text.push('\n');
+            }
+            return Some(extract(text));
+        }
+    }
+
+    if source_id == source_ids::agent_response(block.id) && !block.response.is_empty() {
+        return Some(extract(block.response.clone()));
+    }
+
+    if source_id == source_ids::agent_footer(block.id) {
+        return Some(extract(block.footer_text()));
     }
 
     None
@@ -513,85 +544,6 @@ fn format_table_as_markdown(columns: &[nexus_api::TableColumn], rows: &[Vec<nexu
     }
 
     lines.join("\n")
-}
-
-/// Gather all visible text from a tool invocation for copy/selection extraction.
-fn extract_tool_text(tool: &ToolInvocation) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    // Header label (mirrors tool_header_label in nexus_widgets)
-    parts.push(tool.name.clone());
-
-    if let Some(ref msg) = tool.message {
-        parts.push(msg.clone());
-    }
-
-    if tool.collapsed {
-        // Collapsed summary — just the output first line
-        if let Some(ref output) = tool.output {
-            if let Some(first) = output.lines().next() {
-                let truncated = if first.len() > 200 { &first[..200] } else { first };
-                parts.push(truncated.to_string());
-            }
-        }
-    } else {
-        // Expanded body — parameters + output
-        for (name, value) in &tool.parameters {
-            let display = if value.len() > 100 {
-                format!("{}: {}...", name, &value[..100])
-            } else {
-                format!("{}: {}", name, value)
-            };
-            parts.push(display);
-        }
-        if let Some(ref output) = tool.output {
-            parts.push(output.clone());
-        }
-    }
-
-    parts.join("\n")
-}
-
-/// Gather footer text from an agent block for copy/selection extraction.
-fn extract_agent_footer_text(block: &AgentBlock) -> String {
-    let mut parts: Vec<String> = Vec::new();
-
-    let status = match &block.state {
-        AgentBlockState::Pending => "Waiting...",
-        AgentBlockState::Streaming => "Streaming...",
-        AgentBlockState::Thinking => "Thinking...",
-        AgentBlockState::Executing => "Executing...",
-        AgentBlockState::Completed => "Completed",
-        AgentBlockState::Failed(err) => err.as_str(),
-        AgentBlockState::AwaitingPermission => "Awaiting permission...",
-        AgentBlockState::Interrupted => "Interrupted",
-    };
-    parts.push(status.to_string());
-
-    if let Some(ms) = block.duration_ms {
-        if ms < 1000 {
-            parts.push(format!("{}ms", ms));
-        } else {
-            parts.push(format!("{:.1}s", ms as f64 / 1000.0));
-        }
-    }
-
-    if let Some(cost) = block.cost_usd {
-        parts.push(format!("${:.4}", cost));
-    }
-
-    let total_tokens = block.input_tokens.unwrap_or(0) + block.output_tokens.unwrap_or(0);
-    if total_tokens > 0 {
-        if total_tokens >= 1_000_000 {
-            parts.push(format!("{:.1}M tokens", total_tokens as f64 / 1_000_000.0));
-        } else if total_tokens >= 1_000 {
-            parts.push(format!("{:.1}k tokens", total_tokens as f64 / 1_000.0));
-        } else {
-            parts.push(format!("{} tokens", total_tokens));
-        }
-    }
-
-    parts.join(" ")
 }
 
 #[cfg(test)]
@@ -707,150 +659,4 @@ mod tests {
         assert_eq!(result, "");
     }
 
-    // ========== extract_tool_text tests ==========
-
-    use crate::agent_block::ToolStatus;
-    use std::collections::HashMap;
-
-    fn make_test_tool(name: &str) -> ToolInvocation {
-        ToolInvocation {
-            id: "tool-1".to_string(),
-            name: name.to_string(),
-            parameters: HashMap::new(),
-            output: None,
-            status: ToolStatus::Success,
-            message: None,
-            collapsed: false,
-        }
-    }
-
-    #[test]
-    fn test_extract_tool_text_basic() {
-        let mut tool = make_test_tool("read_file");
-        tool.parameters.insert("path".to_string(), "/test/file.txt".to_string());
-        tool.output = Some("File contents here".to_string());
-
-        let result = extract_tool_text(&tool);
-        assert!(result.contains("read_file"));
-        assert!(result.contains("path: /test/file.txt"));
-        assert!(result.contains("File contents here"));
-    }
-
-    #[test]
-    fn test_extract_tool_text_collapsed() {
-        let mut tool = make_test_tool("bash");
-        tool.parameters.insert("command".to_string(), "ls -la".to_string());
-        tool.output = Some("First line\nSecond line\nThird line".to_string());
-        tool.collapsed = true;
-
-        let result = extract_tool_text(&tool);
-        assert!(result.contains("bash"));
-        assert!(result.contains("First line"));
-        // Collapsed should only show first line
-        assert!(!result.contains("Second line"));
-    }
-
-    #[test]
-    fn test_extract_tool_text_with_message() {
-        let mut tool = make_test_tool("write_file");
-        tool.message = Some("Writing to /test.txt".to_string());
-
-        let result = extract_tool_text(&tool);
-        assert!(result.contains("write_file"));
-        assert!(result.contains("Writing to /test.txt"));
-    }
-
-    #[test]
-    fn test_extract_tool_text_long_parameter_truncated() {
-        let long_value = "x".repeat(200);
-        let mut tool = make_test_tool("test");
-        tool.parameters.insert("content".to_string(), long_value);
-
-        let result = extract_tool_text(&tool);
-        assert!(result.contains("content: "));
-        assert!(result.contains("...")); // Should be truncated
-    }
-
-    // ========== extract_agent_footer_text tests ==========
-
-    fn make_test_agent_block(state: AgentBlockState) -> AgentBlock {
-        AgentBlock {
-            id: BlockId(1),
-            query: "test".to_string(),
-            thinking: String::new(),
-            thinking_collapsed: true,
-            response: String::new(),
-            tools: vec![],
-            active_tool_id: None,
-            images: vec![],
-            state,
-            started_at: std::time::Instant::now(),
-            pending_permission: None,
-            pending_question: None,
-            duration_ms: None,
-            cost_usd: None,
-            input_tokens: None,
-            output_tokens: None,
-            version: 0,
-        }
-    }
-
-    #[test]
-    fn test_extract_agent_footer_text_pending() {
-        let block = make_test_agent_block(AgentBlockState::Pending);
-        let result = extract_agent_footer_text(&block);
-        assert_eq!(result, "Waiting...");
-    }
-
-    #[test]
-    fn test_extract_agent_footer_text_completed_with_stats() {
-        let mut block = make_test_agent_block(AgentBlockState::Completed);
-        block.response = "Done".to_string();
-        block.duration_ms = Some(1500);
-        block.cost_usd = Some(0.0023);
-        block.input_tokens = Some(100);
-        block.output_tokens = Some(50);
-
-        let result = extract_agent_footer_text(&block);
-        assert!(result.contains("Completed"));
-        assert!(result.contains("1.5s"));
-        assert!(result.contains("$0.0023"));
-        assert!(result.contains("150 tokens"));
-    }
-
-    #[test]
-    fn test_extract_agent_footer_text_duration_ms() {
-        let mut block = make_test_agent_block(AgentBlockState::Completed);
-        block.duration_ms = Some(500);
-
-        let result = extract_agent_footer_text(&block);
-        assert!(result.contains("500ms"));
-    }
-
-    #[test]
-    fn test_extract_agent_footer_text_large_tokens() {
-        let mut block = make_test_agent_block(AgentBlockState::Completed);
-        block.input_tokens = Some(500_000);
-        block.output_tokens = Some(600_000);
-
-        let result = extract_agent_footer_text(&block);
-        assert!(result.contains("1.1M tokens"));
-    }
-
-    #[test]
-    fn test_extract_agent_footer_text_k_tokens() {
-        let mut block = make_test_agent_block(AgentBlockState::Completed);
-        block.input_tokens = Some(1500);
-        block.output_tokens = Some(500);
-
-        let result = extract_agent_footer_text(&block);
-        assert!(result.contains("2.0k tokens"));
-    }
-
-    #[test]
-    fn test_extract_agent_footer_text_failed() {
-        let block = make_test_agent_block(AgentBlockState::Failed("Connection error".to_string()));
-        let result = extract_agent_footer_text(&block);
-        assert!(result.contains("Connection error"));
-    }
 }

@@ -315,7 +315,7 @@ pub(super) fn on_mouse(
     hit: Option<HitResult>,
     capture: &CaptureState,
 ) -> MouseResponse<NexusMessage> {
-    // ── Drag state machine intercept ──────────────────────────────
+    // 1. Active drag intercept
     if let Some(resp) = super::drag_state::route_drag_mouse(
         &state.drag.status,
         &event,
@@ -326,7 +326,7 @@ pub(super) fn on_mouse(
         return resp;
     }
 
-    // Composable scroll + input handlers
+    // 2. Composable scroll + input handlers
     route_mouse!(&event, &hit, capture, [
         state.input.completion.scroll       => |a| NexusMessage::Input(InputMsg::CompletionScroll(a)),
         state.input.history_search.scroll   => |a| NexusMessage::Input(InputMsg::HistorySearchScroll(a)),
@@ -335,7 +335,7 @@ pub(super) fn on_mouse(
         state.input.text_input              => |a| NexusMessage::Input(InputMsg::Mouse(a)),
     ]);
 
-    // Right-click → context menu
+    // 3. Right-click → context menu
     if let MouseEvent::ButtonPressed {
         button: MouseButton::Right,
         position,
@@ -345,140 +345,142 @@ pub(super) fn on_mouse(
         return route_right_click(state, position, &hit);
     }
 
-    // Hover tracking (delegated to children + context menu)
+    // 4. Hover tracking
     if let MouseEvent::CursorMoved { .. } = &event {
         route_hover(state, &hit);
     }
 
-    // Context menu item clicks (root handles — transient UI)
-    if let MouseEvent::ButtonPressed {
-        button: MouseButton::Left,
-        ..
-    } = &event
-    {
-        if let Some(msg) = route_context_menu_click(state, &hit) {
-            return MouseResponse::message(msg);
-        }
-    }
-
-    // Widget clicks → delegate to children
+    // 5. Left-click chain
     if let MouseEvent::ButtonPressed {
         button: MouseButton::Left,
         position,
         ..
     } = &event
     {
-        eprintln!("[DEBUG click] hit={:?}", hit);
-        // Z-order: Selection > Anchor > Text
-        // If clicking inside an existing non-collapsed selection, start a selection drag.
-        if let Some((source, origin_addr)) = state.selection.hit_in_selection(
-            &hit,
-            &state.shell.blocks,
-            &state.agent.blocks,
-        ) {
-            let text = state
-                .selection
-                .extract_selected_text(&state.shell.blocks, &state.agent.blocks)
-                .unwrap_or_default();
-            let intent = PendingIntent::SelectionDrag {
-                source,
-                text,
-                origin_addr,
-            };
-            return MouseResponse::message_and_capture(
-                NexusMessage::Drag(DragMsg::Start(intent, *position)),
-                source,
-            );
-        }
-
-        if let Some(HitResult::Widget(id)) = &hit {
-            // Viewer exit buttons (cross-cutting: shell block → ViewerMsg)
-            for block in &state.shell.blocks {
-                if block.view_state.is_some() && *id == source_ids::viewer_exit(block.id) {
-                    return MouseResponse::message(NexusMessage::Viewer(ViewerMsg::Exit(block.id)));
-                }
-            }
-
-            // Try each child in order
-            if let Some(msg) = state.input.on_click(*id) {
-                return MouseResponse::message(NexusMessage::Input(msg));
-            }
-            if let Some(msg) = state.shell.on_click(*id) {
-                return MouseResponse::message(NexusMessage::Shell(msg));
-            }
-            if let Some(msg) = state.agent.on_click(*id) {
-                return MouseResponse::message(NexusMessage::Agent(msg));
-            }
-
-            // Anchor clicks → start pending drag (click fires on release if <5px)
-            if let Some(payload) = state.shell.drag_payload_for_anchor(*id) {
-                // No source_rect - Quick Look will appear without zoom animation
-                // (zoom animation is designed for thumbnails, not text)
-                let intent = PendingIntent::Anchor { source: *id, payload, source_rect: None };
-                return MouseResponse::message_and_capture(
-                    NexusMessage::Drag(DragMsg::Start(intent, *position)),
-                    *id,
-                );
-            }
-
-            // Job pills (cross-cutting: shell data → root scroll action)
-            for job in &state.shell.jobs {
-                if *id == JobBar::job_pill_id(job.id) {
-                    return MouseResponse::message(NexusMessage::ScrollToJob(job.id));
-                }
-            }
-        }
-
-        // Image output — start a pending drag (native OS drag on threshold)
-        {
-            let image_source = match &hit {
-                Some(HitResult::Widget(id)) => Some(*id),
-                Some(HitResult::Content(addr)) => Some(addr.source_id),
-                None => None,
-            };
-            if let Some(src) = image_source {
-                if let Some(payload) = state.shell.image_drag_payload(src) {
-                    let intent = PendingIntent::Anchor { source: src, payload, source_rect: None };
-                    return MouseResponse::message_and_capture(
-                        NexusMessage::Drag(DragMsg::Start(intent, *position)),
-                        src,
-                    );
-                }
-            }
-        }
-
-        // Text content selection — immediate Active(Selecting), no hysteresis
-        if let Some(HitResult::Content(addr)) = hit {
-            let mode = state.drag.click_tracker.register_click(
-                *position,
-                std::time::Instant::now(),
-            );
-            let capture_source = addr.source_id;
-            return MouseResponse::message_and_capture(
-                NexusMessage::Drag(DragMsg::StartSelecting(addr, mode)),
-                capture_source,
-            );
-        }
-
-        // Click landed on a shell block area (e.g. between rows, header,
-        // viewer background) but didn't match any specific widget handler
-        // above.  Focus the block so keyboard input routes to its PTY.
-        let hit_source = match &hit {
-            Some(HitResult::Widget(id)) => Some(*id),
-            Some(HitResult::Content(addr)) => Some(addr.source_id),
-            None => None,
-        };
-        if let Some(src) = hit_source {
-            if let Some(block_id) = state.shell.block_for_source(src) {
-                return MouseResponse::message(NexusMessage::FocusBlock(block_id));
-            }
-        }
-
-        // Clicked empty space: blur inputs
-        return MouseResponse::message(NexusMessage::BlurAll);
+        return route_left_click(state, hit, *position);
     }
 
     MouseResponse::none()
+}
+
+/// Left-click dispatcher — flat chain of `Option<MouseResponse>` handlers.
+fn route_left_click(
+    state: &NexusState,
+    hit: Option<HitResult>,
+    position: strata::primitives::Point,
+) -> MouseResponse<NexusMessage> {
+    // Context menu item click (transient UI)
+    if let Some(msg) = route_context_menu_click(state, &hit) {
+        return MouseResponse::message(msg);
+    }
+    // Selection drag (click inside existing selection)
+    if let Some(r) = state.selection.route_selection_drag(
+        &hit, &state.shell.blocks, &state.agent.blocks, position,
+    ) {
+        return r;
+    }
+    // Widget ID clicks (viewer exit, input/shell/agent on_click, anchor drag, job pills)
+    if let Some(r) = route_widget_click(state, &hit, position) {
+        return r;
+    }
+    // Image drag
+    if let Some(r) = route_image_drag(state, &hit, position) {
+        return r;
+    }
+    // Text content selection
+    if let Some(r) = super::drag_state::route_text_selection_start(
+        &state.drag.click_tracker, hit.clone(), position,
+    ) {
+        return r;
+    }
+    // Block focus fallback
+    if let Some(r) = route_block_focus(state, &hit) {
+        return r;
+    }
+    // Empty space blur
+    MouseResponse::message(NexusMessage::BlurAll)
+}
+
+/// Handle clicks on widget IDs: viewer exit buttons, child widget on_click,
+/// anchor drags, and job pills.
+fn route_widget_click(
+    state: &NexusState,
+    hit: &Option<HitResult>,
+    position: strata::primitives::Point,
+) -> Option<MouseResponse<NexusMessage>> {
+    let id = match hit {
+        Some(HitResult::Widget(id)) => *id,
+        _ => return None,
+    };
+
+    // Viewer exit buttons (cross-cutting: shell block → ViewerMsg)
+    for block in &state.shell.blocks {
+        if block.view_state.is_some() && id == source_ids::viewer_exit(block.id) {
+            return Some(MouseResponse::message(NexusMessage::Viewer(ViewerMsg::Exit(block.id))));
+        }
+    }
+
+    // Try each child in order
+    if let Some(msg) = state.input.on_click(id) {
+        return Some(MouseResponse::message(NexusMessage::Input(msg)));
+    }
+    if let Some(msg) = state.shell.on_click(id) {
+        return Some(MouseResponse::message(NexusMessage::Shell(msg)));
+    }
+    if let Some(msg) = state.agent.on_click(id) {
+        return Some(MouseResponse::message(NexusMessage::Agent(msg)));
+    }
+
+    // Anchor clicks → start pending drag (click fires on release if <5px)
+    if let Some(payload) = state.shell.drag_payload_for_anchor(id) {
+        let intent = PendingIntent::Anchor { source: id, payload, source_rect: None };
+        return Some(MouseResponse::message_and_capture(
+            NexusMessage::Drag(DragMsg::Start(intent, position)),
+            id,
+        ));
+    }
+
+    // Job pills (cross-cutting: shell data → root scroll action)
+    for job in &state.shell.jobs {
+        if id == JobBar::job_pill_id(job.id) {
+            return Some(MouseResponse::message(NexusMessage::ScrollToJob(job.id)));
+        }
+    }
+
+    None
+}
+
+/// Handle image output drag initiation.
+fn route_image_drag(
+    state: &NexusState,
+    hit: &Option<HitResult>,
+    position: strata::primitives::Point,
+) -> Option<MouseResponse<NexusMessage>> {
+    let src = match hit {
+        Some(HitResult::Widget(id)) => *id,
+        Some(HitResult::Content(addr)) => addr.source_id,
+        None => return None,
+    };
+    let payload = state.shell.image_drag_payload(src)?;
+    let intent = PendingIntent::Anchor { source: src, payload, source_rect: None };
+    Some(MouseResponse::message_and_capture(
+        NexusMessage::Drag(DragMsg::Start(intent, position)),
+        src,
+    ))
+}
+
+/// Handle click on a shell block area that didn't match any specific handler — focus the block.
+fn route_block_focus(
+    state: &NexusState,
+    hit: &Option<HitResult>,
+) -> Option<MouseResponse<NexusMessage>> {
+    let src = match hit {
+        Some(HitResult::Widget(id)) => *id,
+        Some(HitResult::Content(addr)) => addr.source_id,
+        None => return None,
+    };
+    let block_id = state.shell.block_for_source(src)?;
+    Some(MouseResponse::message(NexusMessage::FocusBlock(block_id)))
 }
 
 // =========================================================================

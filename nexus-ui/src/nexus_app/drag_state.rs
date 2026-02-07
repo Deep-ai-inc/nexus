@@ -450,6 +450,24 @@ pub fn route_drag_mouse(
     }
 }
 
+/// Start a text selection from a content click. Returns `None` if hit is not Content.
+pub fn route_text_selection_start(
+    click_tracker: &ClickTracker,
+    hit: Option<HitResult>,
+    position: Point,
+) -> Option<MouseResponse<NexusMessage>> {
+    if let Some(HitResult::Content(addr)) = hit {
+        let mode = click_tracker.register_click(position, std::time::Instant::now());
+        let capture_source = addr.source_id;
+        Some(MouseResponse::message_and_capture(
+            NexusMessage::Drag(DragMsg::StartSelecting(addr, mode)),
+            capture_source,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Compute auto-scroll speed based on cursor distance from scroll container edges.
 ///
 /// 40px edge zone, proportional speed up to 8px per tick (~480px/s at 60fps).

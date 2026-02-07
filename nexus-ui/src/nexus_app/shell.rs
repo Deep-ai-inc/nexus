@@ -24,38 +24,7 @@ use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::message::{AnchorAction, ContextMenuMsg, NexusMessage, ShellMsg};
 use super::source_ids;
 
-/// Typed output from ShellWidget → orchestrator.
-pub(crate) enum ShellOutput {
-    /// Nothing happened.
-    None,
-    /// Orchestrator should focus input.
-    FocusInput,
-    /// Orchestrator should focus a specific PTY block.
-    FocusBlock(BlockId),
-    /// Orchestrator should scroll history to bottom.
-    ScrollToBottom,
-    /// Working directory changed.
-    CwdChanged(PathBuf),
-    /// A kernel command finished. Orchestrator should update context.
-    CommandFinished {
-        block_id: BlockId,
-        exit_code: i32,
-        command: String,
-        output: String,
-    },
-    /// A PTY block exited. Root decides focus based on current focus state.
-    BlockExited {
-        id: BlockId,
-    },
-    /// PTY input forwarding failed (block gone). Root should focus input.
-    PtyInputFailed,
-    /// A directory was expanded — orchestrator should load its children.
-    LoadTreeChildren(BlockId, PathBuf),
-}
-
-impl Default for ShellOutput {
-    fn default() -> Self { Self::None }
-}
+use super::update_context::UpdateContext;
 
 /// An anchor entry resolved during rendering — stores both the click action
 /// and drag payload so click/drag handling is an O(1) HashMap lookup.
@@ -398,14 +367,14 @@ impl ShellWidget {
         Subscription::batch(subs)
     }
 
-    /// Handle a message, returning commands and cross-cutting output.
-    pub fn update(&mut self, msg: ShellMsg, ctx: &mut strata::component::Ctx) -> (strata::Command<ShellMsg>, ShellOutput) {
-        let output = match msg {
-            ShellMsg::PtyBatch(batch) => self.handle_pty_batch(batch),
-            ShellMsg::PtyOutput(id, data) => self.handle_pty_output(id, data),
-            ShellMsg::PtyExited(id, exit_code) => self.handle_pty_exited(id, exit_code),
-            ShellMsg::KernelEvent(evt) => self.handle_kernel_event(evt, ctx.images),
-            ShellMsg::SendInterrupt(id) => { self.pty.send_interrupt(id); ShellOutput::None }
+    /// Handle a message, applying cross-cutting effects via UpdateContext.
+    pub fn update(&mut self, msg: ShellMsg, uctx: &mut UpdateContext, images: &mut strata::ImageStore) {
+        match msg {
+            ShellMsg::PtyBatch(batch) => self.handle_pty_batch(batch, uctx),
+            ShellMsg::PtyOutput(id, data) => self.handle_pty_output(id, data, uctx),
+            ShellMsg::PtyExited(id, exit_code) => self.handle_pty_exited(id, exit_code, uctx),
+            ShellMsg::KernelEvent(evt) => self.handle_kernel_event(evt, images, uctx),
+            ShellMsg::SendInterrupt(id) => { self.pty.send_interrupt(id); }
             ShellMsg::KillBlock(id) => {
                 self.pty.kill(id);
                 // Also cancel kernel-native commands (e.g. top) which have
@@ -415,30 +384,25 @@ impl ShellWidget {
                     block.view_state = None;
                     block.version += 1;
                 }
-                ShellOutput::None
             }
             ShellMsg::PtyInput(block_id, event) => {
                 let block = self.block_by_id(block_id);
-                if self.pty.forward_key(block, block_id, &event) {
-                    ShellOutput::None
-                } else {
-                    ShellOutput::PtyInputFailed
+                if !self.pty.forward_key(block, block_id, &event) {
+                    uctx.set_focus(Focus::Input);
+                    uctx.snap_to_bottom();
                 }
             }
-            ShellMsg::SortTable(block_id, col_idx) => { self.sort_table(block_id, col_idx); ShellOutput::None }
+            ShellMsg::SortTable(block_id, col_idx) => { self.sort_table(block_id, col_idx); }
             ShellMsg::OpenAnchor(_, _) => {
                 // Handled at the root level in state_update.rs
-                ShellOutput::None
             }
             ShellMsg::ToggleTreeExpand(block_id, path) => {
-                self.toggle_tree_expand(block_id, path)
+                self.toggle_tree_expand(block_id, path, uctx);
             }
             ShellMsg::TreeChildrenLoaded(block_id, path, entries) => {
                 self.set_tree_children(block_id, path, entries);
-                ShellOutput::None
             }
-        };
-        (strata::Command::none(), output)
+        }
     }
 
     /// Execute a command (kernel or external PTY).
@@ -450,27 +414,28 @@ impl ShellWidget {
         cwd: &str,
         kernel: &Arc<Mutex<Kernel>>,
         kernel_tx: &broadcast::Sender<ShellEvent>,
-    ) -> ShellOutput {
+        uctx: &mut UpdateContext,
+    ) {
         let trimmed = command.trim().to_string();
 
         let classification = kernel.blocking_lock().classify_command(&trimmed);
 
         if classification == CommandClassification::Kernel {
-            self.execute_kernel_command(trimmed, block_id, cwd, kernel, kernel_tx)
+            self.execute_kernel_command(trimmed, block_id, cwd, kernel, kernel_tx, uctx);
         } else {
-            self.execute_pty_command(trimmed, block_id, cwd)
+            self.execute_pty_command(trimmed, block_id, cwd, uctx);
         }
     }
 
     /// Handle a batch of PTY events. Coalesces consecutive Output events
     /// for the same block into a single `feed()` call, preserving ordering
     /// relative to Exited events.
-    pub fn handle_pty_batch(&mut self, batch: Vec<(BlockId, PtyEvent)>) -> ShellOutput {
+    pub fn handle_pty_batch(&mut self, batch: Vec<(BlockId, PtyEvent)>, uctx: &mut UpdateContext) {
         // Coalesce: merge consecutive Output(data) for the same block.
         // When we hit an Exited or a different block, flush the accumulator.
         let mut acc_id: Option<BlockId> = None;
         let mut acc_data: Vec<u8> = Vec::new();
-        let mut last_output = ShellOutput::None;
+        let mut had_exit = false;
 
         let flush = |acc_id: &mut Option<BlockId>,
                      acc_data: &mut Vec<u8>,
@@ -518,7 +483,8 @@ impl ShellWidget {
                         &mut self.blocks,
                         &self.block_index,
                     );
-                    last_output = self.handle_pty_exited(id, code);
+                    self.handle_pty_exited(id, code, uctx);
+                    had_exit = true;
                 }
             }
         }
@@ -543,15 +509,14 @@ impl ShellWidget {
         // Setting dirty would activate the 16ms tick, which fires yet
         // another redundant render with no new content.
 
-        // If the last event was an exit, propagate that; otherwise scroll.
-        match last_output {
-            ShellOutput::None => ShellOutput::ScrollToBottom,
-            other => other,
+        // If no exit happened, scroll to bottom for output.
+        if !had_exit {
+            uctx.snap_to_bottom();
         }
     }
 
     /// Handle a single PTY output event (unbatched fallback).
-    pub fn handle_pty_output(&mut self, id: BlockId, data: Vec<u8>) -> ShellOutput {
+    pub fn handle_pty_output(&mut self, id: BlockId, data: Vec<u8>, uctx: &mut UpdateContext) {
         if let Some(&idx) = self.block_index.get(&id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.parser.feed(&data);
@@ -562,11 +527,11 @@ impl ShellWidget {
             }
         }
         self.terminal_dirty = true;
-        ShellOutput::ScrollToBottom
+        uctx.snap_to_bottom();
     }
 
-    /// Handle PTY exit. Returns the exited block ID so root can decide focus.
-    pub fn handle_pty_exited(&mut self, id: BlockId, exit_code: i32) -> ShellOutput {
+    /// Handle PTY exit. Conditionally returns focus to input if the exited block was focused.
+    pub fn handle_pty_exited(&mut self, id: BlockId, exit_code: i32, uctx: &mut UpdateContext) {
         if let Some(&idx) = self.block_index.get(&id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 block.state = if exit_code == 0 {
@@ -580,7 +545,10 @@ impl ShellWidget {
         }
         self.pty.remove_handle(id);
         self.last_exit_code = Some(exit_code);
-        ShellOutput::BlockExited { id }
+        if *uctx.focus == Focus::Block(id) {
+            uctx.set_focus(Focus::Input);
+            uctx.snap_to_bottom();
+        }
     }
 
     /// Handle a kernel event.
@@ -588,7 +556,8 @@ impl ShellWidget {
         &mut self,
         evt: ShellEvent,
         images: &mut ImageStore,
-    ) -> ShellOutput {
+        uctx: &mut UpdateContext,
+    ) {
         match evt {
             ShellEvent::CommandStarted { block_id, command, .. } => {
                 if !self.block_index.contains_key(&block_id) {
@@ -598,7 +567,6 @@ impl ShellWidget {
                     self.blocks.push(block);
                     self.block_index.insert(block_id, block_idx);
                 }
-                ShellOutput::None
             }
             ShellEvent::StdoutChunk { block_id, data }
             | ShellEvent::StderrChunk { block_id, data } => {
@@ -609,7 +577,6 @@ impl ShellWidget {
                     }
                 }
                 self.terminal_dirty = true;
-                ShellOutput::None
             }
             ShellEvent::CommandOutput { block_id, value } => {
                 // Handle Interactive values: set up viewer state
@@ -662,7 +629,9 @@ impl ShellWidget {
                             }
                         }
                     }
-                    return ShellOutput::FocusBlock(block_id);
+                    uctx.set_focus(Focus::Block(block_id));
+                    uctx.snap_to_bottom();
+                    return;
                 }
 
                 if let Value::Media {
@@ -691,7 +660,6 @@ impl ShellWidget {
                         block.native_output = Some(value);
                     }
                 }
-                ShellOutput::None
             }
             ShellEvent::CommandFinished {
                 block_id,
@@ -700,6 +668,7 @@ impl ShellWidget {
             } => {
                 let mut cmd = String::new();
                 let mut output = String::new();
+                let mut has_viewer = false;
                 if let Some(&idx) = self.block_index.get(&block_id) {
                     if let Some(block) = self.blocks.get_mut(idx) {
                         block.state = if exit_code == 0 {
@@ -716,15 +685,15 @@ impl ShellWidget {
                         } else {
                             raw
                         };
+                        has_viewer = block.view_state.is_some();
                     }
                 }
                 self.last_exit_code = Some(exit_code);
-                ShellOutput::CommandFinished {
-                    block_id,
-                    exit_code,
-                    command: cmd,
-                    output,
+                uctx.on_command_finished(cmd, output, exit_code);
+                if !has_viewer {
+                    uctx.set_focus(Focus::Input);
                 }
+                uctx.snap_to_bottom();
             }
             ShellEvent::JobStateChanged {
                 job_id,
@@ -757,7 +726,6 @@ impl ShellWidget {
                         self.jobs.retain(|j| j.id != job_id);
                     }
                 }
-                ShellOutput::None
             }
             ShellEvent::StreamingUpdate {
                 block_id,
@@ -788,10 +756,11 @@ impl ShellWidget {
                         }
                     }
                 }
-                ShellOutput::None
             }
-            ShellEvent::CwdChanged { new, .. } => ShellOutput::CwdChanged(new),
-            _ => ShellOutput::None,
+            ShellEvent::CwdChanged { new, .. } => {
+                uctx.set_cwd(new);
+            }
+            _ => {}
         }
     }
 
@@ -834,19 +803,30 @@ impl ShellWidget {
     }
 
     /// Toggle tree expansion for a directory.
-    /// Returns LoadTreeChildren if the directory was expanded and needs loading.
-    pub fn toggle_tree_expand(&mut self, block_id: BlockId, path: PathBuf) -> ShellOutput {
+    /// Enqueues LoadTreeChildren command if the directory was expanded and needs loading.
+    pub fn toggle_tree_expand(&mut self, block_id: BlockId, path: PathBuf, uctx: &mut UpdateContext) {
         if let Some(&idx) = self.block_index.get(&block_id) {
             if let Some(block) = self.blocks.get_mut(idx) {
                 let tree = block.ensure_file_tree();
                 let now_expanded = tree.toggle(path.clone());
                 block.version += 1; // Trigger re-render
                 if now_expanded && !block.ensure_file_tree().children.contains_key(&path) {
-                    return ShellOutput::LoadTreeChildren(block_id, path);
+                    let path_clone = path.clone();
+                    uctx.push_command(strata::Command::perform(async move {
+                        let mut entries = Vec::new();
+                        if let Ok(read_dir) = std::fs::read_dir(&path_clone) {
+                            for entry in read_dir.flatten() {
+                                if let Ok(file_entry) = nexus_api::FileEntry::from_path(entry.path()) {
+                                    entries.push(file_entry);
+                                }
+                            }
+                        }
+                        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        NexusMessage::Shell(ShellMsg::TreeChildrenLoaded(block_id, path_clone, entries))
+                    }));
                 }
             }
         }
-        ShellOutput::None
     }
 
     /// Store loaded children for a tree node.
@@ -886,7 +866,8 @@ impl ShellWidget {
         cwd: &str,
         kernel: &Arc<Mutex<Kernel>>,
         kernel_tx: &broadcast::Sender<ShellEvent>,
-    ) -> ShellOutput {
+        uctx: &mut UpdateContext,
+    ) {
         let mut block = Block::new(block_id, cmd.clone());
         block.parser = self.pty.new_parser();
         let block_idx = self.blocks.len();
@@ -929,7 +910,7 @@ impl ShellWidget {
             }
         });
 
-        ShellOutput::ScrollToBottom
+        uctx.snap_to_bottom();
     }
 
     fn execute_pty_command(
@@ -937,7 +918,8 @@ impl ShellWidget {
         cmd: String,
         block_id: BlockId,
         cwd: &str,
-    ) -> ShellOutput {
+        uctx: &mut UpdateContext,
+    ) {
         let mut block = Block::new(block_id, cmd.clone());
         block.parser = self.pty.new_parser();
         let block_idx = self.blocks.len();
@@ -945,7 +927,10 @@ impl ShellWidget {
         self.block_index.insert(block_id, block_idx);
 
         match self.pty.spawn(&cmd, block_id, cwd) {
-            Ok(()) => ShellOutput::FocusBlock(block_id),
+            Ok(()) => {
+                uctx.set_focus(Focus::Block(block_id));
+                uctx.snap_to_bottom();
+            }
             Err(e) => {
                 tracing::error!("Failed to spawn PTY: {}", e);
                 if let Some(&idx) = self.block_index.get(&block_id) {
@@ -955,7 +940,8 @@ impl ShellWidget {
                         block.version += 1;
                     }
                 }
-                ShellOutput::FocusInput
+                uctx.set_focus(Focus::Input);
+                uctx.snap_to_bottom();
             }
         }
     }

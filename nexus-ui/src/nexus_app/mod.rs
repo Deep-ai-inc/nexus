@@ -22,6 +22,7 @@ pub(crate) mod drag_state;
 pub(crate) mod file_drop;
 mod state_policy;
 mod state_update;
+pub(crate) mod update_context;
 mod state_view;
 #[cfg(test)]
 mod tests;

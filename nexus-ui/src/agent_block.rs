@@ -55,6 +55,50 @@ impl ToolInvocation {
             collapsed: false,
         }
     }
+
+    /// Gather all visible text for copy/selection extraction.
+    pub fn extract_text(&self) -> String {
+        let mut text = String::with_capacity(256);
+        text.push_str(&self.name);
+
+        // Parameters
+        if !self.parameters.is_empty() {
+            text.push('(');
+            let mut sorted_keys: Vec<_> = self.parameters.keys().collect();
+            sorted_keys.sort();
+            for (i, key) in sorted_keys.into_iter().enumerate() {
+                if i > 0 { text.push_str(", "); }
+                let val = &self.parameters[key];
+                if val.len() > 100 {
+                    text.push_str(&format!("{}: {}...", key, &val[..100]));
+                } else {
+                    text.push_str(&format!("{}: {}", key, val));
+                }
+            }
+            text.push(')');
+        }
+
+        // Output (if expanded)
+        if !self.collapsed {
+            if let Some(output) = &self.output {
+                text.push('\n');
+                text.push_str(output);
+            } else if let Some(err) = &self.message {
+                text.push('\n');
+                text.push_str(err);
+            }
+        } else if let Some(output) = &self.output {
+            // If collapsed, just show the first line of output as preview
+            if let Some(first_line) = output.lines().next() {
+                text.push('\n');
+                text.push_str(first_line);
+                if output.lines().count() > 1 {
+                    text.push_str("...");
+                }
+            }
+        }
+        text
+    }
 }
 
 /// State of an agent block.
@@ -303,12 +347,59 @@ impl AgentBlock {
         self.version += 1;
     }
 
+    /// Gather footer text (status, duration, cost, tokens) for copy/selection.
+    pub fn footer_text(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+
+        let status = match &self.state {
+            AgentBlockState::Pending => "Waiting...",
+            AgentBlockState::Streaming => "Streaming...",
+            AgentBlockState::Thinking => "Thinking...",
+            AgentBlockState::Executing => "Executing...",
+            AgentBlockState::Completed => "Completed",
+            AgentBlockState::Failed(err) => err.as_str(),
+            AgentBlockState::AwaitingPermission => "Awaiting permission...",
+            AgentBlockState::Interrupted => "Interrupted",
+        };
+        parts.push(status.to_string());
+
+        if let Some(ms) = self.duration_ms {
+            if ms < 1000 {
+                parts.push(format!("{}ms", ms));
+            } else {
+                parts.push(format!("{:.1}s", ms as f64 / 1000.0));
+            }
+        }
+
+        if let Some(cost) = self.cost_usd {
+            parts.push(format!("${:.4}", cost));
+        }
+
+        let total_tokens = self.input_tokens.unwrap_or(0) + self.output_tokens.unwrap_or(0);
+        if total_tokens > 0 {
+            parts.push(format_tokens(total_tokens));
+        }
+
+        parts.join(" | ")
+    }
+
     /// Toggle tool collapsed state.
     pub fn toggle_tool(&mut self, tool_id: &str) {
         if let Some(tool) = self.tools.iter_mut().find(|t| t.id == tool_id) {
             tool.collapsed = !tool.collapsed;
             self.version += 1;
         }
+    }
+}
+
+/// Format a token count for display.
+pub fn format_tokens(total_tokens: u64) -> String {
+    if total_tokens >= 1_000_000 {
+        format!("{:.1}M tokens", total_tokens as f64 / 1_000_000.0)
+    } else if total_tokens >= 1_000 {
+        format!("{:.1}k tokens", total_tokens as f64 / 1_000.0)
+    } else {
+        format!("{} tokens", total_tokens)
     }
 }
 
@@ -645,5 +736,149 @@ mod tests {
         block2.state = AgentBlockState::Completed;
         block2.version = 5;
         assert_ne!(block1, block2);
+    }
+
+    // ========== extract_text tests ==========
+
+    fn make_test_tool(name: &str) -> ToolInvocation {
+        ToolInvocation {
+            id: "tool-1".to_string(),
+            name: name.to_string(),
+            parameters: HashMap::new(),
+            output: None,
+            status: ToolStatus::Success,
+            message: None,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn test_extract_tool_text_basic() {
+        let mut tool = make_test_tool("read_file");
+        tool.parameters.insert("path".to_string(), "/test/file.txt".to_string());
+        tool.output = Some("File contents here".to_string());
+
+        let result = tool.extract_text();
+        assert!(result.contains("read_file"));
+        assert!(result.contains("path: /test/file.txt"));
+        assert!(result.contains("File contents here"));
+    }
+
+    #[test]
+    fn test_extract_tool_text_collapsed() {
+        let mut tool = make_test_tool("bash");
+        tool.parameters.insert("command".to_string(), "ls -la".to_string());
+        tool.output = Some("First line\nSecond line\nThird line".to_string());
+        tool.collapsed = true;
+
+        let result = tool.extract_text();
+        assert!(result.contains("bash"));
+        assert!(result.contains("First line"));
+        // Collapsed should only show first line
+        assert!(!result.contains("Second line"));
+    }
+
+    #[test]
+    fn test_extract_tool_text_with_message() {
+        let mut tool = make_test_tool("write_file");
+        tool.message = Some("Writing to /test.txt".to_string());
+
+        let result = tool.extract_text();
+        assert!(result.contains("write_file"));
+        assert!(result.contains("Writing to /test.txt"));
+    }
+
+    #[test]
+    fn test_extract_tool_text_long_parameter_truncated() {
+        let long_value = "x".repeat(200);
+        let mut tool = make_test_tool("test");
+        tool.parameters.insert("content".to_string(), long_value);
+
+        let result = tool.extract_text();
+        assert!(result.contains("content: "));
+        assert!(result.contains("...")); // Should be truncated
+    }
+
+    // ========== footer_text tests ==========
+
+    fn make_completed_block(state: AgentBlockState) -> AgentBlock {
+        AgentBlock {
+            id: BlockId(1),
+            query: "test".to_string(),
+            thinking: String::new(),
+            thinking_collapsed: true,
+            response: String::new(),
+            tools: vec![],
+            active_tool_id: None,
+            images: vec![],
+            state,
+            started_at: std::time::Instant::now(),
+            pending_permission: None,
+            pending_question: None,
+            duration_ms: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn test_footer_text_pending() {
+        let block = make_completed_block(AgentBlockState::Pending);
+        let result = block.footer_text();
+        assert_eq!(result, "Waiting...");
+    }
+
+    #[test]
+    fn test_footer_text_completed_with_stats() {
+        let mut block = make_completed_block(AgentBlockState::Completed);
+        block.response = "Done".to_string();
+        block.duration_ms = Some(1500);
+        block.cost_usd = Some(0.0023);
+        block.input_tokens = Some(100);
+        block.output_tokens = Some(50);
+
+        let result = block.footer_text();
+        assert!(result.contains("Completed"));
+        assert!(result.contains("1.5s"));
+        assert!(result.contains("$0.0023"));
+        assert!(result.contains("150 tokens"));
+    }
+
+    #[test]
+    fn test_footer_text_duration_ms() {
+        let mut block = make_completed_block(AgentBlockState::Completed);
+        block.duration_ms = Some(500);
+
+        let result = block.footer_text();
+        assert!(result.contains("500ms"));
+    }
+
+    #[test]
+    fn test_footer_text_large_tokens() {
+        let mut block = make_completed_block(AgentBlockState::Completed);
+        block.input_tokens = Some(500_000);
+        block.output_tokens = Some(600_000);
+
+        let result = block.footer_text();
+        assert!(result.contains("1.1M tokens"));
+    }
+
+    #[test]
+    fn test_footer_text_k_tokens() {
+        let mut block = make_completed_block(AgentBlockState::Completed);
+        block.input_tokens = Some(1500);
+        block.output_tokens = Some(500);
+
+        let result = block.footer_text();
+        assert!(result.contains("2.0k tokens"));
+    }
+
+    #[test]
+    fn test_footer_text_failed() {
+        let block = make_completed_block(AgentBlockState::Failed("Connection error".to_string()));
+        let result = block.footer_text();
+        assert!(result.contains("Connection error"));
     }
 }

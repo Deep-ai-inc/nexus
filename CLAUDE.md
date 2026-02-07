@@ -1,0 +1,2 @@
+- Never read more than 10 files in parallel. If you need to read many files, batch them in groups of 5-10.
+- Before reading files, check if you actually need all of them. Prioritize the most relevant files first.

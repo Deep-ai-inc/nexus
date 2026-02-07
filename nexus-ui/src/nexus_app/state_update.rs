@@ -1,6 +1,5 @@
 //! Message dispatch and domain handlers for NexusState.
 
-use nexus_api::Value;
 use strata::Command;
 
 use crate::blocks::Focus;
@@ -8,100 +7,38 @@ use crate::blocks::Focus;
 use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::drag_state::{ActiveKind, DragStatus, PendingIntent};
 use super::file_drop;
-use super::input::InputOutput;
+use super::input::SubmitRequest;
 use super::message::{AnchorAction, ContextMenuMsg, DragMsg, DropZone, FileDropMsg, NexusMessage, ShellMsg, ViewerMsg};
 use super::selection;
-use super::shell::ShellOutput;
-use super::agent::AgentOutput;
+use super::update_context::{UpdateContext, sync_focus_flags};
 use super::NexusState;
 use crate::shell_context::build_shell_context;
 
 // =========================================================================
-// Cross-cutting output handlers
+// Borrow-splitting helpers
 // =========================================================================
 
 impl NexusState {
-    fn apply_shell_output(&mut self, output: ShellOutput) -> Command<NexusMessage> {
-        match output {
-            ShellOutput::None => Command::none(),
-            ShellOutput::FocusInput | ShellOutput::PtyInputFailed => {
-                self.set_focus(Focus::Input);
-                self.scroll.snap_to_bottom();
-                Command::none()
-            }
-            ShellOutput::FocusBlock(id) => {
-                self.set_focus(Focus::Block(id));
-                self.scroll.snap_to_bottom();
-                Command::none()
-            }
-            ShellOutput::ScrollToBottom => {
-                self.scroll.hint_bottom();
-                Command::none()
-            }
-            ShellOutput::CwdChanged(path) => {
-                self.cwd = path.display().to_string();
-                self.context.set_cwd(path);
-                Command::none()
-            }
-            ShellOutput::CommandFinished { block_id, exit_code, command, output } => {
-                self.context.on_command_finished(command, output, exit_code);
-                // Don't reset focus if the block has an active viewer (e.g. top, less)
-                let has_viewer = self.shell.block_by_id(block_id)
-                    .map(|b| b.view_state.is_some())
-                    .unwrap_or(false);
-                if !has_viewer {
-                    self.set_focus(Focus::Input);
-                }
-                self.scroll.snap_to_bottom();
-                Command::none()
-            }
-            ShellOutput::BlockExited { id } => {
-                if self.focus == Focus::Block(id) {
-                    self.set_focus(Focus::Input);
-                    self.scroll.snap_to_bottom();
-                }
-                Command::none()
-            }
-            ShellOutput::LoadTreeChildren(block_id, path) => {
-                // Spawn async directory listing
-                let path_clone = path.clone();
-                Command::perform(async move {
-                    let mut entries = Vec::new();
-                    if let Ok(read_dir) = std::fs::read_dir(&path_clone) {
-                        for entry in read_dir.flatten() {
-                            if let Ok(file_entry) = nexus_api::FileEntry::from_path(entry.path()) {
-                                entries.push(file_entry);
-                            }
-                        }
-                    }
-                    // Sort alphabetically
-                    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                    NexusMessage::Shell(ShellMsg::TreeChildrenLoaded(block_id, path_clone, entries))
-                })
-            }
-        }
+    /// Split self into (&mut ShellWidget, UpdateContext) for shell updates.
+    fn shell_ctx(&mut self) -> (&mut super::shell::ShellWidget, UpdateContext<'_>) {
+        let ctx = UpdateContext::new(
+            &mut self.scroll,
+            &mut self.focus,
+            &mut self.cwd,
+            &mut self.context,
+        );
+        (&mut self.shell, ctx)
     }
 
-    fn apply_agent_output(&mut self, output: AgentOutput) {
-        match output {
-            AgentOutput::None => {}
-            AgentOutput::ScrollToBottom => {
-                self.scroll.hint_bottom();
-            }
-            AgentOutput::FocusQuestionInput => {
-                self.set_focus(Focus::AgentInput);
-                self.scroll.hint_bottom();
-            }
-        }
-    }
-
-    fn apply_input_output(&mut self, output: InputOutput) -> Command<NexusMessage> {
-        match output {
-            InputOutput::None => Command::none(),
-            InputOutput::Submit { text, is_agent, attachments } => {
-                self.handle_submit(text, is_agent, attachments)
-            }
-        }
+    /// Split self into (&mut AgentWidget, UpdateContext) for agent updates.
+    fn agent_ctx(&mut self) -> (&mut super::agent::AgentWidget, UpdateContext<'_>) {
+        let ctx = UpdateContext::new(
+            &mut self.scroll,
+            &mut self.focus,
+            &mut self.cwd,
+            &mut self.context,
+        );
+        (&mut self.agent, ctx)
     }
 }
 
@@ -126,8 +63,12 @@ impl NexusState {
                 } else {
                     self.scroll.snap_to_bottom();
                 }
-                let (_cmd, output) = self.input.update(m, ctx);
-                self.apply_input_output(output)
+                let submit = self.input.update(m);
+                if let Some(req) = submit {
+                    self.handle_submit(req)
+                } else {
+                    Command::none()
+                }
             }
             NexusMessage::Shell(m) => {
                 // Anchor actions are cross-cutting (clipboard, spawn process)
@@ -135,16 +76,21 @@ impl NexusState {
                     self.exec_anchor_action(action);
                     return Command::none();
                 }
-                let (_cmd, output) = self.shell.update(m, ctx);
-                self.apply_shell_output(output)
+                let (shell, mut uctx) = self.shell_ctx();
+                shell.update(m, &mut uctx, ctx.images);
+                let cmds = uctx.into_commands();
+                sync_focus_flags(&self.focus, &mut self.input, &mut self.agent);
+                cmds
             }
             NexusMessage::Agent(m) => {
                 if matches!(m, super::message::AgentMsg::QuestionInputMouse(_)) {
                     self.set_focus(Focus::AgentInput);
                 }
-                let (_cmd, output) = self.agent.update(m, ctx);
-                self.apply_agent_output(output);
-                Command::none()
+                let (agent, mut uctx) = self.agent_ctx();
+                agent.update(m, &mut uctx);
+                let cmds = uctx.into_commands();
+                sync_focus_flags(&self.focus, &mut self.input, &mut self.agent);
+                cmds
             }
             NexusMessage::Selection(m) => {
                 let (_cmd, _) = self.selection.update(m, ctx);
@@ -229,8 +175,12 @@ impl NexusState {
                 self.set_focus(Focus::Input);
                 self.scroll.snap_to_bottom();
                 if let Some(msg) = self.input.on_key(&event) {
-                    let (_cmd, output) = self.input.update(msg, ctx);
-                    self.apply_input_output(output)
+                    let submit = self.input.update(msg);
+                    if let Some(req) = submit {
+                        self.handle_submit(req)
+                    } else {
+                        Command::none()
+                    }
                 } else {
                     Command::none()
                 }
@@ -253,12 +203,9 @@ impl NexusState {
 // =========================================================================
 
 impl NexusState {
-    fn handle_submit(
-        &mut self,
-        text: String,
-        is_agent: bool,
-        attachments: Vec<Value>,
-    ) -> Command<NexusMessage> {
+    fn handle_submit(&mut self, req: SubmitRequest) -> Command<NexusMessage> {
+        let SubmitRequest { text, is_agent, attachments } = req;
+
         // Short-circuit built-in "clear" before any side effects.
         if !is_agent && text.trim() == "clear" {
             return Command::message(NexusMessage::ClearScreen);
@@ -282,10 +229,14 @@ impl NexusState {
             self.scroll.snap_to_bottom();
         } else {
             let block_id = self.next_id();
-            let output =
-                self.shell
-                    .execute(text, block_id, &self.cwd, &self.kernel, &self.kernel_tx);
-            self.apply_shell_output(output);
+            let kernel = self.kernel.clone();
+            let kernel_tx = self.kernel_tx.clone();
+            let cwd = self.cwd.clone();
+            let (shell, mut uctx) = self.shell_ctx();
+            shell.execute(text, block_id, &cwd, &kernel, &kernel_tx, &mut uctx);
+            let cmds = uctx.into_commands();
+            sync_focus_flags(&self.focus, &mut self.input, &mut self.agent);
+            return cmds;
         }
 
         Command::none()
@@ -663,7 +614,11 @@ impl NexusState {
             ContextMenuItem::Rerun => {
                 if let Some(block) = self.target_shell_block(&target) {
                     let cmd = block.command.clone();
-                    return self.handle_submit(cmd, false, Vec::new());
+                    return self.handle_submit(SubmitRequest {
+                        text: cmd,
+                        is_agent: false,
+                        attachments: Vec::new(),
+                    });
                 }
             }
             ContextMenuItem::QuickLook(path) => {
@@ -700,8 +655,6 @@ impl NexusState {
     }
 }
 
-// =========================================================================
-// Streaming update handler
 // =========================================================================
 // Viewer message handler
 // =========================================================================

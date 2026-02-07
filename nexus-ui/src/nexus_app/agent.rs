@@ -39,19 +39,8 @@ fn build_question_answer(questions: &[UserQuestion], answered_idx: usize, select
     serde_json::json!({ "questions": q_array }).to_string()
 }
 
-/// Typed output from AgentWidget → orchestrator.
-pub(crate) enum AgentOutput {
-    /// Nothing happened.
-    None,
-    /// Orchestrator should scroll history to bottom.
-    ScrollToBottom,
-    /// Orchestrator should set focus to the agent question input.
-    FocusQuestionInput,
-}
-
-impl Default for AgentOutput {
-    fn default() -> Self { Self::None }
-}
+use super::update_context::UpdateContext;
+use crate::blocks::Focus;
 
 /// Manages all agent-related state: agent blocks, streaming, permissions.
 pub(crate) struct AgentWidget {
@@ -307,37 +296,35 @@ impl AgentWidget {
         }
     }
 
-    /// Handle a message, returning commands and cross-cutting output.
-    pub fn update(&mut self, msg: AgentMsg, _ctx: &mut strata::component::Ctx) -> (strata::Command<AgentMsg>, AgentOutput) {
-        let output = match msg {
+    /// Handle a message, applying cross-cutting effects via UpdateContext.
+    pub fn update(&mut self, msg: AgentMsg, uctx: &mut UpdateContext) {
+        match msg {
             AgentMsg::Event(evt) => {
                 self.dirty = true;
-                self.handle_event(evt)
+                self.handle_event(evt, uctx);
             }
-            AgentMsg::ToggleThinking(id) => { self.toggle_thinking(id); AgentOutput::None }
-            AgentMsg::ToggleTool(id, idx) => { self.toggle_tool(id, idx); AgentOutput::None }
-            AgentMsg::ExpandAllTools => { self.expand_all_tools(); AgentOutput::None }
-            AgentMsg::PermissionGrant(block_id, perm_id) => { self.permission_grant(block_id, perm_id); AgentOutput::None }
-            AgentMsg::PermissionGrantSession(block_id, perm_id) => { self.permission_grant_session(block_id, perm_id); AgentOutput::None }
-            AgentMsg::PermissionDeny(block_id, perm_id) => { self.permission_deny(block_id, perm_id); AgentOutput::None }
+            AgentMsg::ToggleThinking(id) => { self.toggle_thinking(id); }
+            AgentMsg::ToggleTool(id, idx) => { self.toggle_tool(id, idx); }
+            AgentMsg::ExpandAllTools => { self.expand_all_tools(); }
+            AgentMsg::PermissionGrant(block_id, perm_id) => { self.permission_grant(block_id, perm_id); }
+            AgentMsg::PermissionGrantSession(block_id, perm_id) => { self.permission_grant_session(block_id, perm_id); }
+            AgentMsg::PermissionDeny(block_id, perm_id) => { self.permission_deny(block_id, perm_id); }
             AgentMsg::UserQuestionAnswer(block_id, tool_use_id, answer_json) => {
                 self.answer_question(block_id, tool_use_id, answer_json);
-                AgentOutput::ScrollToBottom
+                uctx.hint_bottom();
             }
             AgentMsg::QuestionInputKey(event) => {
-                self.handle_question_key(&event)
+                self.handle_question_key(&event, uctx);
             }
             AgentMsg::QuestionInputMouse(action) => {
                 self.question_input.apply_mouse(action);
-                AgentOutput::None
             }
-            AgentMsg::Interrupt => { self.interrupt(); AgentOutput::None }
-        };
-        (strata::Command::none(), output)
+            AgentMsg::Interrupt => { self.interrupt(); }
+        }
     }
 
     /// Handle an agent event from the streaming channel.
-    fn handle_event(&mut self, event: AgentEvent) -> AgentOutput {
+    fn handle_event(&mut self, event: AgentEvent, uctx: &mut UpdateContext) {
         // Handle session ID
         if let AgentEvent::SessionStarted { ref session_id } = event {
             self.session_id = Some(session_id.clone());
@@ -360,7 +347,9 @@ impl AgentWidget {
             // Clear stale text; focus will be set by the orchestrator.
             self.question_input.text.clear();
             self.question_input.cursor = 0;
-            return AgentOutput::FocusQuestionInput;
+            uctx.set_focus(Focus::AgentInput);
+            uctx.hint_bottom();
+            return;
         }
 
         if let Some(block_id) = self.active {
@@ -447,7 +436,7 @@ impl AgentWidget {
             }
         }
 
-        AgentOutput::ScrollToBottom
+        uctx.hint_bottom();
     }
 
     /// Toggle thinking section visibility for a block.
@@ -598,7 +587,7 @@ impl AgentWidget {
     }
 
     /// Handle a key event for the question free-form text input.
-    fn handle_question_key(&mut self, event: &KeyEvent) -> AgentOutput {
+    fn handle_question_key(&mut self, event: &KeyEvent, uctx: &mut UpdateContext) {
         use strata::text_input_state::TextInputAction;
 
         match self.question_input.handle_key(event, false) {
@@ -610,14 +599,12 @@ impl AgentWidget {
                             Self::make_freeform_answer(question, block_id, &text)
                         {
                             self.answer_question(bid, tid, answer);
-                            return AgentOutput::ScrollToBottom;
+                            uctx.hint_bottom();
                         }
                     }
                 }
-                AgentOutput::None
             }
-            TextInputAction::Changed => AgentOutput::None,
-            TextInputAction::Blur | TextInputAction::Noop => AgentOutput::None,
+            TextInputAction::Changed | TextInputAction::Blur | TextInputAction::Noop => {}
         }
     }
 
