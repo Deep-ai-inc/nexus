@@ -192,6 +192,159 @@ impl Block {
     pub fn file_tree(&self) -> Option<&FileTreeState> {
         self.file_tree.as_ref()
     }
+
+    // =========================================================================
+    // Viewer update — handles ViewerMsg by delegating to ViewState methods
+    // =========================================================================
+
+    /// Handle a viewer message. Returns true if the block state changed.
+    /// This encapsulates all viewer state manipulation that was previously
+    /// spread across dispatch_viewer_msg in state_update.rs.
+    pub fn update_viewer(&mut self, msg: &crate::nexus_app::message::ViewerMsg) -> bool {
+        use crate::nexus_app::message::ViewerMsg;
+
+        // Handle SortBy specially (needs mutable access to multiple fields)
+        if let ViewerMsg::SortBy(_, sort) = msg {
+            let changed = self.handle_sort(*sort);
+            if changed {
+                self.version += 1;
+            }
+            return changed;
+        }
+
+        // Pre-compute bounds before borrowing view_state mutably
+        let tree_count = self.tree_node_count();
+        let diff_count = self.diff_file_count();
+
+        let Some(view_state) = &mut self.view_state else {
+            return false;
+        };
+
+        let changed = match msg {
+            ViewerMsg::ScrollUp(_) => view_state.scroll_up(),
+            ViewerMsg::ScrollDown(_) => view_state.scroll_down(),
+            ViewerMsg::PageUp(_) => view_state.page_up(),
+            ViewerMsg::PageDown(_) => view_state.page_down(),
+            ViewerMsg::GoToTop(_) => view_state.go_to_top(),
+            ViewerMsg::GoToBottom(_) => view_state.go_to_bottom(),
+            ViewerMsg::SearchStart(_) | ViewerMsg::SearchNext(_) => {
+                // Search TBD — no-op for now
+                false
+            }
+            ViewerMsg::SortBy(_, _) => unreachable!(), // handled above
+            ViewerMsg::TreeToggle(_) => {
+                let selected = view_state.tree_selected();
+                view_state.tree_toggle(selected)
+            }
+            ViewerMsg::TreeUp(_) => view_state.tree_up(),
+            ViewerMsg::TreeDown(_) => view_state.tree_down(tree_count),
+            ViewerMsg::DiffNextFile(_) => view_state.diff_next_file(diff_count),
+            ViewerMsg::DiffPrevFile(_) => view_state.diff_prev_file(),
+            ViewerMsg::DiffToggleFile(_) => view_state.diff_toggle_file(),
+            ViewerMsg::Exit(_) => {
+                // Exit is handled specially by the caller (needs side effects)
+                return false;
+            }
+        };
+
+        if changed {
+            self.version += 1;
+        }
+        changed
+    }
+
+    /// Handle process monitor sort. Returns true if the state changed.
+    fn handle_sort(&mut self, sort: ProcSort) -> bool {
+        if let Some(ViewState::ProcessMonitor { ref mut sort_by, ref mut sort_desc, .. }) =
+            self.view_state
+        {
+            if *sort_by == sort {
+                *sort_desc = !*sort_desc;
+            } else {
+                *sort_by = sort;
+                *sort_desc = true;
+            }
+
+            // Map ProcSort to column index (%CPU=2, %MEM=3, PID=1, Command=10)
+            let col_idx = match sort {
+                ProcSort::Cpu => 2,
+                ProcSort::Mem => 3,
+                ProcSort::Pid => 1,
+                ProcSort::Command => 10,
+            };
+            let ascending = !*sort_desc;
+
+            self.table_sort = TableSort {
+                column: Some(col_idx),
+                ascending,
+            };
+
+            // Re-sort current data
+            Self::sort_table_rows(&mut self.native_output, col_idx, ascending);
+            Self::sort_table_rows(&mut self.stream_latest, col_idx, ascending);
+
+            return true;
+        }
+        false
+    }
+
+    /// Sort rows in a table Value (if it is a Table).
+    fn sort_table_rows(value: &mut Option<Value>, col_idx: usize, ascending: bool) {
+        if let Some(Value::Table { rows, .. }) = value {
+            rows.sort_by(|a, b| {
+                let va = a.get(col_idx);
+                let vb = b.get(col_idx);
+                let cmp = match (va, vb) {
+                    // Compare numeric values
+                    (Some(Value::Int(na)), Some(Value::Int(nb))) => na.cmp(nb),
+                    (Some(Value::Float(na)), Some(Value::Float(nb))) => {
+                        na.partial_cmp(nb).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    (Some(Value::Int(na)), Some(Value::Float(nb))) => {
+                        (*na as f64).partial_cmp(nb).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    (Some(Value::Float(na)), Some(Value::Int(nb))) => {
+                        na.partial_cmp(&(*nb as f64)).unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                    // Fall back to text comparison
+                    (Some(a), Some(b)) => a.to_text().cmp(&b.to_text()),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+                if ascending { cmp } else { cmp.reverse() }
+            });
+        }
+    }
+
+    /// Count tree nodes for TreeBrowser navigation bounds.
+    fn tree_node_count(&self) -> usize {
+        use nexus_api::DomainValue;
+        self.native_output
+            .as_ref()
+            .and_then(|v| {
+                if let Some(DomainValue::Tree(tree)) = v.as_domain() {
+                    Some(tree.nodes.len())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Count diff files for DiffViewer navigation bounds.
+    fn diff_file_count(&self) -> usize {
+        self.native_output
+            .as_ref()
+            .and_then(|v| {
+                if let Value::List(items) = v {
+                    Some(items.len())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
 }
 
 impl PartialEq for Block {
@@ -357,6 +510,172 @@ impl ViewState {
                 Key::Character(c) if c == "q" => Some(ViewerMsg::Exit(id)),
                 _ => None,
             },
+        }
+    }
+
+    // =========================================================================
+    // Scroll/navigation methods — encapsulate viewer state manipulation
+    // =========================================================================
+
+    /// Scroll up by one line. Returns true if the state changed.
+    pub fn scroll_up(&mut self) -> bool {
+        match self {
+            ViewState::Pager { scroll_line, .. }
+            | ViewState::DiffViewer { scroll_line, .. } => {
+                *scroll_line = scroll_line.saturating_sub(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Scroll down by one line. Returns true if the state changed.
+    pub fn scroll_down(&mut self) -> bool {
+        match self {
+            ViewState::Pager { scroll_line, .. }
+            | ViewState::DiffViewer { scroll_line, .. } => {
+                *scroll_line += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Page up (30 lines). Returns true if the state changed.
+    pub fn page_up(&mut self) -> bool {
+        match self {
+            ViewState::Pager { scroll_line, .. }
+            | ViewState::DiffViewer { scroll_line, .. } => {
+                *scroll_line = scroll_line.saturating_sub(30);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Page down (30 lines). Returns true if the state changed.
+    pub fn page_down(&mut self) -> bool {
+        match self {
+            ViewState::Pager { scroll_line, .. }
+            | ViewState::DiffViewer { scroll_line, .. } => {
+                *scroll_line += 30;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Go to top (line 0). Returns true if the state changed.
+    pub fn go_to_top(&mut self) -> bool {
+        match self {
+            ViewState::Pager { scroll_line, .. }
+            | ViewState::DiffViewer { scroll_line, .. } => {
+                *scroll_line = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Go to bottom (max line). Returns true if the state changed.
+    pub fn go_to_bottom(&mut self) -> bool {
+        match self {
+            ViewState::Pager { scroll_line, .. }
+            | ViewState::DiffViewer { scroll_line, .. } => {
+                // Set to a very large value; rendering will clamp
+                *scroll_line = usize::MAX / 2;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Toggle tree node collapse. Returns true if the state changed.
+    pub fn tree_toggle(&mut self, selected_idx: Option<usize>) -> bool {
+        if let ViewState::TreeBrowser { collapsed, .. } = self {
+            if let Some(sel) = selected_idx {
+                if collapsed.contains(&sel) {
+                    collapsed.remove(&sel);
+                } else {
+                    collapsed.insert(sel);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move tree selection up. Returns true if the state changed.
+    pub fn tree_up(&mut self) -> bool {
+        if let ViewState::TreeBrowser { selected, .. } = self {
+            if let Some(sel) = selected {
+                *sel = sel.saturating_sub(1);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Move tree selection down. Returns true if the state changed.
+    pub fn tree_down(&mut self, node_count: usize) -> bool {
+        if let ViewState::TreeBrowser { selected, .. } = self {
+            if let Some(sel) = selected {
+                if *sel + 1 < node_count {
+                    *sel += 1;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Move to next diff file. Returns true if the state changed.
+    pub fn diff_next_file(&mut self, file_count: usize) -> bool {
+        if let ViewState::DiffViewer { current_file, .. } = self {
+            if *current_file + 1 < file_count {
+                *current_file += 1;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Move to previous diff file. Returns true if the state changed.
+    pub fn diff_prev_file(&mut self) -> bool {
+        if let ViewState::DiffViewer { current_file, .. } = self {
+            *current_file = current_file.saturating_sub(1);
+            return true;
+        }
+        false
+    }
+
+    /// Toggle diff file collapse. Returns true if the state changed.
+    pub fn diff_toggle_file(&mut self) -> bool {
+        if let ViewState::DiffViewer { current_file, collapsed_indices, .. } = self {
+            let idx = *current_file;
+            if !collapsed_indices.remove(&idx) {
+                collapsed_indices.insert(idx);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Get the selected tree node index (for TreeBrowser).
+    pub fn tree_selected(&self) -> Option<usize> {
+        if let ViewState::TreeBrowser { selected, .. } = self {
+            *selected
+        } else {
+            None
+        }
+    }
+
+    /// Get the current file index (for DiffViewer).
+    pub fn diff_current_file(&self) -> Option<usize> {
+        if let ViewState::DiffViewer { current_file, .. } = self {
+            Some(*current_file)
+        } else {
+            None
         }
     }
 }

@@ -234,6 +234,30 @@ pub enum ViewerMsg {
     Exit(BlockId),
 }
 
+impl ViewerMsg {
+    /// Extract the block ID from any viewer message.
+    pub fn block_id(&self) -> BlockId {
+        match self {
+            ViewerMsg::ScrollUp(id)
+            | ViewerMsg::ScrollDown(id)
+            | ViewerMsg::PageUp(id)
+            | ViewerMsg::PageDown(id)
+            | ViewerMsg::GoToTop(id)
+            | ViewerMsg::GoToBottom(id)
+            | ViewerMsg::SearchStart(id)
+            | ViewerMsg::SearchNext(id)
+            | ViewerMsg::SortBy(id, _)
+            | ViewerMsg::TreeToggle(id)
+            | ViewerMsg::TreeUp(id)
+            | ViewerMsg::TreeDown(id)
+            | ViewerMsg::DiffNextFile(id)
+            | ViewerMsg::DiffPrevFile(id)
+            | ViewerMsg::DiffToggleFile(id)
+            | ViewerMsg::Exit(id) => *id,
+        }
+    }
+}
+
 // =========================================================================
 // Context menu messages
 // =========================================================================

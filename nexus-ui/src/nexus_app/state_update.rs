@@ -1,11 +1,9 @@
 //! Message dispatch and domain handlers for NexusState.
 
-use nexus_api::{DomainValue, Value, TableColumn};
+use nexus_api::{Value, TableColumn};
 use strata::Command;
 
-
-
-use crate::blocks::{Focus, ViewState, ProcSort};
+use crate::blocks::Focus;
 
 use super::context_menu::{ContextMenuItem, ContextTarget};
 use super::drag_state::{ActiveKind, DragStatus, PendingIntent};
@@ -785,206 +783,26 @@ impl NexusState {
 // =========================================================================
 
 impl NexusState {
+    /// Dispatch a viewer message to the appropriate block.
+    /// Viewer logic is encapsulated in Block::update_viewer().
     fn dispatch_viewer_msg(&mut self, msg: ViewerMsg) {
-        match msg {
-            ViewerMsg::ScrollUp(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    let scrolled = match &mut block.view_state {
-                        Some(ViewState::Pager { scroll_line, .. })
-                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
-                            *scroll_line = scroll_line.saturating_sub(1);
-                            true
-                        }
-                        _ => false,
-                    };
-                    if scrolled { block.version += 1; }
-                }
+        // Exit is special — has side effects beyond block state
+        if let ViewerMsg::Exit(id) = msg {
+            // Cancel directly via the free function — does NOT require the kernel
+            // mutex, which may be held by the command's blocking loop (e.g. top).
+            nexus_kernel::commands::cancel_block(id);
+            if let Some(block) = self.shell.block_by_id_mut(id) {
+                block.view_state = None;
+                block.version += 1;
             }
-            ViewerMsg::ScrollDown(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    let scrolled = match &mut block.view_state {
-                        Some(ViewState::Pager { scroll_line, .. })
-                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
-                            *scroll_line += 1;
-                            true
-                        }
-                        _ => false,
-                    };
-                    if scrolled { block.version += 1; }
-                }
-            }
-            ViewerMsg::PageUp(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    let scrolled = match &mut block.view_state {
-                        Some(ViewState::Pager { scroll_line, .. })
-                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
-                            *scroll_line = scroll_line.saturating_sub(30);
-                            true
-                        }
-                        _ => false,
-                    };
-                    if scrolled { block.version += 1; }
-                }
-            }
-            ViewerMsg::PageDown(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    let scrolled = match &mut block.view_state {
-                        Some(ViewState::Pager { scroll_line, .. })
-                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
-                            *scroll_line += 30;
-                            true
-                        }
-                        _ => false,
-                    };
-                    if scrolled { block.version += 1; }
-                }
-            }
-            ViewerMsg::GoToTop(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    let scrolled = match &mut block.view_state {
-                        Some(ViewState::Pager { scroll_line, .. })
-                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
-                            *scroll_line = 0;
-                            true
-                        }
-                        _ => false,
-                    };
-                    if scrolled { block.version += 1; }
-                }
-            }
-            ViewerMsg::GoToBottom(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    let scrolled = match &mut block.view_state {
-                        Some(ViewState::Pager { scroll_line, .. })
-                        | Some(ViewState::DiffViewer { scroll_line, .. }) => {
-                            // Set to a very large value; rendering will clamp
-                            *scroll_line = usize::MAX / 2;
-                            true
-                        }
-                        _ => false,
-                    };
-                    if scrolled { block.version += 1; }
-                }
-            }
-            ViewerMsg::SearchStart(_id) | ViewerMsg::SearchNext(_id) => {
-                // Search TBD — no-op for now
-            }
-            ViewerMsg::SortBy(id, sort) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::ProcessMonitor { ref mut sort_by, ref mut sort_desc, .. }) = block.view_state {
-                        if *sort_by == sort {
-                            *sort_desc = !*sort_desc;
-                        } else {
-                            *sort_by = sort;
-                            *sort_desc = true;
-                        }
-                        // Map ProcSort to column index (%CPU=2, %MEM=3, PID=1)
-                        let col_idx = match sort {
-                            ProcSort::Cpu => 2,
-                            ProcSort::Mem => 3,
-                            ProcSort::Pid => 1,
-                            ProcSort::Command => 10,
-                        };
-                        let ascending = !*sort_desc;
-                        block.table_sort = crate::blocks::TableSort {
-                            column: Some(col_idx),
-                            ascending,
-                        };
-                        // Re-sort current data
-                        if let Some(Value::Table { ref mut rows, .. }) = block.native_output {
-                            super::shell::ShellWidget::sort_rows(rows, col_idx, ascending);
-                        }
-                        if let Some(Value::Table { ref mut rows, .. }) = block.stream_latest {
-                            super::shell::ShellWidget::sort_rows(rows, col_idx, ascending);
-                        }
-                        block.version += 1;
-                    }
-                }
-            }
-            ViewerMsg::TreeToggle(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::TreeBrowser { ref mut collapsed, ref selected, .. }) = block.view_state {
-                        if let Some(sel) = selected {
-                            if collapsed.contains(sel) {
-                                collapsed.remove(sel);
-                            } else {
-                                collapsed.insert(*sel);
-                            }
-                            block.version += 1;
-                        }
-                    }
-                }
-            }
-            ViewerMsg::TreeUp(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::TreeBrowser { selected, .. }) = &mut block.view_state {
-                        if let Some(sel) = selected {
-                            *sel = sel.saturating_sub(1);
-                        }
-                        block.version += 1;
-                    }
-                }
-            }
-            ViewerMsg::TreeDown(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    let node_count = block.native_output.as_ref().map(|v| {
-                        if let Some(DomainValue::Tree(tree)) = v.as_domain() { tree.nodes.len() } else { 0 }
-                    }).unwrap_or(0);
-                    if let Some(ViewState::TreeBrowser { selected, .. }) = &mut block.view_state {
-                        if let Some(sel) = selected {
-                            if *sel + 1 < node_count {
-                                *sel += 1;
-                            }
-                        }
-                        block.version += 1;
-                    }
-                }
-            }
-            ViewerMsg::DiffNextFile(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::DiffViewer { current_file, .. }) = &mut block.view_state {
-                        // Count diff files in content
-                        let file_count = block.native_output.as_ref()
-                            .and_then(|v| if let Value::List(items) = v { Some(items.len()) } else { None })
-                            .unwrap_or(0);
-                        if *current_file + 1 < file_count {
-                            *current_file += 1;
-                        }
-                        block.version += 1;
-                    }
-                }
-            }
-            ViewerMsg::DiffPrevFile(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::DiffViewer { current_file, .. }) = &mut block.view_state {
-                        *current_file = current_file.saturating_sub(1);
-                        block.version += 1;
-                    }
-                }
-            }
-            ViewerMsg::DiffToggleFile(id) => {
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    if let Some(ViewState::DiffViewer { current_file, collapsed_indices, .. }) =
-                        &mut block.view_state
-                    {
-                        let idx = *current_file;
-                        if !collapsed_indices.remove(&idx) {
-                            collapsed_indices.insert(idx);
-                        }
-                        block.version += 1;
-                    }
-                }
-            }
-            ViewerMsg::Exit(id) => {
-                // Cancel directly via the free function — does NOT require the kernel
-                // mutex, which may be held by the command's blocking loop (e.g. top).
-                nexus_kernel::commands::cancel_block(id);
-                if let Some(block) = self.shell.block_by_id_mut(id) {
-                    block.view_state = None;
-                    block.version += 1;
-                }
-                self.set_focus(Focus::Input);
-            }
+            self.set_focus(Focus::Input);
+            return;
+        }
+
+        // All other messages delegate to Block::update_viewer()
+        let block_id = msg.block_id();
+        if let Some(block) = self.shell.block_by_id_mut(block_id) {
+            block.update_viewer(&msg);
         }
     }
 }
