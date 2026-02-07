@@ -6,7 +6,9 @@
 mod view_context;
 mod shell_block;
 mod tool;
+mod value_renderer;
 
 pub(crate) use view_context::ViewContext;
 pub use shell_block::{ShellBlockWidget, ShellBlockMessage};
 pub use tool::{ToolWidget, ToolMessage};
+pub(crate) use value_renderer::{render_native_value, term_color_to_strata, is_anchor_value, format_eta};
