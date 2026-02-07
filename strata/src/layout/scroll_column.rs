@@ -637,6 +637,11 @@ fn compute_child_width_for_scroll(child: &LayoutChild<'_>, content_width: f32) -
             Length::Fill | Length::FillPortion(_) => content_width,
             Length::Shrink => s.measure().width.min(content_width),
         },
+        LayoutChild::Canvas(c) => match c.width_length() {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => c.measure().width.min(content_width),
+        },
         LayoutChild::Spacer { .. } | LayoutChild::FixedSpacer { .. } => 0.0,
     }
 }

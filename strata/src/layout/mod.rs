@@ -28,6 +28,8 @@ pub mod row;             // Row
 pub mod column;          // Column
 pub mod text_input;      // TextInputElement
 pub mod table;           // TableElement, VirtualTableElement
+pub mod canvas;          // Canvas (custom drawing)
+pub mod list_view;       // ListView (virtualized list)
 pub mod child;           // LayoutChild enum (central switchboard)
 
 // Re-export core types
@@ -50,6 +52,8 @@ pub use row::Row;
 pub use column::Column;
 pub use text_input::TextInputElement;
 pub use table::{TableElement, TableColumn, TableCell, VirtualTableElement, VirtualCell};
+pub use canvas::Canvas;
+pub use list_view::ListView;
 pub use primitives::{LineStyle, PrimitiveBatch};
 
 // =========================================================================

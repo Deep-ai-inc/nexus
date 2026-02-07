@@ -22,8 +22,8 @@ use crate::layout_snapshot::HitResult;
 use crate::primitives::{Color, Point, Rect};
 use crate::layout::{LayoutConstraints, LayoutContext};
 use crate::{
-    AppConfig, ButtonElement, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
-    ImageStore, LayoutSnapshot, Length, LineStyle, MouseResponse, Padding, Row, ScrollAction,
+    AppConfig, ButtonElement, Canvas, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
+    ImageStore, LayoutSnapshot, Length, LineStyle, ListView, MouseResponse, Padding, Row, ScrollAction,
     ScrollColumn, ScrollState, Selection, StrataApp, Subscription, TableCell, TableElement,
     TextElement, TextInputAction, TextInputElement, TextInputMouseAction, TextInputState,
 };
@@ -223,13 +223,15 @@ fn hover_button(id: SourceId, label: &str, bg: Color, hovered: Option<SourceId>)
 ///
 /// Returns a concrete `Column` — no trait objects, no heap allocation.
 /// The caller pushes this into the parent container.
-fn chat_bubble(item: &ChatItem) -> Column<'_> {
+/// Build a chat bubble for an item. Clones strings to return 'static Column.
+fn chat_bubble_owned(item: &ChatItem) -> Column<'static> {
     let (role_color, text_color) = if item.role == "user" {
         (colors::SUCCESS, colors::TEXT_PRIMARY)
     } else {
         (colors::RUNNING, colors::TEXT_SECONDARY)
     };
 
+    let source = item.source;
     let mut card = Column::new()
         .padding(10.0)
         .spacing(4.0)
@@ -240,8 +242,8 @@ fn chat_bubble(item: &ChatItem) -> Column<'_> {
 
     for line in item.text.lines() {
         card = card.push(
-            TextElement::new(line)
-                .source(item.source)
+            TextElement::new(line.to_string())
+                .source(source)
                 .color(text_color),
         );
     }
@@ -267,62 +269,6 @@ fn chat_item_height(item: &ChatItem) -> f32 {
     let body_height = line_count * LINE_HEIGHT;
     let body_spacing = (line_count - 1.0).max(0.0) * inner_spacing;
     padding + role_height + inner_spacing + body_height + body_spacing
-}
-
-/// Compute the visible range and spacer heights for a virtualized list.
-///
-/// Returns `(first_index, last_index, top_spacer_px, bottom_spacer_px)`.
-/// The caller should lay out `items[first..last]` and insert fixed spacers
-/// for the skipped regions to preserve total content height.
-///
-/// `content_above` is the estimated height of scroll column children that
-/// appear before the chat list (image, shell block, etc.).
-fn virtualize_chat(
-    items: &[ChatItem],
-    scroll_offset: f32,
-    viewport_height: f32,
-    spacing: f32,
-) -> (usize, usize, f32, f32) {
-    if items.is_empty() || viewport_height <= 0.0 {
-        return (0, 0, 0.0, 0.0);
-    }
-
-    // Extra items rendered above/below viewport to prevent pop-in
-    const OVERSCAN: usize = 3;
-
-    // Compute all item heights upfront (cheap: just counts newlines)
-    let heights: Vec<f32> = items.iter().map(|item| chat_item_height(item)).collect();
-
-    let mut y = 0.0_f32;
-    let mut first = items.len();
-    let mut last = items.len();
-
-    for (i, h) in heights.iter().enumerate() {
-        let item_bottom = y + h;
-
-        // First item whose bottom edge is past the scroll top
-        if first == items.len() && item_bottom > scroll_offset {
-            first = i.saturating_sub(OVERSCAN);
-        }
-
-        // First item whose top edge is past the scroll bottom
-        if first != items.len() && y > scroll_offset + viewport_height {
-            last = (i + OVERSCAN).min(items.len());
-            break;
-        }
-
-        y += h + spacing;
-    }
-
-    let first = first.min(items.len());
-
-    // Spacer heights from precomputed per-item heights
-    let top_spacer: f32 = heights[..first].iter().sum::<f32>()
-        + if first > 0 { first as f32 * spacing } else { 0.0 };
-    let bottom_spacer: f32 = heights[last..].iter().sum::<f32>()
-        + if last < items.len() { (items.len() - last) as f32 * spacing } else { 0.0 };
-
-    (first, last, top_spacer, bottom_spacer)
 }
 
 /// Generate N demo chat items with realistic variety.
@@ -602,47 +548,26 @@ impl StrataApp for DemoApp {
         let hovered = state.hovered_widget.get();
 
         // =================================================================
-        // BUILD VIRTUALIZED CHAT LIST
+        // BUILD VIRTUALIZED CHAT LIST (using ListView)
         // =================================================================
-        // Only lay out items visible in the scroll viewport. Items above
-        // and below are replaced by fixed spacers to preserve total height
-        // and correct scrollbar proportions. O(n) height scan, O(visible)
-        // layout — scales to thousands of items.
+        // ListView handles virtualization internally: only visible items
+        // are laid out, with automatic spacers for off-screen items.
 
         let chat_spacing = 8.0;
-
-        // Use previous frame's measured position of the chat list within
-        // the scroll column's content space. Avoids hardcoded magic numbers
-        // that break when content above the chat list changes.
         let chat_scroll = (state.left_scroll.offset - state.chat_content_top.get()).max(0.0);
+        let viewport_height = state.left_scroll.bounds.get().height;
 
-        // Compute visible range using scroll state from previous frame.
-        let (first, last, top_spacer, bottom_spacer) = virtualize_chat(
+        let chat_col = ListView::new(
             &state.chat_history,
-            chat_scroll,
-            state.left_scroll.bounds.get().height,
-            chat_spacing,
-        );
-
-        let mut chat_col = Column::new()
-            .spacing(chat_spacing)
-            .width(Length::Fill)
-            .id(SourceId::named("chat_list"));
-
-        // Top spacer replaces items above the viewport
-        if top_spacer > 0.0 {
-            chat_col = chat_col.fixed_spacer(top_spacer);
-        }
-
-        // Only lay out visible items (uses chat_bubble component function)
-        for item in &state.chat_history[first..last] {
-            chat_col = chat_col.push(chat_bubble(item));
-        }
-
-        // Bottom spacer replaces items below the viewport
-        if bottom_spacer > 0.0 {
-            chat_col = chat_col.fixed_spacer(bottom_spacer);
-        }
+            chat_item_height,
+            |item, _idx| chat_bubble_owned(item).into(),
+        )
+        .spacing(chat_spacing)
+        .scroll_offset(chat_scroll)
+        .viewport_height(viewport_height)
+        .width(Length::Fill)
+        .id(SourceId::named("chat_list"))
+        .build();
 
         // =================================================================
         // MAIN LAYOUT: Row with two columns
@@ -786,20 +711,19 @@ impl StrataApp for DemoApp {
                                 hovered,
                             )),
                     )
-                    // Context menu placeholder
+                    // Context menu (drawn inline via Canvas)
                     .push(
-                        Column::new()
+                        Canvas::new(draw_context_menu)
                             .width(Length::Fill)
-                            .height(Length::Fixed(194.0))
-                            .id(SourceId::named("ctx_menu")),
+                            .height(Length::Fixed(194.0)),
                     )
-                    // Drawing styles placeholder
-                    .push(
-                        Column::new()
+                    // Drawing styles with animation (drawn inline via Canvas)
+                    .push({
+                        let anim_t = now.duration_since(state.start_time).as_secs_f32();
+                        Canvas::new(move |bounds, p| draw_line_styles(bounds, p, anim_t))
                             .width(Length::Fill)
                             .height(Length::Fixed(180.0))
-                            .id(SourceId::named("draw_styles")),
-                    )
+                    })
                     // Table
                     .push(Card::new("Table").push(table))
             });
@@ -820,19 +744,6 @@ impl StrataApp for DemoApp {
             let scroll_bounds = state.left_scroll.bounds.get();
             let content_top = chat_bounds.y - scroll_bounds.y + state.left_scroll.offset;
             state.chat_content_top.set(content_top);
-        }
-
-        // =================================================================
-        // POST-LAYOUT: Render primitives into placeholder positions
-        // =================================================================
-        let anim_t = now.duration_since(state.start_time).as_secs_f32();
-
-        if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("ctx_menu")) {
-            view_context_menu(snapshot, bounds.x, bounds.y);
-        }
-
-        if let Some(bounds) = snapshot.widget_bounds(&SourceId::named("draw_styles")) {
-            view_drawing_styles(snapshot, bounds.x, bounds.y, bounds.width, anim_t);
         }
 
         // FPS counter (top-right corner)
@@ -975,14 +886,17 @@ impl StrataApp for DemoApp {
 }
 
 // =========================================================================
-// Overlay: Context Menu (absolute positioned)
+// Canvas Drawers: Context Menu
 // =========================================================================
 
-fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
+use crate::layout::PrimitiveBatch;
+
+/// Draw a context menu - used as a Canvas closure.
+fn draw_context_menu(bounds: Rect, p: &mut PrimitiveBatch) {
+    let x = bounds.x;
+    let y = bounds.y;
     let w = 180.0;
     let h = 150.0;
-
-    let p = snapshot.primitives_mut();
 
     p.add_text("Context Menu", Point::new(x, y), colors::TEXT_SECONDARY, 14.0);
 
@@ -1044,11 +958,14 @@ fn view_context_menu(snapshot: &mut LayoutSnapshot, x: f32, y: f32) {
 }
 
 // =========================================================================
-// Overlay: Drawing Styles (lines, curves, polylines)
+// Canvas Drawers: Drawing Styles (lines, curves, polylines)
 // =========================================================================
 
-fn view_drawing_styles(snapshot: &mut LayoutSnapshot, x: f32, y: f32, width: f32, time: f32) {
-    let p = snapshot.primitives_mut();
+/// Draw line style examples with animation - used as a Canvas closure.
+fn draw_line_styles(bounds: Rect, p: &mut PrimitiveBatch, time: f32) {
+    let x = bounds.x;
+    let y = bounds.y;
+    let width = bounds.width;
 
     p.add_rounded_rect(Rect::new(x, y, width, 180.0), 6.0, colors::BG_BLOCK);
     p.add_text("Drawing Styles", Point::new(x + 10.0, y + 6.0), colors::TEXT_SECONDARY, 14.0);

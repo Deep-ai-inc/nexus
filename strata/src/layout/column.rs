@@ -635,6 +635,11 @@ fn measure_child_height(child: &LayoutChild<'_>, content_width: f32) -> (f32, f3
             Length::Fill | Length::FillPortion(_) => (0.0, s.height.flex()),
             Length::Shrink => (s.measure().height, 0.0),
         },
+        LayoutChild::Canvas(c) => match c.height_length() {
+            Length::Fixed(px) => (px, 0.0),
+            Length::Fill | Length::FillPortion(_) => (0.0, c.height_length().flex()),
+            Length::Shrink => (c.measure().height, 0.0),
+        },
         LayoutChild::Spacer { flex } => (0.0, *flex),
         LayoutChild::FixedSpacer { size } => (*size, 0.0),
     }
@@ -671,6 +676,11 @@ fn compute_child_width(child: &LayoutChild<'_>, content_width: f32) -> f32 {
             Length::Fixed(px) => px,
             Length::Fill | Length::FillPortion(_) => content_width,
             Length::Shrink => s.measure().width.min(content_width),
+        },
+        LayoutChild::Canvas(c) => match c.width_length() {
+            Length::Fixed(px) => px,
+            Length::Fill | Length::FillPortion(_) => content_width,
+            Length::Shrink => c.measure().width.min(content_width),
         },
         LayoutChild::Spacer { .. } | LayoutChild::FixedSpacer { .. } => 0.0,
     }

@@ -35,6 +35,7 @@ use super::row::Row;
 use super::column::Column;
 use super::text_input::{TextInputElement, render_text_input, render_text_input_multiline};
 use super::table::{TableElement, VirtualTableElement, render_table, render_virtual_table};
+use super::canvas::Canvas;
 
 // =========================================================================
 // Type Alias for Clean User Code
@@ -113,6 +114,9 @@ pub enum LayoutChild<'a> {
 
     /// A flow container (wrapping inline layout, like CSS flex-wrap).
     Flow(FlowContainer<'a>),
+
+    /// A canvas for custom primitive drawing.
+    Canvas(Canvas<'a>),
 }
 
 // =========================================================================
@@ -149,6 +153,7 @@ impl<'a> LayoutChild<'a> {
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
             LayoutChild::Flow(f) => f.measure(),
+            LayoutChild::Canvas(c) => c.measure(),
             LayoutChild::Spacer { .. } => return 0.0,
             LayoutChild::FixedSpacer { size } => return *size,
         };
@@ -169,6 +174,7 @@ impl<'a> LayoutChild<'a> {
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
             LayoutChild::Flow(f) => f.measure(),
+            LayoutChild::Canvas(c) => c.measure(),
             LayoutChild::Spacer { .. } => return 0.0,
             LayoutChild::FixedSpacer { .. } => return 0.0,
         };
@@ -197,6 +203,9 @@ impl<'a> LayoutChild<'a> {
             LayoutChild::Flow(f) => {
                 if is_column { 0.0 } else { f.width.flex() }
             }
+            LayoutChild::Canvas(c) => {
+                if is_column { c.height_length().flex() } else { c.width_length().flex() }
+            }
             _ => 0.0,
         }
     }
@@ -215,6 +224,7 @@ impl<'a> LayoutChild<'a> {
             LayoutChild::Row(r) => r.measure(),
             LayoutChild::ScrollColumn(s) => s.measure(),
             LayoutChild::Flow(f) => f.measure(),
+            LayoutChild::Canvas(c) => c.measure(),
             LayoutChild::Spacer { .. } => Size::new(0.0, 0.0),
             LayoutChild::FixedSpacer { size } => Size::new(*size, *size),
         }
@@ -228,6 +238,7 @@ impl<'a> LayoutChild<'a> {
             LayoutChild::ScrollColumn(s) => if is_column { s.height } else { s.width },
             LayoutChild::TextInput(t) => if is_column { t.height } else { t.width },
             LayoutChild::Flow(f) => if is_column { Length::Shrink } else { f.width },
+            LayoutChild::Canvas(c) => if is_column { c.height_length() } else { c.width_length() },
             LayoutChild::Spacer { flex } => Length::FillPortion((*flex * 100.0) as u16),
             LayoutChild::FixedSpacer { size } => Length::Fixed(*size),
             _ => Length::Shrink,
@@ -312,6 +323,14 @@ impl<'a> LayoutChild<'a> {
                 7u64.wrapping_mul(0x9e3779b9)
                     .wrapping_add(f.content_hash())
             }
+            LayoutChild::Canvas(c) => {
+                // Canvas: hash based on width/height lengths (closure is opaque)
+                let w = hash_length(&c.width_length());
+                let h = hash_length(&c.height_length());
+                8u64.wrapping_mul(0x9e3779b9)
+                    .wrapping_add(w)
+                    .wrapping_add(h)
+            }
         }
     }
 
@@ -376,6 +395,21 @@ impl<'a> LayoutChild<'a> {
                 let w = size.width.min(constraints.max_width);
                 render_virtual_table(ctx.snapshot, table, origin.x, origin.y, w, size.height);
                 Size::new(w, size.height)
+            }
+            LayoutChild::Canvas(canvas) => {
+                let size = canvas.measure();
+                let w = match canvas.width_length() {
+                    Length::Fill | Length::FillPortion(_) => constraints.max_width,
+                    Length::Fixed(px) => px,
+                    Length::Shrink => size.width,
+                };
+                let h = match canvas.height_length() {
+                    Length::Fill | Length::FillPortion(_) => constraints.max_height,
+                    Length::Fixed(px) => px,
+                    Length::Shrink => size.height,
+                };
+                canvas.render(ctx.snapshot, origin.x, origin.y, w, h);
+                Size::new(w, h)
             }
             LayoutChild::Spacer { .. } => Size::ZERO,
             LayoutChild::FixedSpacer { size } => Size::new(0.0, size),
@@ -542,6 +576,10 @@ impl<'a> From<VirtualTableElement> for LayoutChild<'a> {
 
 impl<'a> From<FlowContainer<'a>> for LayoutChild<'a> {
     fn from(v: FlowContainer<'a>) -> Self { Self::Flow(v) }
+}
+
+impl<'a> From<Canvas<'a>> for LayoutChild<'a> {
+    fn from(v: Canvas<'a>) -> Self { Self::Canvas(v) }
 }
 
 // =========================================================================
