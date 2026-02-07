@@ -1,11 +1,10 @@
 //! Selection widget — owns selection state and text extraction logic.
 
-use std::collections::HashMap;
-
 use nexus_api::BlockId;
 
 use crate::agent_block::AgentBlock;
 use crate::blocks::{Block, UnifiedBlockRef};
+use super::block_manager::BlockManager;
 use super::context_menu::ContextTarget;
 use super::drag_state::PendingIntent;
 use super::message::{DragMsg, NexusMessage, SelectionMsg};
@@ -163,17 +162,15 @@ impl SelectionWidget {
 
 /// Extract all text from a specific block (for context menu Copy).
 pub(crate) fn extract_block_text(
-    blocks: &[Block],
-    block_index: &HashMap<BlockId, usize>,
+    bm: &BlockManager,
     agent_blocks: &[AgentBlock],
-    agent_block_index: &HashMap<BlockId, usize>,
+    agent_block_index: &std::collections::HashMap<BlockId, usize>,
     input_text: &str,
     target: &ContextTarget,
 ) -> Option<String> {
     match target {
         ContextTarget::Block(block_id) => {
-            let idx = block_index.get(block_id)?;
-            let block = blocks.get(*idx)?;
+            let block = bm.get(*block_id)?;
 
             // If the block has native output, convert it to text
             if let Some(ref value) = block.native_output {

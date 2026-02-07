@@ -12,6 +12,8 @@ pub(crate) mod completion;
 pub(crate) mod history_search;
 pub(crate) mod input;
 pub(crate) mod selection;
+pub(crate) mod block_manager;
+pub(crate) mod jobs;
 pub(crate) mod pty_backend;
 pub(crate) mod shell;
 pub(crate) mod agent;
@@ -422,7 +424,7 @@ impl NexusState {
 
     /// Get the command string of the most recent running block (kernel or PTY).
     fn last_running_command(&self) -> Option<String> {
-        self.shell.blocks.iter().rev()
+        self.shell.bm.blocks.iter().rev()
             .find(|b| b.is_running())
             .map(|b| b.command.clone())
     }

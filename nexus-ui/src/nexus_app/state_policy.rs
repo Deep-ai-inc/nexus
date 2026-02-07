@@ -53,18 +53,18 @@ impl NexusState {
     /// All block IDs (shell + agent) in display order (ascending BlockId).
     /// Single source of truth used by both navigation and layout.
     pub(super) fn all_block_ids_ordered(&self) -> Vec<nexus_api::BlockId> {
-        let mut ids = Vec::with_capacity(self.shell.blocks.len() + self.agent.blocks.len());
+        let mut ids = Vec::with_capacity(self.shell.bm.blocks.len() + self.agent.blocks.len());
         let mut si = 0;
         let mut ai = 0;
-        while si < self.shell.blocks.len() || ai < self.agent.blocks.len() {
-            let take_shell = match (self.shell.blocks.get(si), self.agent.blocks.get(ai)) {
+        while si < self.shell.bm.blocks.len() || ai < self.agent.blocks.len() {
+            let take_shell = match (self.shell.bm.blocks.get(si), self.agent.blocks.get(ai)) {
                 (Some(s), Some(a)) => s.id.0 <= a.id.0,
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => unreachable!(),
             };
             if take_shell {
-                ids.push(self.shell.blocks[si].id);
+                ids.push(self.shell.bm.blocks[si].id);
                 si += 1;
             } else {
                 ids.push(self.agent.blocks[ai].id);
@@ -109,7 +109,7 @@ impl NexusState {
     }
 
     pub(super) fn has_blocks(&self) -> bool {
-        !self.shell.blocks.is_empty() || !self.agent.blocks.is_empty()
+        !self.shell.bm.is_empty() || !self.agent.blocks.is_empty()
     }
 
     // --- Clipboard ---

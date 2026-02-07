@@ -220,7 +220,7 @@ impl NexusState {
             } else {
                 let shell_context = build_shell_context(
                     &self.cwd,
-                    &self.shell.blocks,
+                    &self.shell.bm.blocks,
                     self.input.shell_history(),
                 );
                 format!("{}{}", shell_context, text)
@@ -488,7 +488,7 @@ impl NexusState {
         // Try content selection first
         if let Some(text) =
             self.selection
-                .extract_selected_text(&self.shell.blocks, &self.agent.blocks)
+                .extract_selected_text(&self.shell.bm.blocks, &self.agent.blocks)
         {
             Self::set_clipboard_text(&text);
             return;
@@ -533,7 +533,7 @@ impl NexusState {
                 // First try to copy the selected text (respects user's selection)
                 if let Some(text) = self
                     .selection
-                    .extract_selected_text(&self.shell.blocks, &self.agent.blocks)
+                    .extract_selected_text(&self.shell.bm.blocks, &self.agent.blocks)
                 {
                     Self::set_clipboard_text(&text);
                     return Command::none();
@@ -559,8 +559,7 @@ impl NexusState {
                 // Fall back to entire block text only if no selection
                 if let Some(text) = target.and_then(|t| {
                     selection::extract_block_text(
-                        &self.shell.blocks,
-                        &self.shell.block_index,
+                        &self.shell.bm,
                         &self.agent.blocks,
                         &self.agent.block_index,
                         &self.input.text_input.text,
@@ -579,7 +578,7 @@ impl NexusState {
                 }
                 Some(ContextTarget::Block(_)) | Some(ContextTarget::AgentBlock(_)) => {
                     self.selection
-                        .select_all(&self.shell.blocks, &self.agent.blocks);
+                        .select_all(&self.shell.bm.blocks, &self.agent.blocks);
                 }
             },
             ContextMenuItem::Clear => {
@@ -648,7 +647,7 @@ impl NexusState {
     fn target_shell_block<'a>(&'a self, target: &Option<ContextTarget>) -> Option<&'a crate::blocks::Block> {
         match target {
             Some(ContextTarget::Block(id)) => {
-                self.shell.block_index.get(id).and_then(|&idx| self.shell.blocks.get(idx))
+                self.shell.bm.get(*id)
             }
             _ => None,
         }
