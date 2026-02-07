@@ -16,6 +16,9 @@ pub mod nexus_app;
 pub mod nexus_widgets;
 pub mod markdown;
 
+// New widget module structure (incremental migration from nexus_widgets)
+pub mod widgets;
+
 // Context system (minimal dependencies)
 pub mod context;
 

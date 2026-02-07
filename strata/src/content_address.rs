@@ -63,6 +63,37 @@ impl SourceId {
     pub const fn raw(&self) -> u64 {
         self.0
     }
+
+    /// Create a deterministic child ID from this parent.
+    ///
+    /// Uses entropy-preserving mixing (rotate + XOR with golden ratio constant)
+    /// to derive unique child IDs without allocation or heavy hashing.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Define discriminators as constants
+    /// const HEADER: u64 = 1;
+    /// const BODY: u64 = 2;
+    ///
+    /// // In view: create scoped widget IDs
+    /// .widget_id(block_id.child(HEADER))
+    ///
+    /// // In update: recreate to compare
+    /// if clicked_id == block_id.child(HEADER) {
+    ///     // handle header click
+    /// }
+    /// ```
+    ///
+    /// Note: This is a one-way operation. You cannot recover the parent ID
+    /// from the child. The update function must have access to the same
+    /// parent ID that generated the view.
+    pub const fn child(&self, discriminator: u64) -> Self {
+        // Golden ratio fractional bits - same constant used in FxHash/SplitMix64
+        const PHI: u64 = 0x9E3779B97F4A7C15;
+        let mixed = self.0.rotate_left(21) ^ discriminator.wrapping_mul(PHI);
+        Self(mixed)
+    }
 }
 
 impl Default for SourceId {
