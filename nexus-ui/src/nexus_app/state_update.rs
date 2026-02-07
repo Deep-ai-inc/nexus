@@ -1,6 +1,6 @@
 //! Message dispatch and domain handlers for NexusState.
 
-use nexus_api::{Value, TableColumn};
+use nexus_api::Value;
 use strata::Command;
 
 use crate::blocks::Focus;
@@ -378,83 +378,15 @@ impl NexusState {
         }
     }
 
+    /// Convert a drag payload to a native drag source, using shell state for block lookups.
     fn payload_to_drag_source(&self, payload: &super::drag_state::DragPayload) -> strata::DragSource {
-        use super::drag_state::DragPayload;
+        use super::drag_state::BlockSnapshot;
 
-        match payload {
-            DragPayload::FilePath(p) => {
-                if p.exists() {
-                    strata::DragSource::File(p.clone())
-                } else {
-                    strata::DragSource::Text(p.to_string_lossy().into_owned())
-                }
-            }
-            DragPayload::Text(s) => strata::DragSource::Text(s.clone()),
-            DragPayload::TableRow { block_id, row_index, display } => {
-                if let Some(&idx) = self.shell.block_index.get(block_id) {
-                    if let Some(block) = self.shell.blocks.get(idx) {
-                        if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
-                            if let Some(row) = rows.get(*row_index) {
-                                let header: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-                                let cells: Vec<String> = row.iter().map(|v| v.to_text()).collect();
-                                let tsv = format!("{}\n{}", header.join("\t"), cells.join("\t"));
-                                return strata::DragSource::Tsv(tsv);
-                            }
-                        }
-                    }
-                }
-                strata::DragSource::Text(display.clone())
-            }
-            DragPayload::Block(id) => {
-                if let Some(&idx) = self.shell.block_index.get(id) {
-                    if let Some(block) = self.shell.blocks.get(idx) {
-                        if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
-                            let tsv = table_to_tsv(columns, rows);
-                            let filename = format!("{}-output.tsv", block.command.split_whitespace().next().unwrap_or("block"));
-                            match file_drop::write_drag_temp_file(&filename, tsv.as_bytes()) {
-                                Ok(path) => return strata::DragSource::File(path),
-                                Err(e) => {
-                                    tracing::warn!("Failed to write drag temp file: {}", e);
-                                    return strata::DragSource::Tsv(tsv);
-                                }
-                            }
-                        }
-                        if let Some(ref value) = block.native_output {
-                            return strata::DragSource::Text(value.to_text());
-                        }
-                        return strata::DragSource::Text(
-                            block.parser.grid_with_scrollback().to_string(),
-                        );
-                    }
-                }
-                strata::DragSource::Text(format!("block#{}", id.0))
-            }
-            DragPayload::Image { data, filename } => {
-                let temp_dir = std::env::temp_dir().join("nexus-drag");
-                let _ = std::fs::create_dir_all(&temp_dir);
-                let path = temp_dir.join(filename);
-                match std::fs::write(&path, data) {
-                    Ok(()) => strata::DragSource::Image(path),
-                    Err(e) => {
-                        tracing::warn!("Failed to write image temp file: {}", e);
-                        strata::DragSource::Text(filename.clone())
-                    }
-                }
-            }
-            DragPayload::Selection { text, structured } => {
-                if let Some(super::drag_state::StructuredSelection::TableRows { columns, rows }) = structured {
-                    let mut tsv = columns.join("\t");
-                    tsv.push('\n');
-                    for row in rows {
-                        tsv.push_str(&row.join("\t"));
-                        tsv.push('\n');
-                    }
-                    strata::DragSource::Tsv(tsv)
-                } else {
-                    strata::DragSource::Text(text.clone())
-                }
-            }
-        }
+        payload.to_drag_source(|block_id| {
+            self.shell
+                .block_by_id(block_id)
+                .map(BlockSnapshot::from_block)
+        })
     }
 
     fn insert_text_at_cursor(&mut self, text: &str) {
@@ -711,28 +643,20 @@ impl NexusState {
             }
             ContextMenuItem::CopyOutput => {
                 if let Some(block) = self.target_shell_block(&target) {
-                    let text = if let Some(ref value) = block.native_output {
-                        value.to_text()
-                    } else {
-                        block.parser.grid_with_scrollback().to_string()
-                    };
-                    Self::set_clipboard_text(&text);
+                    Self::set_clipboard_text(&block.copy_output());
                 }
             }
             ContextMenuItem::CopyAsTsv => {
                 if let Some(block) = self.target_shell_block(&target) {
-                    if let Some(Value::Table { columns, rows }) = &block.native_output {
-                        let tsv = table_to_tsv(columns, rows);
+                    if let Some(tsv) = block.copy_as_tsv() {
                         Self::set_clipboard_text(&tsv);
                     }
                 }
             }
             ContextMenuItem::CopyAsJson => {
                 if let Some(block) = self.target_shell_block(&target) {
-                    if let Some(ref value) = block.native_output {
-                        if let Ok(json) = serde_json::to_string_pretty(value) {
-                            Self::set_clipboard_text(&json);
-                        }
+                    if let Some(json) = block.copy_as_json() {
+                        Self::set_clipboard_text(&json);
                     }
                 }
             }
@@ -805,25 +729,4 @@ impl NexusState {
             block.update_viewer(&msg);
         }
     }
-}
-
-fn table_to_tsv(columns: &[TableColumn], rows: &[Vec<Value>]) -> String {
-    let mut buf = String::new();
-    // Header row
-    for (i, col) in columns.iter().enumerate() {
-        if i > 0 { buf.push('\t'); }
-        buf.push_str(&col.name);
-    }
-    buf.push('\n');
-    // Data rows
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i > 0 { buf.push('\t'); }
-            let text = cell.to_text();
-            // Escape tabs/newlines within cell text
-            buf.push_str(&text.replace('\t', " ").replace('\n', " "));
-        }
-        buf.push('\n');
-    }
-    buf
 }

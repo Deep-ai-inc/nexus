@@ -345,6 +345,52 @@ impl Block {
             })
             .unwrap_or(0)
     }
+
+    // =========================================================================
+    // Clipboard helpers — encapsulate block data extraction for copy operations
+    // =========================================================================
+
+    /// Get the block's output text (native or terminal).
+    pub fn copy_output(&self) -> String {
+        if let Some(ref value) = self.native_output {
+            value.to_text()
+        } else {
+            self.parser.grid_with_scrollback().to_string()
+        }
+    }
+
+    /// Get the block's table output as TSV, if it has table output.
+    pub fn copy_as_tsv(&self) -> Option<String> {
+        if let Some(Value::Table { columns, rows }) = &self.native_output {
+            let mut buf = String::new();
+            // Header row
+            for (i, col) in columns.iter().enumerate() {
+                if i > 0 { buf.push('\t'); }
+                buf.push_str(&col.name);
+            }
+            buf.push('\n');
+            // Data rows
+            for row in rows {
+                for (i, cell) in row.iter().enumerate() {
+                    if i > 0 { buf.push('\t'); }
+                    let text = cell.to_text();
+                    // Escape tabs/newlines within cell text
+                    buf.push_str(&text.replace('\t', " ").replace('\n', " "));
+                }
+                buf.push('\n');
+            }
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    /// Get the block's native output as pretty-printed JSON, if it has native output.
+    pub fn copy_as_json(&self) -> Option<String> {
+        self.native_output
+            .as_ref()
+            .and_then(|v| serde_json::to_string_pretty(v).ok())
+    }
 }
 
 impl PartialEq for Block {

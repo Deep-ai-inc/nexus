@@ -200,6 +200,137 @@ impl DragPayload {
         }
         result.join("\n")
     }
+
+    /// Convert this payload to a native drag source.
+    ///
+    /// Takes a block lookup function for payloads that need to access block data
+    /// (TableRow, Block). This keeps DragPayload decoupled from NexusState.
+    pub fn to_drag_source<F>(&self, lookup_block: F) -> strata::DragSource
+    where
+        F: Fn(BlockId) -> Option<BlockSnapshot>,
+    {
+        match self {
+            DragPayload::FilePath(p) => {
+                if p.exists() {
+                    strata::DragSource::File(p.clone())
+                } else {
+                    strata::DragSource::Text(p.to_string_lossy().into_owned())
+                }
+            }
+            DragPayload::Text(s) => strata::DragSource::Text(s.clone()),
+            DragPayload::TableRow { block_id, row_index, display } => {
+                if let Some(snapshot) = lookup_block(*block_id) {
+                    if let Some(tsv) = snapshot.row_as_tsv(*row_index) {
+                        return strata::DragSource::Tsv(tsv);
+                    }
+                }
+                strata::DragSource::Text(display.clone())
+            }
+            DragPayload::Block(id) => {
+                if let Some(snapshot) = lookup_block(*id) {
+                    // Prefer table TSV, then native output text, then terminal text
+                    if let Some(tsv) = snapshot.table_as_tsv() {
+                        let filename = format!("{}-output.tsv",
+                            snapshot.command.split_whitespace().next().unwrap_or("block"));
+                        match super::file_drop::write_drag_temp_file(&filename, tsv.as_bytes()) {
+                            Ok(path) => return strata::DragSource::File(path),
+                            Err(e) => {
+                                tracing::warn!("Failed to write drag temp file: {}", e);
+                                return strata::DragSource::Tsv(tsv);
+                            }
+                        }
+                    }
+                    if let Some(text) = snapshot.native_output_text {
+                        return strata::DragSource::Text(text);
+                    }
+                    return strata::DragSource::Text(snapshot.terminal_text);
+                }
+                strata::DragSource::Text(format!("block#{}", id.0))
+            }
+            DragPayload::Image { data, filename } => {
+                let temp_dir = std::env::temp_dir().join("nexus-drag");
+                let _ = std::fs::create_dir_all(&temp_dir);
+                let path = temp_dir.join(filename);
+                match std::fs::write(&path, data) {
+                    Ok(()) => strata::DragSource::Image(path),
+                    Err(e) => {
+                        tracing::warn!("Failed to write image temp file: {}", e);
+                        strata::DragSource::Text(filename.clone())
+                    }
+                }
+            }
+            DragPayload::Selection { text, structured } => {
+                if let Some(StructuredSelection::TableRows { columns, rows }) = structured {
+                    let mut tsv = columns.join("\t");
+                    tsv.push('\n');
+                    for row in rows {
+                        tsv.push_str(&row.join("\t"));
+                        tsv.push('\n');
+                    }
+                    strata::DragSource::Tsv(tsv)
+                } else {
+                    strata::DragSource::Text(text.clone())
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot of block data needed for drag source conversion.
+/// Avoids holding references across async boundaries.
+pub struct BlockSnapshot {
+    pub command: String,
+    pub terminal_text: String,
+    pub native_output_text: Option<String>,
+    /// Table data if native_output is a Table
+    table_columns: Option<Vec<String>>,
+    table_rows: Option<Vec<Vec<String>>>,
+}
+
+impl BlockSnapshot {
+    /// Create a snapshot from a Block.
+    pub fn from_block(block: &crate::blocks::Block) -> Self {
+        use nexus_api::Value;
+
+        let (table_columns, table_rows) = if let Some(Value::Table { columns, rows }) = &block.native_output {
+            let cols: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let row_data: Vec<Vec<String>> = rows.iter()
+                .map(|row| row.iter().map(|v| v.to_text()).collect())
+                .collect();
+            (Some(cols), Some(row_data))
+        } else {
+            (None, None)
+        };
+
+        Self {
+            command: block.command.clone(),
+            terminal_text: block.parser.grid_with_scrollback().to_string(),
+            native_output_text: block.native_output.as_ref().map(|v| v.to_text()),
+            table_columns,
+            table_rows,
+        }
+    }
+
+    /// Get a single row as TSV (header + row).
+    pub fn row_as_tsv(&self, row_index: usize) -> Option<String> {
+        let columns = self.table_columns.as_ref()?;
+        let rows = self.table_rows.as_ref()?;
+        let row = rows.get(row_index)?;
+        Some(format!("{}\n{}", columns.join("\t"), row.join("\t")))
+    }
+
+    /// Get entire table as TSV.
+    pub fn table_as_tsv(&self) -> Option<String> {
+        let columns = self.table_columns.as_ref()?;
+        let rows = self.table_rows.as_ref()?;
+        let mut buf = columns.join("\t");
+        buf.push('\n');
+        for row in rows {
+            buf.push_str(&row.join("\t"));
+            buf.push('\n');
+        }
+        Some(buf)
+    }
 }
 
 /// When a selection falls entirely within structured output, we can export
