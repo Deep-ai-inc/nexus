@@ -18,7 +18,7 @@ fn main() -> strata::shell::Result {
             .find(|w| w[0] == "--port")
             .and_then(|w| w[1].parse::<u16>().ok())
             .expect("usage: nexus mcp-proxy --port <PORT>");
-        nexus_ui::mcp_proxy::run(port);
+        nexus_ui::features::agent::mcp::run(port);
     }
 
     tracing_subscriber::fmt()
@@ -30,7 +30,7 @@ fn main() -> strata::shell::Result {
         strata::demo::run()?;
     } else {
         tracing::info!("Starting Nexus");
-        nexus_ui::nexus_app::run()?;
+        nexus_ui::app::run()?;
     }
     Ok(())
 }

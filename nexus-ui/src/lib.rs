@@ -5,36 +5,16 @@
 //!
 //! # Module Organization
 //!
-//! - `nexus_app`: Main application (StrataApp implementation)
-//! - `widgets`: UI widget components
-//! - `blocks`: Block types and management
-//! - `systems`: External system integrations (PTY, kernel, agent)
-//! - `context`: Nexus context for environment info
+//! - `app`: Application core (state machine, message routing, views)
+//! - `data`: Shared data models (blocks, agent blocks, jobs, context)
+//! - `features`: Business logic slices (shell, agent, input, selection)
+//! - `ui`: Shared visuals (widgets, theme, markdown, menus)
+//! - `infra`: Low-level system integrations (PTY, kernel, agent systems)
+//! - `utils`: Shared utilities
 
-// Nexus application (StrataApp implementation)
-pub mod nexus_app;
-pub mod markdown;
-
-// Widget module structure
-pub mod widgets;
-
-// Context system (minimal dependencies)
-pub mod context;
-
-// Existing modules needed by others
-pub mod agent_adapter;
-pub mod agent_block;
-pub mod claude_cli;
-pub mod mcp_proxy;
-
-// Block types (depends on agent_block)
-pub mod blocks;
-
-// PTY handling (depends on blocks)
-pub mod pty;
-
-// Shell context (depends on blocks)
-pub mod shell_context;
-
-// Systems (depends on agent_adapter)
-pub mod systems;
+pub mod app;
+pub mod data;
+pub mod features;
+pub mod ui;
+pub mod infra;
+pub mod utils;
