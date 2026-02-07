@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex};
 
-use crate::features::agent::adapter::AgentEvent;
+use crate::features::agent::events::AgentEvent;
 use crate::features::agent::claude::spawn_claude_cli_task;
 
 /// Spawn an agent task to process a query using Claude Code CLI.

@@ -5,7 +5,7 @@
 pub mod blocks;
 pub mod agent_block;
 pub mod jobs;
-pub mod project;
+pub mod providers;
 pub mod context;
 
 pub use blocks::{Block, FileTreeState, Focus, InputMode, ProcSort, PtyEvent, TableSort, UnifiedBlock, UnifiedBlockRef, ViewState, VisualJob, VisualJobState};

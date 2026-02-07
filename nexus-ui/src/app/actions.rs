@@ -1,6 +1,4 @@
-//! UI policy helpers — focus, cursor, clipboard, terminal sizing.
-//!
-//! Scroll policy lives in ScrollModel. Transient overlay policy lives in TransientUi.
+//! State actions — focus, cursor, clipboard, terminal sizing, block navigation.
 
 use std::time::Instant;
 

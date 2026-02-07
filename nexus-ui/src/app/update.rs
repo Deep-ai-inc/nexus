@@ -10,7 +10,7 @@ use crate::features::selection::drop as file_drop;
 use crate::features::input::SubmitRequest;
 use super::message::{AnchorAction, ContextMenuMsg, DragMsg, DropZone, FileDropMsg, NexusMessage, ShellMsg, ViewerMsg};
 use crate::features::selection;
-use super::context::{UpdateContext, sync_focus_flags};
+use super::update_context::{UpdateContext, sync_focus_flags};
 use super::NexusState;
 use crate::features::shell::shell_context::build_shell_context;
 

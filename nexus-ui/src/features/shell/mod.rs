@@ -30,7 +30,7 @@ use crate::ui::context_menu::{ContextMenuItem, ContextTarget};
 use crate::app::message::{AnchorAction, ContextMenuMsg, NexusMessage, ShellMsg};
 use crate::utils::ids as source_ids;
 
-use crate::app::context::UpdateContext;
+use crate::app::update_context::UpdateContext;
 
 /// An anchor entry resolved during rendering — stores both the click action
 /// and drag payload so click/drag handling is an O(1) HashMap lookup.

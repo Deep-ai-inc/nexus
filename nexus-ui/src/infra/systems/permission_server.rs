@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use crate::features::agent::adapter::AgentEvent;
+use crate::features::agent::events::AgentEvent;
 use crate::features::agent::claude::parse_user_questions;
 
 /// Response from the UI to a permission/question request.

@@ -19,7 +19,7 @@
 //!
 //! Providers also generate context snippets for AI prompts.
 
-pub use super::project::{
+pub use super::providers::{
     ContextProvider, ErrorKind, ParsedError, ProviderRegistry, Suggestion,
 };
 

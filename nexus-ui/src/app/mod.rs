@@ -5,9 +5,9 @@
 //! and shared context (kernel, cwd, focus).
 
 pub(crate) mod message;
-pub(crate) mod context;
+pub(crate) mod update_context;
 mod routing;
-mod policy;
+mod actions;
 mod update;
 mod view;
 #[cfg(test)]

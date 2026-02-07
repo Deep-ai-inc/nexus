@@ -145,7 +145,7 @@ pub struct PendingUserQuestion {
     /// Tool use ID for the AskUserQuestion call.
     pub tool_use_id: String,
     /// The questions to present to the user.
-    pub questions: Vec<crate::features::agent::adapter::UserQuestion>,
+    pub questions: Vec<crate::features::agent::events::UserQuestion>,
 }
 
 /// An agent conversation turn (query + response).

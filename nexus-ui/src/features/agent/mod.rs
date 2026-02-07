@@ -1,6 +1,6 @@
 //! Agent widget — owns agent blocks, streaming channels, and permission handling.
 
-pub mod adapter;
+pub mod events;
 pub mod claude;
 pub mod mcp;
 
@@ -16,7 +16,7 @@ use strata::{Padding, Subscription, TextInputState};
 use strata::content_address::SourceId;
 use strata::event_context::KeyEvent;
 
-use self::adapter::{AgentEvent, UserQuestion};
+use self::events::{AgentEvent, UserQuestion};
 use crate::data::agent_block::{AgentBlock, AgentBlockState, PermissionRequest};
 use crate::ui::widgets::AgentBlockWidget;
 use crate::infra::systems::{agent_subscription, spawn_agent_task};
@@ -43,7 +43,7 @@ fn build_question_answer(questions: &[UserQuestion], answered_idx: usize, select
     serde_json::json!({ "questions": q_array }).to_string()
 }
 
-use crate::app::context::UpdateContext;
+use crate::app::update_context::UpdateContext;
 use crate::data::Focus;
 
 /// Manages all agent-related state: agent blocks, streaming, permissions.

@@ -12,7 +12,7 @@ use strata::{ScrollAction, TextInputMouseAction};
 
 use crate::data::ProcSort;
 
-use crate::features::agent::adapter::AgentEvent;
+use crate::features::agent::events::AgentEvent;
 use crate::ui::context_menu::{ContextMenuItem, ContextTarget};
 
 // =========================================================================

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use super::adapter::AgentEvent;
+use super::events::AgentEvent;
 use crate::data::agent_block::ToolStatus;
 
 // =============================================================================
@@ -607,7 +607,7 @@ impl Drop for ClaudeCli {
 // AskUserQuestion Parsing
 // =============================================================================
 
-use super::adapter::{UserQuestion, UserQuestionOption};
+use super::events::{UserQuestion, UserQuestionOption};
 
 /// Parse the AskUserQuestion tool input into our UserQuestion types.
 pub fn parse_user_questions(tool_input: &serde_json::Value) -> Option<Vec<UserQuestion>> {

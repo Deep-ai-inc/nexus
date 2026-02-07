@@ -1,8 +1,4 @@
-//! Agent adapter for Iced UI.
-//!
-//! This module defines the events that flow from the Claude CLI to the UI.
-//! Previously this bridged nexus-agent to Iced, but now it just defines
-//! the event types that claude_cli.rs produces.
+//! Agent events — data payloads flowing from the Claude CLI to the UI.
 
 use crate::data::agent_block::ToolStatus;
 

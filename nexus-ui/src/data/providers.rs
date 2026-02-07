@@ -1,7 +1,7 @@
-//! Context Providers - modular error parsing and context enrichment.
+//! Context providers — modular error parsing and context enrichment.
 //!
-//! Each provider handles a specific domain (Node, Rust, Python, System).
-//! This replaces the monolithic error_parser.rs with a trait-based system.
+//! Each provider handles a specific domain (Node, Rust, Python, System)
+//! via the `ContextProvider` trait.
 
 use super::context::{ProjectContext, ProjectKind};
 
