@@ -114,8 +114,6 @@ impl AgentWidget {
     ) -> strata::ScrollColumn<'a> {
         scroll.push(AgentBlockWidget {
             block,
-            thinking_toggle_id: source_ids::agent_thinking_toggle(block.id),
-            stop_id: source_ids::agent_stop(block.id),
             question_input: if block.pending_question.is_some() {
                 Some(&self.question_input)
             } else {
