@@ -327,116 +327,108 @@ impl AgentWidget {
         }
     }
 
+    /// Look up the currently active agent block (if any).
+    fn active_block_mut(&mut self) -> Option<&mut AgentBlock> {
+        let block_id = self.active?;
+        let &idx = self.block_index.get(&block_id)?;
+        self.blocks.get_mut(idx)
+    }
+
     /// Handle an agent event from the streaming channel.
     fn handle_event(&mut self, event: AgentEvent, uctx: &mut UpdateContext) {
-        // Handle session ID
-        if let AgentEvent::SessionStarted { ref session_id } = event {
-            self.session_id = Some(session_id.clone());
-        }
-
-        // UserQuestionRequested arrives AFTER Finished (active is None).
-        // Handle it on the last block instead.
-        if let AgentEvent::UserQuestionRequested { tool_use_id, questions } = event {
-            if let Some(block) = self.blocks.last_mut() {
-                block.pending_question = Some(crate::data::agent_block::PendingUserQuestion {
-                    tool_use_id,
-                    questions,
-                });
-                block.state = AgentBlockState::AwaitingPermission;
-                // Clear the error-path response text that the CLI generated
-                // after AskUserQuestion failed. We'll get fresh output on resume.
-                block.response.clear();
-                block.version += 1;
+        match event {
+            AgentEvent::SessionStarted { session_id } => {
+                self.session_id = Some(session_id);
             }
-            // Clear stale text; focus will be set by the orchestrator.
-            self.question_input.text.clear();
-            self.question_input.cursor = 0;
-            uctx.set_focus(Focus::AgentInput);
-            uctx.hint_bottom();
-            return;
-        }
-
-        if let Some(block_id) = self.active {
-            if let Some(&idx) = self.block_index.get(&block_id) {
-                if let Some(block) = self.blocks.get_mut(idx) {
-                    match event {
-                        AgentEvent::SessionStarted { .. } => {}
-                        AgentEvent::UserQuestionRequested { .. } => unreachable!(),
-                        AgentEvent::Started { .. } => {
-                            block.state = AgentBlockState::Streaming;
-                        }
-                        AgentEvent::ResponseText(text) => {
-                            block.append_response(&text);
-                        }
-                        AgentEvent::ThinkingText(text) => {
-                            block.append_thinking(&text);
-                        }
-                        AgentEvent::ToolStarted { id, name } => {
-                            block.start_tool(id, name);
-                        }
-                        AgentEvent::ToolParameter {
-                            tool_id,
-                            name,
-                            value,
-                        } => {
-                            block.add_tool_parameter(&tool_id, name, value);
-                        }
-                        AgentEvent::ToolOutput { tool_id, chunk } => {
-                            block.append_tool_output(&tool_id, &chunk);
-                        }
-                        AgentEvent::ToolEnded { .. } => {}
-                        AgentEvent::ToolStatus {
-                            id,
-                            status,
-                            message,
-                            output,
-                        } => {
-                            block.update_tool_status(&id, status, message, output);
-                        }
-                        AgentEvent::ImageAdded { media_type, data } => {
-                            block.add_image(media_type, data);
-                        }
-                        AgentEvent::PermissionRequested {
-                            id,
-                            tool_name,
-                            tool_id,
-                            description,
-                            action,
-                            working_dir,
-                        } => {
-                            block.request_permission(PermissionRequest {
-                                id,
-                                tool_name,
-                                tool_id,
-                                description,
-                                action,
-                                working_dir,
-                            });
-                        }
-                        AgentEvent::UsageUpdate {
-                            cost_usd,
-                            input_tokens,
-                            output_tokens,
-                        } => {
-                            block.cost_usd = cost_usd;
-                            block.input_tokens = input_tokens;
-                            block.output_tokens = output_tokens;
-                            block.version += 1;
-                        }
-                        AgentEvent::Finished { .. } => {
-                            block.complete();
-                            self.active = None;
-                        }
-                        AgentEvent::Interrupted { .. } => {
-                            block.state = AgentBlockState::Interrupted;
-                            self.active = None;
-                        }
-                        AgentEvent::Error(err) => {
-                            block.fail(err);
-                            self.active = None;
-                        }
-                    }
+            // UserQuestionRequested arrives AFTER Finished (active is None).
+            // Handle it on the last block instead.
+            AgentEvent::UserQuestionRequested { tool_use_id, questions } => {
+                if let Some(block) = self.blocks.last_mut() {
+                    block.pending_question = Some(crate::data::agent_block::PendingUserQuestion {
+                        tool_use_id,
+                        questions,
+                    });
+                    block.state = AgentBlockState::AwaitingPermission;
+                    block.response.clear();
+                    block.version += 1;
                 }
+                self.question_input.text.clear();
+                self.question_input.cursor = 0;
+                uctx.set_focus(Focus::AgentInput);
+            }
+            AgentEvent::Started { .. } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.state = AgentBlockState::Streaming;
+                }
+            }
+            AgentEvent::ResponseText(text) => {
+                if let Some(block) = self.active_block_mut() {
+                    block.append_response(&text);
+                }
+            }
+            AgentEvent::ThinkingText(text) => {
+                if let Some(block) = self.active_block_mut() {
+                    block.append_thinking(&text);
+                }
+            }
+            AgentEvent::ToolStarted { id, name } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.start_tool(id, name);
+                }
+            }
+            AgentEvent::ToolParameter { tool_id, name, value } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.add_tool_parameter(&tool_id, name, value);
+                }
+            }
+            AgentEvent::ToolOutput { tool_id, chunk } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.append_tool_output(&tool_id, &chunk);
+                }
+            }
+            AgentEvent::ToolEnded { .. } => {}
+            AgentEvent::ToolStatus { id, status, message, output } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.update_tool_status(&id, status, message, output);
+                }
+            }
+            AgentEvent::ImageAdded { media_type, data } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.add_image(media_type, data);
+                }
+            }
+            AgentEvent::PermissionRequested { id, tool_name, tool_id, description, action, working_dir } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.request_permission(PermissionRequest {
+                        id, tool_name, tool_id, description, action, working_dir,
+                    });
+                }
+            }
+            AgentEvent::UsageUpdate { cost_usd, input_tokens, output_tokens } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.cost_usd = cost_usd;
+                    block.input_tokens = input_tokens;
+                    block.output_tokens = output_tokens;
+                    block.version += 1;
+                }
+            }
+            AgentEvent::Finished { .. } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.complete();
+                }
+                self.active = None;
+            }
+            AgentEvent::Interrupted { .. } => {
+                if let Some(block) = self.active_block_mut() {
+                    block.state = AgentBlockState::Interrupted;
+                }
+                self.active = None;
+            }
+            AgentEvent::Error(err) => {
+                if let Some(block) = self.active_block_mut() {
+                    block.fail(err);
+                }
+                self.active = None;
             }
         }
 

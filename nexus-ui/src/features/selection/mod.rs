@@ -176,7 +176,7 @@ pub(crate) fn extract_block_text(
             let block = bm.get(*block_id)?;
 
             // If the block has native output, convert it to text
-            if let Some(ref value) = block.native_output {
+            if let Some(ref value) = block.structured_output {
                 // Format tables as markdown
                 if let nexus_api::Value::Table { columns, rows } = value {
                     return Some(format_table_as_markdown(columns, rows));
@@ -248,7 +248,7 @@ pub(crate) fn build_source_ordering(blocks: &[Block], agent_blocks: &[AgentBlock
         match block_ref {
             UnifiedBlockRef::Shell(block) => {
                 ordering.register(source_ids::shell_header(block.id));
-                if let Some(ref value) = block.native_output {
+                if let Some(ref value) = block.structured_output {
                     if matches!(value, nexus_api::Value::Table { .. }) {
                         ordering.register(source_ids::table(block.id));
                     } else {
@@ -335,7 +335,7 @@ fn extract_shell_source(
         return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
     }
 
-    if source_id == source_ids::shell_term(block.id) && block.native_output.is_none() {
+    if source_id == source_ids::shell_term(block.id) && block.structured_output.is_none() {
         let grid = if block.parser.is_alternate_screen() || block.is_running() {
             block.parser.grid()
         } else {
@@ -359,7 +359,7 @@ fn extract_shell_source(
     }
 
     if source_id == source_ids::native(block.id) {
-        if let Some(ref value) = block.native_output {
+        if let Some(ref value) = block.structured_output {
             let full_text = value.to_text();
             let lines: Vec<&str> = full_text.lines().collect();
             return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
@@ -367,7 +367,7 @@ fn extract_shell_source(
     }
 
     if source_id == source_ids::table(block.id) {
-        if let Some(nexus_api::Value::Table { columns, rows }) = &block.native_output {
+        if let Some(nexus_api::Value::Table { columns, rows }) = &block.structured_output {
             let text = format_table_as_markdown(columns, rows);
             let lines: Vec<&str> = text.lines().collect();
             return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));

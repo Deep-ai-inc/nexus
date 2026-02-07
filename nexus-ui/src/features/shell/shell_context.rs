@@ -45,7 +45,7 @@ pub fn build_shell_context(
         ctx.push_str(&format!("  exit_code: {}\n", exit_code_from_state(&last_block.state)));
 
         // Include output (native structured or terminal text)
-        if let Some(ref value) = last_block.native_output {
+        if let Some(ref value) = last_block.structured_output {
             let output = value.to_text();
             if !output.is_empty() {
                 ctx.push_str("  output:\n");
@@ -95,7 +95,6 @@ fn exit_code_from_state(state: &BlockState) -> i32 {
         BlockState::Running => -1,
         BlockState::Success => 0,
         BlockState::Failed(code) => *code,
-        BlockState::Killed(signal) => 128 + *signal, // Unix convention: 128 + signal
     }
 }
 
@@ -112,8 +111,13 @@ fn truncate_output(output: &str) -> String {
     if output.len() <= MAX_OUTPUT_LENGTH {
         output.to_string()
     } else {
-        // Try to cut at a line boundary
-        let truncated = &output[..MAX_OUTPUT_LENGTH];
+        // Find a safe char boundary at or before MAX_OUTPUT_LENGTH
+        let mut end = MAX_OUTPUT_LENGTH;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &output[..end];
+        // Try to cut at a line boundary for cleaner output
         if let Some(last_newline) = truncated.rfind('\n') {
             format!("{}\n... (output truncated)", &truncated[..last_newline])
         } else {
@@ -152,10 +156,10 @@ mod tests {
     use crate::data::Block;
     use nexus_api::{BlockId, Value};
 
-    fn make_test_block(id: u64, command: &str, state: BlockState, native_output: Option<Value>) -> Block {
+    fn make_test_block(id: u64, command: &str, state: BlockState, structured_output: Option<Value>) -> Block {
         let mut block = Block::new(BlockId(id), command.to_string());
         block.state = state;
-        block.native_output = native_output;
+        block.structured_output = structured_output;
         block
     }
 

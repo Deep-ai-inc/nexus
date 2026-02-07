@@ -214,7 +214,7 @@ pub enum SelectionMsg {
 // Viewer messages (interactive block viewers)
 // =========================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ViewerMsg {
     ScrollUp(BlockId),
     ScrollDown(BlockId),

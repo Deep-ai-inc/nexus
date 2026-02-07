@@ -19,9 +19,7 @@
 //!
 //! Providers also generate context snippets for AI prompts.
 
-pub use super::providers::{
-    ContextProvider, ErrorKind, ParsedError, ProviderRegistry, Suggestion,
-};
+use super::providers::{ParsedError, ProviderRegistry, Suggestion};
 
 use std::collections::HashMap;
 use std::path::PathBuf;

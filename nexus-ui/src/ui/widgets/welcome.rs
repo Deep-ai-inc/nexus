@@ -3,6 +3,7 @@
 use strata::layout::{Column, LayoutChild, Length, Row, TextElement, Widget};
 
 use crate::ui::theme;
+use crate::utils::text::display_path;
 
 // =========================================================================
 // Welcome Screen — shown when no blocks exist
@@ -14,13 +15,7 @@ pub struct WelcomeScreen<'a> {
 
 impl<'a> Widget<'a> for WelcomeScreen<'a> {
     fn build(self) -> LayoutChild<'a> {
-        // Shorten home directory
-        let home = std::env::var("HOME").unwrap_or_default();
-        let display_cwd = if self.cwd.starts_with(&home) {
-            self.cwd.replacen(&home, "~", 1)
-        } else {
-            self.cwd.to_string()
-        };
+        let display_cwd = display_path(self.cwd);
 
         let logo = r#" ███╗   ██╗███████╗██╗  ██╗██╗   ██╗███████╗
  ████╗  ██║██╔════╝╚██╗██╔╝██║   ██║██╔════╝

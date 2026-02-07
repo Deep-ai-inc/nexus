@@ -72,7 +72,7 @@ pub(crate) fn register_tree_toggle(
 
 /// Manages all shell-related state: terminal blocks, PTY handles, jobs, images.
 pub(crate) struct ShellWidget {
-    pub bm: BlockManager,
+    pub blocks: BlockManager,
     pub(crate) jobs: JobManager,
     pub(crate) pty: PtyBackend,
     pub terminal_dirty: bool,
@@ -91,7 +91,7 @@ impl ShellWidget {
         kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
     ) -> Self {
         Self {
-            bm: BlockManager::new(),
+            blocks: BlockManager::new(),
             jobs: JobManager::new(),
             pty: PtyBackend::new(),
             terminal_dirty: false,
@@ -125,7 +125,7 @@ impl ShellWidget {
         scroll.push(ShellBlockWidget {
             block,
             kill_id: source_ids::kill(block.id),
-            image_info: self.bm.image_info(block.id),
+            image_info: self.blocks.image_info(block.id),
             is_focused,
             click_registry: &self.click_registry,
         })
@@ -145,14 +145,14 @@ impl ShellWidget {
     /// Handle a widget click within shell-owned UI. Returns None if not our widget.
     pub fn on_click(&self, id: SourceId) -> Option<ShellMsg> {
         // Delegate to ShellBlockWidget for block-specific clicks
-        for block in &self.bm.blocks {
+        for block in &self.blocks.blocks {
             if let Some(msg) = ShellBlockWidget::on_click(block, id) {
                 return Some(Self::translate_block_message(block.id, msg));
             }
         }
-        // Table sort headers (check both native_output and stream_latest)
-        for block in &self.bm.blocks {
-            let tables = [&block.native_output, &block.stream_latest];
+        // Table sort headers (check both structured_output and live_value)
+        for block in &self.blocks.blocks {
+            let tables = [&block.structured_output, &block.live_value];
             for table in &tables {
                 if let Some(Value::Table { columns, .. }) = table {
                     for col_idx in 0..columns.len() {
@@ -188,18 +188,18 @@ impl ShellWidget {
 
     /// Look up a block by ID (immutable). Facade over BlockManager.
     pub fn block_by_id(&self, id: BlockId) -> Option<&Block> {
-        self.bm.get(id)
+        self.blocks.get(id)
     }
 
     /// Look up a block by ID (mutable). Facade over BlockManager.
     pub fn block_by_id_mut(&mut self, id: BlockId) -> Option<&mut Block> {
-        self.bm.get_mut(id)
+        self.blocks.get_mut(id)
     }
 
     /// Find the most recent block with an active viewer (e.g. top, less, tree).
     /// Used as a fallback when focus is Input but a viewer is still running.
     pub fn active_viewer_block(&self) -> Option<BlockId> {
-        self.bm.blocks.iter().rev()
+        self.blocks.blocks.iter().rev()
             .find(|b| b.view_state.is_some())
             .map(|b| b.id)
     }
@@ -212,7 +212,7 @@ impl ShellWidget {
                 return Some(id);
             }
         }
-        self.bm.blocks.iter().rev().find(|b| b.is_running()).map(|b| b.id)
+        self.blocks.blocks.iter().rev().find(|b| b.is_running()).map(|b| b.id)
     }
 
     /// Build a context menu for a right-click on shell content.
@@ -223,7 +223,7 @@ impl ShellWidget {
         y: f32,
     ) -> Option<ContextMenuMsg> {
         let block_id = self.block_for_source(source_id)?;
-        let block = self.bm.get(block_id);
+        let block = self.blocks.get(block_id);
 
         let mut items = vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll];
 
@@ -233,7 +233,7 @@ impl ShellWidget {
                 items.push(ContextMenuItem::CopyCommand);
             }
             // Offer structured export for table output
-            if let Some(Value::Table { .. }) = &block.native_output {
+            if let Some(Value::Table { .. }) = &block.structured_output {
                 items.push(ContextMenuItem::CopyAsTsv);
                 items.push(ContextMenuItem::CopyAsJson);
             }
@@ -252,7 +252,7 @@ impl ShellWidget {
 
     /// Build a fallback context menu (last block) for right-click on empty area.
     pub fn fallback_context_menu(&self, x: f32, y: f32) -> Option<ContextMenuMsg> {
-        let block = self.bm.last()?;
+        let block = self.blocks.last()?;
         Some(ContextMenuMsg::Show(
             x, y,
             vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
@@ -281,11 +281,11 @@ impl ShellWidget {
 
     /// If a source belongs to a block with image output, return an Image drag payload.
     pub fn image_drag_payload(&self, source_id: strata::content_address::SourceId) -> Option<crate::features::selection::drag::DragPayload> {
-        for block in &self.bm.blocks {
+        for block in &self.blocks.blocks {
             if source_id == source_ids::native(block.id)
                 || source_id == source_ids::image_output(block.id)
             {
-                if let Some(ref value) = block.native_output {
+                if let Some(ref value) = block.structured_output {
                     if let Some((data, content_type, metadata)) = value.as_media() {
                         if content_type.starts_with("image/") {
                             let ext = match content_type {
@@ -312,7 +312,7 @@ impl ShellWidget {
 
     /// Check if a hit address belongs to a shell block. Returns the block_id if so.
     pub fn block_for_source(&self, source_id: SourceId) -> Option<BlockId> {
-        for block in &self.bm.blocks {
+        for block in &self.blocks.blocks {
             let id = block.id;
             if source_id == source_ids::block_container(id)
                 || source_id == source_ids::shell_term(id)
@@ -331,8 +331,8 @@ impl ShellWidget {
 
     /// Get display text for a table row (tab-separated cell values).
     pub fn row_display_text(&self, block_id: nexus_api::BlockId, row_index: usize) -> String {
-        if let Some(block) = self.bm.get(block_id) {
-            if let Some(nexus_api::Value::Table { rows, .. }) = &block.native_output {
+        if let Some(block) = self.blocks.get(block_id) {
+            if let Some(nexus_api::Value::Table { rows, .. }) = &block.structured_output {
                 if let Some(row) = rows.get(row_index) {
                     return row.iter().map(|v| v.to_text()).collect::<Vec<_>>().join("\t");
                 }
@@ -375,13 +375,13 @@ impl ShellWidget {
                 // Also cancel kernel-native commands (e.g. top) which have
                 // no PTY handle — they use a cancel flag instead.
                 nexus_kernel::commands::cancel_block(id);
-                if let Some(block) = self.bm.get_mut(id).filter(|b| b.view_state.is_some()) {
+                if let Some(block) = self.blocks.get_mut(id).filter(|b| b.view_state.is_some()) {
                     block.view_state = None;
                     block.version += 1;
                 }
             }
             ShellMsg::PtyInput(block_id, event) => {
-                let block = self.bm.get(block_id);
+                let block = self.blocks.get(block_id);
                 if !self.pty.forward_key(block, block_id, &event) {
                     uctx.set_focus(Focus::Input);
                     uctx.snap_to_bottom();
@@ -460,7 +460,7 @@ impl ShellWidget {
                         flush(
                             &mut acc_id,
                             &mut acc_data,
-                            &mut self.bm,
+                            &mut self.blocks,
                         );
                         acc_id = Some(id);
                         acc_data = data;
@@ -471,7 +471,7 @@ impl ShellWidget {
                     flush(
                         &mut acc_id,
                         &mut acc_data,
-                        &mut self.bm,
+                        &mut self.blocks,
                     );
                     self.handle_pty_exited(id, code, uctx);
                     had_exit = true;
@@ -480,19 +480,7 @@ impl ShellWidget {
         }
 
         // Flush remaining accumulated output.
-        if acc_id.is_some() {
-            if !acc_data.is_empty() {
-                if let Some(id) = acc_id {
-                    if let Some(block) = self.bm.get_mut(id) {
-                        block.parser.feed(&acc_data);
-                        if let Some(title) = block.parser.take_title() {
-                            block.osc_title = Some(title);
-                        }
-                        block.version += 1;
-                    }
-                }
-            }
-        }
+        flush(&mut acc_id, &mut acc_data, &mut self.blocks);
 
         // Don't set terminal_dirty here — the batch message itself triggers
         // a render via the iced adapter (every App message bumps frame).
@@ -507,7 +495,7 @@ impl ShellWidget {
 
     /// Handle a single PTY output event (unbatched fallback).
     pub fn handle_pty_output(&mut self, id: BlockId, data: Vec<u8>, uctx: &mut UpdateContext) {
-        if let Some(block) = self.bm.get_mut(id) {
+        if let Some(block) = self.blocks.get_mut(id) {
             block.parser.feed(&data);
             if let Some(title) = block.parser.take_title() {
                 block.osc_title = Some(title);
@@ -520,7 +508,7 @@ impl ShellWidget {
 
     /// Handle PTY exit. Conditionally returns focus to input if the exited block was focused.
     pub fn handle_pty_exited(&mut self, id: BlockId, exit_code: i32, uctx: &mut UpdateContext) {
-        if let Some(block) = self.bm.get_mut(id) {
+        if let Some(block) = self.blocks.get_mut(id) {
             block.state = if exit_code == 0 {
                 BlockState::Success
             } else {
@@ -546,130 +534,29 @@ impl ShellWidget {
     ) {
         match evt {
             ShellEvent::CommandStarted { block_id, command, .. } => {
-                if !self.bm.contains(block_id) {
+                if !self.blocks.contains(block_id) {
                     let mut block = Block::new(block_id, command);
                     block.parser = self.pty.new_parser();
-                    self.bm.push(block);
+                    self.blocks.push(block);
                 }
             }
             ShellEvent::StdoutChunk { block_id, data }
             | ShellEvent::StderrChunk { block_id, data } => {
-                if let Some(block) = self.bm.get_mut(block_id) {
+                if let Some(block) = self.blocks.get_mut(block_id) {
                     block.parser.feed(&data);
                     block.version += 1;
                 }
                 self.terminal_dirty = true;
             }
             ShellEvent::CommandOutput { block_id, value } => {
-                // Handle Interactive values: set up viewer state
-                if let Some(DomainValue::Interactive(req)) = value.as_domain() {
-                    let content = req.content.clone();
-                    let is_monitor = matches!(req.viewer, nexus_api::ViewerKind::ProcessMonitor { .. });
-                    let view_state = match &req.viewer {
-                        nexus_api::ViewerKind::Pager | nexus_api::ViewerKind::ManPage => {
-                            Some(crate::data::ViewState::Pager {
-                                scroll_line: 0,
-                                search: None,
-                                current_match: 0,
-                            })
-                        }
-                        nexus_api::ViewerKind::ProcessMonitor { interval_ms } => {
-                            Some(crate::data::ViewState::ProcessMonitor {
-                                sort_by: crate::data::ProcSort::Cpu,
-                                sort_desc: true,
-                                interval_ms: *interval_ms,
-                            })
-                        }
-                        nexus_api::ViewerKind::TreeBrowser => {
-                            Some(crate::data::ViewState::TreeBrowser {
-                                collapsed: std::collections::HashSet::new(),
-                                selected: Some(0),
-                            })
-                        }
-                        nexus_api::ViewerKind::DiffViewer => {
-                            Some(crate::data::ViewState::DiffViewer {
-                                scroll_line: 0,
-                                current_file: 0,
-                                collapsed_indices: std::collections::HashSet::new(),
-                            })
-                        }
-                    };
-                    if let Some(block) = self.bm.get_mut(block_id) {
-                        block.native_output = Some(content);
-                        block.view_state = view_state;
-                        // Default sort for ProcessMonitor: %CPU (index 2) descending
-                        if is_monitor {
-                            block.table_sort = crate::data::TableSort {
-                                column: Some(2),
-                                ascending: false,
-                            };
-                            // Sort initial data
-                            if let Some(Value::Table { ref mut rows, .. }) = block.native_output {
-                                Self::sort_rows(rows, 2, false);
-                            }
-                        }
-                    }
-                    uctx.set_focus(Focus::Block(block_id));
-                    uctx.snap_to_bottom();
-                    return;
-                }
-
-                if let Value::Media {
-                    ref data,
-                    ref content_type,
-                    ..
-                } = value
-                {
-                    if content_type.starts_with("image/") {
-                        if let Ok(img) = image::load_from_memory(data) {
-                            let rgba = img.to_rgba8();
-                            let (w, h) = rgba.dimensions();
-                            let handle = images.load_rgba(w, h, rgba.into_raw());
-                            self.bm.store_image(block_id, handle, w, h);
-                        }
-                    }
-                }
-                // Auto-enable frame timing for large tables (performance debugging)
-                if let Value::Table { ref rows, .. } = value {
-                    if rows.len() > 100 {
-                        strata::frame_timing::enable();
-                    }
-                }
-                if let Some(block) = self.bm.get_mut(block_id) {
-                    block.native_output = Some(value);
-                }
+                self.handle_command_output(block_id, value, images, uctx);
             }
             ShellEvent::CommandFinished {
                 block_id,
                 exit_code,
                 duration_ms,
             } => {
-                let mut cmd = String::new();
-                let mut output = String::new();
-                let mut has_viewer = false;
-                if let Some(block) = self.bm.get_mut(block_id) {
-                    block.state = if exit_code == 0 {
-                        BlockState::Success
-                    } else {
-                        BlockState::Failed(exit_code)
-                    };
-                    block.duration_ms = Some(duration_ms);
-                    block.version += 1;
-                    cmd = block.command.clone();
-                    let raw = block.parser.grid_with_scrollback().to_string();
-                    output = if raw.len() > 10_000 {
-                        raw[raw.len() - 10_000..].to_string()
-                    } else {
-                        raw
-                    };
-                    has_viewer = block.view_state.is_some();
-                }
-                self.last_exit_code = Some(exit_code);
-                uctx.on_command_finished(cmd, output, exit_code);
-                if !has_viewer {
-                    uctx.set_focus(Focus::Input);
-                }
-                uctx.snap_to_bottom();
+                self.handle_command_finished(block_id, exit_code, duration_ms, uctx);
             }
             ShellEvent::JobStateChanged {
                 job_id,
@@ -683,27 +570,7 @@ impl ShellWidget {
                 update,
                 coalesce,
             } => {
-                if let Some(block) = self.bm.get_mut(block_id) {
-                    if seq > block.stream_seq {
-                        block.stream_seq = seq;
-                        if coalesce {
-                            block.stream_latest = Some(update);
-                            // Re-apply current table sort to new data
-                            if let Some(col_idx) = block.table_sort.column {
-                                let ascending = block.table_sort.ascending;
-                                if let Some(Value::Table { ref mut rows, .. }) = block.stream_latest {
-                                    Self::sort_rows(rows, col_idx, ascending);
-                                }
-                            }
-                        } else {
-                            block.stream_log.push_back(update);
-                            while block.stream_log.len() > 1000 {
-                                block.stream_log.pop_front();
-                            }
-                        }
-                        block.version += 1;
-                    }
-                }
+                self.handle_streaming_update(block_id, seq, update, coalesce);
             }
             ShellEvent::CwdChanged { new, .. } => {
                 uctx.set_cwd(new);
@@ -712,22 +579,164 @@ impl ShellWidget {
         }
     }
 
+    fn handle_command_output(
+        &mut self,
+        block_id: BlockId,
+        value: Value,
+        images: &mut ImageStore,
+        uctx: &mut UpdateContext,
+    ) {
+        // Handle Interactive values: set up viewer state
+        if let Some(DomainValue::Interactive(req)) = value.as_domain() {
+            let content = req.content.clone();
+            let is_monitor = matches!(req.viewer, nexus_api::ViewerKind::ProcessMonitor { .. });
+            let view_state = match &req.viewer {
+                nexus_api::ViewerKind::Pager | nexus_api::ViewerKind::ManPage => {
+                    Some(crate::data::ViewState::Pager {
+                        scroll_line: 0,
+                        search: None,
+                        current_match: 0,
+                    })
+                }
+                nexus_api::ViewerKind::ProcessMonitor { interval_ms } => {
+                    Some(crate::data::ViewState::ProcessMonitor {
+                        sort_by: crate::data::ProcSort::Cpu,
+                        sort_desc: true,
+                        interval_ms: *interval_ms,
+                    })
+                }
+                nexus_api::ViewerKind::TreeBrowser => {
+                    Some(crate::data::ViewState::TreeBrowser {
+                        collapsed: std::collections::HashSet::new(),
+                        selected: Some(0),
+                    })
+                }
+                nexus_api::ViewerKind::DiffViewer => {
+                    Some(crate::data::ViewState::DiffViewer {
+                        scroll_line: 0,
+                        current_file: 0,
+                        collapsed_indices: std::collections::HashSet::new(),
+                    })
+                }
+            };
+            if let Some(block) = self.blocks.get_mut(block_id) {
+                block.structured_output = Some(content);
+                block.view_state = view_state;
+                if is_monitor {
+                    block.table_sort = crate::data::TableSort {
+                        column: Some(2),
+                        ascending: false,
+                    };
+                    if let Some(Value::Table { ref mut rows, .. }) = block.structured_output {
+                        Self::sort_rows(rows, 2, false);
+                    }
+                }
+            }
+            uctx.set_focus(Focus::Block(block_id));
+            uctx.snap_to_bottom();
+            return;
+        }
+
+        if let Value::Media { ref data, ref content_type, .. } = value {
+            if content_type.starts_with("image/") {
+                if let Ok(img) = image::load_from_memory(data) {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let handle = images.load_rgba(w, h, rgba.into_raw());
+                    self.blocks.store_image(block_id, handle, w, h);
+                }
+            }
+        }
+        if let Value::Table { ref rows, .. } = value {
+            if rows.len() > 100 {
+                strata::frame_timing::enable();
+            }
+        }
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            block.structured_output = Some(value);
+        }
+    }
+
+    fn handle_command_finished(
+        &mut self,
+        block_id: BlockId,
+        exit_code: i32,
+        duration_ms: u64,
+        uctx: &mut UpdateContext,
+    ) {
+        let mut cmd = String::new();
+        let mut output = String::new();
+        let mut has_viewer = false;
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            block.state = if exit_code == 0 {
+                BlockState::Success
+            } else {
+                BlockState::Failed(exit_code)
+            };
+            block.duration_ms = Some(duration_ms);
+            block.version += 1;
+            cmd = block.command.clone();
+            let raw = block.parser.grid_with_scrollback().to_string();
+            output = if raw.len() > 10_000 {
+                raw[raw.len() - 10_000..].to_string()
+            } else {
+                raw
+            };
+            has_viewer = block.view_state.is_some();
+        }
+        self.last_exit_code = Some(exit_code);
+        uctx.on_command_finished(cmd, output, exit_code);
+        if !has_viewer {
+            uctx.set_focus(Focus::Input);
+        }
+        uctx.snap_to_bottom();
+    }
+
+    fn handle_streaming_update(
+        &mut self,
+        block_id: BlockId,
+        seq: u64,
+        update: Value,
+        coalesce: bool,
+    ) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            if seq > block.event_seq {
+                block.event_seq = seq;
+                if coalesce {
+                    block.live_value = Some(update);
+                    if let Some(col_idx) = block.table_sort.column {
+                        let ascending = block.table_sort.ascending;
+                        if let Some(Value::Table { ref mut rows, .. }) = block.live_value {
+                            Self::sort_rows(rows, col_idx, ascending);
+                        }
+                    }
+                } else {
+                    block.event_log.push_back(update);
+                    while block.event_log.len() > 1000 {
+                        block.event_log.pop_front();
+                    }
+                }
+                block.version += 1;
+            }
+        }
+    }
+
     /// Paste text into a PTY, respecting Bracketed Paste mode.
     pub fn paste_to_pty(&self, block_id: BlockId, text: &str) -> bool {
-        let block = self.bm.get(block_id);
+        let block = self.blocks.get(block_id);
         self.pty.paste_to_pty(block, block_id, text)
     }
 
-    /// Sort a table by column (works on both native_output and stream_latest).
+    /// Sort a table by column (works on both structured_output and live_value).
     pub fn sort_table(&mut self, block_id: BlockId, col_idx: usize) {
-        if let Some(block) = self.bm.get_mut(block_id) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
             block.table_sort.toggle(col_idx);
             let ascending = block.table_sort.ascending;
-            // Sort whichever table is present (native_output or stream_latest)
-            if let Some(Value::Table { ref mut rows, .. }) = block.native_output {
+            // Sort whichever table is present (structured_output or live_value)
+            if let Some(Value::Table { ref mut rows, .. }) = block.structured_output {
                 Self::sort_rows(rows, col_idx, ascending);
             }
-            if let Some(Value::Table { ref mut rows, .. }) = block.stream_latest {
+            if let Some(Value::Table { ref mut rows, .. }) = block.live_value {
                 Self::sort_rows(rows, col_idx, ascending);
             }
         }
@@ -751,7 +760,7 @@ impl ShellWidget {
     /// Toggle tree expansion for a directory.
     /// Enqueues LoadTreeChildren command if the directory was expanded and needs loading.
     pub fn toggle_tree_expand(&mut self, block_id: BlockId, path: PathBuf, uctx: &mut UpdateContext) {
-        if let Some(block) = self.bm.get_mut(block_id) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
             let tree = block.ensure_file_tree();
             let now_expanded = tree.toggle(path.clone());
             block.version += 1; // Trigger re-render
@@ -775,7 +784,7 @@ impl ShellWidget {
 
     /// Store loaded children for a tree node.
     pub fn set_tree_children(&mut self, block_id: BlockId, path: PathBuf, entries: Vec<nexus_api::FileEntry>) {
-        if let Some(block) = self.bm.get_mut(block_id) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
             block.ensure_file_tree().set_children(path, entries);
             block.version += 1; // Trigger re-render
         }
@@ -785,17 +794,17 @@ impl ShellWidget {
     pub fn clear(&mut self) {
         // Cancel any running kernel commands (e.g. `top`) so they release
         // the kernel mutex.  Must happen before clearing blocks.
-        for block in &self.bm.blocks {
+        for block in &self.blocks.blocks {
             nexus_kernel::commands::cancel_block(block.id);
         }
         self.pty.kill_all();
-        self.bm.clear();
+        self.blocks.clear();
         self.jobs.clear();
     }
 
     /// Propagate terminal size changes to block parsers (delegates to PtyBackend).
     pub fn sync_terminal_size(&mut self) {
-        self.pty.sync_terminal_size(&mut self.bm.blocks);
+        self.pty.sync_terminal_size(&mut self.blocks.blocks);
     }
 
     // ---- Internal ----
@@ -811,7 +820,7 @@ impl ShellWidget {
     ) {
         let mut block = Block::new(block_id, cmd.clone());
         block.parser = self.pty.new_parser();
-        self.bm.push(block);
+        self.blocks.push(block);
 
         let kernel = kernel.clone();
         let kernel_tx = kernel_tx.clone();
@@ -861,7 +870,7 @@ impl ShellWidget {
     ) {
         let mut block = Block::new(block_id, cmd.clone());
         block.parser = self.pty.new_parser();
-        self.bm.push(block);
+        self.blocks.push(block);
 
         match self.pty.spawn(&cmd, block_id, cwd) {
             Ok(()) => {
@@ -870,7 +879,7 @@ impl ShellWidget {
             }
             Err(e) => {
                 tracing::error!("Failed to spawn PTY: {}", e);
-                if let Some(block) = self.bm.get_mut(block_id) {
+                if let Some(block) = self.blocks.get_mut(block_id) {
                     block.state = BlockState::Failed(1);
                     block.parser.feed(format!("Error: {}\n", e).as_bytes());
                     block.version += 1;

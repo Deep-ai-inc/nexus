@@ -7,6 +7,7 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::data::agent_block::{ToolInvocation, ToolStatus};
 use crate::ui::theme;
+use crate::utils::text::truncate_str;
 use strata::content_address::SourceId;
 use strata::layout::{Column, CrossAxisAlignment, Length, Padding, Row, TextElement};
 
@@ -519,14 +520,6 @@ fn shorten_path(path: &str) -> String {
     path.to_string()
 }
 
-/// Truncate a string to max characters, adding ellipsis if needed.
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}\u{2026}", &s[..max])
-    }
-}
 
 // =========================================================================
 // Tests
@@ -571,9 +564,4 @@ mod tests {
         assert_eq!(shorten_path("file.rs"), "file.rs");
     }
 
-    #[test]
-    fn test_truncate_str() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-        assert_eq!(truncate_str("hello world", 5), "hello…");
-    }
 }

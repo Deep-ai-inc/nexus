@@ -1,5 +1,7 @@
 //! Job tracking — owns the visual job list and handles kernel job events.
 
+use crate::utils::text::truncate_str;
+
 /// A job displayed in the status bar.
 #[derive(Debug, Clone)]
 pub struct VisualJob {
@@ -22,11 +24,7 @@ impl VisualJob {
 
     /// Get a shortened display name for the job.
     pub fn display_name(&self) -> String {
-        if self.command.len() > 20 {
-            format!("{}...", &self.command[..17])
-        } else {
-            self.command.clone()
-        }
+        truncate_str(&self.command, 20)
     }
 
     /// Get the icon for this job state.
@@ -120,8 +118,8 @@ mod tests {
     fn test_visual_job_display_name_truncates_long() {
         let job = VisualJob::new(1, "this is a very long command that exceeds twenty chars".to_string(), VisualJobState::Running);
         let name = job.display_name();
-        assert_eq!(name.len(), 20); // 17 chars + "..."
-        assert!(name.ends_with("..."));
+        assert_eq!(name.chars().count(), 21); // 20 chars + ellipsis
+        assert!(name.ends_with('\u{2026}'));
     }
 
     #[test]

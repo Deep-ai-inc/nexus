@@ -220,7 +220,7 @@ impl NexusState {
             } else {
                 let shell_context = build_shell_context(
                     &self.cwd,
-                    &self.shell.bm.blocks,
+                    &self.shell.blocks.blocks,
                     self.input.shell_history(),
                 );
                 format!("{}{}", shell_context, text)
@@ -365,15 +365,8 @@ impl NexusState {
                 }
                 match zone {
                     DropZone::InputBar | DropZone::Empty => {
-                        // Insert shell-quoted path at cursor
                         let quoted = file_drop::shell_quote(&path);
-                        if !self.input.text_input.text.is_empty()
-                            && !self.input.text_input.text.ends_with(' ')
-                        {
-                            self.input.text_input.text.push(' ');
-                        }
-                        self.input.text_input.text.push_str(&quoted);
-                        self.input.text_input.cursor = self.input.text_input.text.len();
+                        self.insert_text_at_cursor(&quoted);
                         Command::none()
                     }
                     DropZone::AgentPanel => {
@@ -399,15 +392,8 @@ impl NexusState {
                         })
                     }
                     DropZone::ShellBlock(_) => {
-                        // Treat same as input bar
                         let quoted = file_drop::shell_quote(&path);
-                        if !self.input.text_input.text.is_empty()
-                            && !self.input.text_input.text.ends_with(' ')
-                        {
-                            self.input.text_input.text.push(' ');
-                        }
-                        self.input.text_input.text.push_str(&quoted);
-                        self.input.text_input.cursor = self.input.text_input.text.len();
+                        self.insert_text_at_cursor(&quoted);
                         Command::none()
                     }
                 }
@@ -425,13 +411,7 @@ impl NexusState {
                 tracing::info!("File loaded for agent: {} ({} bytes)", filename, data.len());
                 // TODO: Create proper attachment when agent attachment API is ready
                 let quoted = file_drop::shell_quote(&path);
-                if !self.input.text_input.text.is_empty()
-                    && !self.input.text_input.text.ends_with(' ')
-                {
-                    self.input.text_input.text.push(' ');
-                }
-                self.input.text_input.text.push_str(&quoted);
-                self.input.text_input.cursor = self.input.text_input.text.len();
+                self.insert_text_at_cursor(&quoted);
                 Command::none()
             }
             FileDropMsg::FileLoadFailed(path, reason) => {
@@ -488,7 +468,7 @@ impl NexusState {
         // Try content selection first
         if let Some(text) =
             self.selection
-                .extract_selected_text(&self.shell.bm.blocks, &self.agent.blocks)
+                .extract_selected_text(&self.shell.blocks.blocks, &self.agent.blocks)
         {
             Self::set_clipboard_text(&text);
             return;
@@ -533,7 +513,7 @@ impl NexusState {
                 // First try to copy the selected text (respects user's selection)
                 if let Some(text) = self
                     .selection
-                    .extract_selected_text(&self.shell.bm.blocks, &self.agent.blocks)
+                    .extract_selected_text(&self.shell.blocks.blocks, &self.agent.blocks)
                 {
                     Self::set_clipboard_text(&text);
                     return Command::none();
@@ -559,7 +539,7 @@ impl NexusState {
                 // Fall back to entire block text only if no selection
                 if let Some(text) = target.and_then(|t| {
                     selection::extract_block_text(
-                        &self.shell.bm,
+                        &self.shell.blocks,
                         &self.agent.blocks,
                         &self.agent.block_index,
                         &self.input.text_input.text,
@@ -578,7 +558,7 @@ impl NexusState {
                 }
                 Some(ContextTarget::Block(_)) | Some(ContextTarget::AgentBlock(_)) => {
                     self.selection
-                        .select_all(&self.shell.bm.blocks, &self.agent.blocks);
+                        .select_all(&self.shell.blocks.blocks, &self.agent.blocks);
                 }
             },
             ContextMenuItem::Clear => {
@@ -647,7 +627,7 @@ impl NexusState {
     fn target_shell_block<'a>(&'a self, target: &Option<ContextTarget>) -> Option<&'a crate::data::Block> {
         match target {
             Some(ContextTarget::Block(id)) => {
-                self.shell.bm.get(*id)
+                self.shell.blocks.get(*id)
             }
             _ => None,
         }

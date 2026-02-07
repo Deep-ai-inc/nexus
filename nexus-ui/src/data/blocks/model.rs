@@ -11,7 +11,8 @@ use crate::data::agent_block::AgentBlock;
 use super::enums::ProcSort;
 use super::view::{ViewState, FileTreeState, TableSort};
 
-/// Unified block type - either a shell command or agent conversation.
+/// A display item in the main scrollable view. Shell and Agent blocks are
+/// interleaved in ascending `BlockId` order; the ID determines position.
 #[derive(Debug)]
 pub enum UnifiedBlock {
     Shell(Block),
@@ -42,7 +43,15 @@ pub enum UnifiedBlockRef<'a> {
     Agent(&'a AgentBlock),
 }
 
-/// A command block containing input and output.
+/// A shell command block: user-typed command + its output.
+///
+/// Output can take three mutually-exclusive forms, checked in priority order:
+/// 1. `live_value` — live-updating structured value (progress bar, table in `top`).
+/// 2. `structured_output` — one-shot structured value (table from `ls`, tree from `find`).
+/// 3. Terminal grid — raw PTY output stored in `parser`.
+///
+/// `event_log` is an orthogonal append-only event log (e.g. ping replies)
+/// rendered below the primary output.
 #[derive(Debug)]
 pub struct Block {
     pub id: BlockId,
@@ -57,7 +66,7 @@ pub struct Block {
     /// Version counter for lazy invalidation.
     pub version: u64,
     /// Native command output (structured data, not terminal output).
-    pub native_output: Option<Value>,
+    pub structured_output: Option<Value>,
     /// Sort state for table output.
     pub table_sort: TableSort,
     /// Whether output contained "permission denied".
@@ -65,11 +74,11 @@ pub struct Block {
     /// Whether output contained "command not found".
     pub has_command_not_found: bool,
     /// Append-only event log (ping replies, etc.). Capped at 1000 entries.
-    pub stream_log: VecDeque<Value>,
+    pub event_log: VecDeque<Value>,
     /// Latest coalesced state (progress bar, live table, etc.).
-    pub stream_latest: Option<Value>,
+    pub live_value: Option<Value>,
     /// Sequence counter for ordering streaming updates.
-    pub stream_seq: u64,
+    pub event_seq: u64,
     /// Interactive viewer state (pager, process monitor, tree browser).
     pub view_state: Option<ViewState>,
     /// Lazy tree expansion state (only allocated when a user clicks a chevron).
@@ -93,13 +102,13 @@ impl Block {
             started_at: Instant::now(),
             duration_ms: None,
             version: 0,
-            native_output: None,
+            structured_output: None,
             table_sort: TableSort::new(),
             has_permission_denied: false,
             has_command_not_found: false,
-            stream_log: VecDeque::new(),
-            stream_latest: None,
-            stream_seq: 0,
+            event_log: VecDeque::new(),
+            live_value: None,
+            event_seq: 0,
             view_state: None,
             file_tree: None,
             osc_title: None,
@@ -208,8 +217,8 @@ impl Block {
             };
 
             // Re-sort current data
-            Self::sort_table_rows(&mut self.native_output, col_idx, ascending);
-            Self::sort_table_rows(&mut self.stream_latest, col_idx, ascending);
+            Self::sort_table_rows(&mut self.structured_output, col_idx, ascending);
+            Self::sort_table_rows(&mut self.live_value, col_idx, ascending);
 
             return true;
         }
@@ -248,7 +257,7 @@ impl Block {
     /// Count tree nodes for TreeBrowser navigation bounds.
     fn tree_node_count(&self) -> usize {
         use nexus_api::DomainValue;
-        self.native_output
+        self.structured_output
             .as_ref()
             .and_then(|v| {
                 if let Some(DomainValue::Tree(tree)) = v.as_domain() {
@@ -262,7 +271,7 @@ impl Block {
 
     /// Count diff files for DiffViewer navigation bounds.
     fn diff_file_count(&self) -> usize {
-        self.native_output
+        self.structured_output
             .as_ref()
             .and_then(|v| {
                 if let Value::List(items) = v {
@@ -280,7 +289,7 @@ impl Block {
 
     /// Get the block's output text (native or terminal).
     pub fn copy_output(&self) -> String {
-        if let Some(ref value) = self.native_output {
+        if let Some(ref value) = self.structured_output {
             value.to_text()
         } else {
             self.parser.grid_with_scrollback().to_string()
@@ -289,7 +298,7 @@ impl Block {
 
     /// Get the block's table output as TSV, if it has table output.
     pub fn copy_as_tsv(&self) -> Option<String> {
-        if let Some(Value::Table { columns, rows }) = &self.native_output {
+        if let Some(Value::Table { columns, rows }) = &self.structured_output {
             let mut buf = String::new();
             // Header row
             for (i, col) in columns.iter().enumerate() {
@@ -315,7 +324,7 @@ impl Block {
 
     /// Get the block's native output as pretty-printed JSON, if it has native output.
     pub fn copy_as_json(&self) -> Option<String> {
-        self.native_output
+        self.structured_output
             .as_ref()
             .and_then(|v| serde_json::to_string_pretty(v).ok())
     }
@@ -366,7 +375,7 @@ mod tests {
         assert_eq!(block.command, "echo hello");
         assert!(block.is_running());
         assert!(!block.collapsed);
-        assert!(block.native_output.is_none());
+        assert!(block.structured_output.is_none());
     }
 
     #[test]
@@ -430,6 +439,203 @@ mod tests {
         block1.version = 1;
         block2.version = 2;
         assert_ne!(block1, block2);
+    }
+
+    // ========== sort_table_rows tests ==========
+
+    fn make_table(rows: Vec<Vec<Value>>) -> Option<Value> {
+        Some(Value::Table {
+            columns: vec![
+                nexus_api::TableColumn::new("a"),
+                nexus_api::TableColumn::new("b"),
+            ],
+            rows,
+        })
+    }
+
+    fn extract_col0_ints(value: &Option<Value>) -> Vec<i64> {
+        if let Some(Value::Table { rows, .. }) = value {
+            rows.iter()
+                .filter_map(|r| if let Value::Int(n) = r[0] { Some(n) } else { None })
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn test_sort_table_rows_int_ascending() {
+        let mut table = make_table(vec![
+            vec![Value::Int(3), Value::String("c".into())],
+            vec![Value::Int(1), Value::String("a".into())],
+            vec![Value::Int(2), Value::String("b".into())],
+        ]);
+        Block::sort_table_rows(&mut table, 0, true);
+        assert_eq!(extract_col0_ints(&table), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_sort_table_rows_int_descending() {
+        let mut table = make_table(vec![
+            vec![Value::Int(1), Value::String("a".into())],
+            vec![Value::Int(3), Value::String("c".into())],
+            vec![Value::Int(2), Value::String("b".into())],
+        ]);
+        Block::sort_table_rows(&mut table, 0, false);
+        assert_eq!(extract_col0_ints(&table), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn test_sort_table_rows_float() {
+        let mut table = make_table(vec![
+            vec![Value::Float(2.5), Value::Unit],
+            vec![Value::Float(1.1), Value::Unit],
+            vec![Value::Float(3.9), Value::Unit],
+        ]);
+        Block::sort_table_rows(&mut table, 0, true);
+        if let Some(Value::Table { rows, .. }) = &table {
+            let vals: Vec<f64> = rows.iter().filter_map(|r| {
+                if let Value::Float(f) = r[0] { Some(f) } else { None }
+            }).collect();
+            assert_eq!(vals, vec![1.1, 2.5, 3.9]);
+        }
+    }
+
+    #[test]
+    fn test_sort_table_rows_mixed_int_float() {
+        let mut table = make_table(vec![
+            vec![Value::Float(2.5), Value::Unit],
+            vec![Value::Int(1), Value::Unit],
+            vec![Value::Float(1.5), Value::Unit],
+            vec![Value::Int(3), Value::Unit],
+        ]);
+        Block::sort_table_rows(&mut table, 0, true);
+        if let Some(Value::Table { rows, .. }) = &table {
+            let vals: Vec<String> = rows.iter().map(|r| r[0].to_text()).collect();
+            assert_eq!(vals, vec!["1", "1.5", "2.5", "3"]);
+        }
+    }
+
+    #[test]
+    fn test_sort_table_rows_text_fallback() {
+        let mut table = make_table(vec![
+            vec![Value::String("banana".into()), Value::Unit],
+            vec![Value::String("apple".into()), Value::Unit],
+            vec![Value::String("cherry".into()), Value::Unit],
+        ]);
+        Block::sort_table_rows(&mut table, 0, true);
+        if let Some(Value::Table { rows, .. }) = &table {
+            let vals: Vec<String> = rows.iter().map(|r| r[0].to_text()).collect();
+            assert_eq!(vals, vec!["apple", "banana", "cherry"]);
+        }
+    }
+
+    #[test]
+    fn test_sort_table_rows_none_values() {
+        // Rows shorter than col_idx → get(col_idx) returns None
+        let mut table = make_table(vec![
+            vec![Value::Int(2)],       // row has 1 element, col 1 is None
+            vec![Value::Int(1), Value::Int(10)],
+        ]);
+        Block::sort_table_rows(&mut table, 1, true);
+        if let Some(Value::Table { rows, .. }) = &table {
+            // None sorts after Some
+            assert_eq!(rows[0].len(), 2); // row with value first
+            assert_eq!(rows[1].len(), 1); // short row last
+        }
+    }
+
+    #[test]
+    fn test_sort_table_rows_not_a_table() {
+        let mut value = Some(Value::String("not a table".into()));
+        Block::sort_table_rows(&mut value, 0, true);
+        // Should be no-op
+        assert_eq!(value, Some(Value::String("not a table".into())));
+    }
+
+    #[test]
+    fn test_sort_table_rows_none_input() {
+        let mut value: Option<Value> = None;
+        Block::sort_table_rows(&mut value, 0, true);
+        assert!(value.is_none());
+    }
+
+    // ========== Clipboard helper tests ==========
+
+    #[test]
+    fn test_copy_as_tsv_basic() {
+        let mut block = Block::new(BlockId(1), "ls".to_string());
+        block.structured_output = Some(Value::Table {
+            columns: vec![
+                nexus_api::TableColumn::new("name"),
+                nexus_api::TableColumn::new("size"),
+            ],
+            rows: vec![
+                vec![Value::String("foo.txt".into()), Value::Int(100)],
+                vec![Value::String("bar.rs".into()), Value::Int(200)],
+            ],
+        });
+        let tsv = block.copy_as_tsv().unwrap();
+        assert_eq!(tsv, "name\tsize\nfoo.txt\t100\nbar.rs\t200\n");
+    }
+
+    #[test]
+    fn test_copy_as_tsv_escapes_tabs_and_newlines() {
+        let mut block = Block::new(BlockId(1), "cmd".to_string());
+        block.structured_output = Some(Value::Table {
+            columns: vec![nexus_api::TableColumn::new("val")],
+            rows: vec![
+                vec![Value::String("has\ttab".into())],
+                vec![Value::String("has\nnewline".into())],
+            ],
+        });
+        let tsv = block.copy_as_tsv().unwrap();
+        assert_eq!(tsv, "val\nhas tab\nhas newline\n");
+    }
+
+    #[test]
+    fn test_copy_as_tsv_not_a_table() {
+        let mut block = Block::new(BlockId(1), "cmd".to_string());
+        block.structured_output = Some(Value::String("hello".into()));
+        assert!(block.copy_as_tsv().is_none());
+    }
+
+    #[test]
+    fn test_copy_as_tsv_no_output() {
+        let block = Block::new(BlockId(1), "cmd".to_string());
+        assert!(block.copy_as_tsv().is_none());
+    }
+
+    #[test]
+    fn test_copy_as_json() {
+        let mut block = Block::new(BlockId(1), "cmd".to_string());
+        block.structured_output = Some(Value::Record(vec![
+            ("key".into(), Value::String("value".into())),
+        ]));
+        let json = block.copy_as_json().unwrap();
+        assert!(json.contains("key"));
+        assert!(json.contains("value"));
+    }
+
+    #[test]
+    fn test_copy_as_json_no_output() {
+        let block = Block::new(BlockId(1), "cmd".to_string());
+        assert!(block.copy_as_json().is_none());
+    }
+
+    #[test]
+    fn test_copy_output_with_structured() {
+        let mut block = Block::new(BlockId(1), "cmd".to_string());
+        block.structured_output = Some(Value::String("structured text".into()));
+        assert_eq!(block.copy_output(), "structured text");
+    }
+
+    #[test]
+    fn test_copy_output_falls_back_to_terminal() {
+        let block = Block::new(BlockId(1), "cmd".to_string());
+        // No structured output, falls back to parser grid (empty for new block)
+        let output = block.copy_output();
+        assert!(output.is_empty() || output.chars().all(|c| c.is_whitespace()));
     }
 
     #[test]

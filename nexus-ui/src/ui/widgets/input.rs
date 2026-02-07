@@ -7,6 +7,7 @@
 
 use nexus_kernel::{Completion, CompletionKind};
 
+use crate::utils::text::display_path;
 use strata::content_address::SourceId;
 use strata::layout::{
     ButtonElement, Column, CrossAxisAlignment, LayoutChild, Length, Padding, Row,
@@ -47,13 +48,7 @@ impl<'a> Widget<'a> for NexusInputBar<'a> {
             .text_color(mode_color)
             .corner_radius(4.0);
 
-        // Shorten cwd for display
-        let home = std::env::var("HOME").unwrap_or_default();
-        let display_cwd = if self.cwd.starts_with(&home) {
-            self.cwd.replacen(&home, "~", 1)
-        } else {
-            self.cwd.to_string()
-        };
+        let display_cwd = display_path(self.cwd);
 
         // Prompt color based on exit code
         let prompt_color = match self.last_exit_code {

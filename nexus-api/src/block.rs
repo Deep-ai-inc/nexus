@@ -27,10 +27,8 @@ pub enum BlockState {
     Running,
     /// Command completed successfully (exit code 0).
     Success,
-    /// Command failed (non-zero exit code).
+    /// Command exited with non-zero code (includes signal kills: 128+signal).
     Failed(i32),
-    /// Command was killed by a signal.
-    Killed(i32),
 }
 
 /// Metadata for a command block.

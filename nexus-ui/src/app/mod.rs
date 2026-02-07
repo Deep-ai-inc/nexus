@@ -13,7 +13,7 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-pub use message::{NexusMessage, InputMsg, ShellMsg, AgentMsg, SelectionMsg, ContextMenuMsg, DragMsg};
+use message::{NexusMessage, InputMsg};
 use crate::ui::context_menu::render_context_menu;
 use crate::features::input::InputWidget;
 use crate::ui::scroll::ScrollModel;
@@ -408,7 +408,7 @@ impl NexusState {
 
     /// Get the command string of the most recent running block (kernel or PTY).
     fn last_running_command(&self) -> Option<String> {
-        self.shell.bm.blocks.iter().rev()
+        self.shell.blocks.blocks.iter().rev()
             .find(|b| b.is_running())
             .map(|b| b.command.clone())
     }
@@ -416,21 +416,12 @@ impl NexusState {
 
 /// Shorten a filesystem path for display (replace home dir with ~).
 fn shorten_path(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if path.starts_with(&home) {
-            return format!("~{}", &path[home.len()..]);
-        }
-    }
-    path.to_string()
+    crate::utils::text::display_path(path)
 }
 
 /// Truncate a title string to a maximum character width, adding ellipsis if needed.
 fn truncate_title(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
-    }
+    crate::utils::text::truncate_str(s, max)
 }
 
 impl RootComponent for NexusState {

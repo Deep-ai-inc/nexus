@@ -101,7 +101,12 @@ impl ToolInvocation {
     }
 }
 
-/// State of an agent block.
+/// Lifecycle state of an agent conversation turn.
+///
+/// Typical progression: `Pending` → `Thinking` → `Streaming` → (`Executing` ↔
+/// `Streaming`) → `Completed`. Can be interrupted at any point (`Interrupted`)
+/// or fail (`Failed`). `AwaitingPermission` pauses execution until the user
+/// approves a dangerous tool call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentBlockState {
     /// Waiting for agent response.

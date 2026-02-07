@@ -7,7 +7,7 @@
 
 pub mod agent;
 pub mod kernel;
-pub mod permission_server;
+pub(crate) mod permission_server;
 pub mod pty;
 
 pub use agent::{agent_subscription, spawn_agent_task};

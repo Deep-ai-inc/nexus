@@ -240,7 +240,7 @@ impl DragPayload {
                             }
                         }
                     }
-                    if let Some(text) = snapshot.native_output_text {
+                    if let Some(text) = snapshot.structured_output_text {
                         return strata::DragSource::Text(text);
                     }
                     return strata::DragSource::Text(snapshot.terminal_text);
@@ -281,8 +281,8 @@ impl DragPayload {
 pub struct BlockSnapshot {
     pub command: String,
     pub terminal_text: String,
-    pub native_output_text: Option<String>,
-    /// Table data if native_output is a Table
+    pub structured_output_text: Option<String>,
+    /// Table data if structured_output is a Table
     table_columns: Option<Vec<String>>,
     table_rows: Option<Vec<Vec<String>>>,
 }
@@ -292,7 +292,7 @@ impl BlockSnapshot {
     pub fn from_block(block: &crate::data::Block) -> Self {
         use nexus_api::Value;
 
-        let (table_columns, table_rows) = if let Some(Value::Table { columns, rows }) = &block.native_output {
+        let (table_columns, table_rows) = if let Some(Value::Table { columns, rows }) = &block.structured_output {
             let cols: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
             let row_data: Vec<Vec<String>> = rows.iter()
                 .map(|row| row.iter().map(|v| v.to_text()).collect())
@@ -305,7 +305,7 @@ impl BlockSnapshot {
         Self {
             command: block.command.clone(),
             terminal_text: block.parser.grid_with_scrollback().to_string(),
-            native_output_text: block.native_output.as_ref().map(|v| v.to_text()),
+            structured_output_text: block.structured_output.as_ref().map(|v| v.to_text()),
             table_columns,
             table_rows,
         }

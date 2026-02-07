@@ -375,7 +375,7 @@ fn route_left_click(
     }
     // Selection drag (click inside existing selection)
     if let Some(r) = state.selection.route_selection_drag(
-        &hit, &state.shell.bm.blocks, &state.agent.blocks, position,
+        &hit, &state.shell.blocks.blocks, &state.agent.blocks, position,
     ) {
         return r;
     }
@@ -414,7 +414,7 @@ fn route_widget_click(
     };
 
     // Viewer exit buttons (cross-cutting: shell block → ViewerMsg)
-    for block in &state.shell.bm.blocks {
+    for block in &state.shell.blocks.blocks {
         if block.view_state.is_some() && id == source_ids::viewer_exit(block.id) {
             return Some(MouseResponse::message(NexusMessage::Viewer(ViewerMsg::Exit(block.id))));
         }
