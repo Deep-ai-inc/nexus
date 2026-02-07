@@ -16,7 +16,8 @@ use strata::{ImageHandle, ImageStore, Subscription};
 use strata::content_address::SourceId;
 
 use crate::blocks::Focus;
-use crate::nexus_widgets::{JobBar, ShellBlockWidget};
+use crate::nexus_widgets::JobBar;
+use crate::widgets::{ShellBlockWidget, ShellBlockMessage};
 
 use super::pty_backend::PtyBackend;
 
@@ -173,10 +174,10 @@ impl ShellWidget {
 
     /// Handle a widget click within shell-owned UI. Returns None if not our widget.
     pub fn on_click(&self, id: SourceId) -> Option<ShellMsg> {
-        // Kill buttons
+        // Delegate to ShellBlockWidget for block-specific clicks
         for block in &self.blocks {
-            if block.is_running() && id == source_ids::kill(block.id) {
-                return Some(ShellMsg::KillBlock(block.id));
+            if let Some(msg) = ShellBlockWidget::on_click(block, id) {
+                return Some(Self::translate_block_message(block.id, msg));
             }
         }
         // Table sort headers (check both native_output and stream_latest)
@@ -198,6 +199,20 @@ impl ShellWidget {
                 Some(ShellMsg::ToggleTreeExpand(*block_id, path.clone()))
             }
             _ => None, // Anchors handled via drag intent path
+        }
+    }
+
+    /// Translate a ShellBlockMessage into a ShellMsg for the update loop.
+    fn translate_block_message(block_id: BlockId, msg: ShellBlockMessage) -> ShellMsg {
+        match msg {
+            ShellBlockMessage::Kill => ShellMsg::KillBlock(block_id),
+            ShellBlockMessage::TreeToggle(path) => ShellMsg::ToggleTreeExpand(block_id, path),
+            // These are handled via other paths (ViewerMsg, registry, etc.)
+            ShellBlockMessage::ExitViewer
+            | ShellBlockMessage::ToggleCollapse
+            | ShellBlockMessage::AnchorClick(_) => {
+                unreachable!("ShellBlockWidget::on_click doesn't return these variants")
+            }
         }
     }
 

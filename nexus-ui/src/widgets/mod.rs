@@ -7,4 +7,4 @@ mod view_context;
 mod shell_block;
 
 pub(crate) use view_context::ViewContext;
-pub(crate) use shell_block::{ShellBlockWidget, ShellBlockMessage};
+pub use shell_block::{ShellBlockWidget, ShellBlockMessage};
