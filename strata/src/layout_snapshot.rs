@@ -653,6 +653,10 @@ pub struct SourceLayout {
     /// For terminals, typically a single Grid item.
     /// For documents, multiple Text items (paragraphs).
     pub items: Vec<ItemLayout>,
+
+    /// Clip rectangle inherited from the containing scroll container.
+    /// Used to clip selection highlights so they don't overflow.
+    pub clip_rect: Option<Rect>,
 }
 
 impl SourceLayout {
@@ -661,6 +665,7 @@ impl SourceLayout {
         Self {
             bounds,
             items: Vec::new(),
+            clip_rect: None,
         }
     }
 
@@ -670,6 +675,7 @@ impl SourceLayout {
         Self {
             bounds,
             items: vec![ItemLayout::Text(text_layout)],
+            clip_rect: None,
         }
     }
 
@@ -679,6 +685,7 @@ impl SourceLayout {
         Self {
             bounds,
             items: vec![ItemLayout::Grid(grid_layout)],
+            clip_rect: None,
         }
     }
 }
@@ -969,11 +976,21 @@ impl LayoutSnapshot {
     /// If the source is already registered, new items are appended and bounds
     /// are expanded. This allows multiple widgets (e.g. per-line TextElements)
     /// to share a single source for cross-line selection.
-    pub fn register_source(&mut self, source_id: SourceId, layout: SourceLayout) {
+    pub fn register_source(&mut self, source_id: SourceId, mut layout: SourceLayout) {
+        let clip = self.current_clip();
+        layout.clip_rect = clip;
         self.source_ordering.register(source_id);
         if let Some(existing) = self.sources.get_mut(&source_id) {
             existing.bounds = existing.bounds.union(&layout.bounds);
             existing.items.extend(layout.items);
+            // When merging, intersect clips (both are in the same container,
+            // but be safe for nested cases).
+            existing.clip_rect = match (existing.clip_rect, clip) {
+                (Some(a), Some(b)) => a.intersection(&b),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
         } else {
             self.sources.insert(source_id, layout);
         }
@@ -1228,7 +1245,7 @@ impl LayoutSnapshot {
     ///
     /// Returns a list of rectangles that cover the selection.
     /// This is used for rendering selection highlights.
-    pub fn selection_bounds(&self, selection: &Selection) -> Vec<Rect> {
+    pub fn selection_bounds(&self, selection: &Selection) -> Vec<(Rect, Option<Rect>)> {
         let (start, end) = self.normalize_selection(selection);
         let mut rects = Vec::new();
 
@@ -1250,6 +1267,8 @@ impl LayoutSnapshot {
                 continue;
             };
 
+            let clip = layout.clip_rect;
+
             // Fast path: entire source is selected — use combined bounds
             let fully_before_start = current_order > start_order
                 || (current_order == start_order
@@ -1259,7 +1278,7 @@ impl LayoutSnapshot {
                 || (current_order == end_order
                     && end.item_index >= layout.items.len());
             if fully_before_start && fully_after_end {
-                rects.push(layout.bounds);
+                rects.push((layout.bounds, clip));
             } else {
                 // Partial selection - need to compute per-item bounds
                 for (item_index, item) in layout.items.iter().enumerate() {
@@ -1273,7 +1292,7 @@ impl LayoutSnapshot {
                         start_order,
                         end_order,
                     );
-                    rects.extend(item_rects);
+                    rects.extend(item_rects.into_iter().map(|r| (r, clip)));
                 }
             }
         }

@@ -157,6 +157,10 @@ enum ShellMessage<M> {
     /// One-shot: set up native platform integration after the event loop starts.
     #[cfg(target_os = "macos")]
     SetupNative,
+
+    /// Force Click (trackpad deep press) — carries window-local cursor position.
+    #[cfg(target_os = "macos")]
+    ForceClick(f32, f32),
 }
 
 impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
@@ -174,6 +178,8 @@ impl<M: std::fmt::Debug> std::fmt::Debug for ShellMessage<M> {
             ShellMessage::PlatformNewWindow => write!(f, "PlatformNewWindow"),
             #[cfg(target_os = "macos")]
             ShellMessage::SetupNative => write!(f, "SetupNative"),
+            #[cfg(target_os = "macos")]
+            ShellMessage::ForceClick(x, y) => write!(f, "ForceClick({}, {})", x, y),
         }
     }
 }
@@ -220,10 +226,13 @@ fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMess
         },
     };
 
-    // Install macOS reopen handler now (needs channel before event loop).
-    // Menu bar setup is deferred to SetupNative (needs winit's menu to exist first).
+    // Install macOS handlers now (need channels before event loop).
+    // Menu bar and event monitors are deferred to SetupNative (needs winit to exist first).
     #[cfg(target_os = "macos")]
-    crate::platform::macos::install_reopen_handler();
+    {
+        crate::platform::macos::install_reopen_handler();
+        crate::platform::macos::install_force_click_handler();
+    }
 
     let app_task = command_to_task(cmd, window_id);
     let tick_task = Task::done(ShellMessage::Tick);
@@ -517,12 +526,45 @@ fn update<A: StrataApp>(
         #[cfg(target_os = "macos")]
         ShellMessage::SetupNative => {
             crate::platform::macos::setup_menu_bar();
+            crate::platform::macos::setup_force_click_monitor();
             Task::none()
         }
 
         #[cfg(target_os = "macos")]
         ShellMessage::PlatformNewWindow => {
             Task::done(ShellMessage::OpenNewWindow)
+        }
+
+        #[cfg(target_os = "macos")]
+        ShellMessage::ForceClick(monitor_x, monitor_y) => {
+            // monitor_x/y are in window-local, top-left-origin coordinates
+            // (converted from Cocoa by setup_force_click_monitor).
+            if let Some((&_wid, ws)) = state.windows.iter().next() {
+                let zoom = ws.current_zoom;
+                // Hit test needs content coordinates (divided by zoom)
+                let content_pos = Point::new(monitor_x / zoom, monitor_y / zoom);
+
+                let hit = ws.cached_snapshot.borrow().as_ref()
+                    .and_then(|s| s.hit_test(content_pos));
+                if let Some(HitResult::Content(addr)) = hit {
+                    // Look up word + word-start address from the app
+                    if let Some((word, word_start, font_size)) = A::force_click_lookup(&ws.app, &addr) {
+                        // Resolve exact pixel position of word start from layout snapshot
+                        let popup_pos = ws.cached_snapshot.borrow().as_ref()
+                            .and_then(|s| s.char_bounds(&word_start))
+                            .map(|rect| {
+                                // rect is in content coordinates; scale to window coordinates.
+                                // atPoint: expects the text baseline origin.
+                                // baseline ≈ top + ascent, where ascent ≈ font_size * 0.8
+                                Point::new(rect.x * zoom, rect.y * zoom + font_size * 0.8)
+                            })
+                            .unwrap_or(Point::new(monitor_x, monitor_y));
+
+                        let _ = crate::platform::show_definition(&word, popup_pos, font_size);
+                    }
+                }
+            }
+            Task::none()
         }
 
         ShellMessage::WindowClosed(wid) => {
@@ -619,6 +661,7 @@ fn subscription<A: StrataApp>(state: &MultiWindowState<A>) -> Subscription<Shell
     #[cfg(target_os = "macos")]
     {
         all_subs.push(Subscription::run(macos_reopen_stream::<A>));
+        all_subs.push(Subscription::run(macos_force_click_stream::<A>));
     }
 
     // Per-window app subscriptions, tagged with window ID.
@@ -669,6 +712,34 @@ fn macos_reopen_stream<A: StrataApp>() -> impl iced::futures::Stream<Item = Shel
         use iced::futures::{SinkExt, StreamExt};
         while arx.next().await.is_some() {
             let _ = output.send(ShellMessage::PlatformNewWindow).await;
+        }
+    })
+}
+
+/// Creates the macOS force click stream for the subscription system.
+#[cfg(target_os = "macos")]
+fn macos_force_click_stream<A: StrataApp>() -> impl iced::futures::Stream<Item = ShellMessage<A::Message>> {
+    iced::stream::channel(1, |mut output: iced::futures::channel::mpsc::Sender<ShellMessage<A::Message>>| async move {
+        let Some(rx) = crate::platform::macos::take_force_click_receiver() else {
+            std::future::pending::<()>().await;
+            return;
+        };
+
+        let (atx, mut arx) = iced::futures::channel::mpsc::unbounded::<(f32, f32)>();
+        std::thread::Builder::new()
+            .name("force-click".into())
+            .spawn(move || {
+                while let Ok(pos) = rx.recv() {
+                    if atx.unbounded_send(pos).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+
+        use iced::futures::{SinkExt, StreamExt};
+        while let Some((x, y)) = arx.next().await {
+            let _ = output.send(ShellMessage::ForceClick(x, y)).await;
         }
     })
 }
@@ -1180,16 +1251,17 @@ impl PipelineWrapper {
         if let Some(sel) = selection {
             if !sel.is_collapsed() {
                 let selection_rects = snapshot.selection_bounds(sel);
-                let scaled_rects: Vec<_> = selection_rects
-                    .iter()
-                    .map(|r| crate::primitives::Rect {
+                for (r, clip) in &selection_rects {
+                    let start = pipeline.instance_count();
+                    let scaled = crate::primitives::Rect {
                         x: r.x * scale,
                         y: r.y * scale,
                         width: r.width * scale,
                         height: r.height * scale,
-                    })
-                    .collect();
-                pipeline.add_solid_rects(&scaled_rects, crate::gpu::SELECTION_COLOR);
+                    };
+                    pipeline.add_solid_rects(&[scaled], crate::gpu::SELECTION_COLOR);
+                    maybe_clip(pipeline, start, clip, scale);
+                }
             }
         }
 

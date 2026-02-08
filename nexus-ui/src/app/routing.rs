@@ -373,11 +373,14 @@ fn route_left_click(
     if let Some(msg) = route_context_menu_click(state, &hit) {
         return MouseResponse::message(msg);
     }
-    // Selection drag (click inside existing selection)
-    if let Some(r) = state.selection.route_selection_drag(
-        &hit, &state.shell.blocks.blocks, &state.agent.blocks, position,
-    ) {
-        return r;
+    // Selection drag (click inside existing selection) — but NOT on multi-clicks,
+    // which should pass through to route_text_selection_start for word/line snap.
+    if !state.drag.click_tracker.would_be_multi_click(position) {
+        if let Some(r) = state.selection.route_selection_drag(
+            &hit, &state.shell.blocks.blocks, &state.agent.blocks, position,
+        ) {
+            return r;
+        }
     }
     // Widget ID clicks (viewer exit, input/shell/agent on_click, anchor drag, job pills)
     if let Some(r) = route_widget_click(state, &hit, position) {

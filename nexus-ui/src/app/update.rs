@@ -7,6 +7,7 @@ use crate::data::Focus;
 use crate::ui::context_menu::{ContextMenuItem, ContextTarget};
 use crate::features::selection::drag::{ActiveKind, DragStatus, PendingIntent};
 use crate::features::selection::drop as file_drop;
+use crate::features::selection::snap;
 use crate::features::input::SubmitRequest;
 use super::message::{AnchorAction, ContextMenuMsg, DragMsg, DropZone, FileDropMsg, NexusMessage, ShellMsg, ViewerMsg};
 use crate::features::selection;
@@ -93,7 +94,14 @@ impl NexusState {
                 cmds
             }
             NexusMessage::Selection(m) => {
-                let (_cmd, _) = self.selection.update(m, ctx);
+                let snap_content = match &m {
+                    super::message::SelectionMsg::Extend(addr)
+                    | super::message::SelectionMsg::Start(addr, _) => {
+                        self.build_snap_content(addr.source_id)
+                    }
+                    _ => None,
+                };
+                let (_cmd, _) = self.selection.update(m, ctx, snap_content.as_ref());
                 Command::none()
             }
             NexusMessage::Viewer(m) => { self.dispatch_viewer_msg(m); Command::none() }
@@ -185,6 +193,43 @@ impl NexusState {
                     Command::none()
                 }
             }
+            NexusMessage::ForceClick(addr, position) => {
+                if let Some(content) = self.build_snap_content(addr.source_id) {
+                    // Debug: confirm char under the hit-tested address
+                    match &content {
+                        snap::SnapContent::Grid { chars, .. } => {
+                            let o = addr.content_offset.min(chars.len().saturating_sub(1));
+                            tracing::debug!("force-click grid offset={} char={:?}", o, chars[o]);
+                        }
+                        snap::SnapContent::Text { lines } => {
+                            if let Some(line) = lines.get(addr.item_index) {
+                                let chars: Vec<char> = line.chars().collect();
+                                let o = addr.content_offset.min(chars.len().saturating_sub(1));
+                                tracing::debug!("force-click text item={} offset={} char={:?}", addr.item_index, o, chars.get(o));
+                            }
+                        }
+                    }
+                    let (start, end) = snap::snap_word(&addr, &content);
+                    let word = snap::extract_snap_text(&start, &end, &content);
+                    tracing::debug!("force-click word={:?} position=({}, {})", word, position.x, position.y);
+                    if !word.trim().is_empty() {
+                        let font_size = 14.0 * self.zoom_level;
+                        let char_width = 8.4 * self.zoom_level;
+                        // Compute word start X: shift left from cursor by chars before click
+                        let chars_before = addr.content_offset.saturating_sub(start.content_offset);
+                        let word_start_x = position.x - chars_before as f32 * char_width;
+                        // Baseline Y: shift down from cursor to approximate text baseline
+                        let baseline_y = position.y + font_size * 0.75;
+                        let word_origin = strata::primitives::Point::new(word_start_x, baseline_y);
+                        if let Err(e) = strata::platform::show_definition(&word, word_origin, font_size) {
+                            tracing::warn!("show_definition failed: {}", e);
+                        }
+                    }
+                } else {
+                    tracing::debug!("force-click: no snap content for source {:?}", addr.source_id);
+                }
+                Command::none()
+            }
             NexusMessage::ZoomIn => { self.zoom_in(); Command::none() }
             NexusMessage::ZoomOut => { self.zoom_out(); Command::none() }
             NexusMessage::ZoomReset => { self.zoom_level = 1.0; Command::none() }
@@ -256,9 +301,11 @@ impl NexusState {
                     self.set_focus(crate::data::Focus::Block(block_id));
                 }
                 // Immediate Active — no Pending hysteresis for raw text clicks.
+                let snap_content = self.build_snap_content(addr.source_id);
                 self.selection.update(
                     super::message::SelectionMsg::Start(addr.clone(), mode),
                     ctx,
+                    snap_content.as_ref(),
                 );
                 self.drag.status = DragStatus::Active(ActiveKind::Selecting);
             }
@@ -309,6 +356,7 @@ impl NexusState {
                                 self.selection.update(
                                     super::message::SelectionMsg::Start(origin_addr, crate::features::selection::drag::SelectMode::Char),
                                     ctx,
+                                    None,
                                 );
                             }
                             // Future intents — no-op
@@ -320,6 +368,7 @@ impl NexusState {
                         self.selection.update(
                             super::message::SelectionMsg::End,
                             ctx,
+                            None,
                         );
                     }
                     _ => {}
@@ -337,6 +386,111 @@ impl NexusState {
                 .block_by_id(block_id)
                 .map(BlockSnapshot::from_block)
         })
+    }
+
+    /// Build a snap content snapshot for the given source ID.
+    pub(crate) fn build_snap_content(&self, source_id: strata::content_address::SourceId) -> Option<snap::SnapContent> {
+        use crate::utils::ids as source_ids;
+
+        let text_snap = |text: String| -> snap::SnapContent {
+            snap::SnapContent::Text { lines: text.lines().map(String::from).collect() }
+        };
+
+        // Check shell blocks
+        for block in &self.shell.blocks.blocks {
+            if source_id == source_ids::shell_term(block.id) && block.structured_output.is_none() {
+                let grid = if block.parser.is_alternate_screen() || block.is_running() {
+                    block.parser.grid()
+                } else {
+                    block.parser.grid_with_scrollback()
+                };
+                let chars = grid.cells().iter().map(|c| c.c).collect();
+                return Some(snap::SnapContent::Grid { chars, cols: grid.cols() as usize });
+            }
+            if source_id == source_ids::shell_header(block.id) {
+                return Some(text_snap(format!("$ {}", block.command)));
+            }
+            if source_id == source_ids::native(block.id) {
+                if let Some(ref value) = block.structured_output {
+                    return Some(text_snap(value.to_text()));
+                }
+            }
+            if source_id == source_ids::table(block.id) {
+                if let Some(nexus_api::Value::Table { columns, rows }) = &block.structured_output {
+                    // Build lines matching the table's register_source order:
+                    // headers (one per column), then data cells row-by-row, column-by-column.
+                    let mut lines = Vec::with_capacity(columns.len() + rows.len() * columns.len());
+                    for col in columns {
+                        let name = if block.table_sort.column == Some(lines.len()) {
+                            if block.table_sort.ascending {
+                                format!("{} \u{25B2}", col.name)
+                            } else {
+                                format!("{} \u{25BC}", col.name)
+                            }
+                        } else {
+                            col.name.clone()
+                        };
+                        lines.push(name);
+                    }
+                    for row in rows {
+                        for (col_idx, cell) in row.iter().enumerate() {
+                            let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
+                                nexus_api::format_value_for_display(cell, fmt)
+                            } else {
+                                cell.to_text()
+                            };
+                            lines.push(text);
+                        }
+                    }
+                    return Some(snap::SnapContent::Text { lines });
+                }
+            }
+        }
+        // Check agent blocks
+        for block in &self.agent.blocks {
+            if source_id == source_ids::agent_response(block.id) {
+                return Some(text_snap(block.response.clone()));
+            }
+            if source_id == source_ids::agent_thinking(block.id) {
+                return Some(text_snap(block.thinking.clone()));
+            }
+            if source_id == source_ids::agent_query(block.id) {
+                return Some(snap::SnapContent::Text {
+                    lines: vec!["?".to_string(), block.query.clone()],
+                });
+            }
+            for (i, tool) in block.tools.iter().enumerate() {
+                if source_id == source_ids::agent_tool(block.id, i) {
+                    return Some(text_snap(tool.extract_text()));
+                }
+            }
+            if let Some(ref perm) = block.pending_permission {
+                if source_id == source_ids::agent_perm_text(block.id) {
+                    let mut text = String::from("\u{26A0} Permission Required\n");
+                    text.push_str(&perm.description);
+                    text.push('\n');
+                    text.push_str(&perm.action);
+                    if let Some(ref dir) = perm.working_dir {
+                        text.push_str(&format!("\nin {}", dir));
+                    }
+                    return Some(text_snap(text));
+                }
+            }
+            if let Some(ref q) = block.pending_question {
+                if source_id == source_ids::agent_question_text(block.id) {
+                    let mut text = String::from("\u{2753} Claude is asking:\n");
+                    for question in &q.questions {
+                        text.push_str(&question.question);
+                        text.push('\n');
+                    }
+                    return Some(text_snap(text));
+                }
+            }
+            if source_id == source_ids::agent_footer(block.id) {
+                return Some(text_snap(block.footer_text()));
+            }
+        }
+        None
     }
 
     fn insert_text_at_cursor(&mut self, text: &str) {

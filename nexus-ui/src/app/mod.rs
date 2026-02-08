@@ -364,6 +364,28 @@ impl Component for NexusState {
     fn zoom_level(&self) -> f32 {
         self.zoom_level
     }
+
+    fn force_click_message(
+        addr: strata::content_address::ContentAddress,
+        position: strata::primitives::Point,
+    ) -> Option<NexusMessage> {
+        Some(NexusMessage::ForceClick(addr, position))
+    }
+
+    fn force_click_lookup(
+        &self,
+        addr: &strata::content_address::ContentAddress,
+    ) -> Option<(String, strata::content_address::ContentAddress, f32)> {
+        use crate::features::selection::snap;
+        let content = self.build_snap_content(addr.source_id)?;
+        let (start, end) = snap::snap_word(addr, &content);
+        let word = snap::extract_snap_text(&start, &end, &content);
+        if word.trim().is_empty() {
+            return None;
+        }
+        let font_size = 14.0 * self.zoom_level;
+        Some((word, start, font_size))
+    }
 }
 
 // =========================================================================

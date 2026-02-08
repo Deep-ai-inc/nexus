@@ -599,6 +599,168 @@ pub fn setup_menu_bar() {
     unsafe { app.setWindowsMenu(Some(&window_menu)) };
 }
 
+// =============================================================================
+// Force Click (Dictionary Lookup)
+// =============================================================================
+
+/// Show the macOS dictionary/definition popup for the given text.
+///
+/// Uses `NSView.showDefinitionForAttributedString:atPoint:` to display the
+/// system dictionary popup at the given position. The `position` is in
+/// window-local, top-left-origin coordinates (Strata's coordinate system).
+/// `font_size` should match the rendered text size (base_size * zoom).
+pub fn show_definition(text: &str, position: crate::primitives::Point, font_size: f32) -> Result<(), String> {
+    unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+        let app = NSApplication::sharedApplication(mtm);
+        let window = app.keyWindow().or_else(|| app.mainWindow()).ok_or("No window")?;
+        let view = window.contentView().ok_or("No content view")?;
+
+        // position is in Strata coords (top-left origin).
+        // showDefinitionForAttributedString:atPoint: expects view-local coords.
+        // If the view isFlipped (top-left origin, common for framework views),
+        // no Y conversion needed. Otherwise flip from top-left to bottom-left.
+        let flipped: bool = msg_send![&*view, isFlipped];
+        let bounds: NSRect = msg_send![&*view, bounds];
+        let view_point = if flipped {
+            NSPoint::new(position.x as f64, position.y as f64)
+        } else {
+            NSPoint::new(position.x as f64, bounds.size.height - position.y as f64)
+        };
+
+        // Create NSAttributedString with matching monospace font
+        let ns_text = NSString::from_str(text);
+        let font: Retained<AnyObject> = msg_send_id![
+            AnyClass::get("NSFont").unwrap(),
+            monospacedSystemFontOfSize: font_size as f64,
+            weight: 0.0_f64  // NSFontWeightRegular
+        ];
+        let font_key = NSString::from_str("NSFont");
+        let attrs: Retained<AnyObject> = msg_send_id![
+            AnyClass::get("NSDictionary").unwrap(),
+            dictionaryWithObject: &*font,
+            forKey: &*font_key
+        ];
+        let attr_string: Retained<AnyObject> = msg_send_id![
+            msg_send_id![AnyClass::get("NSAttributedString").unwrap(), alloc],
+            initWithString: &*ns_text,
+            attributes: &*attrs
+        ];
+
+        // showDefinitionForAttributedString:atPoint: on NSView
+        let _: () = msg_send![&*view, showDefinitionForAttributedString: &*attr_string atPoint: view_point];
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Force Click Event Monitor
+// =============================================================================
+
+/// Sender for force click events: (x, y) in screen coordinates.
+static FORCE_CLICK_TX: OnceLock<mpsc::Sender<(f32, f32)>> = OnceLock::new();
+
+/// Receiver half, taken once by the iced subscription.
+static FORCE_CLICK_RX: Mutex<Option<mpsc::Receiver<(f32, f32)>>> = Mutex::new(None);
+
+/// Install a local NSEvent monitor for pressure (Force Touch) events.
+///
+/// When the trackpad transitions to stage 2 (deep click), sends the
+/// cursor position through the channel. Idempotent — safe to call
+/// multiple times, only the first call registers.
+pub fn install_force_click_handler() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let (tx, rx) = mpsc::channel();
+        FORCE_CLICK_TX.set(tx).ok();
+        *FORCE_CLICK_RX.lock().unwrap() = Some(rx);
+
+        // The rest (NSEvent monitor) is set up in SetupNative phase
+        // where we have access to the main thread and event loop.
+    });
+}
+
+/// Actually register the NSEvent pressure monitor (must be called on main thread
+/// after the event loop has started).
+pub fn setup_force_click_monitor() {
+    use block2::RcBlock;
+
+    // Track stage transitions to avoid repeated firing.
+    static WAS_DEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    unsafe {
+        let ns_event_class = AnyClass::get("NSEvent")
+            .expect("NSEvent class not found");
+
+        // NSEventMaskPressure = 1 << 34
+        let mask: u64 = 1 << 34;
+
+        // The handler block receives an NSEvent and returns it (or nil to discard).
+        // We use RcBlock to create a closure-based ObjC block.
+        let block = RcBlock::new(|event: *mut AnyObject| -> *mut AnyObject {
+            if event.is_null() {
+                return event;
+            }
+            // Read event.stage (NSInteger)
+            let stage: NSInteger = msg_send![event, stage];
+            let is_deep = stage >= 2;
+            let was = WAS_DEEP.swap(is_deep, std::sync::atomic::Ordering::Relaxed);
+
+            if is_deep && !was {
+                // Transition to deep click — get cursor position
+                if let Some(tx) = FORCE_CLICK_TX.get() {
+                    let mtm = MainThreadMarker::new_unchecked();
+                    let app = NSApplication::sharedApplication(mtm);
+                    if let Some(window) = app.mainWindow() {
+                        if let Some(view) = window.contentView() {
+                            // locationInWindow is in window coords (bottom-left origin).
+                            // Convert to view-local via convertPoint:fromView:nil to
+                            // account for title bar / window chrome offset.
+                            let loc_window: NSPoint = msg_send![event, locationInWindow];
+                            let loc_view: NSPoint = msg_send![
+                                &*view, convertPoint: loc_window
+                                fromView: std::ptr::null::<AnyObject>()
+                            ];
+                            // Convert to Strata/iced top-left origin.
+                            // If the view isFlipped, convertPoint already gives top-left;
+                            // otherwise we need to flip Y manually.
+                            let flipped: bool = msg_send![&*view, isFlipped];
+                            let x = loc_view.x as f32;
+                            let y = if flipped {
+                                loc_view.y as f32
+                            } else {
+                                let view_height = view.frame().size.height;
+                                (view_height - loc_view.y) as f32
+                            };
+                            let _ = tx.send((x, y));
+                        }
+                    }
+                }
+            }
+            event
+        });
+
+        // [NSEvent addLocalMonitorForEventsMatchingMask:mask handler:block]
+        let _monitor: *mut AnyObject = msg_send![
+            ns_event_class,
+            addLocalMonitorForEventsMatchingMask: mask,
+            handler: &*block
+        ];
+        // Monitor is retained by AppKit; block is leaked (lives for app lifetime).
+        std::mem::forget(block);
+    }
+}
+
+/// Take the force click receiver (call exactly once from the subscription setup).
+pub fn take_force_click_receiver() -> Option<mpsc::Receiver<(f32, f32)>> {
+    FORCE_CLICK_RX.lock().unwrap().take()
+}
+
+// =============================================================================
+// Native Menu Bar
+// =============================================================================
+
 /// Create a menu item with a Cmd+key shortcut.
 fn make_menu_item(
     mtm: MainThreadMarker,

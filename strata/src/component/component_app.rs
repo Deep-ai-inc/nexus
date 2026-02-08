@@ -152,4 +152,18 @@ where
     fn zoom_level(state: &C) -> f32 {
         state.zoom_level()
     }
+
+    fn force_click_message(
+        addr: crate::content_address::ContentAddress,
+        position: crate::primitives::Point,
+    ) -> Option<C::Message> {
+        C::force_click_message(addr, position)
+    }
+
+    fn force_click_lookup(
+        state: &C,
+        addr: &crate::content_address::ContentAddress,
+    ) -> Option<(String, crate::content_address::ContentAddress, f32)> {
+        state.force_click_lookup(addr)
+    }
 }

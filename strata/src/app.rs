@@ -392,6 +392,29 @@ pub trait StrataApp: Sized + 'static {
         String::from("Strata App")
     }
 
+    /// Create a message for a Force Click (trackpad deep press) event.
+    ///
+    /// The `addr` is the content address at the click position,
+    /// `position` is the window-local cursor position for showing the popup.
+    /// Returns `None` if Force Click should be ignored.
+    fn force_click_message(
+        _addr: crate::content_address::ContentAddress,
+        _position: crate::primitives::Point,
+    ) -> Option<Self::Message> {
+        None
+    }
+
+    /// Look up the word at a content address for Force Click dictionary lookup.
+    ///
+    /// Returns `(word_text, word_start_addr, font_size)` so the adapter can
+    /// resolve the exact pixel position from the layout snapshot.
+    fn force_click_lookup(
+        _state: &Self::State,
+        _addr: &crate::content_address::ContentAddress,
+    ) -> Option<(String, crate::content_address::ContentAddress, f32)> {
+        None
+    }
+
     /// Background color for the application window.
     fn background_color(_state: &Self::State) -> crate::primitives::Color {
         crate::primitives::Color::BLACK

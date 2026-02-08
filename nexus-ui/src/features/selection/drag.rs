@@ -359,6 +359,22 @@ impl ClickTracker {
         }
     }
 
+    /// Would the next click at this position be a multi-click (double or triple)?
+    ///
+    /// Non-mutating peek — used to skip selection-drag routing on multi-clicks.
+    pub fn would_be_multi_click(&self, pos: Point) -> bool {
+        let (last_time, last_pos, count) = self.state.get();
+        if let Some(t) = last_time {
+            let dt = Instant::now().duration_since(t).as_millis();
+            let dx = pos.x - last_pos.x;
+            let dy = pos.y - last_pos.y;
+            if dt < 500 && (dx * dx + dy * dy) < DRAG_THRESHOLD_SQ {
+                return count >= 1; // next click would be count+1 ≥ 2
+            }
+        }
+        false
+    }
+
     /// Register a click and return the selection mode based on click count.
     ///
     /// - 1 click → Char

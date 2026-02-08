@@ -2,6 +2,7 @@
 
 pub(crate) mod drag;
 pub(crate) mod drop;
+pub(crate) mod snap;
 
 use nexus_api::BlockId;
 
@@ -25,6 +26,8 @@ pub(crate) struct SelectionWidget {
     pub selection: Option<Selection>,
     pub is_selecting: bool,
     pub select_mode: self::drag::SelectMode,
+    /// Snapped anchor range for word/line drag-extend.
+    snap_origin: Option<(ContentAddress, ContentAddress)>,
 }
 
 impl SelectionWidget {
@@ -33,19 +36,70 @@ impl SelectionWidget {
             selection: None,
             is_selecting: false,
             select_mode: self::drag::SelectMode::Char,
+            snap_origin: None,
         }
     }
 
-    pub fn update(&mut self, msg: SelectionMsg, _ctx: &mut Ctx) -> (Command<SelectionMsg>, ()) {
+    pub fn update(
+        &mut self,
+        msg: SelectionMsg,
+        _ctx: &mut Ctx,
+        snap_content: Option<&snap::SnapContent>,
+    ) -> (Command<SelectionMsg>, ()) {
         match msg {
             SelectionMsg::Start(addr, mode) => {
                 self.select_mode = mode;
-                self.selection = Some(Selection::new(addr.clone(), addr));
+                match (mode, snap_content) {
+                    (drag::SelectMode::Word, Some(content)) => {
+                        let (start, end) = snap::snap_word(&addr, content);
+                        self.selection = Some(Selection::new(start.clone(), end.clone()));
+                        self.snap_origin = Some((start, end));
+                    }
+                    (drag::SelectMode::Line, Some(content)) => {
+                        let (start, end) = snap::snap_line(&addr, content);
+                        self.selection = Some(Selection::new(start.clone(), end.clone()));
+                        self.snap_origin = Some((start, end));
+                    }
+                    _ => {
+                        // Char mode or no snap content: fall back to char behavior
+                        self.selection = Some(Selection::new(addr.clone(), addr));
+                        self.snap_origin = None;
+                    }
+                }
                 self.is_selecting = true;
             }
             SelectionMsg::Extend(addr) => {
                 if let Some(sel) = &mut self.selection {
-                    sel.focus = addr;
+                    match (self.select_mode, snap_content, &self.snap_origin) {
+                        (drag::SelectMode::Word, Some(content), Some((origin_start, origin_end))) => {
+                            let (snapped_start, snapped_end) = snap::snap_word(&addr, content);
+                            // Compare focus to origin to determine direction
+                            let focus_before_origin = (addr.item_index, addr.content_offset)
+                                < (origin_start.item_index, origin_start.content_offset);
+                            if focus_before_origin {
+                                sel.anchor = origin_end.clone();
+                                sel.focus = snapped_start;
+                            } else {
+                                sel.anchor = origin_start.clone();
+                                sel.focus = snapped_end;
+                            }
+                        }
+                        (drag::SelectMode::Line, Some(content), Some((origin_start, origin_end))) => {
+                            let (snapped_start, snapped_end) = snap::snap_line(&addr, content);
+                            let focus_before_origin = (addr.item_index, addr.content_offset)
+                                < (origin_start.item_index, origin_start.content_offset);
+                            if focus_before_origin {
+                                sel.anchor = origin_end.clone();
+                                sel.focus = snapped_start;
+                            } else {
+                                sel.anchor = origin_start.clone();
+                                sel.focus = snapped_end;
+                            }
+                        }
+                        _ => {
+                            sel.focus = addr;
+                        }
+                    }
                 }
             }
             SelectionMsg::End => {
@@ -54,6 +108,7 @@ impl SelectionWidget {
             SelectionMsg::Clear => {
                 self.selection = None;
                 self.is_selecting = false;
+                self.snap_origin = None;
             }
         }
         (Command::none(), ())
