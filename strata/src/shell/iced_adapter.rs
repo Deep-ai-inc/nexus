@@ -94,8 +94,13 @@ struct WindowState<A: StrataApp> {
     /// Current pointer capture state.
     capture: CaptureState,
 
-    /// Current window size (logical points).
+    /// Current window size (logical points, from OS Resized events).
     window_size: (f32, f32),
+
+    /// Base window size: the logical size at 100% zoom. Stable during zoom
+    /// operations — only changes when the user manually resizes the window.
+    /// `window_size ≈ base_size * current_zoom` (modulo OS rounding).
+    base_size: (f32, f32),
 
     /// Current zoom level (mirrors app state; used for resize detection).
     current_zoom: f32,
@@ -194,6 +199,7 @@ fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMess
         app: app_state,
         capture: CaptureState::None,
         window_size: (config.window_size.0, config.window_size.1),
+        base_size: (config.window_size.0, config.window_size.1),
         current_zoom: 1.0,
         cursor_position: None,
         frame: 0,
@@ -260,10 +266,12 @@ fn update<A: StrataApp>(
                 // Resize window when zoom level changes
                 let new_zoom = A::zoom_level(&window.app);
                 if (new_zoom - window.current_zoom).abs() > 0.001 {
-                    let ratio = new_zoom / window.current_zoom;
-                    let new_w = (window.window_size.0 * ratio).max(200.0);
-                    let new_h = (window.window_size.1 * ratio).max(150.0);
                     window.current_zoom = new_zoom;
+                    // Derive target from base_size (not current window_size) to
+                    // prevent floating-point drift. Ceil ensures we never lose a
+                    // pixel that could drop a terminal column.
+                    let new_w = (window.base_size.0 * new_zoom).ceil().max(200.0);
+                    let new_h = (window.base_size.1 * new_zoom).ceil().max(150.0);
                     return Task::batch([
                         command_to_task(cmd, wid),
                         iced::window::resize(wid, iced::Size::new(new_w, new_h)),
@@ -288,6 +296,12 @@ fn update<A: StrataApp>(
                 match win_event {
                     iced::window::Event::Resized(size) => {
                         window.window_size = (size.width, size.height);
+                        // Derive base size (the unzoomed logical size) so future
+                        // zoom operations start from the correct reference.
+                        window.base_size = (
+                            size.width / window.current_zoom,
+                            size.height / window.current_zoom,
+                        );
                     }
                     iced::window::Event::CloseRequested => {
                         return close_window::<A>(state, wid);
@@ -329,9 +343,10 @@ fn update<A: StrataApp>(
                             None => {
                                 drop(cache);
                                 let mut snapshot = LayoutSnapshot::new();
-                                let vp_w = window.window_size.0 / zoom;
-                                let vp_h = window.window_size.1 / zoom;
-                                snapshot.set_viewport(Rect::new(0.0, 0.0, vp_w, vp_h));
+                                snapshot.set_viewport(Rect::new(
+                                    0.0, 0.0,
+                                    window.base_size.0, window.base_size.1,
+                                ));
                                 snapshot.set_zoom_level(zoom);
                                 A::view(&window.app, &mut snapshot);
                                 let hit = adjusted_cursor
@@ -392,10 +407,9 @@ fn update<A: StrataApp>(
                             // Resize window on zoom change
                             let new_zoom = A::zoom_level(&window.app);
                             if (new_zoom - window.current_zoom).abs() > 0.001 {
-                                let ratio = new_zoom / window.current_zoom;
-                                let new_w = (window.window_size.0 * ratio).max(200.0);
-                                let new_h = (window.window_size.1 * ratio).max(150.0);
                                 window.current_zoom = new_zoom;
+                                let new_w = (window.base_size.0 * new_zoom).ceil().max(200.0);
+                                let new_h = (window.base_size.1 * new_zoom).ceil().max(150.0);
                                 return Task::batch([
                                     command_to_task(cmd, wid),
                                     iced::window::resize(wid, iced::Size::new(new_w, new_h)),
@@ -471,6 +485,7 @@ fn update<A: StrataApp>(
                     app: app_state,
                     capture: CaptureState::None,
                     window_size: state.window_config.size,
+                    base_size: state.window_config.size,
                     current_zoom: 1.0,
                     cursor_position: None,
                     frame: 0,
@@ -533,9 +548,11 @@ fn view<A: StrataApp>(state: &MultiWindowState<A>, window_id: iced::window::Id) 
     };
 
     let mut snapshot = LayoutSnapshot::new();
-    // Set the actual window size as viewport; the app's view() will divide by
-    // zoom to get the virtual viewport for layout.
-    snapshot.set_viewport(Rect::new(0.0, 0.0, window.window_size.0, window.window_size.1));
+    // Use base_size (the unzoomed logical size) as the viewport. This is
+    // stable during zoom operations — layout always sees the same dimensions
+    // regardless of whether the OS resize has landed yet.
+    snapshot.set_viewport(Rect::new(0.0, 0.0, window.base_size.0, window.base_size.1));
+    snapshot.set_zoom_level(A::zoom_level(&window.app));
 
     A::view(&window.app, &mut snapshot);
 

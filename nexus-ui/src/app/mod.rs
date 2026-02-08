@@ -100,7 +100,6 @@ pub struct NexusState {
     pub kernel_tx: broadcast::Sender<nexus_api::ShellEvent>,
 
     // --- Layout ---
-    pub window_size: (f32, f32),
     pub zoom_level: f32,
 
     // --- UI state ---
@@ -148,13 +147,12 @@ impl Component for NexusState {
         let fps = if prev == 0.0 { instant_fps } else { prev * 0.95 + instant_fps * 0.05 };
         self.fps_smooth.set(fps);
 
-        // Virtual viewport: divide actual window size by zoom so layout always
-        // sees the same logical dimensions → same cols/rows regardless of zoom.
-        snapshot.set_zoom_level(self.zoom_level);
-        let actual_vp = snapshot.viewport();
-        let vw = actual_vp.width / self.zoom_level;
-        let vh = actual_vp.height / self.zoom_level;
-        snapshot.set_viewport(Rect::new(0.0, 0.0, vw, vh));
+        // The adapter sets the viewport to the stable base size (unzoomed
+        // logical dimensions). Layout always sees the same cols/rows regardless
+        // of zoom — the adapter handles window resizing and GPU scaling.
+        let vp = snapshot.viewport();
+        let vw = vp.width;
+        let vh = vp.height;
 
         let (cols, rows) = NexusState::compute_terminal_size(vw, vh);
         self.shell.pty.terminal_size.set((cols, rows));
@@ -482,7 +480,6 @@ impl RootComponent for NexusState {
             kernel,
             kernel_tx,
 
-            window_size: (1200.0, 800.0),
             zoom_level: 1.0,
 
             last_edit_time: Instant::now(),
