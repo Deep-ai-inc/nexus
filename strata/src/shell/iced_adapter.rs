@@ -296,12 +296,21 @@ fn update<A: StrataApp>(
                 match win_event {
                     iced::window::Event::Resized(size) => {
                         window.window_size = (size.width, size.height);
-                        // Derive base size (the unzoomed logical size) so future
-                        // zoom operations start from the correct reference.
-                        window.base_size = (
-                            size.width / window.current_zoom,
-                            size.height / window.current_zoom,
-                        );
+                        // Only update base_size if this looks like a manual
+                        // resize (user dragged the window edge). Zoom-triggered
+                        // resizes land close to base_size * zoom — preserve the
+                        // existing base_size in that case to avoid sub-pixel
+                        // drift that could drop a terminal column.
+                        let expected_w = window.base_size.0 * window.current_zoom;
+                        let expected_h = window.base_size.1 * window.current_zoom;
+                        if (size.width - expected_w).abs() > 2.0
+                            || (size.height - expected_h).abs() > 2.0
+                        {
+                            window.base_size = (
+                                size.width / window.current_zoom,
+                                size.height / window.current_zoom,
+                            );
+                        }
                     }
                     iced::window::Event::CloseRequested => {
                         return close_window::<A>(state, wid);
