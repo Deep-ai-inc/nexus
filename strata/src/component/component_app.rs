@@ -148,4 +148,8 @@ where
     fn should_exit(state: &C) -> bool {
         RootComponent::should_exit(state)
     }
+
+    fn zoom_level(state: &C) -> f32 {
+        state.zoom_level()
+    }
 }

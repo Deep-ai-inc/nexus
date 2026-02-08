@@ -742,6 +742,10 @@ pub struct LayoutSnapshot {
     /// Current debug depth for nested layouts (debug builds only).
     #[cfg(debug_assertions)]
     debug_depth: u32,
+
+    /// Zoom level (1.0 = 100%). Used by the GPU renderer to scale all content
+    /// and by the adapter to adjust mouse coordinates.
+    zoom_level: f32,
 }
 
 impl Default for LayoutSnapshot {
@@ -771,6 +775,7 @@ impl LayoutSnapshot {
             debug_enabled: false,
             #[cfg(debug_assertions)]
             debug_depth: 0,
+            zoom_level: 1.0,
         }
     }
 
@@ -944,6 +949,16 @@ impl LayoutSnapshot {
     /// Get the viewport rectangle.
     pub fn viewport(&self) -> Rect {
         self.viewport
+    }
+
+    /// Set the zoom level (1.0 = 100%).
+    pub fn set_zoom_level(&mut self, zoom: f32) {
+        self.zoom_level = zoom;
+    }
+
+    /// Get the current zoom level.
+    pub fn zoom_level(&self) -> f32 {
+        self.zoom_level
     }
 
     /// Register a source with its layout.

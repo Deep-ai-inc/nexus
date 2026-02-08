@@ -94,8 +94,11 @@ struct WindowState<A: StrataApp> {
     /// Current pointer capture state.
     capture: CaptureState,
 
-    /// Current window size.
+    /// Current window size (logical points).
     window_size: (f32, f32),
+
+    /// Current zoom level (mirrors app state; used for resize detection).
+    current_zoom: f32,
 
     /// Current cursor position.
     cursor_position: Option<Point>,
@@ -191,6 +194,7 @@ fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMess
         app: app_state,
         capture: CaptureState::None,
         window_size: (config.window_size.0, config.window_size.1),
+        current_zoom: 1.0,
         cursor_position: None,
         frame: 0,
         image_store,
@@ -246,13 +250,27 @@ fn update<A: StrataApp>(
             if let Some(window) = state.windows.get_mut(&wid) {
                 let cmd = A::update(&mut window.app, msg, &mut window.image_store);
                 window.frame = window.frame.wrapping_add(1);
-                let task = command_to_task(cmd, wid);
 
                 // Check if this window wants to close
                 if A::should_exit(&window.app) {
+                    let task = command_to_task(cmd, wid);
                     return Task::batch([task, close_window::<A>(state, wid)]);
                 }
-                task
+
+                // Resize window when zoom level changes
+                let new_zoom = A::zoom_level(&window.app);
+                if (new_zoom - window.current_zoom).abs() > 0.001 {
+                    let ratio = new_zoom / window.current_zoom;
+                    let new_w = (window.window_size.0 * ratio).max(200.0);
+                    let new_h = (window.window_size.1 * ratio).max(150.0);
+                    window.current_zoom = new_zoom;
+                    return Task::batch([
+                        command_to_task(cmd, wid),
+                        iced::window::resize(wid, iced::Size::new(new_w, new_h)),
+                    ]);
+                }
+
+                command_to_task(cmd, wid)
             } else {
                 Task::none()
             }
@@ -284,19 +302,24 @@ fn update<A: StrataApp>(
                     window.cursor_position = Some(Point::new(position.x, position.y));
                 }
 
-                if let Some(strata_event) = convert_mouse_event(mouse_event, window.cursor_position)
+                // Adjust cursor position to virtual-viewport coordinates (divide by zoom)
+                let zoom = window.current_zoom;
+                let adjusted_cursor = window.cursor_position
+                    .map(|p| Point::new(p.x / zoom, p.y / zoom));
+
+                if let Some(strata_event) = convert_mouse_event(mouse_event, adjusted_cursor)
                 {
                     let hit: Option<HitResult> = {
                         let cache = window.cached_snapshot.borrow();
                         match cache.as_ref() {
                             Some(snapshot) => {
-                                let raw_hit = window.cursor_position
+                                let raw_hit = adjusted_cursor
                                     .and_then(|pos| snapshot.hit_test(pos));
 
                                 if window.capture.is_captured()
                                     && !matches!(&raw_hit, Some(HitResult::Content(_)))
                                 {
-                                    window.cursor_position
+                                    adjusted_cursor
                                         .and_then(|pos| snapshot.nearest_content(pos.x, pos.y))
                                         .or(raw_hit)
                                 } else {
@@ -306,12 +329,12 @@ fn update<A: StrataApp>(
                             None => {
                                 drop(cache);
                                 let mut snapshot = LayoutSnapshot::new();
-                                snapshot.set_viewport(Rect::new(
-                                    0.0, 0.0,
-                                    window.window_size.0, window.window_size.1,
-                                ));
+                                let vp_w = window.window_size.0 / zoom;
+                                let vp_h = window.window_size.1 / zoom;
+                                snapshot.set_viewport(Rect::new(0.0, 0.0, vp_w, vp_h));
+                                snapshot.set_zoom_level(zoom);
                                 A::view(&window.app, &mut snapshot);
-                                let hit = window.cursor_position
+                                let hit = adjusted_cursor
                                     .and_then(|pos| snapshot.hit_test(pos));
                                 *window.cached_snapshot.borrow_mut() = Some(Arc::new(snapshot));
                                 hit
@@ -362,11 +385,23 @@ fn update<A: StrataApp>(
                                 return Task::done(ShellMessage::ExitApp);
                             }
                             let cmd = A::update(&mut window.app, msg, &mut window.image_store);
-                            let task = command_to_task(cmd, wid);
                             if A::should_exit(&window.app) {
+                                let task = command_to_task(cmd, wid);
                                 return Task::batch([task, close_window::<A>(state, wid)]);
                             }
-                            return task;
+                            // Resize window on zoom change
+                            let new_zoom = A::zoom_level(&window.app);
+                            if (new_zoom - window.current_zoom).abs() > 0.001 {
+                                let ratio = new_zoom / window.current_zoom;
+                                let new_w = (window.window_size.0 * ratio).max(200.0);
+                                let new_h = (window.window_size.1 * ratio).max(150.0);
+                                window.current_zoom = new_zoom;
+                                return Task::batch([
+                                    command_to_task(cmd, wid),
+                                    iced::window::resize(wid, iced::Size::new(new_w, new_h)),
+                                ]);
+                            }
+                            return command_to_task(cmd, wid);
                         }
                     }
                     iced::keyboard::Event::KeyReleased { key, modifiers, .. } => {
@@ -376,11 +411,11 @@ fn update<A: StrataApp>(
                         };
                         if let Some(msg) = A::on_key(&window.app, strata_event) {
                             let cmd = A::update(&mut window.app, msg, &mut window.image_store);
-                            let task = command_to_task(cmd, wid);
                             if A::should_exit(&window.app) {
+                                let task = command_to_task(cmd, wid);
                                 return Task::batch([task, close_window::<A>(state, wid)]);
                             }
-                            return task;
+                            return command_to_task(cmd, wid);
                         }
                     }
                     _ => {}
@@ -398,9 +433,12 @@ fn update<A: StrataApp>(
                 };
                 if let Some(fe) = file_event {
                     let hit = {
+                        let zoom = window.current_zoom;
                         let cache = window.cached_snapshot.borrow();
                         cache.as_ref().and_then(|snapshot| {
-                            window.cursor_position.and_then(|pos| snapshot.hit_test(pos))
+                            window.cursor_position.and_then(|pos| {
+                                snapshot.hit_test(Point::new(pos.x / zoom, pos.y / zoom))
+                            })
                         })
                     };
                     if let Some(msg) = A::on_file_drop(&window.app, fe, hit) {
@@ -433,6 +471,7 @@ fn update<A: StrataApp>(
                     app: app_state,
                     capture: CaptureState::None,
                     window_size: state.window_config.size,
+                    current_zoom: 1.0,
                     cursor_position: None,
                     frame: 0,
                     image_store,
@@ -494,6 +533,8 @@ fn view<A: StrataApp>(state: &MultiWindowState<A>, window_id: iced::window::Id) 
     };
 
     let mut snapshot = LayoutSnapshot::new();
+    // Set the actual window size as viewport; the app's view() will divide by
+    // zoom to get the virtual viewport for layout.
     snapshot.set_viewport(Rect::new(0.0, 0.0, window.window_size.0, window.window_size.1));
 
     A::view(&window.app, &mut snapshot);
@@ -794,7 +835,8 @@ impl<Message> shader::Program<Message> for StrataShaderProgram {
             return iced::mouse::Interaction::default();
         };
 
-        match self.snapshot.cursor_at(Point::new(pos.x, pos.y)) {
+        let zoom = self.snapshot.zoom_level();
+        match self.snapshot.cursor_at(Point::new(pos.x / zoom, pos.y / zoom)) {
             CursorIcon::Arrow => iced::mouse::Interaction::Idle,
             CursorIcon::Text => iced::mouse::Interaction::Text,
             CursorIcon::Pointer => iced::mouse::Interaction::Pointer,
@@ -883,7 +925,9 @@ impl PipelineWrapper {
         pending_images: Vec<PendingImage>,
         pending_unloads: Vec<ImageHandle>,
     ) {
-        let scale = viewport.scale_factor() as f32;
+        let dpi_scale = viewport.scale_factor() as f32;
+        let zoom = snapshot.zoom_level();
+        let scale = dpi_scale * zoom;
 
         // Lock FontSystem once for the entire frame
         let fs_mutex = crate::text_engine::get_font_system();
@@ -1270,7 +1314,10 @@ impl PipelineWrapper {
             }
         }
         // 5. Primitive text runs (with viewport culling)
-        let viewport_bottom = bounds.height;
+        // Use virtual viewport height (not physical bounds) since text positions
+        // are in virtual-viewport space. At zoom < 1 the virtual viewport is
+        // larger than the window, so using bounds.height would cull visible text.
+        let viewport_bottom = snapshot.viewport().height;
         for prim in &primitives.text_runs {
             // Cull text runs entirely outside the viewport (always check position)
             if prim.position.y > viewport_bottom || prim.position.y + prim.font_size * 1.5 < 0.0 {
@@ -1354,14 +1401,15 @@ impl PipelineWrapper {
             label: Some("Strata Staging Upload"),
         });
 
-        // Prepare for GPU (upload buffers via staging belt)
-        // Prepare for GPU (upload buffers via staging belt)
+        // Prepare for GPU (upload buffers via staging belt).
+        // Viewport size uses dpi_scale (not zoomed scale) because the render
+        // target is fixed at window_physical_pixels = window_logical * dpi.
         pipeline.prepare(
             device,
             queue,
             &mut encoder,
-            bounds.width * scale,
-            bounds.height * scale,
+            bounds.width * dpi_scale,
+            bounds.height * dpi_scale,
         );
 
         // Submit staging commands. The staging belt's copy commands need to

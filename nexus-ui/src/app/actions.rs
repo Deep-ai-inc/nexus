@@ -6,7 +6,19 @@ use strata::ImageStore;
 
 use super::NexusState;
 
+const ZOOM_STEP: f32 = 0.1;
+const ZOOM_MIN: f32 = 0.5;
+const ZOOM_MAX: f32 = 3.0;
+
 impl NexusState {
+    pub(super) fn zoom_in(&mut self) {
+        self.zoom_level = (self.zoom_level + ZOOM_STEP).min(ZOOM_MAX);
+    }
+
+    pub(super) fn zoom_out(&mut self) {
+        self.zoom_level = (self.zoom_level - ZOOM_STEP).max(ZOOM_MIN);
+    }
+
     pub(super) fn next_id(&mut self) -> nexus_api::BlockId {
         let id = self.next_block_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         nexus_api::BlockId(id)

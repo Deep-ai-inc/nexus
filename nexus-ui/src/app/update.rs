@@ -185,10 +185,9 @@ impl NexusState {
                     Command::none()
                 }
             }
-            NexusMessage::ZoomIn | NexusMessage::ZoomOut | NexusMessage::ZoomReset => {
-                // Zoom stubs — shortcuts wired, rendering deferred
-                Command::none()
-            }
+            NexusMessage::ZoomIn => { self.zoom_in(); Command::none() }
+            NexusMessage::ZoomOut => { self.zoom_out(); Command::none() }
+            NexusMessage::ZoomReset => { self.zoom_level = 1.0; Command::none() }
             #[cfg(debug_assertions)]
             NexusMessage::ToggleDebugLayout => {
                 self.debug_layout = !self.debug_layout;

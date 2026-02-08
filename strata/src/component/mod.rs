@@ -95,4 +95,9 @@ pub trait Component {
     fn selection(&self) -> Option<&Selection> {
         None
     }
+
+    /// Current zoom level (1.0 = 100%).
+    fn zoom_level(&self) -> f32 {
+        1.0
+    }
 }

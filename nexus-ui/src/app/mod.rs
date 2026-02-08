@@ -101,6 +101,7 @@ pub struct NexusState {
 
     // --- Layout ---
     pub window_size: (f32, f32),
+    pub zoom_level: f32,
 
     // --- UI state ---
     pub last_edit_time: Instant,
@@ -147,9 +148,13 @@ impl Component for NexusState {
         let fps = if prev == 0.0 { instant_fps } else { prev * 0.95 + instant_fps * 0.05 };
         self.fps_smooth.set(fps);
 
-        let vp = snapshot.viewport();
-        let vw = vp.width;
-        let vh = vp.height;
+        // Virtual viewport: divide actual window size by zoom so layout always
+        // sees the same logical dimensions → same cols/rows regardless of zoom.
+        snapshot.set_zoom_level(self.zoom_level);
+        let actual_vp = snapshot.viewport();
+        let vw = actual_vp.width / self.zoom_level;
+        let vh = actual_vp.height / self.zoom_level;
+        snapshot.set_viewport(Rect::new(0.0, 0.0, vw, vh));
 
         let (cols, rows) = NexusState::compute_terminal_size(vw, vh);
         self.shell.pty.terminal_size.set((cols, rows));
@@ -357,6 +362,10 @@ impl Component for NexusState {
     fn selection(&self) -> Option<&strata::Selection> {
         self.selection.selection.as_ref()
     }
+
+    fn zoom_level(&self) -> f32 {
+        self.zoom_level
+    }
 }
 
 // =========================================================================
@@ -474,6 +483,7 @@ impl RootComponent for NexusState {
             kernel_tx,
 
             window_size: (1200.0, 800.0),
+            zoom_level: 1.0,
 
             last_edit_time: Instant::now(),
             exit_requested: false,

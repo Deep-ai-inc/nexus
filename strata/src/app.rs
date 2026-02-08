@@ -401,6 +401,12 @@ pub trait StrataApp: Sized + 'static {
     fn should_exit(_state: &Self::State) -> bool {
         false
     }
+
+    /// Current zoom level (1.0 = 100%). Used by the shell adapter for GPU scaling
+    /// and window resize on zoom change.
+    fn zoom_level(_state: &Self::State) -> f32 {
+        1.0
+    }
 }
 
 /// Request to start an OS-level outbound drag.
