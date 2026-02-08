@@ -101,17 +101,6 @@ pub trait Component {
         1.0
     }
 
-    /// Create a message for a Force Click (trackpad deep press).
-    ///
-    /// `addr`: content address at the click position.
-    /// `position`: window-local cursor position for the popup.
-    fn force_click_message(
-        _addr: crate::content_address::ContentAddress,
-        _position: crate::primitives::Point,
-    ) -> Option<Self::Message> {
-        None
-    }
-
     /// Look up the word at a content address for Force Click dictionary lookup.
     ///
     /// Returns `(word_text, word_start_addr, font_size)`.

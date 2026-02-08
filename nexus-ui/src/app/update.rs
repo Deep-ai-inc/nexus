@@ -193,43 +193,6 @@ impl NexusState {
                     Command::none()
                 }
             }
-            NexusMessage::ForceClick(addr, position) => {
-                if let Some(content) = self.build_snap_content(addr.source_id) {
-                    // Debug: confirm char under the hit-tested address
-                    match &content {
-                        snap::SnapContent::Grid { chars, .. } => {
-                            let o = addr.content_offset.min(chars.len().saturating_sub(1));
-                            tracing::debug!("force-click grid offset={} char={:?}", o, chars[o]);
-                        }
-                        snap::SnapContent::Text { lines } => {
-                            if let Some(line) = lines.get(addr.item_index) {
-                                let chars: Vec<char> = line.chars().collect();
-                                let o = addr.content_offset.min(chars.len().saturating_sub(1));
-                                tracing::debug!("force-click text item={} offset={} char={:?}", addr.item_index, o, chars.get(o));
-                            }
-                        }
-                    }
-                    let (start, end) = snap::snap_word(&addr, &content);
-                    let word = snap::extract_snap_text(&start, &end, &content);
-                    tracing::debug!("force-click word={:?} position=({}, {})", word, position.x, position.y);
-                    if !word.trim().is_empty() {
-                        let font_size = 14.0 * self.zoom_level;
-                        let char_width = 8.4 * self.zoom_level;
-                        // Compute word start X: shift left from cursor by chars before click
-                        let chars_before = addr.content_offset.saturating_sub(start.content_offset);
-                        let word_start_x = position.x - chars_before as f32 * char_width;
-                        // Baseline Y: shift down from cursor to approximate text baseline
-                        let baseline_y = position.y + font_size * 0.75;
-                        let word_origin = strata::primitives::Point::new(word_start_x, baseline_y);
-                        if let Err(e) = strata::platform::show_definition(&word, word_origin, font_size) {
-                            tracing::warn!("show_definition failed: {}", e);
-                        }
-                    }
-                } else {
-                    tracing::debug!("force-click: no snap content for source {:?}", addr.source_id);
-                }
-                Command::none()
-            }
             NexusMessage::ZoomIn => { self.zoom_in(); Command::none() }
             NexusMessage::ZoomOut => { self.zoom_out(); Command::none() }
             NexusMessage::ZoomReset => { self.zoom_level = 1.0; Command::none() }

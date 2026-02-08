@@ -365,13 +365,6 @@ impl Component for NexusState {
         self.zoom_level
     }
 
-    fn force_click_message(
-        addr: strata::content_address::ContentAddress,
-        position: strata::primitives::Point,
-    ) -> Option<NexusMessage> {
-        Some(NexusMessage::ForceClick(addr, position))
-    }
-
     fn force_click_lookup(
         &self,
         addr: &strata::content_address::ContentAddress,

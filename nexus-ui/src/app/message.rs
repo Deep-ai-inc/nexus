@@ -56,9 +56,6 @@ pub enum NexusMessage {
     ZoomOut,
     ZoomReset,
 
-    /// Force Click (trackpad deep press) — look up word definition.
-    ForceClick(strata::content_address::ContentAddress, strata::primitives::Point),
-
     /// Toggle debug layout visualization (Cmd+Shift+D in debug builds).
     #[cfg(debug_assertions)]
     ToggleDebugLayout,
