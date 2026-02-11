@@ -68,7 +68,7 @@ impl super::Surface {
             swapchain_format: RwLock::new(None),
             extent: RwLock::new(wgt::Extent3d::default()),
             main_thread_id: thread::current().id(),
-            present_with_transaction: false,
+            present_with_transaction: true,
         }
     }
 

@@ -68,8 +68,9 @@ nexus-term = { path = "nexus-term" }
 strata = { path = "strata" }
 
 # Local patches for flicker-free macOS window resize:
-# - wgpu-hal: presentsWithTransaction so compositor waits for each frame
+# - wgpu-hal v27: presentsWithTransaction so compositor waits for each frame
+#   (iced_wgpu uses wgpu v27, NOT v23 — must patch the v27 hal)
 # - iced_winit: synchronous render during modal resize loop
 [patch.crates-io]
-wgpu-hal = { path = "patches/wgpu-hal" }
+wgpu-hal = { path = "patches/wgpu-hal-27" }
 iced_winit = { path = "patches/iced_winit" }

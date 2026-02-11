@@ -772,13 +772,18 @@ pub fn take_force_click_receiver() -> Option<mpsc::Receiver<(f32, f32)>> {
 /// Sets:
 /// 1. **NSWindow.backgroundColor** — fills any gap with the app's dark color.
 /// 2. **NSView.layerContentsPlacement = ScaleAxesIndependently** — stretches
-///    root layer stale content to fill (avoids position desync on resize).
+///    stale content to fill (avoids position desync on missed frames).
 /// 3. **NSView.layerContentsRedrawPolicy = OnSetNeedsDisplay** — prevents
 ///    macOS from forcing system redraws during resize (the default
 ///    `DuringViewResize` triggers `updateLayer` independently of our render).
 /// 4. **Root CALayer: backgroundColor + contentsGravity + disable animations**
 ///    — the root layer is what the user sees behind the Metal sublayer.
 /// 5. **CAMetalLayer sublayer: same treatment** — gravity, bg, no animations.
+///
+/// Works in concert with the synchronous render in iced_winit's Resized
+/// handler (which renders a fresh frame during the resize tracking loop)
+/// and presentsWithTransaction (which atomically commits the frame with
+/// the window resize). TopLeft gravity is a fallback for rare missed frames.
 ///
 /// Safe to call multiple times (idempotent). Call after each window is created.
 pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
@@ -873,16 +878,12 @@ fn create_cg_color(r: f64, g: f64, b: f64) -> CGColorPtr {
 }
 
 /// Configure a single CALayer for flicker-free resize: stretch content
-/// to fill (no positioning desync), set background color, and disable
-/// implicit CA animations.
+/// to fill, set background color, and disable implicit CA animations.
 ///
-/// We use `kCAGravityResize` (stretch) rather than `kCAGravityTopLeft`
-/// because on macOS the window **origin moves** during vertical resize
-/// (bottom-left origin in Cocoa). With `topLeft` gravity, the compositor
-/// shows one frame where the layer content is positioned at the old
-/// origin → visible shift. With `resize` gravity, the old drawable is
-/// stretched to fill the entire layer — no positioning to desync.
-/// A few pixels of stretch per frame is imperceptible.
+/// We use `kCAGravityResize` (stretch) so that on missed frames, stale
+/// content fills the entire layer (no positioning to desync). This is a
+/// fallback — the synchronous render in iced_winit's Resized handler
+/// normally presents a fresh frame atomically (via presentsWithTransaction).
 unsafe fn configure_layer_for_resize(layer: *mut AnyObject, bg_cg_color: CGColorPtr) {
     let gravity = ns_string!("resize");
     let _: () = msg_send![layer, setContentsGravity: &*gravity];
