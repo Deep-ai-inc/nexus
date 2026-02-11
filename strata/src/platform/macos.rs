@@ -14,13 +14,14 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, ProtocolObject};
 use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSDraggingItem, NSDraggingSession,
+    NSApplication, NSColor, NSDraggingItem, NSDraggingSession,
     NSImage, NSMenu, NSMenuItem, NSPasteboardItem, NSPasteboardTypeFileURL,
-    NSPasteboardTypeString, NSPasteboardWriting, NSWorkspace,
+    NSPasteboardTypeString, NSPasteboardWriting, NSViewLayerContentsPlacement,
+    NSViewLayerContentsRedrawPolicy, NSWorkspace,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSInteger, NSObject, NSPoint, NSRect, NSSize, NSString, NSURL,
-    ns_string,
+    CGFloat, MainThreadMarker, NSArray, NSInteger, NSObject, NSPoint, NSRect, NSSize, NSString,
+    NSURL, ns_string,
 };
 
 use crate::app::DragSource;
@@ -758,7 +759,176 @@ pub fn take_force_click_receiver() -> Option<mpsc::Receiver<(f32, f32)>> {
 }
 
 // =============================================================================
-// Native Menu Bar
+// Window Resize Appearance
+// =============================================================================
+
+/// Configure window appearance for flicker-free resize.
+///
+/// The key insight: wgpu-hal adds a CAMetalLayer as a **sublayer** of the
+/// NSView's root CALayer. During resize, macOS updates the root layer
+/// immediately, potentially showing stale/shifted content for one frame
+/// before the Metal sublayer catches up. We must configure BOTH layers.
+///
+/// Sets:
+/// 1. **NSWindow.backgroundColor** — fills any gap with the app's dark color.
+/// 2. **NSView.layerContentsPlacement = ScaleAxesIndependently** — stretches
+///    root layer stale content to fill (avoids position desync on resize).
+/// 3. **NSView.layerContentsRedrawPolicy = OnSetNeedsDisplay** — prevents
+///    macOS from forcing system redraws during resize (the default
+///    `DuringViewResize` triggers `updateLayer` independently of our render).
+/// 4. **Root CALayer: backgroundColor + contentsGravity + disable animations**
+///    — the root layer is what the user sees behind the Metal sublayer.
+/// 5. **CAMetalLayer sublayer: same treatment** — gravity, bg, no animations.
+///
+/// Safe to call multiple times (idempotent). Call after each window is created.
+pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+
+    let bg_color = unsafe {
+        NSColor::colorWithSRGBRed_green_blue_alpha(
+            r as CGFloat,
+            g as CGFloat,
+            b as CGFloat,
+            1.0,
+        )
+    };
+
+    // Create CGColor directly via CoreGraphics to avoid objc2 encoding
+    // mismatch (-[NSColor CGColor] returns ^{CGColor=} but msg_send!
+    // expects ^v for *const c_void).
+    let cg_color = create_cg_color(r as f64, g as f64, b as f64);
+
+    // Configure all existing windows.
+    let windows = app.windows();
+    for window in windows.iter() {
+        window.setBackgroundColor(Some(&bg_color));
+        if let Some(view) = window.contentView() {
+            unsafe {
+                view.setLayerContentsPlacement(NSViewLayerContentsPlacement::ScaleAxesIndependently);
+
+                // Prevent macOS from forcing redraws during resize.
+                // The default DuringViewResize triggers updateLayer/drawRect
+                // independently of our render loop, causing flickering.
+                view.setLayerContentsRedrawPolicy(
+                    NSViewLayerContentsRedrawPolicy::NSViewLayerContentsRedrawOnSetNeedsDisplay,
+                );
+            }
+
+            unsafe {
+                let root: *mut AnyObject = msg_send![&*view, layer];
+                if !root.is_null() {
+                    // Configure the ROOT layer — this is what shows
+                    // behind the Metal sublayer during the resize gap.
+                    configure_layer_for_resize(root, cg_color);
+
+                    // Configure the Metal SUBLAYER.
+                    configure_metal_sublayers(root, cg_color);
+                }
+            }
+        }
+    }
+}
+
+/// Opaque CGColorRef wrapper with correct objc2 type encoding (`^{CGColor=}`).
+///
+/// objc2's `msg_send!` validates argument/return encodings at runtime.
+/// Raw `*const c_void` encodes as `^v` which mismatches CoreGraphics'
+/// `^{CGColor=}`, causing a panic. This newtype carries the right encoding.
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct CGColorPtr(*const std::ffi::c_void);
+
+unsafe impl objc2::encode::Encode for CGColorPtr {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+        &objc2::encode::Encoding::Struct("CGColor", &[]),
+    );
+}
+
+unsafe impl objc2::encode::RefEncode for CGColorPtr {
+    const ENCODING_REF: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+        &<Self as objc2::encode::Encode>::ENCODING,
+    );
+}
+
+/// Create a CGColorRef directly via CoreGraphics C API.
+fn create_cg_color(r: f64, g: f64, b: f64) -> CGColorPtr {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
+        fn CGColorCreate(
+            space: *const std::ffi::c_void,
+            components: *const f64,
+        ) -> *const std::ffi::c_void;
+        fn CGColorSpaceRelease(space: *mut std::ffi::c_void);
+    }
+
+    unsafe {
+        let space = CGColorSpaceCreateDeviceRGB();
+        let components: [f64; 4] = [r, g, b, 1.0];
+        let color = CGColorCreate(space, components.as_ptr());
+        CGColorSpaceRelease(space);
+        CGColorPtr(color)
+    }
+}
+
+/// Configure a single CALayer for flicker-free resize: stretch content
+/// to fill (no positioning desync), set background color, and disable
+/// implicit CA animations.
+///
+/// We use `kCAGravityResize` (stretch) rather than `kCAGravityTopLeft`
+/// because on macOS the window **origin moves** during vertical resize
+/// (bottom-left origin in Cocoa). With `topLeft` gravity, the compositor
+/// shows one frame where the layer content is positioned at the old
+/// origin → visible shift. With `resize` gravity, the old drawable is
+/// stretched to fill the entire layer — no positioning to desync.
+/// A few pixels of stretch per frame is imperceptible.
+unsafe fn configure_layer_for_resize(layer: *mut AnyObject, bg_cg_color: CGColorPtr) {
+    let gravity = ns_string!("resize");
+    let _: () = msg_send![layer, setContentsGravity: &*gravity];
+    let _: () = msg_send![layer, setBackgroundColor: bg_cg_color];
+
+    // Disable implicit CA animations on bounds/position/contents changes.
+    // Without this, CA animates frame changes during live resize.
+    let null_cls = AnyClass::get("NSNull").unwrap();
+    let null_obj: *mut AnyObject = msg_send![null_cls, null];
+    let dict_cls = AnyClass::get("NSMutableDictionary").unwrap();
+    let actions: *mut AnyObject = msg_send![dict_cls, new];
+    for key in [
+        ns_string!("bounds"),
+        ns_string!("position"),
+        ns_string!("contents"),
+        ns_string!("contentsScale"),
+    ] {
+        let _: () = msg_send![actions, setObject: null_obj forKey: &*key];
+    }
+    let _: () = msg_send![layer, setActions: actions];
+}
+
+/// Walk a layer's sublayers and configure any CAMetalLayer found.
+unsafe fn configure_metal_sublayers(root: *mut AnyObject, bg_cg_color: CGColorPtr) {
+    let sublayers: *mut AnyObject = msg_send![root, sublayers];
+    if sublayers.is_null() {
+        return;
+    }
+    let count: usize = msg_send![sublayers, count];
+    let Some(metal_cls) = AnyClass::get("CAMetalLayer") else {
+        return;
+    };
+    for i in 0..count {
+        let layer: *mut AnyObject = msg_send![sublayers, objectAtIndex: i];
+        if layer.is_null() {
+            continue;
+        }
+        let is_metal: Bool = msg_send![layer, isKindOfClass: metal_cls];
+        if is_metal.as_bool() {
+            configure_layer_for_resize(layer, bg_cg_color);
+        }
+    }
+}
+
+// =============================================================================
+// Native Menu Bar (make_menu_item helper)
 // =============================================================================
 
 /// Create a menu item with a Cmd+key shortcut.

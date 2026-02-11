@@ -111,6 +111,10 @@ struct WindowState<A: StrataApp> {
     /// Frame counter (forces shader redraw when changed).
     frame: u64,
 
+    /// Whether this window has been configured for flicker-free resize.
+    #[cfg(target_os = "macos")]
+    resize_configured: bool,
+
     /// Shared image store for dynamic image loading.
     image_store: crate::gpu::ImageStore,
 
@@ -209,6 +213,8 @@ fn init<A: StrataApp>(config: AppConfig) -> (MultiWindowState<A>, Task<ShellMess
         current_zoom: 1.0,
         cursor_position: None,
         frame: 0,
+        #[cfg(target_os = "macos")]
+        resize_configured: false,
         image_store,
         cached_snapshot: RefCell::new(None),
         pending_images: Arc::new(Mutex::new(Vec::new())),
@@ -318,6 +324,18 @@ fn update<A: StrataApp>(
                             window.base_size = (
                                 size.width / window.current_zoom,
                                 size.height / window.current_zoom,
+                            );
+                        }
+
+                        // Configure new windows for flicker-free resize on
+                        // their first Resized event (which fires when the
+                        // window first appears).
+                        #[cfg(target_os = "macos")]
+                        if !window.resize_configured {
+                            window.resize_configured = true;
+                            let bg = A::background_color(&window.app);
+                            crate::platform::macos::configure_resize_appearance(
+                                bg.r, bg.g, bg.b,
                             );
                         }
                     }
@@ -507,6 +525,8 @@ fn update<A: StrataApp>(
                     current_zoom: 1.0,
                     cursor_position: None,
                     frame: 0,
+                    #[cfg(target_os = "macos")]
+                    resize_configured: false,
                     image_store,
                     cached_snapshot: RefCell::new(None),
                     pending_images: Arc::new(Mutex::new(Vec::new())),
