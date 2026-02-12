@@ -80,7 +80,7 @@
 //       even when the mouse is still (unlike dispatch_async)
 //
 // Mode transition (drag → idle):
-//   - Timer fires after ~8ms of no setFrameSize calls
+//   - Timer fires after one display refresh interval of no setFrameSize calls
 //   - Hides overlay, clears its contents, renders via presentDrawable
 //   - No drawable stranding because CAMetalLayer is never hidden
 //
@@ -134,7 +134,7 @@
 // - Normal rendering: 120Hz on background CVDisplayLink thread
 // - Resize rendering: Matches mouse event rate (~120Hz on ProMotion)
 // - Input latency: Double-buffered semaphore (kMaxInFlightFrameCount = 2)
-//   for minimum latency (~8ms at 120Hz vs ~16ms with triple buffering)
+//   for minimum latency (1 frame ahead vs 2 with triple buffering)
 // - Drawable pool: 3 drawables (extra headroom for sync/async transitions)
 // - Color: Explicit sRGB colorspace for correct rendering on P3 displays
 // - Thread safety: @synchronized protects drawableSize during resize
@@ -164,6 +164,7 @@ static const NSUInteger kMaxInFlightFrameCount = 2;
 
 @property (nonatomic, assign) BOOL isResizing;
 @property (nonatomic, strong) NSTimer *resizeTimer;
+@property (nonatomic, assign) NSTimeInterval displayRefreshInterval;
 @end
 
 @implementation ResizeView
@@ -245,6 +246,15 @@ static const NSUInteger kMaxInFlightFrameCount = 2;
         // to main queue) for lowest jitter. Paused during live resize.
         CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
         CVDisplayLinkSetOutputCallback(_displayLink, &displayLinkCallback, (__bridge void *)self);
+
+        // Query display refresh rate for adaptive timer interval.
+        CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(_displayLink);
+        if (period.flags & kCVTimeIsIndefinite) {
+            _displayRefreshInterval = 1.0 / 60.0;  // fallback
+        } else {
+            _displayRefreshInterval = (double)period.timeValue / (double)period.timeScale;
+        }
+
         CVDisplayLinkStart(_displayLink);
     }
     return self;
@@ -290,7 +300,7 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 
         // Reset idle timer — fires when mouse stops moving.
         [_resizeTimer invalidate];
-        _resizeTimer = [NSTimer timerWithTimeInterval:1.0/120.0
+        _resizeTimer = [NSTimer timerWithTimeInterval:_displayRefreshInterval
                                                target:self
                                              selector:@selector(resizeTimerFired)
                                              userInfo:nil
@@ -318,7 +328,7 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 }
 
 - (void)resizeTimerFired {
-    // Mouse has been still for >8ms during resize drag.
+    // Mouse has been still for one refresh interval during resize drag.
     // Switch to async mode: hide overlay, render via presentDrawable.
     // presentDrawable works here because Window Server only blocks layer
     // updates during ACTIVE geometry changes. Static mouse = no block.
