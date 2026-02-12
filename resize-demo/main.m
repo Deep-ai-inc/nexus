@@ -1,5 +1,8 @@
-// Minimal macOS Metal resize demo.
-// Tests: IOSurface-on-overlay-layer approach for flicker-free resize.
+// Ultra-Low Latency macOS Metal Resize Demo
+// Features:
+// 1. IOSurface Sync for flicker-free resize.
+// 2. Background Thread Rendering for 120Hz smoothness.
+// 3. Triple Buffering (Semaphore) for lowest input latency.
 //
 // Build: clang -framework Cocoa -framework Metal -framework QuartzCore
 //        -framework IOSurface -framework CoreVideo -o resize-demo main.m
@@ -10,17 +13,19 @@
 #import <QuartzCore/QuartzCore.h>
 #import <IOSurface/IOSurface.h>
 
-// ---------------------------------------------------------------------------
-// ResizeView — hosts a CAMetalLayer sublayer, renders during resize
-// ---------------------------------------------------------------------------
+static const NSUInteger kMaxInFlightFrameCount = 3;
+
 @interface ResizeView : NSView
 @property (nonatomic, strong) CAMetalLayer *metalLayer;
-@property (nonatomic, strong) CALayer *overlayLayer;  // sits ABOVE metalLayer
+@property (nonatomic, strong) CALayer *overlayLayer;
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
 @property (nonatomic, strong) id<MTLRenderPipelineState> pipeline;
+
+@property (nonatomic, strong) dispatch_semaphore_t inFlightSemaphore;
 @property (nonatomic, assign) CFTimeInterval startTime;
 @property (nonatomic, assign) CVDisplayLinkRef displayLink;
+
 @property (nonatomic, assign) BOOL isResizing;
 @property (nonatomic, strong) NSTimer *resizeTimer;
 @end
@@ -35,8 +40,9 @@
 
         _device = MTLCreateSystemDefaultDevice();
         _commandQueue = [_device newCommandQueue];
+        _inFlightSemaphore = dispatch_semaphore_create(kMaxInFlightFrameCount);
 
-        // Tiny shader: fullscreen triangle + animated grid.
+        // Animated grid shader.
         NSString *src = @
             "#include <metal_stdlib>\n"
             "using namespace metal;\n"
@@ -53,22 +59,16 @@
             "}\n";
         NSError *err = nil;
         id<MTLLibrary> lib = [_device newLibraryWithSource:src options:nil error:&err];
-        if (err) NSLog(@"Shader error: %@", err);
         MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
         pd.vertexFunction = [lib newFunctionWithName:@"vs"];
         pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
         _pipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (err) NSLog(@"Pipeline error: %@", err);
 
         // Disable implicit animations.
         NSDictionary *noAnim = @{
-            @"bounds": [NSNull null],
-            @"position": [NSNull null],
-            @"contents": [NSNull null],
-            @"contentsScale": [NSNull null],
-            @"hidden": [NSNull null],
-            @"opacity": [NSNull null],
+            @"bounds": [NSNull null], @"position": [NSNull null],
+            @"contents": [NSNull null], @"hidden": [NSNull null],
         };
 
         // CAMetalLayer as sublayer (same as wgpu-hal default).
@@ -81,31 +81,25 @@
         _metalLayer.actions = noAnim;
         _metalLayer.contentsGravity = kCAGravityTopLeft;
 
-        // Overlay layer: plain CALayer ABOVE metalLayer for IOSurface during resize.
+        // Overlay layer above metalLayer for IOSurface during resize.
         _overlayLayer = [CALayer layer];
         _overlayLayer.actions = noAnim;
         _overlayLayer.contentsGravity = kCAGravityTopLeft;
         _overlayLayer.hidden = YES;
 
         [self.layer addSublayer:_metalLayer];
-        [self.layer addSublayer:_overlayLayer];  // on top of metalLayer
+        [self.layer addSublayer:_overlayLayer];
         self.layer.actions = noAnim;
+        self.layer.backgroundColor = CGColorCreateGenericRGB(0.15, 0.15, 0.15, 1.0);
 
         _metalLayer.frame = self.layer.bounds;
         _metalLayer.contentsScale = self.layer.contentsScale;
         _overlayLayer.frame = self.layer.bounds;
         _overlayLayer.contentsScale = self.layer.contentsScale;
 
-        CGColorRef bg = CGColorCreateGenericRGB(0.15, 0.15, 0.15, 1.0);
-        self.layer.backgroundColor = bg;
-        _metalLayer.backgroundColor = bg;
-        CGColorRelease(bg);
-
-        self.layer.contentsGravity = kCAGravityTopLeft;
-
         _startTime = CACurrentMediaTime();
 
-        // CVDisplayLink for monitor-rate animation outside resize.
+        // CVDisplayLink — renders on background thread.
         CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
         CVDisplayLinkSetOutputCallback(_displayLink, &displayLinkCallback, (__bridge void *)self);
         CVDisplayLinkStart(_displayLink);
@@ -113,15 +107,14 @@
     return self;
 }
 
+// CVDisplayLink callback — background thread, no main queue dispatch.
 static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     const CVTimeStamp *now, const CVTimeStamp *outputTime,
     CVOptionFlags flagsIn, CVOptionFlags *flagsOut, void *ctx) {
     ResizeView *view = (__bridge ResizeView *)ctx;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (!view.isResizing) {
-            [view renderAsync];
-        }
-    });
+    if (!view.isResizing) {
+        [view renderAsync];
+    }
     return kCVReturnSuccess;
 }
 
@@ -132,19 +125,23 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Resize Logic (Main Thread)
+// ---------------------------------------------------------------------------
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
 
-    _metalLayer.frame = self.layer.bounds;
-    _metalLayer.contentsScale = self.layer.contentsScale;
-    _overlayLayer.frame = self.layer.bounds;
-    _overlayLayer.contentsScale = self.layer.contentsScale;
+    @synchronized (self) {
+        _metalLayer.frame = self.layer.bounds;
+        _overlayLayer.frame = self.layer.bounds;
 
-    CGFloat scale = self.layer.contentsScale;
-    _metalLayer.drawableSize = CGSizeMake(newSize.width * scale, newSize.height * scale);
+        CGFloat scale = self.layer.contentsScale;
+        _metalLayer.drawableSize = CGSizeMake(newSize.width * scale, newSize.height * scale);
+        _metalLayer.contentsScale = scale;
+        _overlayLayer.contentsScale = scale;
+    }
 
     if (_isResizing) {
-        // Show overlay, render IOSurface onto it.
         _overlayLayer.hidden = NO;
         [self renderSyncToOverlay];
 
@@ -161,19 +158,22 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
-    CGFloat scale = self.layer.contentsScale;
-    NSSize size = self.frame.size;
-    _metalLayer.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
-    [self renderAsync];
+    @synchronized (self) {
+        CGFloat scale = self.layer.contentsScale;
+        NSSize size = self.frame.size;
+        _metalLayer.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
+    }
 }
 
 - (void)viewWillStartLiveResize {
     [super viewWillStartLiveResize];
+    // Pause background rendering to avoid contention.
+    CVDisplayLinkStop(_displayLink);
     _isResizing = YES;
 }
 
 - (void)resizeTimerFired {
-    // Mouse is still — hide overlay, use presentDrawable on sublayer.
+    // Mouse stopped — hide overlay, render via presentDrawable.
     _overlayLayer.hidden = YES;
     _overlayLayer.contents = nil;
     [self renderAsync];
@@ -186,34 +186,23 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     _overlayLayer.contents = nil;
     [_resizeTimer invalidate];
     _resizeTimer = nil;
-    [self renderAsync];
+
+    // Resume background rendering.
+    CVDisplayLinkStart(_displayLink);
 }
 
-// --- Sync render: IOSurface on overlay layer (during active drag) ---------
+// ---------------------------------------------------------------------------
+// SYNC RENDER (Main Thread — blocking, for flicker-free resize)
+// ---------------------------------------------------------------------------
 - (void)renderSyncToOverlay {
-    // Simulate very heavy app logic (100ms = ~10fps cap).
-    usleep(100000);
-
     id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
     if (!drawable) return;
 
     id<MTLCommandBuffer> cmdBuf = [_commandQueue commandBuffer];
-    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-    rpd.colorAttachments[0].texture = drawable.texture;
-    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.15, 0.15, 0.15, 1.0);
-
-    id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
-    [enc setRenderPipelineState:_pipeline];
-    float time = (float)(CACurrentMediaTime() - _startTime);
-    [enc setFragmentBytes:&time length:sizeof(float) atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [enc endEncoding];
+    [self encodeFrame:cmdBuf drawable:drawable];
 
     IOSurfaceRef ioSurface = drawable.texture.iosurface;
 
-    // Don't presentDrawable — just commit + wait for GPU.
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
 
@@ -222,12 +211,38 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     }
 }
 
-// --- Async render: normal drawable presentation ---------------------------
+// ---------------------------------------------------------------------------
+// ASYNC RENDER (Background Thread — non-blocking, triple-buffered)
+// ---------------------------------------------------------------------------
 - (void)renderAsync {
-    id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
-    if (!drawable) return;
+    // Wait for an available slot (triple buffering backpressure).
+    dispatch_semaphore_wait(_inFlightSemaphore, DISPATCH_TIME_FOREVER);
 
-    id<MTLCommandBuffer> cmdBuf = [_commandQueue commandBuffer];
+    @synchronized (self) {
+        id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
+        if (!drawable) {
+            dispatch_semaphore_signal(_inFlightSemaphore);
+            return;
+        }
+
+        id<MTLCommandBuffer> cmdBuf = [_commandQueue commandBuffer];
+
+        __block dispatch_semaphore_t sema = _inFlightSemaphore;
+        [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+            dispatch_semaphore_signal(sema);
+        }];
+
+        [self encodeFrame:cmdBuf drawable:drawable];
+
+        [cmdBuf presentDrawable:drawable];
+        [cmdBuf commit];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared encoding logic
+// ---------------------------------------------------------------------------
+- (void)encodeFrame:(id<MTLCommandBuffer>)cmdBuf drawable:(id<CAMetalDrawable>)drawable {
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = drawable.texture;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -240,15 +255,12 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     [enc setFragmentBytes:&time length:sizeof(float) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
-
-    [cmdBuf presentDrawable:drawable];
-    [cmdBuf commit];
 }
 
 @end
 
 // ---------------------------------------------------------------------------
-// App delegate — creates window
+// App Delegate & Main
 // ---------------------------------------------------------------------------
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property (nonatomic, strong) NSWindow *window;
@@ -266,15 +278,12 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
                    NSWindowStyleMaskMiniaturizable)
         backing:NSBackingStoreBuffered
         defer:NO];
-
-    _window.title = @"Metal Resize Demo";
+    _window.title = @"Ultra-Low Latency Metal Resize";
     _window.contentView = [[ResizeView alloc] initWithFrame:frame];
-
     _window.backgroundColor = [NSColor colorWithSRGBRed:0.15
                                                   green:0.15
                                                    blue:0.15
                                                   alpha:1.0];
-
     [_window makeKeyAndOrderFront:nil];
 }
 
@@ -284,17 +293,12 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 
 @end
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-
         AppDelegate *delegate = [[AppDelegate alloc] init];
         app.delegate = delegate;
-
         [app activateIgnoringOtherApps:YES];
         [app run];
     }
