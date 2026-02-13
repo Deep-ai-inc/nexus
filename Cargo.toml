@@ -49,28 +49,18 @@ image = "0.25"
 # Terminal state (headless ANSI parsing)
 alacritty_terminal = "0.25"
 
-# UI dependencies (Iced + WGPU)
-# "lazy" feature enables cached/memoized widget rendering for performance
-# Use wgpu-only (no tiny-skia fallback) to enable Shader widget
-iced = { version = "0.14", default-features = false, features = ["tokio", "advanced", "wgpu", "lazy", "image"] }
+# UI dependencies (native macOS backend + WGPU)
 cosmic-text = "0.12"
 arboard = "3.4"  # Cross-platform clipboard
 dirs = "5.0"  # Platform-specific directories (home, config, etc.)
 urlencoding = "2.1"  # URL encoding/decoding for file:// URLs
 unicode-width = "0.2"  # Unicode display width calculation (CJK, emoji)
 bytemuck = { version = "1.14", features = ["derive"] }  # Safe transmutes for GPU buffers
-wgpu = "23.0"  # GPU access (same version Iced uses)
+wgpu = "23.0"  # GPU access (direct Metal backend)
+pollster = "0.4"  # Blocking async for wgpu init
 
 # Internal crates
 nexus-api = { path = "nexus-api" }
 nexus-kernel = { path = "nexus-kernel" }
 nexus-term = { path = "nexus-term" }
 strata = { path = "strata" }
-
-# Local patches for flicker-free macOS window resize:
-# - wgpu-hal v27: presentsWithTransaction so compositor waits for each frame
-#   (iced_wgpu uses wgpu v27, NOT v23 — must patch the v27 hal)
-# - iced_winit: synchronous render during modal resize loop
-[patch.crates-io]
-wgpu-hal = { path = "patches/wgpu-hal-27" }
-iced_winit = { path = "patches/iced_winit" }

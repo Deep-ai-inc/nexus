@@ -874,10 +874,8 @@ impl StrataApp for DemoApp {
     }
 
     fn subscription(_state: &Self::State) -> Subscription<Self::Message> {
-        Subscription::from_iced(
-            crate::shell::time::every(std::time::Duration::from_secs(1))
-                .map(|_| DemoMessage::TimerTick),
-        )
+        // Timer tick is no longer needed — the native backend renders continuously.
+        Subscription::none()
     }
 
     fn title(_state: &Self::State) -> String {

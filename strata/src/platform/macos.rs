@@ -16,7 +16,7 @@ use objc2::{declare_class, msg_send, msg_send_id, mutability, sel, ClassType, De
 use objc2_app_kit::{
     NSApplication, NSColor, NSDraggingItem, NSDraggingSession,
     NSImage, NSMenu, NSMenuItem, NSPasteboardItem, NSPasteboardTypeFileURL,
-    NSPasteboardTypeString, NSPasteboardWriting, NSViewLayerContentsPlacement,
+    NSPasteboardTypeString, NSPasteboardWriting,
     NSViewLayerContentsRedrawPolicy, NSWorkspace,
 };
 use objc2_foundation::{
@@ -767,23 +767,28 @@ pub fn take_force_click_receiver() -> Option<mpsc::Receiver<(f32, f32)>> {
 /// The key insight: wgpu-hal adds a CAMetalLayer as a **sublayer** of the
 /// NSView's root CALayer. During resize, macOS updates the root layer
 /// immediately, potentially showing stale/shifted content for one frame
-/// before the Metal sublayer catches up. We must configure BOTH layers.
+/// before the Metal sublayer catches up.
+///
+/// **Key optimization**: Promotes the CAMetalLayer from a sublayer to
+/// the view's root layer. This eliminates the dual-layer architecture
+/// (root + sublayer) that causes gravity/desync/gap issues during resize.
+/// When the Metal layer IS the root, there's no "layer behind" to flash,
+/// no sublayer auto-resize to desync, and presentsWithTransaction can
+/// work because the layer content changes are part of the view's own
+/// resize transaction.
 ///
 /// Sets:
 /// 1. **NSWindow.backgroundColor** — fills any gap with the app's dark color.
-/// 2. **NSView.layerContentsPlacement = ScaleAxesIndependently** — stretches
-///    stale content to fill (avoids position desync on missed frames).
-/// 3. **NSView.layerContentsRedrawPolicy = OnSetNeedsDisplay** — prevents
-///    macOS from forcing system redraws during resize (the default
-///    `DuringViewResize` triggers `updateLayer` independently of our render).
-/// 4. **Root CALayer: backgroundColor + contentsGravity + disable animations**
-///    — the root layer is what the user sees behind the Metal sublayer.
-/// 5. **CAMetalLayer sublayer: same treatment** — gravity, bg, no animations.
+/// 2. **NSView.layerContentsRedrawPolicy = OnSetNeedsDisplay** — prevents
+///    macOS from forcing system redraws during resize.
+/// 3. **Configure root + Metal sublayer** — gravity, background, no animations.
+///
+/// The CAMetalLayer is promoted to root in wgpu-hal's `get_metal_layer`
+/// (patched to create a CAMetalLayer as the view's root layer instead of
+/// adding an observer sublayer). This eliminates the dual-layer gap.
 ///
 /// Works in concert with the synchronous render in iced_winit's Resized
-/// handler (which renders a fresh frame during the resize tracking loop)
-/// and presentsWithTransaction (which atomically commits the frame with
-/// the window resize). TopLeft gravity is a fallback for rare missed frames.
+/// handler and presentsWithTransaction for atomic frame+resize updates.
 ///
 /// Safe to call multiple times (idempotent). Call after each window is created.
 pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
@@ -799,22 +804,14 @@ pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
         )
     };
 
-    // Create CGColor directly via CoreGraphics to avoid objc2 encoding
-    // mismatch (-[NSColor CGColor] returns ^{CGColor=} but msg_send!
-    // expects ^v for *const c_void).
     let cg_color = create_cg_color(r as f64, g as f64, b as f64);
 
-    // Configure all existing windows.
     let windows = app.windows();
     for window in windows.iter() {
         window.setBackgroundColor(Some(&bg_color));
         if let Some(view) = window.contentView() {
             unsafe {
-                view.setLayerContentsPlacement(NSViewLayerContentsPlacement::ScaleAxesIndependently);
-
                 // Prevent macOS from forcing redraws during resize.
-                // The default DuringViewResize triggers updateLayer/drawRect
-                // independently of our render loop, causing flickering.
                 view.setLayerContentsRedrawPolicy(
                     NSViewLayerContentsRedrawPolicy::NSViewLayerContentsRedrawOnSetNeedsDisplay,
                 );
@@ -822,15 +819,40 @@ pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
 
             unsafe {
                 let root: *mut AnyObject = msg_send![&*view, layer];
-                if !root.is_null() {
-                    // Configure the ROOT layer — this is what shows
-                    // behind the Metal sublayer during the resize gap.
-                    configure_layer_for_resize(root, cg_color);
-
-                    // Configure the Metal SUBLAYER.
-                    configure_metal_sublayers(root, cg_color);
+                if root.is_null() {
+                    continue;
                 }
+
+                // Configure root layer (which IS the CAMetalLayer after
+                // our wgpu-hal patch promotes it).
+                configure_layer_for_resize(root, cg_color);
+
+                // Also configure any sublayers (fallback if wgpu-hal
+                // patch isn't active — original sublayer architecture).
+                configure_metal_sublayers(root, cg_color);
             }
+        }
+    }
+}
+
+/// Walk a layer's sublayers and configure any CAMetalLayer found.
+unsafe fn configure_metal_sublayers(root: *mut AnyObject, bg_cg_color: CGColorPtr) {
+    let sublayers: *mut AnyObject = msg_send![root, sublayers];
+    if sublayers.is_null() {
+        return;
+    }
+    let count: usize = msg_send![sublayers, count];
+    let Some(metal_cls) = AnyClass::get("CAMetalLayer") else {
+        return;
+    };
+    for i in 0..count {
+        let layer: *mut AnyObject = msg_send![sublayers, objectAtIndex: i];
+        if layer.is_null() {
+            continue;
+        }
+        let is_metal: Bool = msg_send![layer, isKindOfClass: metal_cls];
+        if is_metal.as_bool() {
+            unsafe { configure_layer_for_resize(layer, bg_cg_color) };
         }
     }
 }
@@ -842,7 +864,7 @@ pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
 /// `^{CGColor=}`, causing a panic. This newtype carries the right encoding.
 #[repr(transparent)]
 #[derive(Copy, Clone)]
-struct CGColorPtr(*const std::ffi::c_void);
+pub(crate) struct CGColorPtr(*const std::ffi::c_void);
 
 unsafe impl objc2::encode::Encode for CGColorPtr {
     const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
@@ -857,7 +879,7 @@ unsafe impl objc2::encode::RefEncode for CGColorPtr {
 }
 
 /// Create a CGColorRef directly via CoreGraphics C API.
-fn create_cg_color(r: f64, g: f64, b: f64) -> CGColorPtr {
+pub(crate) fn create_cg_color(r: f64, g: f64, b: f64) -> CGColorPtr {
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
@@ -877,13 +899,11 @@ fn create_cg_color(r: f64, g: f64, b: f64) -> CGColorPtr {
     }
 }
 
-/// Configure a single CALayer for flicker-free resize: stretch content
-/// to fill, set background color, and disable implicit CA animations.
+/// Configure a single CALayer for flicker-free resize: set gravity,
+/// background color, and disable implicit CA animations.
 ///
-/// We use `kCAGravityResize` (stretch) so that on missed frames, stale
-/// content fills the entire layer (no positioning to desync). This is a
-/// fallback — the synchronous render in iced_winit's Resized handler
-/// normally presents a fresh frame atomically (via presentsWithTransaction).
+/// Uses `kCAGravityResize` (stretch) so that on rare missed frames,
+/// stale content fills the entire layer without position desync.
 unsafe fn configure_layer_for_resize(layer: *mut AnyObject, bg_cg_color: CGColorPtr) {
     let gravity = ns_string!("resize");
     let _: () = msg_send![layer, setContentsGravity: &*gravity];
@@ -906,27 +926,6 @@ unsafe fn configure_layer_for_resize(layer: *mut AnyObject, bg_cg_color: CGColor
     let _: () = msg_send![layer, setActions: actions];
 }
 
-/// Walk a layer's sublayers and configure any CAMetalLayer found.
-unsafe fn configure_metal_sublayers(root: *mut AnyObject, bg_cg_color: CGColorPtr) {
-    let sublayers: *mut AnyObject = msg_send![root, sublayers];
-    if sublayers.is_null() {
-        return;
-    }
-    let count: usize = msg_send![sublayers, count];
-    let Some(metal_cls) = AnyClass::get("CAMetalLayer") else {
-        return;
-    };
-    for i in 0..count {
-        let layer: *mut AnyObject = msg_send![sublayers, objectAtIndex: i];
-        if layer.is_null() {
-            continue;
-        }
-        let is_metal: Bool = msg_send![layer, isKindOfClass: metal_cls];
-        if is_metal.as_bool() {
-            configure_layer_for_resize(layer, bg_cg_color);
-        }
-    }
-}
 
 // =============================================================================
 // Native Menu Bar (make_menu_item helper)

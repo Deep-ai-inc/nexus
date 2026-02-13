@@ -213,64 +213,92 @@ impl<M> Default for Command<M> {
 
 /// A subscription to external events.
 ///
-/// Thin wrapper around `iced::Subscription` for zero-overhead pass-through.
-/// Apps construct these using `from_iced()` and the adapter wires them directly
-/// into iced's subscription system.
+/// Wraps async event streams that the native backend polls on a timer.
+/// Apps construct these using helpers in `shell::subscription` and the
+/// backend drains them to deliver messages.
 pub struct Subscription<M> {
-    pub(crate) subs: Vec<iced::Subscription<M>>,
+    pub(crate) streams: Vec<Box<dyn SubscriptionStream<Item = M>>>,
+}
+
+/// Type-erased async stream for subscription polling.
+#[allow(dead_code)]
+pub(crate) trait SubscriptionStream: Send {
+    type Item;
+    /// Try to receive the next item without blocking.
+    fn try_recv(&mut self) -> Option<Self::Item>;
+}
+
+impl<T: Send> SubscriptionStream for Box<dyn SubscriptionStream<Item = T>> {
+    type Item = T;
+    fn try_recv(&mut self) -> Option<T> {
+        (**self).try_recv()
+    }
 }
 
 impl<M> Subscription<M> {
     /// Create an empty subscription.
     pub fn none() -> Self {
-        Self { subs: Vec::new() }
-    }
-
-    /// Create a subscription from a native iced subscription.
-    pub fn from_iced(sub: iced::Subscription<M>) -> Self {
-        Self { subs: vec![sub] }
+        Self { streams: Vec::new() }
     }
 
     /// Batch multiple subscriptions together.
     pub fn batch(subscriptions: impl IntoIterator<Item = Subscription<M>>) -> Self {
         Self {
-            subs: subscriptions.into_iter().flat_map(|s| s.subs).collect(),
+            streams: subscriptions.into_iter().flat_map(|s| s.streams).collect(),
         }
     }
 
     /// Map the message type using a closure.
-    ///
-    /// The closure must be Clone because subscriptions are rebuilt per-frame.
     pub fn map<F, N>(self, f: F) -> Subscription<N>
     where
-        M: 'static,
-        N: 'static,
+        M: Send + 'static,
+        N: Send + 'static,
         F: Fn(M) -> N + Clone + Send + 'static,
     {
         Subscription {
-            subs: self.subs.into_iter().map(|s| s.map(f.clone())).collect(),
+            streams: self.streams.into_iter().map(|s| {
+                Box::new(MappedStream { inner: s, map_fn: f.clone() })
+                    as Box<dyn SubscriptionStream<Item = N>>
+            }).collect(),
         }
     }
 
     /// Map the message type using a function pointer.
-    ///
-    /// Useful when you have a named function or method reference.
-    pub fn map_msg<N: 'static>(self, f: fn(M) -> N) -> Subscription<N>
+    pub fn map_msg<N: Send + 'static>(self, f: fn(M) -> N) -> Subscription<N>
     where
-        M: 'static,
+        M: Send + 'static,
     {
         self.map(f)
     }
 
     /// Check if this subscription is empty.
     pub fn is_empty(&self) -> bool {
-        self.subs.is_empty()
+        self.streams.is_empty()
     }
 }
 
 impl<M> Default for Subscription<M> {
     fn default() -> Self {
         Self::none()
+    }
+}
+
+/// A stream that maps items from an inner stream.
+#[allow(dead_code)]
+struct MappedStream<S, F> {
+    inner: S,
+    map_fn: F,
+}
+
+impl<S, F, M, N> SubscriptionStream for MappedStream<S, F>
+where
+    S: SubscriptionStream<Item = M>,
+    F: Fn(M) -> N + Send,
+    N: Send,
+{
+    type Item = N;
+    fn try_recv(&mut self) -> Option<N> {
+        self.inner.try_recv().map(&self.map_fn)
     }
 }
 

@@ -21,7 +21,6 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
 chrono = { workspace = true }
-iced = { workspace = true }
 portable-pty = { workspace = true }
 arboard = { workspace = true }  # Clipboard support
 image = { workspace = true }  # Image processing for clipboard images

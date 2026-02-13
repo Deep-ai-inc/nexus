@@ -342,17 +342,13 @@ impl Component for NexusState {
     }
 
     fn subscription(&self) -> Subscription<NexusMessage> {
-        let mut subs = vec![
+        let subs = vec![
             self.shell.subscription(),
             self.agent.subscription(),
         ];
 
-        if self.shell.needs_redraw() || self.agent.needs_redraw() || self.drag.auto_scroll.get().is_some() {
-            subs.push(Subscription::from_iced(
-                strata::shell::time::every(std::time::Duration::from_millis(16))
-                    .map(|_| NexusMessage::Tick),
-            ));
-        }
+        // Timer ticks are no longer needed — the native backend renders
+        // continuously and polls subscriptions on a timer.
 
         Subscription::batch(subs)
     }

@@ -627,14 +627,14 @@ impl StrataPipeline {
             view_formats: &[],
         });
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
+            wgpu::ImageCopyTexture {
                 texture: &placeholder_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &[255u8, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout {
+            wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(4),
                 rows_per_image: Some(1),
@@ -1175,7 +1175,7 @@ impl StrataPipeline {
 
         // Upload the modified region to GPU
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
+            wgpu::ImageCopyTexture {
                 texture: &atlas.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: ax, y: ay, z: 0 },
@@ -1183,7 +1183,7 @@ impl StrataPipeline {
             },
             // Upload just the rows we wrote (contiguous in source data)
             data,
-            wgpu::TexelCopyBufferLayout {
+            wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(width * 4),
                 rows_per_image: Some(height),
@@ -1269,14 +1269,14 @@ impl StrataPipeline {
 
         // Upload entire atlas data
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
+            wgpu::ImageCopyTexture {
                 texture: &atlas.texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             &atlas.data,
-            wgpu::TexelCopyBufferLayout {
+            wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(new_width * 4),
                 rows_per_image: Some(new_height),
@@ -2003,7 +2003,7 @@ impl StrataPipeline {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
-        clip_bounds: &crate::shell::Rectangle<u32>,
+        clip_bounds: &crate::shell::ClipBounds,
     ) {
         // Background color is specified in sRGB but the render target is sRGB format,
         // which means the GPU will apply linear→sRGB conversion on output. We must
@@ -2027,7 +2027,6 @@ impl StrataPipeline {
             label: Some("Strata Render Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
-                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(clear_color),
@@ -2118,14 +2117,14 @@ impl StrataPipeline {
         let byte_offset = ((min_y * atlas_width + min_x) * 4) as u64;
 
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
+            wgpu::ImageCopyTexture {
                 texture: &self.atlas_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: min_x, y: min_y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             data,
-            wgpu::TexelCopyBufferLayout {
+            wgpu::ImageDataLayout {
                 offset: byte_offset,
                 bytes_per_row: Some(atlas_width * 4), // stride = full atlas row width
                 rows_per_image: None,
@@ -2143,14 +2142,14 @@ impl StrataPipeline {
         let atlas_width = self.glyph_atlas.atlas_width;
         let atlas_height = self.glyph_atlas.atlas_height;
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
+            wgpu::ImageCopyTexture {
                 texture: &self.atlas_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             self.glyph_atlas.atlas_data(),
-            wgpu::TexelCopyBufferLayout {
+            wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(atlas_width * 4),
                 rows_per_image: Some(atlas_height),
