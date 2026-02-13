@@ -108,6 +108,7 @@ struct WindowState<A: StrataApp> {
     command_tx: std::sync::mpsc::Sender<A::Message>,
     command_rx: std::sync::mpsc::Receiver<A::Message>,
     window: *mut AnyObject, // Weak back-pointer to NSWindow (prevent retain cycle)
+    current_title: String, // Cached to avoid NSString allocation + ObjC call every tick
     pending_window_resize: Option<(f32, f32)>, // Deferred setContentSize (avoid reentrant borrow)
     poll_timer: *mut c_void, // CFRunLoopTimerRef for main-thread polling (invalidated on close)
 }
@@ -312,6 +313,7 @@ fn open_new_window_with_state<A: StrataApp>(
         command_tx: command_tx.clone(),
         command_rx,
         window: window_ptr,
+        current_title: String::new(),
         pending_window_resize: None,
         poll_timer: std::ptr::null_mut(),
     };
@@ -327,6 +329,7 @@ fn open_new_window_with_state<A: StrataApp>(
     // Set window title from app state.
     let title = A::title(&win_state.app);
     window.setTitle(&NSString::from_str(&title));
+    win_state.current_title = title;
 
     // Store state pointer in the view's ivar.
     let win_state_ptr = Box::into_raw(Box::new(RefCell::new(win_state)));
@@ -348,8 +351,8 @@ fn open_new_window_with_state<A: StrataApp>(
 
     WINDOW_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    // Leak the Retained wrapper. With releasedWhenClosed=NO, the window
-    // lives until process exit (small leak, but avoids use-after-free).
+    // Leak the Retained wrapper's +1 retain. Balanced by autorelease
+    // in handle_window_close (deferred past the close call stack).
     std::mem::forget(window);
 
     Ok(())
@@ -1145,21 +1148,18 @@ fn init_metal(
     let phys_w = (win_w * dpi_scale) as u32;
     let phys_h = (win_h * dpi_scale) as u32;
 
-    // Wrap the existing CAMetalLayer
+    // Wrap the existing CAMetalLayer. The layer was created via [CAMetalLayer layer]
+    // (autoreleased) and retained by the view's layer hierarchy via addSublayer:.
+    // from_ptr consumes a +1 retain, so we must retain first to give it its own reference.
+    // Without this, dropping MetalLayer would over-release, freeing the layer while
+    // the hierarchy still holds it — causing a crash when the view deallocs.
     use metal::foreign_types::ForeignType;
+    unsafe { let _: *mut AnyObject = msg_send![metal_layer_ptr as *mut AnyObject, retain]; }
     let layer = unsafe { metal::MetalLayer::from_ptr(metal_layer_ptr as *mut _) };
     layer.set_device(&device);
     layer.set_pixel_format(pixel_format);
     layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(phys_w as f64, phys_h as f64));
     layer.set_framebuffer_only(true);
-    // Keep the layer alive — we stored it in the struct. But MetalLayer::from_ptr
-    // takes ownership. We need to retain it since the view also owns the layer.
-    // Actually, from_ptr assumes ownership (consumes a +1 retain). The layer is
-    // already retained by the view, so we need from_ptr to NOT release it.
-    // Use ManuallyDrop to prevent double-release.
-    let layer = std::mem::ManuallyDrop::new(layer);
-    // Re-wrap as a proper retained reference
-    let layer = unsafe { metal::MetalLayer::from_ptr(metal::foreign_types::ForeignType::as_ptr(&*layer)) };
 
     let in_flight_semaphore = unsafe { dispatch_semaphore_create(3) };
 
@@ -1722,10 +1722,8 @@ fn handle_resize_idle<A: StrataApp>(info: *mut c_void) {
 // Window Close Cleanup
 // ============================================================================
 
-/// Cleanup handler for windowWillClose:. Invalidates timers and drops Rust state.
-/// The window itself is NOT released here — with releasedWhenClosed=NO and
-/// mem::forget at creation, the ordered-out window object leaks (~2KB).
-/// This is safe because the alternative (releasing during close) is a minefield.
+/// Cleanup handler for windowWillClose:. Invalidates timers, drops Rust state,
+/// and autoreleases the window (balancing the mem::forget from creation).
 fn handle_window_close<A: StrataApp>(view: &AnyObject) {
     unsafe {
         // Get state pointer from ivar.
@@ -1739,9 +1737,9 @@ fn handle_window_close<A: StrataApp>(view: &AnyObject) {
         let ivar_ptr = view_ptr.offset(ivar.offset()) as *mut *mut c_void;
         *ivar_ptr = std::ptr::null_mut();
 
-        // Invalidate timers before dropping state.
+        // Extract window pointer and invalidate timers before dropping state.
         let state_cell = &*(state_ptr as *const RefCell<WindowState<A>>);
-        {
+        let window_ptr = {
             let mut state = state_cell.borrow_mut();
 
             // Invalidate the per-window poll timer so the callback never fires
@@ -1753,13 +1751,25 @@ fn handle_window_close<A: StrataApp>(view: &AnyObject) {
 
             // Invalidate resize timer if active.
             invalidate_resize_timer(&mut state.resize_timer);
-        }
+
+            state.window
+        };
 
         // Drop the state (releases GPU resources, app state, channels, etc.).
         // State only holds a raw *mut to the window — no release is sent.
         drop(Box::from_raw(state_ptr as *mut RefCell<WindowState<A>>));
 
         WINDOW_COUNT.fetch_sub(1, Ordering::Relaxed);
+
+        // Autorelease the window to balance the mem::forget from creation.
+        // We use autorelease (not release) because close is still on the call
+        // stack — the pool drains after the current event finishes processing.
+        // This is safe now because the timer is invalidated (the earlier segfault
+        // was the timer callback sending setTitle: to a freed window, not the
+        // release itself).
+        if !window_ptr.is_null() {
+            let _: *mut AnyObject = msg_send![window_ptr, autorelease];
+        }
     }
 }
 
@@ -1850,13 +1860,14 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 state.last_render_time = Instant::now();
             }
 
-            // Update window title (cheap when unchanged — AppKit compares internally).
-            if !state.window.is_null() {
-                let new_title = A::title(&state.app);
+            // Update window title only when changed (avoids NSString alloc + ObjC call per tick).
+            let new_title = A::title(&state.app);
+            if new_title != state.current_title && !state.window.is_null() {
                 unsafe {
                     let ns_title = NSString::from_str(&new_title);
                     let _: () = msg_send![state.window, setTitle: &*ns_title];
                 }
+                state.current_title = new_title;
             }
 
             // Drop the borrow before flushing deferred resize.
