@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
@@ -56,7 +56,7 @@ impl std::error::Error for Error {}
 const BASE_FONT_SIZE: f32 = 14.0;
 
 // ============================================================================
-// Shared Scene State (main thread writes, render thread reads)
+// Scene (built each frame for rendering)
 // ============================================================================
 
 /// A scene snapshot ready for rendering.
@@ -68,66 +68,14 @@ struct Scene {
     pending_unloads: Vec<ImageHandle>,
 }
 
-/// Thread-safe scene slot for main↔render handoff.
-struct SceneSlot {
-    scene: Mutex<Option<Scene>>,
-    notify: Condvar,
-}
-
-impl SceneSlot {
-    fn new() -> Self {
-        Self {
-            scene: Mutex::new(None),
-            notify: Condvar::new(),
-        }
-    }
-
-    fn store(&self, scene: Scene) {
-        *self.scene.lock().unwrap() = Some(scene);
-        self.notify.notify_one();
-    }
-
-    fn wait_timeout(&self, timeout: std::time::Duration) -> Option<Scene> {
-        let mut slot = self.scene.lock().unwrap();
-        if slot.is_none() {
-            slot = self.notify.wait_timeout(slot, timeout).unwrap().0;
-        }
-        slot.take()
-    }
-}
-
 // ============================================================================
-// Surface Size (shared)
+// Render Resources (main thread only)
 // ============================================================================
 
-struct SurfaceSize {
-    width: AtomicU64,
-    height: AtomicU64,
-    dirty: AtomicBool,
-}
-
-impl SurfaceSize {
-    fn new(w: u32, h: u32) -> Self {
-        Self {
-            width: AtomicU64::new(w as u64),
-            height: AtomicU64::new(h as u64),
-            dirty: AtomicBool::new(true),
-        }
-    }
-
-    fn set(&self, w: u32, h: u32) {
-        self.width.store(w as u64, Ordering::Relaxed);
-        self.height.store(h as u64, Ordering::Relaxed);
-        self.dirty.store(true, Ordering::Release);
-    }
-
-    fn get(&self) -> (u32, u32) {
-        (self.width.load(Ordering::Relaxed) as u32, self.height.load(Ordering::Relaxed) as u32)
-    }
-
-    fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::AcqRel)
-    }
+struct RenderResources {
+    gpu: GpuState,
+    pipeline: StrataPipeline,
+    current_scale: f32,
 }
 
 // ============================================================================
@@ -145,8 +93,11 @@ struct WindowState<A: StrataApp> {
     cursor_position: Option<Point>,
     image_store: ImageStore,
     cached_snapshot: Option<Arc<LayoutSnapshot>>,
-    scene_slot: Arc<SceneSlot>,
-    surface_size: Arc<SurfaceSize>,
+    render: RenderResources,
+    overlay_layer_ptr: *mut AnyObject,
+    resize_timer: *mut c_void, // CFRunLoopTimerRef, null when inactive
+    needs_render: bool,
+    surface_dirty: bool,
     dpi_scale: f32,
     tokio_rt: Arc<tokio::runtime::Runtime>,
     command_tx: std::sync::mpsc::Sender<A::Message>,
@@ -219,12 +170,21 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     // Initialize wgpu.
     let gpu = init_wgpu(view_state.metal_layer_ptr, win_w, win_h, dpi_scale)?;
 
-    // Shared state for render thread.
-    let scene_slot = Arc::new(SceneSlot::new());
-    let surface_size = Arc::new(SurfaceSize::new(
-        (win_w * dpi_scale) as u32,
-        (win_h * dpi_scale) as u32,
-    ));
+    // Initialize pipeline on main thread.
+    let scale = dpi_scale;
+    let fs_mutex = crate::text_engine::get_font_system();
+    let mut font_system = fs_mutex.lock().unwrap();
+    let pipeline = StrataPipeline::new(
+        &gpu.device, &gpu.queue, gpu.surface_config.format,
+        BASE_FONT_SIZE * scale, &mut font_system,
+    );
+    drop(font_system);
+
+    let render = RenderResources {
+        gpu,
+        pipeline,
+        current_scale: scale,
+    };
 
     // Initialize application.
     let mut image_store = ImageStore::new();
@@ -244,29 +204,24 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         cursor_position: None,
         image_store,
         cached_snapshot: None,
-        scene_slot: scene_slot.clone(),
-        surface_size: surface_size.clone(),
+        render,
+        overlay_layer_ptr: view_state.overlay_layer_ptr,
+        resize_timer: std::ptr::null_mut(),
+        needs_render: true,
+        surface_dirty: false,
         dpi_scale,
         tokio_rt: tokio_rt.clone(),
         command_tx: command_tx.clone(),
         command_rx,
     };
 
-    // Build initial scene.
-    build_and_send_scene::<A>(&mut win_state);
-
-    // Start render thread.
-    let render_scene_slot = scene_slot.clone();
-    let render_surface_size = surface_size.clone();
-    let render_stop = Arc::new(AtomicBool::new(false));
-    let render_stop_clone = render_stop.clone();
-
-    std::thread::Builder::new()
-        .name("strata-render".into())
-        .spawn(move || {
-            render_thread_main(gpu, render_scene_slot, render_surface_size, render_stop_clone, dpi_scale);
-        })
-        .map_err(|e| Error::Window(format!("Failed to start render thread: {e}")))?;
+    // Render first frame synchronously before showing window.
+    {
+        let scene = build_scene::<A>(&win_state);
+        win_state.cached_snapshot = Some(scene.snapshot.clone());
+        render_frame(&mut win_state.render, &scene, dpi_scale);
+        win_state.needs_render = false;
+    }
 
     // Store state pointer in the view's ivar.
     let win_state_ptr = Box::into_raw(Box::new(RefCell::new(win_state)));
@@ -281,13 +236,7 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     // Install typed event handlers.
     install_event_handlers::<A>();
 
-    // macOS platform integration — these depend on an NSApplicationDelegate
-    // which we need to set up natively. Skipped for Milestone 1.
-    // TODO(milestone4): crate::platform::macos::setup_menu_bar();
-    // TODO(milestone4): crate::platform::macos::install_force_click_handler();
-    // TODO(milestone4): crate::platform::macos::setup_force_click_monitor();
-
-    // Main thread timer for async result polling.
+    // Main thread timer: polls async commands AND renders (~16ms).
     install_main_thread_timer::<A>(win_state_ptr);
 
     // Show window and run.
@@ -296,7 +245,6 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     unsafe { ns_app.run() };
 
     // Cleanup (unreachable).
-    render_stop.store(true, Ordering::Release);
     drop(unsafe { Box::from_raw(win_state_ptr) });
     Ok(())
 }
@@ -308,6 +256,7 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
 struct ViewState {
     view: Retained<AnyObject>,
     metal_layer_ptr: *mut c_void,
+    overlay_layer_ptr: *mut AnyObject,
 }
 
 fn create_view_and_layers(
@@ -432,6 +381,7 @@ fn create_view_and_layers(
     Ok(ViewState {
         view,
         metal_layer_ptr: metal_layer as *mut c_void,
+        overlay_layer_ptr: overlay_layer,
     })
 }
 
@@ -541,12 +491,17 @@ extern "C" fn is_flipped(_this: &AnyObject, _sel: Sel) -> Bool {
 static mut MOUSE_HANDLER: Option<fn(&AnyObject, MouseEvent)> = None;
 static mut KEY_HANDLER: Option<fn(&AnyObject, KeyEvent)> = None;
 static mut RESIZE_HANDLER: Option<fn(&AnyObject, f32, f32)> = None;
+static mut RESIZE_START_HANDLER: Option<fn(&AnyObject)> = None;
+static mut RESIZE_END_HANDLER: Option<fn(&AnyObject)> = None;
 
 fn install_event_handlers<A: StrataApp>() {
     unsafe {
         MOUSE_HANDLER = Some(handle_mouse_event::<A>);
         KEY_HANDLER = Some(handle_key_event::<A>);
         RESIZE_HANDLER = Some(handle_resize::<A>);
+        RESIZE_START_HANDLER = Some(handle_resize_start::<A>);
+        RESIZE_END_HANDLER = Some(handle_resize_end::<A>);
+        RESIZE_IDLE_HANDLER = Some(handle_resize_idle::<A>);
     }
 }
 
@@ -715,11 +670,21 @@ extern "C" fn set_frame_size(this: &AnyObject, _sel: Sel, new_size: NSSize) {
 extern "C" fn view_will_start_live_resize(this: &AnyObject, _sel: Sel) {
     let superclass = AnyClass::get("NSView").unwrap();
     let _: () = unsafe { msg_send![super(this, superclass), viewWillStartLiveResize] };
+    unsafe {
+        if let Some(handler) = RESIZE_START_HANDLER {
+            handler(this);
+        }
+    }
 }
 
 extern "C" fn view_did_end_live_resize(this: &AnyObject, _sel: Sel) {
     let superclass = AnyClass::get("NSView").unwrap();
     let _: () = unsafe { msg_send![super(this, superclass), viewDidEndLiveResize] };
+    unsafe {
+        if let Some(handler) = RESIZE_END_HANDLER {
+            handler(this);
+        }
+    }
 }
 
 // ============================================================================
@@ -790,9 +755,79 @@ fn handle_resize<A: StrataApp>(view: &AnyObject, new_w: f32, new_h: f32) {
 
     let phys_w = (new_w * state.dpi_scale) as u32;
     let phys_h = (new_h * state.dpi_scale) as u32;
-    state.surface_size.set(phys_w, phys_h);
+    if phys_w == 0 || phys_h == 0 { return; }
 
-    build_and_send_scene::<A>(&mut state);
+    // Check if we're in live resize (ivar set by viewWillStartLiveResize).
+    let is_resizing = unsafe {
+        let ivar = view.class().instance_variable("_is_resizing").unwrap();
+        *ivar.load::<u8>(view) != 0
+    };
+
+    if is_resizing {
+        // Sync render path: render directly to overlay layer.
+        let dpi_scale = state.dpi_scale;
+        let overlay_layer = state.overlay_layer_ptr;
+
+        // Build scene and update cached snapshot for hit-testing.
+        let scene = build_scene::<A>(&state);
+        state.cached_snapshot = Some(scene.snapshot.clone());
+
+        // Reconfigure surface at new size and sync render.
+        state.render.gpu.surface_config.width = phys_w;
+        state.render.gpu.surface_config.height = phys_h;
+        render_sync_to_overlay(&mut state.render, &scene, overlay_layer, dpi_scale);
+
+        // Reset the resize idle timer.
+        let timer_info = state_cell as *const _ as *mut c_void;
+        reset_resize_idle_timer(&mut state.resize_timer, timer_info);
+    } else {
+        // Normal path: mark surface dirty and request render.
+        state.render.gpu.surface_config.width = phys_w;
+        state.render.gpu.surface_config.height = phys_h;
+        state.surface_dirty = true;
+        state.needs_render = true;
+    }
+}
+
+fn handle_resize_start<A: StrataApp>(view: &AnyObject) {
+    let Some(_state_cell) = (unsafe { get_state::<A>(view) }) else { return };
+
+    // Set _is_resizing ivar.
+    unsafe {
+        let view_ptr = view as *const AnyObject as *mut u8;
+        let ivar = view.class().instance_variable("_is_resizing").unwrap();
+        let ivar_ptr = view_ptr.offset(ivar.offset()) as *mut u8;
+        *ivar_ptr = 1;
+    }
+}
+
+fn handle_resize_end<A: StrataApp>(view: &AnyObject) {
+    let Some(state_cell) = (unsafe { get_state::<A>(view) }) else { return };
+    let mut state = state_cell.borrow_mut();
+
+    // Clear _is_resizing ivar.
+    unsafe {
+        let view_ptr = view as *const AnyObject as *mut u8;
+        let ivar = view.class().instance_variable("_is_resizing").unwrap();
+        let ivar_ptr = view_ptr.offset(ivar.offset()) as *mut u8;
+        *ivar_ptr = 0;
+    }
+
+    // Invalidate resize timer.
+    invalidate_resize_timer(&mut state.resize_timer);
+
+    // Hide overlay, clear contents.
+    let overlay = state.overlay_layer_ptr;
+    if !overlay.is_null() {
+        unsafe {
+            let _: () = msg_send![overlay, setHidden: Bool::YES];
+            let _: () = msg_send![overlay, setContents: std::ptr::null::<AnyObject>()];
+        }
+    }
+
+    // Reconfigure surface and trigger a normal render on the next timer tick.
+    state.surface_dirty = true;
+    state.needs_render = true;
 }
 
 fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
@@ -808,10 +843,10 @@ fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
         state.current_zoom = new_zoom;
     }
 
-    build_and_send_scene::<A>(state);
+    invalidate_and_request_render::<A>(state);
 }
 
-fn build_and_send_scene<A: StrataApp>(state: &mut WindowState<A>) {
+fn build_scene<A: StrataApp>(state: &WindowState<A>) -> Scene {
     let zoom = A::zoom_level(&state.app);
     let mut snapshot = LayoutSnapshot::new();
     snapshot.set_viewport(Rect::new(0.0, 0.0, state.base_size.0, state.base_size.1));
@@ -819,18 +854,20 @@ fn build_and_send_scene<A: StrataApp>(state: &mut WindowState<A>) {
     A::view(&state.app, &mut snapshot);
 
     let snapshot = Arc::new(snapshot);
-    state.cached_snapshot = Some(snapshot.clone());
 
-    let pending_images = state.image_store.drain_pending();
-    let pending_unloads = state.image_store.drain_pending_unloads();
-
-    state.scene_slot.store(Scene {
+    Scene {
         snapshot,
         selection: A::selection(&state.app).cloned(),
         background: A::background_color(&state.app),
-        pending_images,
-        pending_unloads,
-    });
+        pending_images: Vec::new(),
+        pending_unloads: Vec::new(),
+    }
+}
+
+fn invalidate_and_request_render<A: StrataApp>(state: &mut WindowState<A>) {
+    let scene = build_scene::<A>(state);
+    state.cached_snapshot = Some(scene.snapshot.clone());
+    state.needs_render = true;
 }
 
 // ============================================================================
@@ -969,68 +1006,53 @@ fn init_wgpu(
 }
 
 // ============================================================================
-// Render Thread
+// IOSurface Extraction (for resize overlay)
 // ============================================================================
 
-fn render_thread_main(
-    mut gpu: GpuState,
-    scene_slot: Arc<SceneSlot>,
-    surface_size: Arc<SurfaceSize>,
-    stop: Arc<AtomicBool>,
-    dpi_scale: f32,
-) {
-    let fs_mutex = crate::text_engine::get_font_system();
-    let mut font_system = fs_mutex.lock().unwrap();
-    let scale = dpi_scale;
-    let mut pipeline = StrataPipeline::new(
-        &gpu.device, &gpu.queue, gpu.surface_config.format,
-        BASE_FONT_SIZE * scale, &mut font_system,
-    );
-    drop(font_system);
-    let mut current_scale = scale;
-    let mut last_scene: Option<Scene> = None;
-
-    while !stop.load(Ordering::Acquire) {
-        let new_scene = scene_slot.wait_timeout(std::time::Duration::from_millis(16));
-        if let Some(scene) = new_scene {
-            last_scene = Some(scene);
-        }
-
-        let Some(scene) = last_scene.as_ref() else { continue; };
-
-        if surface_size.take_dirty() {
-            let (w, h) = surface_size.get();
-            if w > 0 && h > 0 {
-                gpu.surface_config.width = w;
-                gpu.surface_config.height = h;
-                gpu.surface.configure(&gpu.device, &gpu.surface_config);
-            }
-        }
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            render_frame(&mut gpu, &mut pipeline, scene, &mut current_scale, dpi_scale);
-        }));
-        if result.is_err() {
-            eprintln!("Render thread panicked, continuing...");
-        }
+/// Extract IOSurfaceRef from a wgpu texture's underlying Metal drawable.
+///
+/// Uses wgpu's `as_hal` to access the private metal::Texture, then sends
+/// the `iosurface` ObjC message to get the backing IOSurface.
+/// Must be called BEFORE the SurfaceTexture is dropped or presented.
+fn extract_iosurface(texture: &wgpu::Texture) -> Option<IOSurfacePtr> {
+    unsafe {
+        texture.as_hal::<wgpu::hal::api::Metal, _, _>(|hal_texture| {
+            hal_texture.and_then(|t| {
+                let metal_tex = t.raw_handle();
+                // metal::Texture uses foreign-types; as_ptr() gives *mut MTLTexture.
+                // Cast to *mut AnyObject for objc2's msg_send! receiver.
+                // Return type is IOSurfacePtr (encoding: ^{__IOSurface=}).
+                use metal::foreign_types::ForeignType;
+                let raw_ptr = metal_tex.as_ptr() as *mut AnyObject;
+                let iosurface: IOSurfacePtr = msg_send![raw_ptr, iosurface];
+                if iosurface.0.is_null() { None } else { Some(iosurface) }
+            })
+        })
     }
 }
 
-fn render_frame(
-    gpu: &mut GpuState,
-    pipeline: &mut StrataPipeline,
+/// Synchronous render to the overlay layer during resize.
+///
+/// Acquires a drawable via wgpu::Surface, renders the scene, waits for GPU
+/// completion, extracts the IOSurface, and sets it on the overlay CALayer.
+/// The frame is NOT presented — it's dropped, returning the drawable to the pool.
+fn render_sync_to_overlay(
+    res: &mut RenderResources,
     scene: &Scene,
-    current_scale: &mut f32,
+    overlay_layer: *mut AnyObject,
     dpi_scale: f32,
 ) {
+    let gpu = &mut res.gpu;
+
+    // Reconfigure surface at current size.
+    gpu.surface.configure(&gpu.device, &gpu.surface_config);
+
     let frame = match gpu.surface.get_current_texture() {
         Ok(f) => f,
-        Err(wgpu::SurfaceError::Timeout) => return,
-        Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-            gpu.surface.configure(&gpu.device, &gpu.surface_config);
+        Err(e) => {
+            eprintln!("Sync render: surface error: {e:?}");
             return;
         }
-        Err(e) => { eprintln!("Surface error: {e:?}"); return; }
     };
 
     let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1040,32 +1062,113 @@ fn render_frame(
     let fs_mutex = crate::text_engine::get_font_system();
     let mut font_system = fs_mutex.lock().unwrap();
 
-    if (*current_scale - scale).abs() > 0.01 {
-        *pipeline = StrataPipeline::new(
+    if (res.current_scale - scale).abs() > 0.01 {
+        res.pipeline = StrataPipeline::new(
             &gpu.device, &gpu.queue, gpu.surface_config.format,
             BASE_FONT_SIZE * scale, &mut font_system,
         );
-        *current_scale = scale;
+        res.current_scale = scale;
     }
 
     // Upload/unload images.
     for img in &scene.pending_images {
-        pipeline.load_image_rgba(&gpu.device, &gpu.queue, img.width, img.height, &img.data);
+        res.pipeline.load_image_rgba(&gpu.device, &gpu.queue, img.width, img.height, &img.data);
     }
     for handle in &scene.pending_unloads {
-        pipeline.unload_image(*handle);
+        res.pipeline.unload_image(*handle);
     }
 
-    pipeline.after_frame();
-    pipeline.clear();
-    pipeline.set_background(scene.background);
+    res.pipeline.after_frame();
+    res.pipeline.clear();
+    res.pipeline.set_background(scene.background);
 
-    populate_pipeline(pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
+    populate_pipeline(&mut res.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
+    drop(font_system);
+
+    // Prepare (staging upload).
+    let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Sync Staging Upload"),
+    });
+    res.pipeline.prepare(
+        &gpu.device, &gpu.queue, &mut encoder,
+        gpu.surface_config.width as f32, gpu.surface_config.height as f32,
+    );
+    gpu.queue.submit(std::iter::once(encoder.finish()));
+
+    // Render pass.
+    let mut render_encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Sync Render"),
+    });
+    let clip = ClipBounds {
+        x: 0, y: 0,
+        width: gpu.surface_config.width,
+        height: gpu.surface_config.height,
+    };
+    res.pipeline.render(&mut render_encoder, &view, &clip);
+    gpu.queue.submit(std::iter::once(render_encoder.finish()));
+
+    // Wait for GPU to finish writing pixels.
+    gpu.device.poll(wgpu::Maintain::Wait);
+
+    // Extract IOSurface BEFORE dropping the frame.
+    if let Some(iosurface) = extract_iosurface(&frame.texture) {
+        unsafe {
+            // setContents: takes `id` (@) — bridge-cast IOSurfaceRef to id.
+            let contents_id = iosurface.0 as *mut AnyObject;
+            let _: () = msg_send![overlay_layer, setContents: contents_id];
+            let _: () = msg_send![overlay_layer, setHidden: Bool::NO];
+        }
+    }
+
+    // Drop frame WITHOUT calling present() — drawable returns to pool via refcount.
+    drop(frame);
+}
+
+fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32) {
+    let gpu = &mut res.gpu;
+
+    let frame = match gpu.surface.get_current_texture() {
+        Ok(f) => f,
+        Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            gpu.surface.configure(&gpu.device, &gpu.surface_config);
+            return;
+        }
+        Err(_) => return,
+    };
+
+    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let zoom = scene.snapshot.zoom_level();
+    let scale = dpi_scale * zoom;
+
+    let fs_mutex = crate::text_engine::get_font_system();
+    let mut font_system = fs_mutex.lock().unwrap();
+
+    if (res.current_scale - scale).abs() > 0.01 {
+        res.pipeline = StrataPipeline::new(
+            &gpu.device, &gpu.queue, gpu.surface_config.format,
+            BASE_FONT_SIZE * scale, &mut font_system,
+        );
+        res.current_scale = scale;
+    }
+
+    // Upload/unload images.
+    for img in &scene.pending_images {
+        res.pipeline.load_image_rgba(&gpu.device, &gpu.queue, img.width, img.height, &img.data);
+    }
+    for handle in &scene.pending_unloads {
+        res.pipeline.unload_image(*handle);
+    }
+
+    res.pipeline.after_frame();
+    res.pipeline.clear();
+    res.pipeline.set_background(scene.background);
+
+    populate_pipeline(&mut res.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
 
     let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Strata Staging Upload"),
     });
-    pipeline.prepare(
+    res.pipeline.prepare(
         &gpu.device, &gpu.queue, &mut encoder,
         gpu.surface_config.width as f32, gpu.surface_config.height as f32,
     );
@@ -1079,7 +1182,7 @@ fn render_frame(
         width: gpu.surface_config.width,
         height: gpu.surface_config.height,
     };
-    pipeline.render(&mut render_encoder, &view, &clip);
+    res.pipeline.render(&mut render_encoder, &view, &clip);
     gpu.queue.submit(std::iter::once(render_encoder.finish()));
 
     frame.present();
@@ -1362,51 +1465,167 @@ fn spawn_commands<M: Send + 'static>(
 }
 
 // ============================================================================
+// Resize Idle Timer (CFRunLoopTimer)
+// ============================================================================
+
+// CoreFoundation FFI shared by both timers.
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRunLoopGetMain() -> *mut c_void;
+    fn CFRunLoopAddTimer(rl: *mut c_void, timer: *mut c_void, mode: *const c_void);
+    fn CFRunLoopTimerCreate(
+        allocator: *const c_void, fire_date: f64, interval: f64,
+        flags: u64, order: i64,
+        callout: extern "C" fn(*mut c_void, *mut c_void),
+        context: *mut CFRunLoopTimerContext,
+    ) -> *mut c_void;
+    fn CFRunLoopTimerInvalidate(timer: *mut c_void);
+    fn CFAbsoluteTimeGetCurrent() -> f64;
+}
+
+unsafe extern "C" {
+    static kCFRunLoopCommonModes: *const c_void;
+}
+
+#[repr(C)]
+struct CFRunLoopTimerContext {
+    version: i64,
+    info: *mut c_void,
+    retain: *const c_void,
+    release: *const c_void,
+    copy_description: *const c_void,
+}
+
+/// Reset (or create) the resize idle timer. Fires ~16ms after the last setFrameSize.
+/// When it fires, we hide the overlay and do one presentDrawable render
+/// (which works when the mouse is still during the resize tracking loop).
+fn reset_resize_idle_timer(timer_ptr: &mut *mut c_void, state_info: *mut c_void) {
+    // Invalidate any existing timer.
+    if !timer_ptr.is_null() {
+        unsafe { CFRunLoopTimerInvalidate(*timer_ptr); }
+        *timer_ptr = std::ptr::null_mut();
+    }
+
+    unsafe {
+        let mut context = CFRunLoopTimerContext {
+            version: 0,
+            info: state_info,
+            retain: std::ptr::null(),
+            release: std::ptr::null(),
+            copy_description: std::ptr::null(),
+        };
+
+        // One-shot timer: fire_date = now + 16ms, interval = 0 (non-repeating).
+        let fire_date = CFAbsoluteTimeGetCurrent() + 0.016;
+        let timer = CFRunLoopTimerCreate(
+            std::ptr::null(), fire_date, 0.0,
+            0, 0, resize_idle_timer_callback, &mut context,
+        );
+
+        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+        *timer_ptr = timer;
+    }
+}
+
+fn invalidate_resize_timer(timer_ptr: &mut *mut c_void) {
+    if !timer_ptr.is_null() {
+        unsafe { CFRunLoopTimerInvalidate(*timer_ptr); }
+        *timer_ptr = std::ptr::null_mut();
+    }
+}
+
+/// Resize idle timer callback. Called on main thread when mouse has been still
+/// for ~16ms during resize. Hides overlay and does a normal presentDrawable render.
+extern "C" fn resize_idle_timer_callback(_timer: *mut c_void, _info: *mut c_void) {
+    // NOTE: This callback fires for ALL StrataApp instances, but we only have one.
+    // The info pointer is the raw RefCell<WindowState<A>> pointer, but we don't
+    // know A here. Instead, we use a type-erased handler set during install_event_handlers.
+    unsafe {
+        if let Some(handler) = RESIZE_IDLE_HANDLER {
+            handler(_info);
+        }
+    }
+}
+
+/// Type-erased resize idle handler (set during install_event_handlers).
+static mut RESIZE_IDLE_HANDLER: Option<fn(*mut c_void)> = None;
+
+fn handle_resize_idle<A: StrataApp>(info: *mut c_void) {
+    let state_cell = unsafe { &*(info as *const RefCell<WindowState<A>>) };
+    let mut state = state_cell.borrow_mut();
+
+    // Hide overlay, clear contents.
+    let overlay = state.overlay_layer_ptr;
+    if !overlay.is_null() {
+        unsafe {
+            let _: () = msg_send![overlay, setHidden: Bool::YES];
+            let _: () = msg_send![overlay, setContents: std::ptr::null::<AnyObject>()];
+        }
+    }
+
+    // Reconfigure surface and do one normal presentDrawable render
+    // (works when mouse is still during the resize tracking loop).
+    state.render.gpu.surface.configure(
+        &state.render.gpu.device,
+        &state.render.gpu.surface_config,
+    );
+    let scene = build_scene::<A>(&state);
+    let dpi_scale = state.dpi_scale;
+    render_frame(&mut state.render, &scene, dpi_scale);
+}
+
+// ============================================================================
 // Main Thread Timer
 // ============================================================================
 
 fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A>>) {
+    extern "C" fn timer_callback<A: StrataApp>(_timer: *mut c_void, info: *mut c_void) {
+        let state_ptr = info as *mut RefCell<WindowState<A>>;
+        let state_cell = unsafe { &*state_ptr };
+        let mut state = state_cell.borrow_mut();
+
+        // Drain pending async results.
+        let mut messages = Vec::new();
+        while let Ok(msg) = state.command_rx.try_recv() {
+            messages.push(msg);
+        }
+
+        if !messages.is_empty() {
+            for msg in messages {
+                process_message::<A>(&mut state, msg);
+            }
+        }
+
+        // Render if needed.
+        if state.needs_render {
+            state.needs_render = false;
+
+            if state.surface_dirty {
+                state.surface_dirty = false;
+                state.render.gpu.surface.configure(
+                    &state.render.gpu.device,
+                    &state.render.gpu.surface_config,
+                );
+            }
+
+            let scene = build_scene::<A>(&state);
+            state.cached_snapshot = Some(scene.snapshot.clone());
+
+            // Drain pending images/unloads into the scene.
+            let pending_images = state.image_store.drain_pending();
+            let pending_unloads = state.image_store.drain_pending_unloads();
+            let scene = Scene {
+                pending_images,
+                pending_unloads,
+                ..scene
+            };
+
+            let dpi_scale = state.dpi_scale;
+            render_frame(&mut state.render, &scene, dpi_scale);
+        }
+    }
+
     unsafe {
-        #[link(name = "CoreFoundation", kind = "framework")]
-        unsafe extern "C" {
-            fn CFRunLoopGetMain() -> *mut c_void;
-            fn CFRunLoopAddTimer(rl: *mut c_void, timer: *mut c_void, mode: *const c_void);
-            fn CFRunLoopTimerCreate(
-                allocator: *const c_void, fire_date: f64, interval: f64,
-                flags: u64, order: i64,
-                callout: extern "C" fn(*mut c_void, *mut c_void),
-                context: *mut CFRunLoopTimerContext,
-            ) -> *mut c_void;
-            fn CFAbsoluteTimeGetCurrent() -> f64;
-        }
-
-        #[repr(C)]
-        struct CFRunLoopTimerContext {
-            version: i64,
-            info: *mut c_void,
-            retain: *const c_void,
-            release: *const c_void,
-            copy_description: *const c_void,
-        }
-
-        extern "C" fn timer_callback<A: StrataApp>(_timer: *mut c_void, info: *mut c_void) {
-            let state_ptr = info as *mut RefCell<WindowState<A>>;
-            let state_cell = unsafe { &*state_ptr };
-            let mut state = state_cell.borrow_mut();
-
-            // Drain pending async results into a vec first.
-            let mut messages = Vec::new();
-            while let Ok(msg) = state.command_rx.try_recv() {
-                messages.push(msg);
-            }
-
-            if !messages.is_empty() {
-                for msg in messages {
-                    process_message::<A>(&mut state, msg);
-                }
-            }
-        }
-
         let mut context = CFRunLoopTimerContext {
             version: 0,
             info: state_ptr as *mut c_void,
@@ -1420,9 +1639,6 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             0, 0, timer_callback::<A>, &mut context,
         );
 
-        unsafe extern "C" {
-            static kCFRunLoopCommonModes: *const c_void;
-        }
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
     }
 }
@@ -1443,6 +1659,24 @@ pub struct ClipBounds {
 // ============================================================================
 // Newtype wrappers for CoreGraphics pointers (objc2 type encoding validation)
 // ============================================================================
+
+/// Wrapper for IOSurfaceRef that satisfies objc2's type encoding checks.
+/// The `iosurface` selector on MTLTexture returns `^{__IOSurface=}`, not `@`.
+#[derive(Copy, Clone)]
+#[allow(dead_code)]
+struct IOSurfacePtr(*mut c_void);
+
+unsafe impl objc2::encode::Encode for IOSurfacePtr {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+        &objc2::encode::Encoding::Struct("__IOSurface", &[]),
+    );
+}
+
+unsafe impl objc2::encode::RefEncode for IOSurfacePtr {
+    const ENCODING_REF: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
+        &<Self as objc2::encode::Encode>::ENCODING,
+    );
+}
 
 /// Wrapper for CGColorSpaceRef that satisfies objc2's type encoding checks.
 #[derive(Copy, Clone)]

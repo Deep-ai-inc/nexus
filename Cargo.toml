@@ -64,3 +64,6 @@ nexus-api = { path = "nexus-api" }
 nexus-kernel = { path = "nexus-kernel" }
 nexus-term = { path = "nexus-term" }
 strata = { path = "strata" }
+
+[patch.crates-io]
+wgpu-hal = { path = "patches/wgpu-hal" }

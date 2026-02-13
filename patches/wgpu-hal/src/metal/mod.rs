@@ -511,6 +511,15 @@ pub struct Texture {
     copy_size: crate::CopyExtent,
 }
 
+impl Texture {
+    /// Expose the raw Metal texture for IOSurface extraction during resize.
+    /// # Safety
+    /// Caller must not use the texture after the parent wgpu::Texture is dropped.
+    pub unsafe fn raw_handle(&self) -> &metal::Texture {
+        &self.raw
+    }
+}
+
 impl crate::DynTexture for Texture {}
 
 unsafe impl Send for Texture {}
