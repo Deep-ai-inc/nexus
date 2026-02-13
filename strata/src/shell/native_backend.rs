@@ -1590,6 +1590,14 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             messages.push(msg);
         }
 
+        // Poll subscriptions for new events.
+        let mut sub = A::subscription(&state.app);
+        for stream in &mut sub.streams {
+            while let Some(msg) = stream.try_recv() {
+                messages.push(msg);
+            }
+        }
+
         if !messages.is_empty() {
             for msg in messages {
                 process_message::<A>(&mut state, msg);
