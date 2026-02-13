@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use objc2::rc::Retained;
@@ -106,9 +107,33 @@ struct WindowState<A: StrataApp> {
     tokio_rt: Arc<tokio::runtime::Runtime>,
     command_tx: std::sync::mpsc::Sender<A::Message>,
     command_rx: std::sync::mpsc::Receiver<A::Message>,
-    window_ptr: *mut AnyObject, // Retained NSWindow for resize-on-zoom
+    window: *mut AnyObject, // Weak back-pointer to NSWindow (prevent retain cycle)
     pending_window_resize: Option<(f32, f32)>, // Deferred setContentSize (avoid reentrant borrow)
+    poll_timer: *mut c_void, // CFRunLoopTimerRef for main-thread polling (invalidated on close)
 }
+
+// ============================================================================
+// Multi-Window Globals (main thread only)
+// ============================================================================
+
+/// App-wide resources shared across all windows.
+struct AppGlobals<A: StrataApp> {
+    config: AppConfig,
+    shared: A::SharedState,
+    tokio_rt: Arc<tokio::runtime::Runtime>,
+}
+
+/// Type-erased pointer to AppGlobals<A>. Set once in run_with_config, never changed.
+static mut APP_GLOBALS_PTR: *mut c_void = std::ptr::null_mut();
+
+/// Monomorphized function pointer to create a new window. Set once in run_with_config.
+static mut CREATE_WINDOW_FN: Option<fn()> = None;
+
+/// Number of open windows. When decremented to 0, app stays alive for dock reopen.
+static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Cascade position for new windows (each new window offsets from the previous).
+static mut CASCADE_POINT: NSPoint = NSPoint::new(0.0, 0.0);
 
 // ============================================================================
 // Public API
@@ -123,7 +148,7 @@ pub fn run<A: StrataApp>() -> Result<(), Error> {
 pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
-    // Tokio runtime for async tasks.
+    // Tokio runtime for async tasks (shared across all windows).
     let tokio_rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -134,6 +159,65 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     // NSApplication setup.
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+
+    // Store app-wide globals for window creation.
+    let shared = A::SharedState::default();
+    let globals = Box::new(AppGlobals::<A> {
+        config: config.clone(),
+        shared: shared.clone(),
+        tokio_rt: tokio_rt.clone(),
+    });
+    unsafe {
+        APP_GLOBALS_PTR = Box::into_raw(globals) as *mut c_void;
+        CREATE_WINDOW_FN = Some(open_new_window::<A>);
+    }
+
+    // Install typed event handlers (before first window — handlers must be ready).
+    install_event_handlers::<A>();
+
+    // Create first window with initial app state.
+    let mut image_store = ImageStore::new();
+    let (app_state, init_cmd) = A::init(&shared, &mut image_store);
+    open_new_window_with_state::<A>(app_state, init_cmd, image_store)?;
+
+    // Set up native menu bar, force click, and app delegate.
+    setup_native_menu_bar(mtm, &ns_app);
+    crate::platform::macos::install_force_click_handler();
+    crate::platform::macos::setup_force_click_monitor();
+    install_app_delegate(mtm, &ns_app);
+
+    // Enter tokio runtime context so tokio::spawn and async I/O work on main thread.
+    let _tokio_guard = tokio_rt.enter();
+
+    // Run the macOS event loop (blocks until app terminates).
+    unsafe { ns_app.activate() };
+    unsafe { ns_app.run() };
+
+    Ok(())
+}
+
+/// Create a new window (called from Cmd+N, dock reopen, or NewWindow message).
+/// Reads AppGlobals from the global static — must be called after run_with_config sets it up.
+fn open_new_window<A: StrataApp>() {
+    let globals = unsafe { &*(APP_GLOBALS_PTR as *const AppGlobals<A>) };
+    let mut image_store = ImageStore::new();
+    let Some((app_state, cmd)) = A::create_window(&globals.shared, &mut image_store) else {
+        return; // App doesn't support multi-window
+    };
+    if let Err(e) = open_new_window_with_state::<A>(app_state, cmd, image_store) {
+        eprintln!("Failed to create new window: {e}");
+    }
+}
+
+/// Shared window creation logic for both initial and subsequent windows.
+fn open_new_window_with_state<A: StrataApp>(
+    app_state: A::State,
+    init_cmd: Command<A::Message>,
+    image_store: ImageStore,
+) -> Result<(), Error> {
+    let globals = unsafe { &*(APP_GLOBALS_PTR as *const AppGlobals<A>) };
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let config = &globals.config;
 
     // Create NSWindow.
     let (win_w, win_h) = config.window_size;
@@ -156,6 +240,10 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         )
     };
 
+    // We manage the window lifetime manually — prevent AppKit from releasing
+    // it during close (which would free it while the timer still holds a pointer).
+    unsafe { let _: () = msg_send![&*window, setReleasedWhenClosed: Bool::NO]; }
+
     let bg_color = unsafe {
         NSColor::colorWithSRGBRed_green_blue_alpha(
             config.background_color.r as CGFloat,
@@ -165,18 +253,22 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         )
     };
     window.setBackgroundColor(Some(&bg_color));
-    window.setTitle(&NSString::from_str(&config.title));
     window.setMinSize(NSSize::new(400.0, 300.0));
 
     let dpi_scale = window.backingScaleFactor() as f32;
 
     // Create custom NSView with layer hierarchy.
-    let view_state = create_view_and_layers(mtm, &window, &config, dpi_scale)?;
+    let view_state = create_view_and_layers(mtm, &window, config, dpi_scale)?;
+
+    // Set the view as the window's delegate (for windowWillClose: handling).
+    unsafe {
+        let _: () = msg_send![&*window, setDelegate: &*view_state.view];
+    }
 
     // Initialize Metal.
     let gpu = init_metal(view_state.metal_layer_ptr, win_w, win_h, dpi_scale)?;
 
-    // Compile Metal shader library once and initialize pipeline on main thread.
+    // Compile Metal shader library and initialize pipeline.
     let scale = dpi_scale;
     let library = StrataPipeline::compile_library(&gpu.device);
     let fs_mutex = crate::text_engine::get_font_system();
@@ -194,17 +286,14 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         current_scale: scale,
     };
 
-    // Initialize application.
-    let mut image_store = ImageStore::new();
-    let shared = A::SharedState::default();
-    let (app_state, init_cmd) = A::init(&shared, &mut image_store);
-
     let (command_tx, command_rx) = std::sync::mpsc::channel();
-    spawn_commands(&tokio_rt, init_cmd, command_tx.clone());
+    spawn_commands(&globals.tokio_rt, init_cmd, command_tx.clone());
+
+    let window_ptr = &*window as *const NSWindow as *mut AnyObject;
 
     let mut win_state = WindowState::<A> {
         app: app_state,
-        shared,
+        shared: globals.shared.clone(),
         capture: CaptureState::None,
         window_size: (win_w, win_h),
         base_size: (win_w, win_h),
@@ -219,11 +308,12 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         surface_dirty: false,
         last_render_time: Instant::now(),
         dpi_scale,
-        tokio_rt: tokio_rt.clone(),
+        tokio_rt: globals.tokio_rt.clone(),
         command_tx: command_tx.clone(),
         command_rx,
-        window_ptr: &*window as *const NSWindow as *mut AnyObject,
+        window: window_ptr,
         pending_window_resize: None,
+        poll_timer: std::ptr::null_mut(),
     };
 
     // Render first frame synchronously before showing window.
@@ -233,6 +323,10 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         render_frame(&mut win_state.render, &scene, dpi_scale);
         win_state.needs_render = false;
     }
+
+    // Set window title from app state.
+    let title = A::title(&win_state.app);
+    window.setTitle(&NSString::from_str(&title));
 
     // Store state pointer in the view's ivar.
     let win_state_ptr = Box::into_raw(Box::new(RefCell::new(win_state)));
@@ -244,27 +338,20 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         *ivar_ptr = win_state_ptr as *mut c_void;
     }
 
-    // Set up native menu bar and force click monitor.
-    setup_native_menu_bar(mtm, &ns_app);
-    crate::platform::macos::install_force_click_handler();
-    crate::platform::macos::setup_force_click_monitor();
+    // Install per-window poll timer and store the reference for cleanup.
+    let poll_timer = install_main_thread_timer::<A>(win_state_ptr);
+    unsafe { (*win_state_ptr).borrow_mut().poll_timer = poll_timer; }
 
-    // Install typed event handlers.
-    install_event_handlers::<A>();
-
-    // Main thread timer: polls async commands AND renders (~16ms).
-    install_main_thread_timer::<A>(win_state_ptr);
-
-    // Enter tokio runtime context so tokio::spawn and async I/O work on main thread.
-    let _tokio_guard = tokio_rt.enter();
-
-    // Show window and run.
+    // Cascade window position and show.
+    unsafe { CASCADE_POINT = window.cascadeTopLeftFromPoint(CASCADE_POINT); }
     window.makeKeyAndOrderFront(None);
-    unsafe { ns_app.activate() };
-    unsafe { ns_app.run() };
 
-    // Cleanup (unreachable).
-    drop(unsafe { Box::from_raw(win_state_ptr) });
+    WINDOW_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Leak the Retained wrapper. With releasedWhenClosed=NO, the window
+    // lives until process exit (small leak, but avoids use-after-free).
+    std::mem::forget(window);
+
     Ok(())
 }
 
@@ -492,6 +579,9 @@ fn register_strata_view_class() -> &'static AnyClass {
                 Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(mouse_entered)), c"v@:@");
             add_method_raw(cls_ptr, sel!(mouseExited:),
                 Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(mouse_exited)), c"v@:@");
+            // NSWindowDelegate method — view acts as its window's delegate.
+            add_method_raw(cls_ptr, sel!(windowWillClose:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(window_will_close)), c"v@:@");
         }
 
         cls
@@ -515,6 +605,7 @@ static mut KEY_HANDLER: Option<fn(&AnyObject, KeyEvent)> = None;
 static mut RESIZE_HANDLER: Option<fn(&AnyObject, f32, f32)> = None;
 static mut RESIZE_START_HANDLER: Option<fn(&AnyObject)> = None;
 static mut RESIZE_END_HANDLER: Option<fn(&AnyObject)> = None;
+static mut WINDOW_CLOSE_HANDLER: Option<fn(&AnyObject)> = None;
 
 fn install_event_handlers<A: StrataApp>() {
     unsafe {
@@ -524,6 +615,7 @@ fn install_event_handlers<A: StrataApp>() {
         RESIZE_START_HANDLER = Some(handle_resize_start::<A>);
         RESIZE_END_HANDLER = Some(handle_resize_end::<A>);
         RESIZE_IDLE_HANDLER = Some(handle_resize_idle::<A>);
+        WINDOW_CLOSE_HANDLER = Some(handle_window_close::<A>);
     }
 }
 
@@ -547,6 +639,14 @@ fn dispatch_resize(view: &AnyObject, w: f32, h: f32) {
     unsafe {
         if let Some(handler) = RESIZE_HANDLER {
             handler(view, w, h);
+        }
+    }
+}
+
+fn dispatch_window_close(view: &AnyObject) {
+    unsafe {
+        if let Some(handler) = WINDOW_CLOSE_HANDLER {
+            handler(view);
         }
     }
 }
@@ -709,6 +809,10 @@ extern "C" fn view_did_end_live_resize(this: &AnyObject, _sel: Sel) {
     }
 }
 
+extern "C" fn window_will_close(this: &AnyObject, _sel: Sel, _notification: *mut AnyObject) {
+    dispatch_window_close(this);
+}
+
 // ============================================================================
 // Event Handling
 // ============================================================================
@@ -718,7 +822,7 @@ extern "C" fn view_did_end_live_resize(this: &AnyObject, _sel: Sel) {
 fn flush_pending_resize<A: StrataApp>(state_cell: &RefCell<WindowState<A>>) {
     let pending = state_cell.borrow_mut().pending_window_resize.take();
     if let Some((w, h)) = pending {
-        let window_ptr = state_cell.borrow().window_ptr;
+        let window_ptr = state_cell.borrow().window;
         if !window_ptr.is_null() {
             unsafe {
                 let size = NSSize::new(w as f64, h as f64);
@@ -883,6 +987,10 @@ fn handle_resize_end<A: StrataApp>(view: &AnyObject) {
 fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
     if A::is_exit_request(&msg) {
         std::process::exit(0);
+    }
+    if A::is_new_window_request(&msg) {
+        if let Some(f) = unsafe { CREATE_WINDOW_FN } { f(); }
+        return; // Don't pass to update()
     }
 
     let cmd = A::update(&mut state.app, msg, &mut state.image_store);
@@ -1611,10 +1719,55 @@ fn handle_resize_idle<A: StrataApp>(info: *mut c_void) {
 }
 
 // ============================================================================
+// Window Close Cleanup
+// ============================================================================
+
+/// Cleanup handler for windowWillClose:. Invalidates timers and drops Rust state.
+/// The window itself is NOT released here — with releasedWhenClosed=NO and
+/// mem::forget at creation, the ordered-out window object leaks (~2KB).
+/// This is safe because the alternative (releasing during close) is a minefield.
+fn handle_window_close<A: StrataApp>(view: &AnyObject) {
+    unsafe {
+        // Get state pointer from ivar.
+        let Some(ivar) = view.class().instance_variable("_strata_state") else { return };
+        let state_ptr = *ivar.load::<*mut c_void>(view);
+        if state_ptr.is_null() { return; } // Already cleaned up.
+
+        // Null out the ivar FIRST to prevent reentrant access from callbacks
+        // triggered during cleanup (e.g. setFrameSize: during orderOut).
+        let view_ptr = view as *const AnyObject as *mut u8;
+        let ivar_ptr = view_ptr.offset(ivar.offset()) as *mut *mut c_void;
+        *ivar_ptr = std::ptr::null_mut();
+
+        // Invalidate timers before dropping state.
+        let state_cell = &*(state_ptr as *const RefCell<WindowState<A>>);
+        {
+            let mut state = state_cell.borrow_mut();
+
+            // Invalidate the per-window poll timer so the callback never fires
+            // again (it holds a raw pointer to this state).
+            if !state.poll_timer.is_null() {
+                CFRunLoopTimerInvalidate(state.poll_timer);
+                state.poll_timer = std::ptr::null_mut();
+            }
+
+            // Invalidate resize timer if active.
+            invalidate_resize_timer(&mut state.resize_timer);
+        }
+
+        // Drop the state (releases GPU resources, app state, channels, etc.).
+        // State only holds a raw *mut to the window — no release is sent.
+        drop(Box::from_raw(state_ptr as *mut RefCell<WindowState<A>>));
+
+        WINDOW_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// ============================================================================
 // Main Thread Timer
 // ============================================================================
 
-fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A>>) {
+fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A>>) -> *mut c_void {
     extern "C" fn timer_callback<A: StrataApp>(_timer: *mut c_void, info: *mut c_void) {
         // Autorelease pool: ensures temporary ObjC objects (NSEvent, NSString, etc.)
         // created by msg_send! during this tick are released deterministically rather
@@ -1697,6 +1850,15 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 state.last_render_time = Instant::now();
             }
 
+            // Update window title (cheap when unchanged — AppKit compares internally).
+            if !state.window.is_null() {
+                let new_title = A::title(&state.app);
+                unsafe {
+                    let ns_title = NSString::from_str(&new_title);
+                    let _: () = msg_send![state.window, setTitle: &*ns_title];
+                }
+            }
+
             // Drop the borrow before flushing deferred resize.
             drop(state);
             flush_pending_resize::<A>(state_cell);
@@ -1718,6 +1880,7 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
         );
 
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+        timer
     }
 }
 
@@ -1798,6 +1961,12 @@ fn setup_native_menu_bar(mtm: MainThreadMarker, ns_app: &NSApplication) {
     // --- File menu ---
     let file_menu = NSMenu::new(mtm);
     unsafe { file_menu.setTitle(ns_string!("File")) };
+    let new_window = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(), ns_string!("New Window"), Some(sel!(newDocument:)), ns_string!("n"),
+        )
+    };
+    file_menu.addItem(&new_window);
     let close_window = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc(), ns_string!("Close Window"), Some(sel!(performClose:)), ns_string!("w"),
@@ -1823,4 +1992,78 @@ fn setup_native_menu_bar(mtm: MainThreadMarker, ns_app: &NSApplication) {
     unsafe { ns_app.setWindowsMenu(Some(&window_menu)) };
 
     ns_app.setMainMenu(Some(&menubar));
+}
+
+// ============================================================================
+// Application Delegate (dock reopen, Cmd+N, quit behavior)
+// ============================================================================
+
+fn register_app_delegate_class() -> &'static AnyClass {
+    static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+    CLASS.get_or_init(|| {
+        let superclass = AnyClass::get("NSObject").unwrap();
+        let builder = ClassBuilder::new("StrataAppDelegate", superclass).unwrap();
+
+        let cls = builder.register();
+        let cls_ptr = cls as *const _ as *mut objc2::ffi::objc_class;
+
+        unsafe fn add_method_raw(
+            cls: *mut objc2::ffi::objc_class,
+            sel: Sel,
+            imp: objc2::ffi::IMP,
+            types: &std::ffi::CStr,
+        ) {
+            unsafe { objc2::ffi::class_addMethod(cls, sel.as_ptr(), imp, types.as_ptr()); }
+        }
+
+        unsafe {
+            // Keep app alive after last window closes (for dock reopen).
+            add_method_raw(cls_ptr, sel!(applicationShouldTerminateAfterLastWindowClosed:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject) -> Bool, unsafe extern "C" fn()>(
+                    app_should_terminate_after_last_window_closed)), c"B@:@");
+            // Dock click with no visible windows → open a new window.
+            add_method_raw(cls_ptr, sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject, Bool) -> Bool, unsafe extern "C" fn()>(
+                    app_should_handle_reopen)), c"B@:@B");
+            // Cmd+N routes here via responder chain (newDocument: on NSApplication).
+            add_method_raw(cls_ptr, sel!(newDocument:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(
+                    new_document)), c"v@:@");
+        }
+
+        cls
+    })
+}
+
+extern "C" fn app_should_terminate_after_last_window_closed(
+    _this: &AnyObject, _sel: Sel, _app: *mut AnyObject,
+) -> Bool {
+    Bool::NO
+}
+
+extern "C" fn app_should_handle_reopen(
+    _this: &AnyObject, _sel: Sel, _app: *mut AnyObject, has_visible_windows: Bool,
+) -> Bool {
+    if !has_visible_windows.as_bool() {
+        if let Some(f) = unsafe { CREATE_WINDOW_FN } { f(); }
+    }
+    Bool::YES
+}
+
+extern "C" fn new_document(_this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+    if let Some(f) = unsafe { CREATE_WINDOW_FN } { f(); }
+}
+
+fn install_app_delegate(_mtm: MainThreadMarker, ns_app: &NSApplication) {
+    let delegate_class = register_app_delegate_class();
+    let delegate: Retained<AnyObject> = unsafe {
+        let raw: *mut AnyObject = msg_send![delegate_class, alloc];
+        let raw: *mut AnyObject = msg_send![raw, init];
+        Retained::from_raw(raw).expect("Failed to create StrataAppDelegate")
+    };
+    unsafe {
+        let _: () = msg_send![ns_app, setDelegate: &*delegate];
+    }
+    // Keep delegate alive for the app's lifetime.
+    std::mem::forget(delegate);
 }
