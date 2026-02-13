@@ -395,16 +395,19 @@ impl CharGlyphCache {
 }
 
 impl StrataPipeline {
-    /// Create a new pipeline.
-    pub fn new(device: &metal::DeviceRef, format: metal::MTLPixelFormat, font_size: f32, font_system: &mut FontSystem) -> Self {
+    /// Compile the Metal shader library. Call once at init, pass to `new()`.
+    pub fn compile_library(device: &metal::DeviceRef) -> metal::Library {
+        let options = metal::CompileOptions::new();
+        device
+            .new_library_with_source(include_str!("shaders/glyph.metal"), &options)
+            .expect("Failed to compile Metal shader")
+    }
+
+    /// Create a new pipeline with a pre-compiled shader library.
+    pub fn new(device: &metal::DeviceRef, library: &metal::Library, format: metal::MTLPixelFormat, font_size: f32, font_system: &mut FontSystem) -> Self {
         let mut glyph_atlas = GlyphAtlas::new(font_size, font_system);
         glyph_atlas.precache_ascii(font_system);
 
-        // Compile MSL shader
-        let options = metal::CompileOptions::new();
-        let library = device
-            .new_library_with_source(include_str!("shaders/glyph.metal"), &options)
-            .expect("Failed to compile Metal shader");
         let vs_fn = library
             .get_function("vs_main", None)
             .expect("Missing vs_main");

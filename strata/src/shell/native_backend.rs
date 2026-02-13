@@ -75,6 +75,8 @@ struct Scene {
 
 struct RenderResources {
     gpu: GpuState,
+    /// Pre-compiled Metal shader library (compiled once, reused on pipeline recreation).
+    library: metal::Library,
     pipeline: StrataPipeline,
     current_scale: f32,
 }
@@ -174,18 +176,20 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     // Initialize Metal.
     let gpu = init_metal(view_state.metal_layer_ptr, win_w, win_h, dpi_scale)?;
 
-    // Initialize pipeline on main thread.
+    // Compile Metal shader library once and initialize pipeline on main thread.
     let scale = dpi_scale;
+    let library = StrataPipeline::compile_library(&gpu.device);
     let fs_mutex = crate::text_engine::get_font_system();
     let mut font_system = fs_mutex.lock().unwrap();
     let pipeline = StrataPipeline::new(
-        &gpu.device, gpu.pixel_format,
+        &gpu.device, &library, gpu.pixel_format,
         BASE_FONT_SIZE * scale, &mut font_system,
     );
     drop(font_system);
 
     let render = RenderResources {
         gpu,
+        library,
         pipeline,
         current_scale: scale,
     };
@@ -1108,7 +1112,7 @@ fn render_sync_to_overlay(
 
     if (res.current_scale - scale).abs() > 0.01 {
         res.pipeline = StrataPipeline::new(
-            &gpu.device, gpu.pixel_format,
+            &gpu.device, &res.library, gpu.pixel_format,
             BASE_FONT_SIZE * scale, &mut font_system,
         );
         res.current_scale = scale;
@@ -1173,7 +1177,7 @@ fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32) {
 
     if (res.current_scale - scale).abs() > 0.01 {
         res.pipeline = StrataPipeline::new(
-            &gpu.device, gpu.pixel_format,
+            &gpu.device, &res.library, gpu.pixel_format,
             BASE_FONT_SIZE * scale, &mut font_system,
         );
         res.current_scale = scale;
@@ -1609,86 +1613,91 @@ fn handle_resize_idle<A: StrataApp>(info: *mut c_void) {
 
 fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A>>) {
     extern "C" fn timer_callback<A: StrataApp>(_timer: *mut c_void, info: *mut c_void) {
-        let state_ptr = info as *mut RefCell<WindowState<A>>;
-        let state_cell = unsafe { &*state_ptr };
-        // try_borrow_mut: if state is already borrowed (e.g. QuickLook modal
-        // panel pumps the run loop during a mouse handler), skip this tick.
-        let Ok(mut state) = state_cell.try_borrow_mut() else { return };
+        // Autorelease pool: ensures temporary ObjC objects (NSEvent, NSString, etc.)
+        // created by msg_send! during this tick are released deterministically rather
+        // than lingering until the run loop's outer pool drains.
+        objc2::rc::autoreleasepool(|_| {
+            let state_ptr = info as *mut RefCell<WindowState<A>>;
+            let state_cell = unsafe { &*state_ptr };
+            // try_borrow_mut: if state is already borrowed (e.g. QuickLook modal
+            // panel pumps the run loop during a mouse handler), skip this tick.
+            let Ok(mut state) = state_cell.try_borrow_mut() else { return };
 
-        // Drain pending async results.
-        let mut messages = Vec::new();
-        while let Ok(msg) = state.command_rx.try_recv() {
-            messages.push(msg);
-        }
-
-        // Poll subscriptions for new events.
-        let mut sub = A::subscription(&state.app);
-        for stream in &mut sub.streams {
-            while let Some(msg) = stream.try_recv() {
+            // Drain pending async results.
+            let mut messages = Vec::new();
+            while let Ok(msg) = state.command_rx.try_recv() {
                 messages.push(msg);
             }
-        }
 
-        // Poll force click events (thread-local queue, no channel needed).
-        for (x, y) in crate::platform::macos::drain_force_click_events() {
-            let zoom = state.current_zoom;
-            let content_pos = Point::new(x / zoom, y / zoom);
-            let hit = state.cached_snapshot.as_ref()
-                .and_then(|s| s.hit_test(content_pos));
-            if let Some(HitResult::Content(addr)) = hit {
-                if let Some((word, word_start, font_size)) = A::force_click_lookup(&state.app, &addr) {
-                    let popup_pos = state.cached_snapshot.as_ref()
-                        .and_then(|s| s.char_bounds(&word_start))
-                        .map(|rect| Point::new(rect.x * zoom, rect.y * zoom + font_size * 0.8))
-                        .unwrap_or(Point::new(x, y));
-                    let _ = crate::platform::macos::show_definition(&word, popup_pos, font_size * zoom);
+            // Poll subscriptions for new events.
+            let mut sub = A::subscription(&state.app);
+            for stream in &mut sub.streams {
+                while let Some(msg) = stream.try_recv() {
+                    messages.push(msg);
                 }
             }
-        }
 
-        if !messages.is_empty() {
-            for msg in messages {
-                process_message::<A>(&mut state, msg);
-            }
-        }
-
-        // Periodic re-render for cursor blink (toggles every 500ms).
-        if state.last_render_time.elapsed().as_millis() >= 500 {
-            state.needs_render = true;
-        }
-
-        // Render if needed.
-        if state.needs_render {
-            state.needs_render = false;
-
-            if state.surface_dirty {
-                state.surface_dirty = false;
-                state.render.gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(
-                    state.render.gpu.surface_width as f64,
-                    state.render.gpu.surface_height as f64,
-                ));
+            // Poll force click events (thread-local queue, no channel needed).
+            for (x, y) in crate::platform::macos::drain_force_click_events() {
+                let zoom = state.current_zoom;
+                let content_pos = Point::new(x / zoom, y / zoom);
+                let hit = state.cached_snapshot.as_ref()
+                    .and_then(|s| s.hit_test(content_pos));
+                if let Some(HitResult::Content(addr)) = hit {
+                    if let Some((word, word_start, font_size)) = A::force_click_lookup(&state.app, &addr) {
+                        let popup_pos = state.cached_snapshot.as_ref()
+                            .and_then(|s| s.char_bounds(&word_start))
+                            .map(|rect| Point::new(rect.x * zoom, rect.y * zoom + font_size * 0.8))
+                            .unwrap_or(Point::new(x, y));
+                        let _ = crate::platform::macos::show_definition(&word, popup_pos, font_size * zoom);
+                    }
+                }
             }
 
-            let scene = build_scene::<A>(&state);
-            state.cached_snapshot = Some(scene.snapshot.clone());
+            if !messages.is_empty() {
+                for msg in messages {
+                    process_message::<A>(&mut state, msg);
+                }
+            }
 
-            // Drain pending images/unloads into the scene.
-            let pending_images = state.image_store.drain_pending();
-            let pending_unloads = state.image_store.drain_pending_unloads();
-            let scene = Scene {
-                pending_images,
-                pending_unloads,
-                ..scene
-            };
+            // Periodic re-render for cursor blink (toggles every 500ms).
+            if state.last_render_time.elapsed().as_millis() >= 500 {
+                state.needs_render = true;
+            }
 
-            let dpi_scale = state.dpi_scale;
-            render_frame(&mut state.render, &scene, dpi_scale);
-            state.last_render_time = Instant::now();
-        }
+            // Render if needed.
+            if state.needs_render {
+                state.needs_render = false;
 
-        // Drop the borrow before flushing deferred resize.
-        drop(state);
-        flush_pending_resize::<A>(state_cell);
+                if state.surface_dirty {
+                    state.surface_dirty = false;
+                    state.render.gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(
+                        state.render.gpu.surface_width as f64,
+                        state.render.gpu.surface_height as f64,
+                    ));
+                }
+
+                let scene = build_scene::<A>(&state);
+                state.cached_snapshot = Some(scene.snapshot.clone());
+
+                // Drain pending images/unloads into the scene.
+                let pending_images = state.image_store.drain_pending();
+                let pending_unloads = state.image_store.drain_pending_unloads();
+                let scene = Scene {
+                    pending_images,
+                    pending_unloads,
+                    ..scene
+                };
+
+                let dpi_scale = state.dpi_scale;
+                render_frame(&mut state.render, &scene, dpi_scale);
+                state.last_render_time = Instant::now();
+            }
+
+            // Drop the borrow before flushing deferred resize.
+            drop(state);
+            flush_pending_resize::<A>(state_cell);
+        });
     }
 
     unsafe {
