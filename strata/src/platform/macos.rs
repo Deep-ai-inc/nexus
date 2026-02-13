@@ -665,6 +665,20 @@ static FORCE_CLICK_TX: OnceLock<mpsc::Sender<(f32, f32)>> = OnceLock::new();
 /// Receiver half, taken once by the iced subscription.
 static FORCE_CLICK_RX: Mutex<Option<mpsc::Receiver<(f32, f32)>>> = Mutex::new(None);
 
+/// Thread-local queue for force click events (native backend, same-thread).
+use std::cell::RefCell;
+thread_local! {
+    static FORCE_CLICK_QUEUE: RefCell<Vec<(f32, f32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drain pending force click events from the thread-local queue.
+pub fn drain_force_click_events() -> Vec<(f32, f32)> {
+    FORCE_CLICK_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        std::mem::take(&mut *q)
+    })
+}
+
 /// Install a local NSEvent monitor for pressure (Force Touch) events.
 ///
 /// When the trackpad transitions to stage 2 (deep click), sends the
@@ -707,13 +721,12 @@ pub fn setup_force_click_monitor() {
             let stage: NSInteger = msg_send![event, stage];
             let is_deep = stage >= 2;
             let was = WAS_DEEP.swap(is_deep, std::sync::atomic::Ordering::Relaxed);
-
             if is_deep && !was {
                 // Transition to deep click — get cursor position
                 if let Some(tx) = FORCE_CLICK_TX.get() {
                     let mtm = MainThreadMarker::new_unchecked();
                     let app = NSApplication::sharedApplication(mtm);
-                    if let Some(window) = app.mainWindow() {
+                    if let Some(window) = app.mainWindow().or(app.keyWindow()) {
                         if let Some(view) = window.contentView() {
                             // locationInWindow is in window coords (bottom-left origin).
                             // Convert to view-local via convertPoint:fromView:nil to
@@ -735,6 +748,7 @@ pub fn setup_force_click_monitor() {
                                 (view_height - loc_view.y) as f32
                             };
                             let _ = tx.send((x, y));
+                            FORCE_CLICK_QUEUE.with(|q| q.borrow_mut().push((x, y)));
                         }
                     }
                 }

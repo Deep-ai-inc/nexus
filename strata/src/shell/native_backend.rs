@@ -104,6 +104,8 @@ struct WindowState<A: StrataApp> {
     tokio_rt: Arc<tokio::runtime::Runtime>,
     command_tx: std::sync::mpsc::Sender<A::Message>,
     command_rx: std::sync::mpsc::Receiver<A::Message>,
+    window_ptr: *mut AnyObject, // Retained NSWindow for resize-on-zoom
+    pending_window_resize: Option<(f32, f32)>, // Deferred setContentSize (avoid reentrant borrow)
 }
 
 // ============================================================================
@@ -216,6 +218,8 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         tokio_rt: tokio_rt.clone(),
         command_tx: command_tx.clone(),
         command_rx,
+        window_ptr: &*window as *const NSWindow as *mut AnyObject,
+        pending_window_resize: None,
     };
 
     // Render first frame synchronously before showing window.
@@ -236,11 +240,19 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         *ivar_ptr = win_state_ptr as *mut c_void;
     }
 
+    // Set up native menu bar and force click monitor.
+    setup_native_menu_bar(mtm, &ns_app);
+    crate::platform::macos::install_force_click_handler();
+    crate::platform::macos::setup_force_click_monitor();
+
     // Install typed event handlers.
     install_event_handlers::<A>();
 
     // Main thread timer: polls async commands AND renders (~16ms).
     install_main_thread_timer::<A>(win_state_ptr);
+
+    // Enter tokio runtime context so tokio::spawn and async I/O work on main thread.
+    let _tokio_guard = tokio_rt.enter();
 
     // Show window and run.
     window.makeKeyAndOrderFront(None);
@@ -694,58 +706,78 @@ extern "C" fn view_did_end_live_resize(this: &AnyObject, _sel: Sel) {
 // Event Handling
 // ============================================================================
 
+/// Apply deferred window resize (must be called after dropping the state borrow,
+/// since setContentSize triggers a synchronous setFrameSize callback).
+fn flush_pending_resize<A: StrataApp>(state_cell: &RefCell<WindowState<A>>) {
+    let pending = state_cell.borrow_mut().pending_window_resize.take();
+    if let Some((w, h)) = pending {
+        let window_ptr = state_cell.borrow().window_ptr;
+        if !window_ptr.is_null() {
+            unsafe {
+                let size = NSSize::new(w as f64, h as f64);
+                let _: () = msg_send![window_ptr, setContentSize: size];
+            }
+        }
+    }
+}
+
 fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) {
     let Some(state_cell) = (unsafe { get_state::<A>(view) }) else { return };
-    let mut state = state_cell.borrow_mut();
+    {
+        let mut state = state_cell.borrow_mut();
 
-    // Update cursor position.
-    match &strata_event {
-        MouseEvent::CursorMoved { position } |
-        MouseEvent::ButtonPressed { position, .. } |
-        MouseEvent::ButtonReleased { position, .. } |
-        MouseEvent::WheelScrolled { position, .. } => {
-            state.cursor_position = Some(*position);
+        // Update cursor position.
+        match &strata_event {
+            MouseEvent::CursorMoved { position } |
+            MouseEvent::ButtonPressed { position, .. } |
+            MouseEvent::ButtonReleased { position, .. } |
+            MouseEvent::WheelScrolled { position, .. } => {
+                state.cursor_position = Some(*position);
+            }
+            _ => {}
         }
-        _ => {}
-    }
 
-    let zoom = state.current_zoom;
-    let adjusted_cursor = state.cursor_position.map(|p| Point::new(p.x / zoom, p.y / zoom));
+        let zoom = state.current_zoom;
+        let adjusted_cursor = state.cursor_position.map(|p| Point::new(p.x / zoom, p.y / zoom));
 
-    let hit = state.cached_snapshot.as_ref().and_then(|snapshot| {
-        let raw_hit = adjusted_cursor.and_then(|pos| snapshot.hit_test(pos));
-        if state.capture.is_captured() && !matches!(&raw_hit, Some(HitResult::Content(_))) {
-            adjusted_cursor.and_then(|pos| snapshot.nearest_content(pos.x, pos.y)).or(raw_hit)
-        } else {
-            raw_hit
+        let hit = state.cached_snapshot.as_ref().and_then(|snapshot| {
+            let raw_hit = adjusted_cursor.and_then(|pos| snapshot.hit_test(pos));
+            if state.capture.is_captured() && !matches!(&raw_hit, Some(HitResult::Content(_))) {
+                adjusted_cursor.and_then(|pos| snapshot.nearest_content(pos.x, pos.y)).or(raw_hit)
+            } else {
+                raw_hit
+            }
+        });
+
+        let is_cursor_moved = matches!(strata_event, MouseEvent::CursorMoved { .. });
+        if !hit.is_some() && !state.capture.is_captured() && !is_cursor_moved {
+            return;
         }
-    });
 
-    let is_cursor_moved = matches!(strata_event, MouseEvent::CursorMoved { .. });
-    if !hit.is_some() && !state.capture.is_captured() && !is_cursor_moved {
-        return;
+        let response = A::on_mouse(&state.app, strata_event, hit, &state.capture);
+
+        match response.capture {
+            CaptureRequest::Capture(source) => state.capture = CaptureState::Captured(source),
+            CaptureRequest::Release => state.capture = CaptureState::None,
+            CaptureRequest::None => {}
+        }
+
+        if let Some(msg) = response.message {
+            process_message::<A>(&mut state, msg);
+        }
     }
-
-    let response = A::on_mouse(&state.app, strata_event, hit, &state.capture);
-
-    match response.capture {
-        CaptureRequest::Capture(source) => state.capture = CaptureState::Captured(source),
-        CaptureRequest::Release => state.capture = CaptureState::None,
-        CaptureRequest::None => {}
-    }
-
-    if let Some(msg) = response.message {
-        process_message::<A>(&mut state, msg);
-    }
+    flush_pending_resize::<A>(state_cell);
 }
 
 fn handle_key_event<A: StrataApp>(view: &AnyObject, key_event: KeyEvent) {
     let Some(state_cell) = (unsafe { get_state::<A>(view) }) else { return };
-    let mut state = state_cell.borrow_mut();
-
-    if let Some(msg) = A::on_key(&state.app, key_event) {
-        process_message::<A>(&mut state, msg);
+    {
+        let mut state = state_cell.borrow_mut();
+        if let Some(msg) = A::on_key(&state.app, key_event) {
+            process_message::<A>(&mut state, msg);
+        }
     }
+    flush_pending_resize::<A>(state_cell);
 }
 
 fn handle_resize<A: StrataApp>(view: &AnyObject, new_w: f32, new_h: f32) {
@@ -754,7 +786,14 @@ fn handle_resize<A: StrataApp>(view: &AnyObject, new_w: f32, new_h: f32) {
 
     state.window_size = (new_w, new_h);
     let zoom = state.current_zoom;
-    state.base_size = (new_w / zoom, new_h / zoom);
+    // Only update base_size if this looks like a manual resize (user dragged
+    // the window edge). Zoom-triggered resizes land close to base_size * zoom —
+    // preserve the existing base_size to avoid sub-pixel drift.
+    let expected_w = state.base_size.0 * zoom;
+    let expected_h = state.base_size.1 * zoom;
+    if (new_w - expected_w).abs() > 2.0 || (new_h - expected_h).abs() > 2.0 {
+        state.base_size = (new_w / zoom, new_h / zoom);
+    }
 
     let phys_w = (new_w * state.dpi_scale) as u32;
     let phys_h = (new_h * state.dpi_scale) as u32;
@@ -844,6 +883,11 @@ fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
     let new_zoom = A::zoom_level(&state.app);
     if (new_zoom - state.current_zoom).abs() > 0.001 {
         state.current_zoom = new_zoom;
+        // Defer window resize — setContentSize triggers setFrameSize synchronously,
+        // which would re-enter borrow_mut on the RefCell. Applied after borrow is released.
+        let new_w = (state.base_size.0 * new_zoom).ceil().max(200.0);
+        let new_h = (state.base_size.1 * new_zoom).ceil().max(150.0);
+        state.pending_window_resize = Some((new_w, new_h));
     }
 
     invalidate_and_request_render::<A>(state);
@@ -1585,7 +1629,9 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
     extern "C" fn timer_callback<A: StrataApp>(_timer: *mut c_void, info: *mut c_void) {
         let state_ptr = info as *mut RefCell<WindowState<A>>;
         let state_cell = unsafe { &*state_ptr };
-        let mut state = state_cell.borrow_mut();
+        // try_borrow_mut: if state is already borrowed (e.g. QuickLook modal
+        // panel pumps the run loop during a mouse handler), skip this tick.
+        let Ok(mut state) = state_cell.try_borrow_mut() else { return };
 
         // Drain pending async results.
         let mut messages = Vec::new();
@@ -1598,6 +1644,23 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
         for stream in &mut sub.streams {
             while let Some(msg) = stream.try_recv() {
                 messages.push(msg);
+            }
+        }
+
+        // Poll force click events (thread-local queue, no channel needed).
+        for (x, y) in crate::platform::macos::drain_force_click_events() {
+            let zoom = state.current_zoom;
+            let content_pos = Point::new(x / zoom, y / zoom);
+            let hit = state.cached_snapshot.as_ref()
+                .and_then(|s| s.hit_test(content_pos));
+            if let Some(HitResult::Content(addr)) = hit {
+                if let Some((word, word_start, font_size)) = A::force_click_lookup(&state.app, &addr) {
+                    let popup_pos = state.cached_snapshot.as_ref()
+                        .and_then(|s| s.char_bounds(&word_start))
+                        .map(|rect| Point::new(rect.x * zoom, rect.y * zoom + font_size * 0.8))
+                        .unwrap_or(Point::new(x, y));
+                    let _ = crate::platform::macos::show_definition(&word, popup_pos, font_size * zoom);
+                }
             }
         }
 
@@ -1640,6 +1703,10 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             render_frame(&mut state.render, &scene, dpi_scale);
             state.last_render_time = Instant::now();
         }
+
+        // Drop the borrow before flushing deferred resize.
+        drop(state);
+        flush_pending_resize::<A>(state_cell);
     }
 
     unsafe {
@@ -1710,4 +1777,56 @@ unsafe impl objc2::encode::RefEncode for CGColorSpacePtr {
     const ENCODING_REF: objc2::encode::Encoding = objc2::encode::Encoding::Pointer(
         &<Self as objc2::encode::Encode>::ENCODING,
     );
+}
+
+// ============================================================================
+// Native Menu Bar
+// ============================================================================
+
+fn setup_native_menu_bar(mtm: MainThreadMarker, ns_app: &NSApplication) {
+    use objc2_app_kit::{NSMenu, NSMenuItem};
+
+    // Create menu bar.
+    let menubar = NSMenu::new(mtm);
+
+    // --- App menu (About, Hide, Quit) ---
+    let app_menu = NSMenu::new(mtm);
+    let quit = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(), ns_string!("Quit"), Some(sel!(terminate:)), ns_string!("q"),
+        )
+    };
+    app_menu.addItem(&quit);
+    let app_item = NSMenuItem::new(mtm);
+    app_item.setSubmenu(Some(&app_menu));
+    menubar.addItem(&app_item);
+
+    // --- File menu ---
+    let file_menu = NSMenu::new(mtm);
+    unsafe { file_menu.setTitle(ns_string!("File")) };
+    let close_window = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(), ns_string!("Close Window"), Some(sel!(performClose:)), ns_string!("w"),
+        )
+    };
+    file_menu.addItem(&close_window);
+    let file_item = NSMenuItem::new(mtm);
+    file_item.setSubmenu(Some(&file_menu));
+    menubar.addItem(&file_item);
+
+    // --- Window menu ---
+    let window_menu = NSMenu::new(mtm);
+    unsafe { window_menu.setTitle(ns_string!("Window")) };
+    let minimize = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(), ns_string!("Minimize"), Some(sel!(performMiniaturize:)), ns_string!("m"),
+        )
+    };
+    window_menu.addItem(&minimize);
+    let window_item = NSMenuItem::new(mtm);
+    window_item.setSubmenu(Some(&window_menu));
+    menubar.addItem(&window_item);
+    unsafe { ns_app.setWindowsMenu(Some(&window_menu)) };
+
+    ns_app.setMainMenu(Some(&menubar));
 }
