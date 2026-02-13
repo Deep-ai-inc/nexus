@@ -333,6 +333,9 @@ fn create_view_and_layers(
 
     unsafe {
         let _: () = msg_send![metal_layer, setPixelFormat: 80u64]; // MTLPixelFormatBGRA8Unorm_sRGB
+        // Mark layer opaque so the compositor ignores the alpha channel.
+        // wgpu did this internally via CompositeAlphaMode::Auto → Opaque.
+        let _: () = msg_send![metal_layer, setOpaque: Bool::YES];
         let _: () = msg_send![metal_layer, setFramebufferOnly: Bool::YES];
         let _: () = msg_send![metal_layer, setAllowsNextDrawableTimeout: Bool::YES];
         let _: () = msg_send![metal_layer, setPresentsWithTransaction: Bool::NO];
