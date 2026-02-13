@@ -9,6 +9,7 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
@@ -98,6 +99,7 @@ struct WindowState<A: StrataApp> {
     resize_timer: *mut c_void, // CFRunLoopTimerRef, null when inactive
     needs_render: bool,
     surface_dirty: bool,
+    last_render_time: Instant,
     dpi_scale: f32,
     tokio_rt: Arc<tokio::runtime::Runtime>,
     command_tx: std::sync::mpsc::Sender<A::Message>,
@@ -209,6 +211,7 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
         resize_timer: std::ptr::null_mut(),
         needs_render: true,
         surface_dirty: false,
+        last_render_time: Instant::now(),
         dpi_scale,
         tokio_rt: tokio_rt.clone(),
         command_tx: command_tx.clone(),
@@ -1604,6 +1607,11 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             }
         }
 
+        // Periodic re-render for cursor blink (toggles every 500ms).
+        if state.last_render_time.elapsed().as_millis() >= 500 {
+            state.needs_render = true;
+        }
+
         // Render if needed.
         if state.needs_render {
             state.needs_render = false;
@@ -1630,6 +1638,7 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
 
             let dpi_scale = state.dpi_scale;
             render_frame(&mut state.render, &scene, dpi_scale);
+            state.last_render_time = Instant::now();
         }
     }
 
