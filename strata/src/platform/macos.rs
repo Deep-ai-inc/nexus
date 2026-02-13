@@ -300,11 +300,10 @@ pub fn preview_file_with_local_rect(path: &Path, local_rect: crate::primitives::
 
 /// Initiate an OS-level outbound drag.
 ///
-/// Must be called on the main thread during event processing (i.e., from within
-/// an Iced update cycle) so that `[NSApp currentEvent]` returns the triggering
-/// mouse event.
+/// Must be called on the main thread during event processing so that
+/// `[NSApp currentEvent]` returns the triggering mouse event.
 pub fn start_drag(source: &DragSource) -> Result<(), String> {
-    // Safety: we are on the main thread (called from iced update loop).
+    // Safety: we are on the main thread (called from native backend update loop).
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
     unsafe {
@@ -437,10 +436,10 @@ fn write_drag_temp_file(filename: &str, data: &[u8]) -> Result<PathBuf, std::io:
 /// Sender for the reopen channel — the delegate method sends on this.
 static REOPEN_TX: OnceLock<mpsc::Sender<()>> = OnceLock::new();
 
-/// Receiver half, taken once by the iced subscription.
+/// Receiver half, taken once by the subscription system.
 static REOPEN_RX: Mutex<Option<mpsc::Receiver<()>>> = Mutex::new(None);
 
-/// C function injected into winit's WinitApplicationDelegate at runtime.
+/// C function injected into the NSApplicationDelegate at runtime.
 ///
 /// Signature matches `applicationShouldHandleReopen:hasVisibleWindows:`:
 ///   `- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)flag`
@@ -504,7 +503,7 @@ pub fn take_reopen_receiver() -> Option<mpsc::Receiver<()>> {
 
 /// C function injected into WinitApplicationDelegate for Cmd+N (newDocument:).
 ///
-/// Reuses the same reopen channel — the iced subscription treats it as
+/// Reuses the same reopen channel — the subscription treats it as
 /// "platform requests a new window".
 extern "C" fn handle_new_document(
     _this: &AnyObject,
@@ -662,7 +661,7 @@ pub fn show_definition(text: &str, position: crate::primitives::Point, font_size
 /// Sender for force click events: (x, y) in screen coordinates.
 static FORCE_CLICK_TX: OnceLock<mpsc::Sender<(f32, f32)>> = OnceLock::new();
 
-/// Receiver half, taken once by the iced subscription.
+/// Receiver half, taken once by the subscription system.
 static FORCE_CLICK_RX: Mutex<Option<mpsc::Receiver<(f32, f32)>>> = Mutex::new(None);
 
 /// Thread-local queue for force click events (native backend, same-thread).
@@ -736,7 +735,7 @@ pub fn setup_force_click_monitor() {
                                 &*view, convertPoint: loc_window
                                 fromView: std::ptr::null::<AnyObject>()
                             ];
-                            // Convert to Strata/iced top-left origin.
+                            // Convert to Strata top-left origin.
                             // If the view isFlipped, convertPoint already gives top-left;
                             // otherwise we need to flip Y manually.
                             let flipped: bool = msg_send![&*view, isFlipped];
@@ -778,33 +777,13 @@ pub fn take_force_click_receiver() -> Option<mpsc::Receiver<(f32, f32)>> {
 
 /// Configure window appearance for flicker-free resize.
 ///
-/// The key insight: wgpu-hal adds a CAMetalLayer as a **sublayer** of the
-/// NSView's root CALayer. During resize, macOS updates the root layer
-/// immediately, potentially showing stale/shifted content for one frame
-/// before the Metal sublayer catches up.
-///
-/// **Key optimization**: Promotes the CAMetalLayer from a sublayer to
-/// the view's root layer. This eliminates the dual-layer architecture
-/// (root + sublayer) that causes gravity/desync/gap issues during resize.
-/// When the Metal layer IS the root, there's no "layer behind" to flash,
-/// no sublayer auto-resize to desync, and presentsWithTransaction can
-/// work because the layer content changes are part of the view's own
-/// resize transaction.
-///
 /// Sets:
 /// 1. **NSWindow.backgroundColor** — fills any gap with the app's dark color.
 /// 2. **NSView.layerContentsRedrawPolicy = OnSetNeedsDisplay** — prevents
 ///    macOS from forcing system redraws during resize.
 /// 3. **Configure root + Metal sublayer** — gravity, background, no animations.
 ///
-/// The CAMetalLayer is promoted to root in wgpu-hal's `get_metal_layer`
-/// (patched to create a CAMetalLayer as the view's root layer instead of
-/// adding an observer sublayer). This eliminates the dual-layer gap.
-///
-/// Works in concert with the synchronous render in iced_winit's Resized
-/// handler and presentsWithTransaction for atomic frame+resize updates.
-///
-/// Safe to call multiple times (idempotent). Call after each window is created.
+/// Safe to call multiple times (idempotent).
 pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
@@ -837,12 +816,10 @@ pub fn configure_resize_appearance(r: f32, g: f32, b: f32) {
                     continue;
                 }
 
-                // Configure root layer (which IS the CAMetalLayer after
-                // our wgpu-hal patch promotes it).
+                // Configure root layer.
                 configure_layer_for_resize(root, cg_color);
 
-                // Also configure any sublayers (fallback if wgpu-hal
-                // patch isn't active — original sublayer architecture).
+                // Also configure any sublayers (Metal layer + overlay).
                 configure_metal_sublayers(root, cg_color);
             }
         }

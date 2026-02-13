@@ -483,7 +483,7 @@ impl ShellWidget {
         flush(&mut acc_id, &mut acc_data, &mut self.blocks);
 
         // Don't set terminal_dirty here — the batch message itself triggers
-        // a render via the iced adapter (every App message bumps frame).
+        // a render (every App message bumps frame).
         // Setting dirty would activate the 16ms tick, which fires yet
         // another redundant render with no new content.
 

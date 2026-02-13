@@ -19,12 +19,12 @@
 //!
 //! # Apple Silicon Optimization
 //!
-//! Uses `StagingBelt` for buffer uploads to exploit unified memory on M1/M2/M3.
+//! Uses `StorageMode::Shared` buffers for zero-copy uploads on unified memory (M1/M2/M3/M4).
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -32,9 +32,10 @@ use cosmic_text::{
     Attrs, Buffer, CacheKey, CacheKeyFlags, Family, FontSystem, Metrics, Shaping, Style,
     SubpixelBin, Weight, fontdb,
 };
-use crate::shell::wgpu;
 use lru::LruCache;
-use wgpu::util::StagingBelt;
+
+/// Number of in-flight frames for triple-buffered dynamic buffers.
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 use super::glyph_atlas::GlyphAtlas;
 use crate::primitives::{Color, Rect};
@@ -149,7 +150,7 @@ struct LoadedImage {
 
 /// Image atlas — packs loaded images into a single RGBA texture using shelf packing.
 struct ImageAtlas {
-    texture: wgpu::Texture,
+    texture: metal::Texture,
     width: u32,
     height: u32,
     /// Shelf packer state.
@@ -279,26 +280,24 @@ struct CachedRow {
 /// Uses a unified ubershader that renders all 2D primitives in one draw call.
 /// Instances are rendered in buffer order, enabling perfect Z-ordering.
 pub struct StrataPipeline {
-    pipeline: wgpu::RenderPipeline,
-    globals_buffer: wgpu::Buffer,
-    globals_bind_group: wgpu::BindGroup,
-    atlas_texture: wgpu::Texture,
-    /// Combined bind group for glyph atlas (bindings 0–1) + image atlas (bindings 2–3).
-    atlas_bind_group: wgpu::BindGroup,
-    atlas_bind_group_layout: wgpu::BindGroupLayout,
-    atlas_sampler: wgpu::Sampler,
+    pipeline: metal::RenderPipelineState,
+    /// Triple-buffered globals uniform (one per in-flight frame).
+    globals_buffers: Vec<metal::Buffer>,
+    atlas_texture: metal::Texture,
+    atlas_sampler: metal::SamplerState,
     /// Image atlas (separate texture from glyph atlas — full RGBA).
     image_atlas: ImageAtlas,
-    image_sampler: wgpu::Sampler,
-    instance_buffer: wgpu::Buffer,
+    image_sampler: metal::SamplerState,
+    /// Triple-buffered instance vertex buffer (one per in-flight frame).
+    instance_buffers: Vec<metal::Buffer>,
     instance_capacity: usize,
     glyph_atlas: GlyphAtlas,
     /// All instances to render, in draw order.
     instances: Vec<GpuInstance>,
     /// Background color.
     background: Color,
-    /// Staging belt for unified memory uploads (Apple Silicon optimization).
-    staging_belt: StagingBelt,
+    /// Frame index for triple-buffer slot selection (frame_index % 3).
+    frame_index: u64,
     /// LRU shape cache: avoids re-shaping unchanged text each frame.
     /// Key is hash(text, font_size_bits), value is (atlas_generation, glyphs).
     /// When atlas generation mismatches, the entry is stale and must be rebuilt.
@@ -397,250 +396,94 @@ impl CharGlyphCache {
 
 impl StrataPipeline {
     /// Create a new pipeline.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, font_size: f32, font_system: &mut FontSystem) -> Self {
+    pub fn new(device: &metal::DeviceRef, format: metal::MTLPixelFormat, font_size: f32, font_system: &mut FontSystem) -> Self {
         let mut glyph_atlas = GlyphAtlas::new(font_size, font_system);
         glyph_atlas.precache_ascii(font_system);
 
-        // Create shader module
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Strata Ubershader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/glyph.wgsl").into()),
-        });
+        // Compile MSL shader
+        let options = metal::CompileOptions::new();
+        let library = device
+            .new_library_with_source(include_str!("shaders/glyph.metal"), &options)
+            .expect("Failed to compile Metal shader");
+        let vs_fn = library
+            .get_function("vs_main", None)
+            .expect("Missing vs_main");
+        let fs_fn = library
+            .get_function("fs_main", None)
+            .expect("Missing fs_main");
 
-        // Create globals bind group layout
-        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Strata Globals Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        // Build vertex descriptor (9 attributes matching GpuInstance layout, buffer index 0)
+        let vertex_desc = metal::VertexDescriptor::new();
+        let layouts = vertex_desc.layouts();
+        let layout0 = layouts.object_at(0).unwrap();
+        layout0.set_stride(std::mem::size_of::<GpuInstance>() as u64);
+        layout0.set_step_function(metal::MTLVertexStepFunction::PerInstance);
+        layout0.set_step_rate(1);
 
-        // Create combined atlas bind group layout (group 1):
-        //   binding 0: glyph atlas texture
-        //   binding 1: glyph atlas sampler
-        //   binding 2: image atlas texture
-        //   binding 3: image atlas sampler
-        let atlas_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Strata Atlas Layout"),
-                entries: &[
-                    // Glyph atlas
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // Image atlas
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+        let attrs = vertex_desc.attributes();
+        let attr_defs: [(u64, metal::MTLVertexFormat); 9] = [
+            (0, metal::MTLVertexFormat::Float2),   // pos
+            (8, metal::MTLVertexFormat::Float2),   // size
+            (16, metal::MTLVertexFormat::Float2),  // uv_tl
+            (24, metal::MTLVertexFormat::Float2),  // uv_br
+            (32, metal::MTLVertexFormat::UInt),    // color
+            (36, metal::MTLVertexFormat::UInt),    // mode
+            (40, metal::MTLVertexFormat::Float),   // corner_radius
+            (44, metal::MTLVertexFormat::UInt),    // texture_layer
+            (48, metal::MTLVertexFormat::Float4),  // clip_rect
+        ];
+        for (i, (offset, fmt)) in attr_defs.iter().enumerate() {
+            let a = attrs.object_at(i as u64).unwrap();
+            a.set_format(*fmt);
+            a.set_offset(*offset);
+            a.set_buffer_index(0);
+        }
 
-        // Create pipeline layout (2 bind groups: globals, combined atlas)
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Strata Pipeline Layout"),
-            bind_group_layouts: &[&globals_layout, &atlas_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        // Build render pipeline descriptor
+        let rpd = metal::RenderPipelineDescriptor::new();
+        rpd.set_vertex_function(Some(&vs_fn));
+        rpd.set_fragment_function(Some(&fs_fn));
+        rpd.set_vertex_descriptor(Some(&vertex_desc));
 
-        // Create render pipeline
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Strata Ubershader Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GpuInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &[
-                        // pos
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        // size
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 8,
-                            shader_location: 1,
-                        },
-                        // uv_tl
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 16,
-                            shader_location: 2,
-                        },
-                        // uv_br
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 24,
-                            shader_location: 3,
-                        },
-                        // color
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Uint32,
-                            offset: 32,
-                            shader_location: 4,
-                        },
-                        // mode
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Uint32,
-                            offset: 36,
-                            shader_location: 5,
-                        },
-                        // corner_radius
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32,
-                            offset: 40,
-                            shader_location: 6,
-                        },
-                        // texture_layer
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Uint32,
-                            offset: 44,
-                            shader_location: 7,
-                        },
-                        // clip_rect
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 48,
-                            shader_location: 8,
-                        },
-                    ],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        // Color attachment with alpha blending
+        let color_attach = rpd
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+        color_attach.set_pixel_format(format);
+        color_attach.set_blending_enabled(true);
+        color_attach.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+        color_attach.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+        color_attach.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        color_attach.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        color_attach.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        color_attach.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
-        // Create globals buffer
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Strata Globals Buffer"),
-            size: std::mem::size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let pipeline = device
+            .new_render_pipeline_state(&rpd)
+            .expect("Failed to create render pipeline state");
 
-        // Create globals bind group
-        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Strata Globals Bind Group"),
-            layout: &globals_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: globals_buffer.as_entire_binding(),
-            }],
-        });
+        // Triple-buffered globals (uniform) buffers
+        let globals_size = std::mem::size_of::<Globals>() as u64;
+        let globals_buffers: Vec<metal::Buffer> = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| device.new_buffer(globals_size, metal::MTLResourceOptions::StorageModeShared))
+            .collect();
 
-        // Create atlas texture
+        // Glyph atlas texture
         let (atlas_width, atlas_height) = (glyph_atlas.atlas_width, glyph_atlas.atlas_height);
-        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Strata Atlas Texture"),
-            size: wgpu::Extent3d {
-                width: atlas_width,
-                height: atlas_height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let atlas_texture = create_rgba_texture(device, atlas_width, atlas_height);
 
-        // Create sampler
-        let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Strata Atlas Sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        // Samplers (linear filtering)
+        let sampler_desc = metal::SamplerDescriptor::new();
+        sampler_desc.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+        sampler_desc.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+        let atlas_sampler = device.new_sampler(&sampler_desc);
+        let image_sampler = device.new_sampler(&sampler_desc);
 
-        // Create image sampler (shared across atlas rebuilds)
-        let image_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Strata Image Sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        // Create 1×1 white placeholder image atlas (no images loaded yet)
-        let placeholder_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Strata Image Atlas Placeholder"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &placeholder_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[255u8, 255, 255, 255],
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        );
+        // 1×1 white placeholder image atlas
+        let placeholder_texture = create_rgba_texture(device, 1, 1);
+        let white_pixel: [u8; 4] = [255, 255, 255, 255];
+        upload_texture_region(&placeholder_texture, 0, 0, 1, 1, &white_pixel, 4);
 
         let image_atlas = ImageAtlas {
             texture: placeholder_texture,
@@ -653,60 +496,26 @@ impl StrataPipeline {
             images: Vec::new(),
         };
 
-        // Create combined atlas bind group (glyph atlas + image atlas)
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let image_atlas_view = image_atlas.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Strata Combined Atlas Bind Group"),
-            layout: &atlas_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&atlas_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&image_atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&image_sampler),
-                },
-            ],
-        });
-
-        // Create instance buffer
+        // Triple-buffered instance buffers
         let initial_capacity = 4096;
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Strata Instance Buffer"),
-            size: (initial_capacity * std::mem::size_of::<GpuInstance>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Create staging belt for unified memory uploads.
-        let staging_belt = StagingBelt::new(8 * 1024 * 1024);
+        let instance_buf_size = (initial_capacity * std::mem::size_of::<GpuInstance>()) as u64;
+        let instance_buffers: Vec<metal::Buffer> = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| device.new_buffer(instance_buf_size, metal::MTLResourceOptions::StorageModeShared))
+            .collect();
 
         Self {
             pipeline,
-            globals_buffer,
-            globals_bind_group,
+            globals_buffers,
             atlas_texture,
-            atlas_bind_group,
-            atlas_bind_group_layout,
             atlas_sampler,
             image_atlas,
             image_sampler,
-            instance_buffer,
+            instance_buffers,
             instance_capacity: initial_capacity,
             glyph_atlas,
             instances: Vec::new(),
             background: Color::BLACK,
-            staging_belt,
+            frame_index: 0,
             shape_cache: LruCache::new(NonZeroUsize::new(16384).unwrap()),
             cache_hits: 0,
             cache_misses: 0,
@@ -1120,22 +929,20 @@ impl StrataPipeline {
     /// Load a PNG image and return a handle for rendering.
     pub fn load_image_png(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &metal::DeviceRef,
         path: &Path,
     ) -> ImageHandle {
         let img = image::open(path)
             .unwrap_or_else(|e| panic!("Failed to load image {}: {}", path.display(), e))
             .to_rgba8();
         let (w, h) = img.dimensions();
-        self.load_image_rgba(device, queue, w, h, &img.into_raw())
+        self.load_image_rgba(device, w, h, &img.into_raw())
     }
 
     /// Load raw RGBA pixel data and return a handle for rendering.
     pub fn load_image_rgba(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &metal::DeviceRef,
         width: u32,
         height: u32,
         data: &[u8],
@@ -1157,7 +964,7 @@ impl StrataPipeline {
         if needed_width > atlas.width || needed_height > atlas.height {
             let new_width = needed_width.next_power_of_two().max(256);
             let new_height = needed_height.next_power_of_two().max(256);
-            self.grow_image_atlas(device, queue, new_width, new_height);
+            self.grow_image_atlas(device, new_width, new_height);
         }
 
         let atlas = &mut self.image_atlas;
@@ -1173,23 +980,8 @@ impl StrataPipeline {
             atlas.data[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
         }
 
-        // Upload the modified region to GPU
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &atlas.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: ax, y: ay, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            // Upload just the rows we wrote (contiguous in source data)
-            data,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 4),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
+        // Upload the modified region to GPU (contiguous source data)
+        upload_texture_region(&atlas.texture, ax, ay, width, height, data, width * 4);
 
         // Record UV region
         let uv_tl = [ax as f32 / atlas.width as f32, ay as f32 / atlas.height as f32];
@@ -1228,8 +1020,7 @@ impl StrataPipeline {
     /// Grow the image atlas to a new size, preserving existing data.
     fn grow_image_atlas(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &metal::DeviceRef,
         new_width: u32,
         new_height: u32,
     ) {
@@ -1255,40 +1046,13 @@ impl StrataPipeline {
         atlas.width = new_width;
         atlas.height = new_height;
 
-        // Recreate GPU texture
-        atlas.texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Strata Image Atlas"),
-            size: wgpu::Extent3d { width: new_width, height: new_height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        // Upload entire atlas data
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &atlas.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &atlas.data,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(new_width * 4),
-                rows_per_image: Some(new_height),
-            },
-            wgpu::Extent3d { width: new_width, height: new_height, depth_or_array_layers: 1 },
-        );
+        // Recreate GPU texture and upload entire atlas data
+        atlas.texture = create_rgba_texture(device, new_width, new_height);
+        upload_texture_region(&atlas.texture, 0, 0, new_width, new_height, &atlas.data, new_width * 4);
 
         // Recompute UV regions for all loaded images
         for slot in &mut atlas.images {
             let Some(img) = slot.as_mut() else { continue };
-            // UVs were based on old atlas dimensions — need to recompute from pixel positions.
-            // We don't store pixel positions separately, so derive them from old UVs.
             let px_x = img.uv_tl[0] * old_width as f32;
             let px_y = img.uv_tl[1] * old_height as f32;
             img.uv_tl = [px_x / new_width as f32, px_y / new_height as f32];
@@ -1297,9 +1061,6 @@ impl StrataPipeline {
                 (px_y + img.height as f32) / new_height as f32,
             ];
         }
-
-        // Rebuild combined bind group (image atlas texture changed)
-        self.rebuild_combined_bind_group(device);
     }
 
     // =========================================================================
@@ -1924,28 +1685,30 @@ impl StrataPipeline {
     // GPU upload and rendering
     // =========================================================================
 
-    /// Prepare for rendering (upload data to GPU).
+    /// Prepare for rendering (upload data to GPU via unified memory).
+    ///
+    /// Writes globals and instance data directly into the current triple-buffer
+    /// slot. No staging belt or command encoder needed — Apple Silicon unified
+    /// memory makes CPU writes immediately visible to the GPU.
     pub fn prepare(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
+        device: &metal::DeviceRef,
         viewport_width: f32,
         viewport_height: f32,
     ) {
-        // Check if atlas was resized
+        // Check if glyph atlas was resized
         if self.glyph_atlas.was_resized() {
-            self.recreate_atlas_texture(device, queue);
+            self.recreate_atlas_texture(device);
             self.glyph_atlas.ack_resize();
-            // Drain dirty region — full atlas was already uploaded by recreate
             self.glyph_atlas.take_dirty_region();
-            // Atlas UVs changed — all cached row instances are stale
             self.invalidate_grid_row_cache();
         } else if let Some(dirty) = self.glyph_atlas.take_dirty_region() {
-            self.upload_atlas_region(queue, dirty);
+            self.upload_atlas_region(dirty);
         }
 
-        // Update globals
+        let slot = (self.frame_index % MAX_FRAMES_IN_FLIGHT as u64) as usize;
+
+        // Write globals directly into the current slot's buffer
         let globals = Globals {
             transform: create_orthographic_matrix(viewport_width, viewport_height),
             atlas_size: [
@@ -1954,60 +1717,51 @@ impl StrataPipeline {
             ],
             _padding: [0.0, 0.0],
         };
-        queue.write_buffer(&self.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        unsafe {
+            let dst = self.globals_buffers[slot].contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(
+                bytemuck::bytes_of(&globals).as_ptr(),
+                dst,
+                std::mem::size_of::<Globals>(),
+            );
+        }
 
-        // Cap instance count to stay within wgpu's maximum buffer size (256 MB).
-        // Each GpuInstance is 64 bytes, so the hard limit is ~4M instances.
-        // We use a slightly lower cap to leave headroom for other allocations.
-        const MAX_INSTANCES: usize = 2 * 1024 * 1024; // 2M instances = 128 MB
+        // Cap instance count (64 bytes each, 2M = 128 MB)
+        const MAX_INSTANCES: usize = 2 * 1024 * 1024;
         if self.instances.len() > MAX_INSTANCES {
             self.instances.truncate(MAX_INSTANCES);
         }
 
-        // Resize instance buffer if needed
+        // Resize all 3 instance buffers if needed
         if self.instances.len() > self.instance_capacity {
             self.instance_capacity = self.instances.len().next_power_of_two().min(MAX_INSTANCES);
-            self.instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Strata Instance Buffer"),
-                size: (self.instance_capacity * std::mem::size_of::<GpuInstance>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let buf_size = (self.instance_capacity * std::mem::size_of::<GpuInstance>()) as u64;
+            self.instance_buffers = (0..MAX_FRAMES_IN_FLIGHT)
+                .map(|_| device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared))
+                .collect();
         }
 
-        // Upload instances via staging belt
+        // Write instance data directly into the current slot's buffer
         if !self.instances.is_empty() {
-            let instance_bytes = self.instances.len() * std::mem::size_of::<GpuInstance>();
-            if let Some(size) = NonZeroU64::new(instance_bytes as u64) {
-                let mut staging_buffer = self.staging_belt.write_buffer(
-                    encoder,
-                    &self.instance_buffer,
-                    0,
-                    size,
-                    device,
-                );
-                staging_buffer.copy_from_slice(bytemuck::cast_slice(&self.instances));
+            let src = bytemuck::cast_slice::<GpuInstance, u8>(&self.instances);
+            unsafe {
+                let dst = self.instance_buffers[slot].contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
             }
         }
-
-        self.staging_belt.finish();
-    }
-
-    /// Reclaim staging buffer memory after GPU finishes the frame.
-    pub fn after_frame(&mut self) {
-        self.staging_belt.recall();
     }
 
     /// Render all instances in a single draw call.
+    ///
+    /// Creates a render pass on the command buffer, sets all pipeline state,
+    /// and draws. The caller manages the command buffer lifecycle (present + commit).
     pub fn render(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
+        command_buffer: &metal::CommandBufferRef,
+        target: &metal::TextureRef,
         clip_bounds: &crate::shell::ClipBounds,
     ) {
-        // Background color is specified in sRGB but the render target is sRGB format,
-        // which means the GPU will apply linear→sRGB conversion on output. We must
-        // convert to linear here to avoid double-gamma (same as unpack_color in shader).
+        // Convert sRGB background to linear for the clear color
         fn srgb_to_linear(c: f32) -> f64 {
             let c = c as f64;
             if c <= 0.04045 {
@@ -2016,151 +1770,121 @@ impl StrataPipeline {
                 ((c + 0.055) / 1.055).powf(2.4)
             }
         }
-        let clear_color = wgpu::Color {
-            r: srgb_to_linear(self.background.r),
-            g: srgb_to_linear(self.background.g),
-            b: srgb_to_linear(self.background.b),
-            a: self.background.a as f64,
-        };
 
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Strata Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_color),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
+        let rpd = metal::RenderPassDescriptor::new();
+        let color_attach = rpd.color_attachments().object_at(0).unwrap();
+        color_attach.set_texture(Some(target));
+        color_attach.set_load_action(metal::MTLLoadAction::Clear);
+        color_attach.set_store_action(metal::MTLStoreAction::Store);
+        color_attach.set_clear_color(metal::MTLClearColor::new(
+            srgb_to_linear(self.background.r),
+            srgb_to_linear(self.background.g),
+            srgb_to_linear(self.background.b),
+            self.background.a as f64,
+        ));
+
+        let encoder = command_buffer.new_render_command_encoder(&rpd);
+        encoder.set_scissor_rect(metal::MTLScissorRect {
+            x: clip_bounds.x as u64,
+            y: clip_bounds.y as u64,
+            width: clip_bounds.width as u64,
+            height: clip_bounds.height as u64,
         });
-
-        render_pass.set_scissor_rect(
-            clip_bounds.x,
-            clip_bounds.y,
-            clip_bounds.width,
-            clip_bounds.height,
-        );
 
         if !self.instances.is_empty() {
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-            render_pass.draw(0..6, 0..self.instances.len() as u32);
+            let slot = (self.frame_index % MAX_FRAMES_IN_FLIGHT as u64) as usize;
+            encoder.set_render_pipeline_state(&self.pipeline);
+            encoder.set_vertex_buffer(0, Some(&self.instance_buffers[slot]), 0);
+            encoder.set_vertex_buffer(1, Some(&self.globals_buffers[slot]), 0);
+            encoder.set_fragment_buffer(0, Some(&self.globals_buffers[slot]), 0);
+            encoder.set_fragment_texture(0, Some(&self.atlas_texture));
+            encoder.set_fragment_sampler_state(0, Some(&self.atlas_sampler));
+            encoder.set_fragment_texture(1, Some(&self.image_atlas.texture));
+            encoder.set_fragment_sampler_state(1, Some(&self.image_sampler));
+            encoder.draw_primitives_instanced(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                6,
+                self.instances.len() as u64,
+            );
         }
+
+        encoder.end_encoding();
     }
 
-    fn recreate_atlas_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Advance the triple-buffer frame index. Call after render + commit.
+    pub fn advance_frame(&mut self) {
+        self.frame_index += 1;
+    }
+
+    fn recreate_atlas_texture(&mut self, device: &metal::DeviceRef) {
         let (width, height) = (self.glyph_atlas.atlas_width, self.glyph_atlas.atlas_height);
-
-        self.atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Strata Atlas Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        self.upload_atlas_full(queue);
-        self.rebuild_combined_bind_group(device);
-    }
-
-    /// Rebuild the combined bind group (glyph atlas + image atlas in group 1).
-    /// Must be called whenever either atlas texture changes.
-    fn rebuild_combined_bind_group(&mut self, device: &wgpu::Device) {
-        let glyph_view = self.atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let image_view = self.image_atlas.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Strata Combined Atlas Bind Group"),
-            layout: &self.atlas_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&glyph_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.atlas_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&image_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.image_sampler),
-                },
-            ],
-        });
+        self.atlas_texture = create_rgba_texture(device, width, height);
+        self.upload_atlas_full();
     }
 
     /// Upload only the dirty region of the glyph atlas to the GPU.
-    fn upload_atlas_region(&self, queue: &wgpu::Queue, region: (u32, u32, u32, u32)) {
+    fn upload_atlas_region(&self, region: (u32, u32, u32, u32)) {
         let (min_x, min_y, max_x, max_y) = region;
         let atlas_width = self.glyph_atlas.atlas_width;
-        let region_w = max_x - min_x;
-        let region_h = max_y - min_y;
         let data = self.glyph_atlas.atlas_data();
 
-        // Offset into atlas_data for the first pixel of the dirty rect.
-        let byte_offset = ((min_y * atlas_width + min_x) * 4) as u64;
+        // Pointer to the first pixel of the dirty rect within the full atlas data.
+        let byte_offset = ((min_y * atlas_width + min_x) * 4) as usize;
 
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: min_x, y: min_y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::ImageDataLayout {
-                offset: byte_offset,
-                bytes_per_row: Some(atlas_width * 4), // stride = full atlas row width
-                rows_per_image: None,
-            },
-            wgpu::Extent3d {
-                width: region_w,
-                height: region_h,
-                depth_or_array_layers: 1,
-            },
+        upload_texture_region(
+            &self.atlas_texture,
+            min_x, min_y,
+            max_x - min_x, max_y - min_y,
+            &data[byte_offset..],
+            atlas_width * 4, // stride = full atlas row width
         );
     }
 
     /// Upload the entire glyph atlas (used after resize/recreate).
-    fn upload_atlas_full(&self, queue: &wgpu::Queue) {
+    fn upload_atlas_full(&self) {
         let atlas_width = self.glyph_atlas.atlas_width;
         let atlas_height = self.glyph_atlas.atlas_height;
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.atlas_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        upload_texture_region(
+            &self.atlas_texture,
+            0, 0,
+            atlas_width, atlas_height,
             self.glyph_atlas.atlas_data(),
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas_width * 4),
-                rows_per_image: Some(atlas_height),
-            },
-            wgpu::Extent3d {
-                width: atlas_width,
-                height: atlas_height,
-                depth_or_array_layers: 1,
-            },
+            atlas_width * 4,
         );
     }
+}
+
+// =============================================================================
+// Metal helpers
+// =============================================================================
+
+/// Create a 2D RGBA8 sRGB texture with shared storage (Apple Silicon unified memory).
+fn create_rgba_texture(device: &metal::DeviceRef, width: u32, height: u32) -> metal::Texture {
+    let desc = metal::TextureDescriptor::new();
+    desc.set_width(width as u64);
+    desc.set_height(height as u64);
+    desc.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm_sRGB);
+    desc.set_storage_mode(metal::MTLStorageMode::Shared);
+    desc.set_usage(metal::MTLTextureUsage::ShaderRead);
+    device.new_texture(&desc)
+}
+
+/// Upload a rectangle of pixel data to a Metal texture via `replace_region`.
+///
+/// Works directly for `StorageMode::Shared` — no blit encoder needed.
+fn upload_texture_region(
+    texture: &metal::TextureRef,
+    x: u32, y: u32,
+    width: u32, height: u32,
+    data: &[u8],
+    bytes_per_row: u32,
+) {
+    let region = metal::MTLRegion {
+        origin: metal::MTLOrigin { x: x as u64, y: y as u64, z: 0 },
+        size: metal::MTLSize { width: width as u64, height: height as u64, depth: 1 },
+    };
+    texture.replace_region(region, 0, data.as_ptr() as *const std::ffi::c_void, bytes_per_row as u64);
 }
 
 /// Create an orthographic projection matrix.

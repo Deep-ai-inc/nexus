@@ -5,8 +5,8 @@
 //! - Pointer capture (all mouse events go to capturing widget)
 //! - Message emission
 //!
-//! This solves iced's lack of global pointer capture, which breaks
-//! drag selection when the cursor leaves the widget bounds.
+//! Global pointer capture ensures drag selection works correctly
+//! even when the cursor leaves the widget bounds.
 
 use std::cell::RefCell;
 use std::path::PathBuf;

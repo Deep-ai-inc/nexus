@@ -1,8 +1,8 @@
 //! Native macOS Backend
 //!
-//! Replaces the iced adapter with a direct NSApplication + NSWindow + wgpu
-//! backend. Renders on a dedicated thread with three-layer architecture for
-//! flicker-free resize.
+//! Direct NSApplication + NSWindow + Metal backend. Renders on the main thread
+//! with three-layer architecture for flicker-free resize (CAMetalLayer + overlay
+//! CALayer for IOSurface during active resize).
 //!
 //! This is the ONLY module that bridges Strata to the macOS window system.
 
@@ -171,15 +171,15 @@ pub fn run_with_config<A: StrataApp>(config: AppConfig) -> Result<(), Error> {
     // Create custom NSView with layer hierarchy.
     let view_state = create_view_and_layers(mtm, &window, &config, dpi_scale)?;
 
-    // Initialize wgpu.
-    let gpu = init_wgpu(view_state.metal_layer_ptr, win_w, win_h, dpi_scale)?;
+    // Initialize Metal.
+    let gpu = init_metal(view_state.metal_layer_ptr, win_w, win_h, dpi_scale)?;
 
     // Initialize pipeline on main thread.
     let scale = dpi_scale;
     let fs_mutex = crate::text_engine::get_font_system();
     let mut font_system = fs_mutex.lock().unwrap();
     let pipeline = StrataPipeline::new(
-        &gpu.device, &gpu.queue, gpu.surface_config.format,
+        &gpu.device, gpu.pixel_format,
         BASE_FONT_SIZE * scale, &mut font_system,
     );
     drop(font_system);
@@ -814,9 +814,10 @@ fn handle_resize<A: StrataApp>(view: &AnyObject, new_w: f32, new_h: f32) {
         let scene = build_scene::<A>(&state);
         state.cached_snapshot = Some(scene.snapshot.clone());
 
-        // Reconfigure surface at new size and sync render.
-        state.render.gpu.surface_config.width = phys_w;
-        state.render.gpu.surface_config.height = phys_h;
+        // Reconfigure layer at new size and sync render.
+        state.render.gpu.surface_width = phys_w;
+        state.render.gpu.surface_height = phys_h;
+        state.render.gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(phys_w as f64, phys_h as f64));
         render_sync_to_overlay(&mut state.render, &scene, overlay_layer, dpi_scale);
 
         // Reset the resize idle timer.
@@ -824,8 +825,8 @@ fn handle_resize<A: StrataApp>(view: &AnyObject, new_w: f32, new_h: f32) {
         reset_resize_idle_timer(&mut state.resize_timer, timer_info);
     } else {
         // Normal path: mark surface dirty and request render.
-        state.render.gpu.surface_config.width = phys_w;
-        state.render.gpu.surface_config.height = phys_h;
+        state.render.gpu.surface_width = phys_w;
+        state.render.gpu.surface_height = phys_h;
         state.surface_dirty = true;
         state.needs_render = true;
     }
@@ -993,96 +994,93 @@ fn convert_key_code(key_code: u16, event: &NSEvent) -> Key {
 }
 
 // ============================================================================
-// wgpu Initialization
+// Metal Initialization
 // ============================================================================
 
 struct GpuState {
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface_config: wgpu::SurfaceConfiguration,
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    layer: metal::MetalLayer,
+    pixel_format: metal::MTLPixelFormat,
+    surface_width: u32,
+    surface_height: u32,
+    /// dispatch_semaphore_t for triple-buffered in-flight frame gating.
+    in_flight_semaphore: *mut c_void,
 }
 
-fn init_wgpu(
+unsafe extern "C" {
+    fn dispatch_semaphore_create(value: isize) -> *mut c_void;
+    fn dispatch_semaphore_wait(dsema: *mut c_void, timeout: u64) -> isize;
+    fn dispatch_semaphore_signal(dsema: *mut c_void) -> isize;
+}
+/// DISPATCH_TIME_FOREVER
+const DISPATCH_TIME_FOREVER: u64 = !0;
+
+fn init_metal(
     metal_layer_ptr: *mut c_void,
     win_w: f32,
     win_h: f32,
     dpi_scale: f32,
 ) -> Result<GpuState, Error> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::METAL,
-        ..Default::default()
-    });
+    let device = metal::Device::system_default()
+        .ok_or_else(|| Error::Gpu("No Metal device found".into()))?;
+    let queue = device.new_command_queue();
 
-    let surface = unsafe {
-        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(metal_layer_ptr))
-    }.map_err(|e| Error::Gpu(format!("Failed to create surface: {e}")))?;
-
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: Some(&surface),
-        force_fallback_adapter: false,
-    })).ok_or_else(|| Error::Gpu("No suitable GPU adapter".into()))?;
-
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            label: Some("Strata Device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-        },
-        None,
-    )).map_err(|e| Error::Gpu(format!("Failed to create device: {e}")))?;
-
+    let pixel_format = metal::MTLPixelFormat::BGRA8Unorm_sRGB;
     let phys_w = (win_w * dpi_scale) as u32;
     let phys_h = (win_h * dpi_scale) as u32;
 
-    let surface_config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: wgpu::TextureFormat::Bgra8UnormSrgb,
-        width: phys_w,
-        height: phys_h,
-        present_mode: wgpu::PresentMode::AutoVsync,
-        alpha_mode: wgpu::CompositeAlphaMode::Auto,
-        view_formats: vec![],
-        desired_maximum_frame_latency: 2,
-    };
-    surface.configure(&device, &surface_config);
+    // Wrap the existing CAMetalLayer
+    use metal::foreign_types::ForeignType;
+    let layer = unsafe { metal::MetalLayer::from_ptr(metal_layer_ptr as *mut _) };
+    layer.set_device(&device);
+    layer.set_pixel_format(pixel_format);
+    layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(phys_w as f64, phys_h as f64));
+    layer.set_framebuffer_only(true);
+    // Keep the layer alive — we stored it in the struct. But MetalLayer::from_ptr
+    // takes ownership. We need to retain it since the view also owns the layer.
+    // Actually, from_ptr assumes ownership (consumes a +1 retain). The layer is
+    // already retained by the view, so we need from_ptr to NOT release it.
+    // Use ManuallyDrop to prevent double-release.
+    let layer = std::mem::ManuallyDrop::new(layer);
+    // Re-wrap as a proper retained reference
+    let layer = unsafe { metal::MetalLayer::from_ptr(metal::foreign_types::ForeignType::as_ptr(&*layer)) };
 
-    Ok(GpuState { surface, device, queue, surface_config })
+    let in_flight_semaphore = unsafe { dispatch_semaphore_create(3) };
+
+    Ok(GpuState {
+        device,
+        queue,
+        layer,
+        pixel_format,
+        surface_width: phys_w,
+        surface_height: phys_h,
+        in_flight_semaphore,
+    })
 }
 
 // ============================================================================
-// IOSurface Extraction (for resize overlay)
+// IOSurface Extraction
 // ============================================================================
 
-/// Extract IOSurfaceRef from a wgpu texture's underlying Metal drawable.
+/// Extract IOSurfaceRef from a Metal texture (the drawable's backing surface).
 ///
-/// Uses wgpu's `as_hal` to access the private metal::Texture, then sends
-/// the `iosurface` ObjC message to get the backing IOSurface.
-/// Must be called BEFORE the SurfaceTexture is dropped or presented.
-fn extract_iosurface(texture: &wgpu::Texture) -> Option<IOSurfacePtr> {
+/// Extract the IOSurface backing a Metal texture via `msg_send!`.
+/// Must be called BEFORE the drawable is dropped or presented.
+fn extract_iosurface(texture: &metal::TextureRef) -> Option<IOSurfacePtr> {
     unsafe {
-        texture.as_hal::<wgpu::hal::api::Metal, _, _>(|hal_texture| {
-            hal_texture.and_then(|t| {
-                let metal_tex = t.raw_handle();
-                // metal::Texture uses foreign-types; as_ptr() gives *mut MTLTexture.
-                // Cast to *mut AnyObject for objc2's msg_send! receiver.
-                // Return type is IOSurfacePtr (encoding: ^{__IOSurface=}).
-                use metal::foreign_types::ForeignType;
-                let raw_ptr = metal_tex.as_ptr() as *mut AnyObject;
-                let iosurface: IOSurfacePtr = msg_send![raw_ptr, iosurface];
-                if iosurface.0.is_null() { None } else { Some(iosurface) }
-            })
-        })
+        use metal::foreign_types::ForeignTypeRef;
+        let raw_ptr = texture.as_ptr() as *mut AnyObject;
+        let iosurface: IOSurfacePtr = msg_send![raw_ptr, iosurface];
+        if iosurface.0.is_null() { None } else { Some(iosurface) }
     }
 }
 
 /// Synchronous render to the overlay layer during resize.
 ///
-/// Acquires a drawable via wgpu::Surface, renders the scene, waits for GPU
+/// Acquires a drawable from CAMetalLayer, renders the scene, waits for GPU
 /// completion, extracts the IOSurface, and sets it on the overlay CALayer.
-/// The frame is NOT presented — it's dropped, returning the drawable to the pool.
+/// The frame is NOT presented — the drawable returns to the pool via drop.
 fn render_sync_to_overlay(
     res: &mut RenderResources,
     scene: &Scene,
@@ -1091,18 +1089,17 @@ fn render_sync_to_overlay(
 ) {
     let gpu = &mut res.gpu;
 
-    // Reconfigure surface at current size.
-    gpu.surface.configure(&gpu.device, &gpu.surface_config);
+    // Resize the drawable surface
+    gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(gpu.surface_width as f64, gpu.surface_height as f64));
 
-    let frame = match gpu.surface.get_current_texture() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Sync render: surface error: {e:?}");
+    let drawable = match gpu.layer.next_drawable() {
+        Some(d) => d,
+        None => {
+            eprintln!("Sync render: no drawable available");
             return;
         }
     };
 
-    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
     let zoom = scene.snapshot.zoom_level();
     let scale = dpi_scale * zoom;
 
@@ -1111,79 +1108,63 @@ fn render_sync_to_overlay(
 
     if (res.current_scale - scale).abs() > 0.01 {
         res.pipeline = StrataPipeline::new(
-            &gpu.device, &gpu.queue, gpu.surface_config.format,
+            &gpu.device, gpu.pixel_format,
             BASE_FONT_SIZE * scale, &mut font_system,
         );
         res.current_scale = scale;
     }
 
-    // Upload/unload images.
     for img in &scene.pending_images {
-        res.pipeline.load_image_rgba(&gpu.device, &gpu.queue, img.width, img.height, &img.data);
+        res.pipeline.load_image_rgba(&gpu.device, img.width, img.height, &img.data);
     }
     for handle in &scene.pending_unloads {
         res.pipeline.unload_image(*handle);
     }
 
-    res.pipeline.after_frame();
     res.pipeline.clear();
     res.pipeline.set_background(scene.background);
 
     populate_pipeline(&mut res.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
     drop(font_system);
 
-    // Prepare (staging upload).
-    let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Sync Staging Upload"),
-    });
-    res.pipeline.prepare(
-        &gpu.device, &gpu.queue, &mut encoder,
-        gpu.surface_config.width as f32, gpu.surface_config.height as f32,
-    );
-    gpu.queue.submit(std::iter::once(encoder.finish()));
+    // Prepare (writes directly to unified memory buffers)
+    res.pipeline.prepare(&gpu.device, gpu.surface_width as f32, gpu.surface_height as f32);
 
-    // Render pass.
-    let mut render_encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Sync Render"),
-    });
-    let clip = ClipBounds {
-        x: 0, y: 0,
-        width: gpu.surface_config.width,
-        height: gpu.surface_config.height,
-    };
-    res.pipeline.render(&mut render_encoder, &view, &clip);
-    gpu.queue.submit(std::iter::once(render_encoder.finish()));
+    // Render
+    let cmd_buf = gpu.queue.new_command_buffer();
+    let clip = ClipBounds { x: 0, y: 0, width: gpu.surface_width, height: gpu.surface_height };
+    res.pipeline.render(cmd_buf, drawable.texture(), &clip);
+    res.pipeline.advance_frame();
 
-    // Wait for GPU to finish writing pixels.
-    gpu.device.poll(wgpu::Maintain::Wait);
+    // Wait for GPU completion, then extract IOSurface
+    cmd_buf.commit();
+    cmd_buf.wait_until_completed();
 
-    // Extract IOSurface BEFORE dropping the frame.
-    if let Some(iosurface) = extract_iosurface(&frame.texture) {
+    if let Some(iosurface) = extract_iosurface(drawable.texture()) {
         unsafe {
-            // setContents: takes `id` (@) — bridge-cast IOSurfaceRef to id.
             let contents_id = iosurface.0 as *mut AnyObject;
             let _: () = msg_send![overlay_layer, setContents: contents_id];
             let _: () = msg_send![overlay_layer, setHidden: Bool::NO];
         }
     }
-
-    // Drop frame WITHOUT calling present() — drawable returns to pool via refcount.
-    drop(frame);
+    // Drop drawable WITHOUT presenting — returns to pool via refcount.
 }
 
 fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32) {
     let gpu = &mut res.gpu;
 
-    let frame = match gpu.surface.get_current_texture() {
-        Ok(f) => f,
-        Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-            gpu.surface.configure(&gpu.device, &gpu.surface_config);
+    // Gate on semaphore — wait until a triple-buffer slot is free
+    unsafe { dispatch_semaphore_wait(gpu.in_flight_semaphore, DISPATCH_TIME_FOREVER); }
+
+    let drawable = match gpu.layer.next_drawable() {
+        Some(d) => d,
+        None => {
+            // Drawable pool exhausted — signal semaphore back and skip frame
+            unsafe { dispatch_semaphore_signal(gpu.in_flight_semaphore); }
             return;
         }
-        Err(_) => return,
     };
 
-    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
     let zoom = scene.snapshot.zoom_level();
     let scale = dpi_scale * zoom;
 
@@ -1192,51 +1173,52 @@ fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32) {
 
     if (res.current_scale - scale).abs() > 0.01 {
         res.pipeline = StrataPipeline::new(
-            &gpu.device, &gpu.queue, gpu.surface_config.format,
+            &gpu.device, gpu.pixel_format,
             BASE_FONT_SIZE * scale, &mut font_system,
         );
         res.current_scale = scale;
     }
 
-    // Upload/unload images.
     for img in &scene.pending_images {
-        res.pipeline.load_image_rgba(&gpu.device, &gpu.queue, img.width, img.height, &img.data);
+        res.pipeline.load_image_rgba(&gpu.device, img.width, img.height, &img.data);
     }
     for handle in &scene.pending_unloads {
         res.pipeline.unload_image(*handle);
     }
 
-    res.pipeline.after_frame();
     res.pipeline.clear();
     res.pipeline.set_background(scene.background);
 
     populate_pipeline(&mut res.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
+    drop(font_system);
 
-    let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Strata Staging Upload"),
+    // Prepare (writes directly to unified memory buffers)
+    res.pipeline.prepare(&gpu.device, gpu.surface_width as f32, gpu.surface_height as f32);
+
+    // Render + present
+    let cmd_buf = gpu.queue.new_command_buffer();
+    let clip = ClipBounds { x: 0, y: 0, width: gpu.surface_width, height: gpu.surface_height };
+    res.pipeline.render(cmd_buf, drawable.texture(), &clip);
+    res.pipeline.advance_frame();
+
+    cmd_buf.present_drawable(&drawable);
+
+    // Signal semaphore on GPU completion (non-blocking — runs on Metal's callback thread)
+    let semaphore = gpu.in_flight_semaphore;
+    let block = block2::StackBlock::new(move |_buf: *mut AnyObject| {
+        unsafe { dispatch_semaphore_signal(semaphore); }
     });
-    res.pipeline.prepare(
-        &gpu.device, &gpu.queue, &mut encoder,
-        gpu.surface_config.width as f32, gpu.surface_config.height as f32,
-    );
-    gpu.queue.submit(std::iter::once(encoder.finish()));
+    unsafe {
+        use metal::foreign_types::ForeignTypeRef;
+        let cmd_ptr = cmd_buf.as_ptr() as *mut AnyObject;
+        let _: () = msg_send![cmd_ptr, addCompletedHandler: &*block];
+    }
 
-    let mut render_encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Strata Render"),
-    });
-    let clip = ClipBounds {
-        x: 0, y: 0,
-        width: gpu.surface_config.width,
-        height: gpu.surface_config.height,
-    };
-    res.pipeline.render(&mut render_encoder, &view, &clip);
-    gpu.queue.submit(std::iter::once(render_encoder.finish()));
-
-    frame.present();
+    cmd_buf.commit();
 }
 
 // ============================================================================
-// Pipeline Population (from iced_adapter)
+// Pipeline Population
 // ============================================================================
 
 fn populate_pipeline(
@@ -1610,12 +1592,12 @@ fn handle_resize_idle<A: StrataApp>(info: *mut c_void) {
         }
     }
 
-    // Reconfigure surface and do one normal presentDrawable render
+    // Reconfigure layer and do one normal presentDrawable render
     // (works when mouse is still during the resize tracking loop).
-    state.render.gpu.surface.configure(
-        &state.render.gpu.device,
-        &state.render.gpu.surface_config,
-    );
+    state.render.gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(
+        state.render.gpu.surface_width as f64,
+        state.render.gpu.surface_height as f64,
+    ));
     let scene = build_scene::<A>(&state);
     let dpi_scale = state.dpi_scale;
     render_frame(&mut state.render, &scene, dpi_scale);
@@ -1681,10 +1663,10 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
 
             if state.surface_dirty {
                 state.surface_dirty = false;
-                state.render.gpu.surface.configure(
-                    &state.render.gpu.device,
-                    &state.render.gpu.surface_config,
-                );
+                state.render.gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(
+                    state.render.gpu.surface_width as f64,
+                    state.render.gpu.surface_height as f64,
+                ));
             }
 
             let scene = build_scene::<A>(&state);
@@ -1728,7 +1710,7 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
 }
 
 // ============================================================================
-// ClipBounds (replaces iced::Rectangle<u32>)
+// ClipBounds
 // ============================================================================
 
 /// Clip rectangle in physical pixels.

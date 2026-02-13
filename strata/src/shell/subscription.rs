@@ -78,7 +78,7 @@ impl<T: Send + 'static> SubscriptionStream for BatchedReceiverStream<T> {
 /// Waits for at least one event, then drains remaining pending events
 /// into a batch. This coalesces rapid updates into fewer messages.
 ///
-/// - `_batch_delay_ms`: Ignored in the native backend (was used for iced timing)
+/// - `_batch_delay_ms`: Ignored (reserved for future use)
 /// - `max_batch`: Maximum events per batch to prevent stalls
 pub fn from_receiver_batched<T: Send + 'static>(
     rx: Arc<Mutex<mpsc::UnboundedReceiver<T>>>,

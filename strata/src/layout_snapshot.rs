@@ -6,8 +6,8 @@
 //! - Character bounds (content address → screen rect)
 //! - Selection rendering
 //!
-//! This solves iced's broken text APIs by storing character positions computed
-//! during layout rather than re-querying them.
+//! Character positions are computed once during layout and stored for
+//! efficient querying by both the renderer and event handlers.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -693,7 +693,7 @@ impl SourceLayout {
 /// The layout snapshot captures all layout information for a frame.
 ///
 /// Built once during layout, used by both rendering and queries.
-/// This is the core type that solves iced's broken hit-testing.
+/// This is the core type for layout-based hit-testing.
 #[derive(Debug, Clone)]
 pub struct LayoutSnapshot {
     /// Layout information for each registered source.

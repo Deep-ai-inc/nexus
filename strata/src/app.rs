@@ -1,7 +1,7 @@
 //! Strata Application Trait
 //!
 //! Defines the `StrataApp` trait that applications implement to use Strata.
-//! This is similar to iced's application pattern but with Strata primitives.
+//! This follows the Elm pattern (init → update → view) with Strata primitives.
 
 use std::future::Future;
 use std::pin::Pin;

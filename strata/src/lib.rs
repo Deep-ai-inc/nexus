@@ -49,7 +49,7 @@ pub mod scroll_state;
 // Application trait
 pub mod app;
 
-// Shell integration (iced adapter)
+// Shell integration (native macOS backend)
 pub mod shell;
 
 // Demo application
