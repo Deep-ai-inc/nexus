@@ -388,10 +388,6 @@ impl CharGlyphCache {
         }
     }
 
-    #[inline]
-    fn contains(&self, ch: char, bold: bool, italic: bool) -> bool {
-        self.get(ch, bold, italic).is_some()
-    }
 }
 
 impl StrataPipeline {
@@ -629,23 +625,21 @@ impl StrataPipeline {
     /// `begin_grid_row` is reused to avoid allocation.
     pub fn end_grid_row(&mut self, row_index: usize, signature: u64, start: usize, row_y_used: f32) {
         let atlas_gen = self.glyph_atlas.generation();
-        let new_instances: Vec<GpuInstance> = self.instances.drain(start..).collect();
 
         if let Some(cached) = &mut self.grid_row_cache[row_index] {
-            // Recycle: Vec was cleared in begin_grid_row
-            cached.instances.extend(new_instances.iter().map(|inst| {
-                let mut relative = *inst;
-                relative.pos[1] -= row_y_used;
-                relative
+            // Recycle: Vec was cleared in begin_grid_row.
+            // drain() yields owned values — no intermediate Vec allocation.
+            cached.instances.extend(self.instances.drain(start..).map(|mut inst| {
+                inst.pos[1] -= row_y_used;
+                inst
             }));
             cached.signature = signature;
             cached.atlas_gen = atlas_gen;
         } else {
             // First time caching this row
-            let instances: Vec<GpuInstance> = new_instances.iter().map(|inst| {
-                let mut relative = *inst;
-                relative.pos[1] -= row_y_used;
-                relative
+            let instances: Vec<GpuInstance> = self.instances.drain(start..).map(|mut inst| {
+                inst.pos[1] -= row_y_used;
+                inst
             }).collect();
             self.grid_row_cache[row_index] = Some(CachedRow {
                 instances,
@@ -657,9 +651,9 @@ impl StrataPipeline {
 
     /// Gather all cached grid rows into the instance buffer.
     ///
-    /// For each row, copies cached instances and applies the absolute Y offset
-    /// (`base_y + row_idx * cell_h`) and optional clip rect.
-    /// This is a tight memcpy + float-add loop — auto-vectorizable.
+    /// For each row, copies cached instances with the absolute Y offset
+    /// (`base_y + row_idx * cell_h`) and optional clip rect applied in a
+    /// single pass (fused copy + transform for better cache locality).
     pub fn gather_grid_rows(&mut self, base_y: f32, cell_h: f32, num_rows: usize, clip: Option<[f32; 4]>) {
         for row_idx in 0..num_rows.min(self.grid_row_cache.len()) {
             if let Some(cached) = &self.grid_row_cache[row_idx] {
@@ -667,15 +661,14 @@ impl StrataPipeline {
                     continue;
                 }
                 let row_y = base_y + row_idx as f32 * cell_h;
-                let start = self.instances.len();
-                self.instances.extend_from_slice(&cached.instances);
-
-                // Apply absolute Y offset and clip rect
-                for inst in &mut self.instances[start..] {
+                self.instances.reserve(cached.instances.len());
+                for src in &cached.instances {
+                    let mut inst = *src;
                     inst.pos[1] += row_y;
                     if let Some(c) = clip {
                         inst.clip_rect = c;
                     }
+                    self.instances.push(inst);
                 }
             }
         }
@@ -1287,18 +1280,20 @@ impl StrataPipeline {
             }
         };
 
-        // ── Tier A: all-simple fast path ─────────────────────────────────
-        // Every char is single-width (1 column) and already cached.
-        // This covers 99%+ of terminal output (ASCII from top, ls, etc.).
-        let all_simple_cached = text.chars().all(|ch| {
-            UnicodeWidthChar::width(ch) == Some(1)
-                && self.char_glyph_cache.contains(ch, bold, italic)
-        });
-
-        if all_simple_cached {
-            self.cache_hits += 1;
+        // ── Tier A: single-pass fast path ────────────────────────────────
+        // Attempt to render each char directly from the per-char cache.
+        // Bail on first non-simple char (wide, uncached) and fall through
+        // to the general path. Processes each char exactly once (no
+        // separate predicate pass) — covers 99%+ of terminal output.
+        {
+            let fast_start = self.instances.len();
             let mut cursor_x = x;
+            let mut fast_ok = true;
             for ch in text.chars() {
+                if UnicodeWidthChar::width(ch) != Some(1) {
+                    fast_ok = false;
+                    break;
+                }
                 if let Some((font_id, glyph_id, flags)) = self.char_glyph_cache.get(ch, bold, italic) {
                     let cache_key = CacheKey {
                         font_id,
@@ -1323,10 +1318,18 @@ impl StrataPipeline {
                             clip_rect: NO_CLIP,
                         });
                     }
+                } else {
+                    fast_ok = false;
+                    break;
                 }
                 cursor_x += cell_width;
             }
-            return;
+            if fast_ok {
+                self.cache_hits += 1;
+                return;
+            }
+            // Bail: undo partial instances from the failed fast path
+            self.instances.truncate(fast_start);
         }
 
         // ── General path: unicode-width–aware, grapheme clusters ─────────
