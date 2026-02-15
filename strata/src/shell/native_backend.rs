@@ -111,6 +111,7 @@ struct WindowState<A: StrataApp> {
     current_title: String, // Cached to avoid NSString allocation + ObjC call every tick
     pending_window_resize: Option<(f32, f32)>, // Deferred setContentSize (avoid reentrant borrow)
     poll_timer: *mut c_void, // CFRunLoopTimerRef for main-thread polling (invalidated on close)
+    transactional_present: bool, // When true, render_if_needed uses presentsWithTransaction
 }
 
 // ============================================================================
@@ -316,13 +317,14 @@ fn open_new_window_with_state<A: StrataApp>(
         current_title: String::new(),
         pending_window_resize: None,
         poll_timer: std::ptr::null_mut(),
+        transactional_present: false,
     };
 
     // Render first frame synchronously before showing window.
     {
         let scene = build_scene::<A>(&win_state);
         win_state.cached_snapshot = Some(scene.snapshot.clone());
-        render_frame(&mut win_state.render, &scene, dpi_scale);
+        render_frame(&mut win_state.render, &scene, dpi_scale, false);
         win_state.needs_render = false;
     }
 
@@ -825,13 +827,46 @@ extern "C" fn window_will_close(this: &AnyObject, _sel: Sel, _notification: *mut
 fn flush_pending_resize<A: StrataApp>(state_cell: &RefCell<WindowState<A>>) {
     let pending = state_cell.borrow_mut().pending_window_resize.take();
     if let Some((w, h)) = pending {
-        let window_ptr = state_cell.borrow().window;
+        // Enable transactional presentation: the drawable and window geometry
+        // change are committed atomically via CATransaction, preventing the
+        // compositor from showing a frame where the window has new bounds but
+        // stale Metal content (which manifests as a 1-frame vertical misalignment).
+        let (window_ptr, layer_ptr) = {
+            let mut state = state_cell.borrow_mut();
+            let window_ptr = state.window;
+            let layer_ptr = {
+                use metal::foreign_types::ForeignTypeRef;
+                state.render.gpu.layer.as_ptr() as *mut AnyObject
+            };
+            state.transactional_present = true;
+            (window_ptr, layer_ptr)
+        };
+
         if !window_ptr.is_null() {
             unsafe {
+                // Enable presentsWithTransaction so drawable.present() defers
+                // to the CA transaction commit instead of the next vsync.
+                let _: () = msg_send![layer_ptr, setPresentsWithTransaction: true];
+
+                let ca_transaction = AnyClass::get("CATransaction").unwrap();
+                let _: () = msg_send![ca_transaction, begin];
+                let _: () = msg_send![ca_transaction, setDisableActions: true];
+
+                // setContentSize triggers setFrameSize → handle_resize, which
+                // calls render_if_needed in transactional mode (commit + wait +
+                // drawable.present). The drawable is registered with this transaction.
                 let size = NSSize::new(w as f64, h as f64);
                 let _: () = msg_send![window_ptr, setContentSize: size];
+
+                // Commit: atomically applies window geometry + drawable.
+                let _: () = msg_send![ca_transaction, commit];
+
+                // Restore normal async presentation for subsequent renders.
+                let _: () = msg_send![layer_ptr, setPresentsWithTransaction: false];
             }
         }
+
+        state_cell.borrow_mut().transactional_present = false;
     }
 }
 
@@ -890,6 +925,13 @@ fn handle_key_event<A: StrataApp>(view: &AnyObject, key_event: KeyEvent) {
         if let Some(msg) = A::on_key(&state.app, key_event) {
             process_message::<A>(&mut state, msg);
         }
+        // Only render here for non-zoom key events (typing, shortcuts, etc.).
+        // For zoom, skip — presenting a drawable at the old surface size would
+        // give the compositor a stale frame. handle_resize renders at the
+        // correct size inside setFrameSize when the pending resize flushes.
+        if state.pending_window_resize.is_none() {
+            render_if_needed::<A>(&mut state);
+        }
     }
     flush_pending_resize::<A>(state_cell);
 }
@@ -938,11 +980,14 @@ fn handle_resize<A: StrataApp>(view: &AnyObject, new_w: f32, new_h: f32) {
         let timer_info = state_cell as *const _ as *mut c_void;
         reset_resize_idle_timer(&mut state.resize_timer, timer_info);
     } else {
-        // Normal path: mark surface dirty and request render.
+        // Programmatic resize (zoom, tiling, etc.) — render immediately at the
+        // new size. For zoom, flush_pending_resize wraps this in a CATransaction
+        // with presentsWithTransaction so the drawable and geometry are atomic.
         state.render.gpu.surface_width = phys_w;
         state.render.gpu.surface_height = phys_h;
         state.surface_dirty = true;
         state.needs_render = true;
+        render_if_needed::<A>(&mut state);
     }
 }
 
@@ -1003,13 +1048,18 @@ fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
     if (new_zoom - state.current_zoom).abs() > 0.001 {
         state.current_zoom = new_zoom;
         // Defer window resize — setContentSize triggers setFrameSize synchronously,
-        // which would re-enter borrow_mut on the RefCell. Applied after borrow is released.
+        // which would re-enter borrow_mut on the RefCell. flush_pending_resize
+        // wraps the resize in a CATransaction with presentsWithTransaction so
+        // handle_resize → render_if_needed presents atomically with the geometry.
         let new_w = (state.base_size.0 * new_zoom).ceil().max(200.0);
         let new_h = (state.base_size.1 * new_zoom).ceil().max(150.0);
         state.pending_window_resize = Some((new_w, new_h));
+        // Just flag render — skip scene build since surface dims are stale.
+        // render_if_needed will build the scene at the correct size.
+        state.needs_render = true;
+    } else {
+        invalidate_and_request_render::<A>(state);
     }
-
-    invalidate_and_request_render::<A>(state);
 }
 
 fn build_scene<A: StrataApp>(state: &WindowState<A>) -> Scene {
@@ -1034,6 +1084,40 @@ fn invalidate_and_request_render<A: StrataApp>(state: &mut WindowState<A>) {
     let scene = build_scene::<A>(state);
     state.cached_snapshot = Some(scene.snapshot.clone());
     state.needs_render = true;
+}
+
+/// Render a frame if `needs_render` is set.
+///
+/// Reconfigures the drawable surface if `surface_dirty` is set (e.g. after a
+/// zoom-triggered resize), builds the scene, drains pending images, and
+/// presents. Called from both the timer callback and `handle_key_event` so
+/// that zoom changes render in the same event — no stale frame visible.
+fn render_if_needed<A: StrataApp>(state: &mut WindowState<A>) {
+    if !state.needs_render { return; }
+    state.needs_render = false;
+
+    if state.surface_dirty {
+        state.surface_dirty = false;
+        state.render.gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(
+            state.render.gpu.surface_width as f64,
+            state.render.gpu.surface_height as f64,
+        ));
+    }
+
+    let scene = build_scene::<A>(state);
+    state.cached_snapshot = Some(scene.snapshot.clone());
+
+    let pending_images = state.image_store.drain_pending();
+    let pending_unloads = state.image_store.drain_pending_unloads();
+    let scene = Scene {
+        pending_images,
+        pending_unloads,
+        ..scene
+    };
+
+    let dpi_scale = state.dpi_scale;
+    render_frame(&mut state.render, &scene, dpi_scale, state.transactional_present);
+    state.last_render_time = Instant::now();
 }
 
 // ============================================================================
@@ -1265,7 +1349,7 @@ fn render_sync_to_overlay(
     // Drop drawable WITHOUT presenting — returns to pool via refcount.
 }
 
-fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32) {
+fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32, transactional: bool) {
     let gpu = &mut res.gpu;
 
     // Gate on semaphore — wait until a triple-buffer slot is free
@@ -1310,26 +1394,41 @@ fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32) {
     // Prepare (writes directly to unified memory buffers)
     res.pipeline.prepare(&gpu.device, gpu.surface_width as f32, gpu.surface_height as f32);
 
-    // Render + present
+    // Render
     let cmd_buf = gpu.queue.new_command_buffer();
     let clip = ClipBounds { x: 0, y: 0, width: gpu.surface_width, height: gpu.surface_height };
     res.pipeline.render(cmd_buf, drawable.texture(), &clip);
     res.pipeline.advance_frame();
 
-    cmd_buf.present_drawable(&drawable);
+    if transactional {
+        // Synchronous transactional present: the drawable is registered with the
+        // enclosing CATransaction so it's composited atomically with the window
+        // geometry change. Must wait for GPU completion before calling present().
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+        unsafe {
+            use metal::foreign_types::ForeignTypeRef;
+            let drawable_ptr = drawable.as_ptr() as *mut AnyObject;
+            let _: () = msg_send![drawable_ptr, present];
+        }
+        unsafe { dispatch_semaphore_signal(gpu.in_flight_semaphore); }
+    } else {
+        // Async present: drawable is presented at the next vsync.
+        cmd_buf.present_drawable(&drawable);
 
-    // Signal semaphore on GPU completion (non-blocking — runs on Metal's callback thread)
-    let semaphore = gpu.in_flight_semaphore;
-    let block = block2::StackBlock::new(move |_buf: *mut AnyObject| {
-        unsafe { dispatch_semaphore_signal(semaphore); }
-    });
-    unsafe {
-        use metal::foreign_types::ForeignTypeRef;
-        let cmd_ptr = cmd_buf.as_ptr() as *mut AnyObject;
-        let _: () = msg_send![cmd_ptr, addCompletedHandler: &*block];
+        // Signal semaphore on GPU completion (non-blocking — runs on Metal's callback thread)
+        let semaphore = gpu.in_flight_semaphore;
+        let block = block2::StackBlock::new(move |_buf: *mut AnyObject| {
+            unsafe { dispatch_semaphore_signal(semaphore); }
+        });
+        unsafe {
+            use metal::foreign_types::ForeignTypeRef;
+            let cmd_ptr = cmd_buf.as_ptr() as *mut AnyObject;
+            let _: () = msg_send![cmd_ptr, addCompletedHandler: &*block];
+        }
+
+        cmd_buf.commit();
     }
-
-    cmd_buf.commit();
 }
 
 // ============================================================================
@@ -1715,7 +1814,7 @@ fn handle_resize_idle<A: StrataApp>(info: *mut c_void) {
     ));
     let scene = build_scene::<A>(&state);
     let dpi_scale = state.dpi_scale;
-    render_frame(&mut state.render, &scene, dpi_scale);
+    render_frame(&mut state.render, &scene, dpi_scale, false);
 }
 
 // ============================================================================
@@ -1831,35 +1930,6 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 state.needs_render = true;
             }
 
-            // Render if needed.
-            if state.needs_render {
-                state.needs_render = false;
-
-                if state.surface_dirty {
-                    state.surface_dirty = false;
-                    state.render.gpu.layer.set_drawable_size(core_graphics_types::geometry::CGSize::new(
-                        state.render.gpu.surface_width as f64,
-                        state.render.gpu.surface_height as f64,
-                    ));
-                }
-
-                let scene = build_scene::<A>(&state);
-                state.cached_snapshot = Some(scene.snapshot.clone());
-
-                // Drain pending images/unloads into the scene.
-                let pending_images = state.image_store.drain_pending();
-                let pending_unloads = state.image_store.drain_pending_unloads();
-                let scene = Scene {
-                    pending_images,
-                    pending_unloads,
-                    ..scene
-                };
-
-                let dpi_scale = state.dpi_scale;
-                render_frame(&mut state.render, &scene, dpi_scale);
-                state.last_render_time = Instant::now();
-            }
-
             // Update window title only when changed (avoids NSString alloc + ObjC call per tick).
             let new_title = A::title(&state.app);
             if new_title != state.current_title && !state.window.is_null() {
@@ -1871,8 +1941,14 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             }
 
             // Drop the borrow before flushing deferred resize.
+            // setContentSize triggers setFrameSize → handle_resize synchronously,
+            // which borrows the state to update surface dimensions.
             drop(state);
             flush_pending_resize::<A>(state_cell);
+
+            // Render after flush so zoom changes take effect immediately.
+            let Ok(mut state) = state_cell.try_borrow_mut() else { return };
+            render_if_needed::<A>(&mut state);
         });
     }
 
