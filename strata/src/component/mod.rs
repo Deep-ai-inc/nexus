@@ -110,4 +110,10 @@ pub trait Component {
     ) -> Option<(String, crate::content_address::ContentAddress, f32)> {
         None
     }
+
+    /// Called by the native backend at ~60fps. Use for periodic effects like
+    /// auto-scroll during drag selection.
+    fn on_tick(&mut self) -> Command<Self::Message> {
+        Command::none()
+    }
 }

@@ -436,8 +436,9 @@ pub fn route_drag_mouse(
                     MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
                 }
                 MouseEvent::CursorLeft => {
-                    auto_scroll.set(None);
-                    MouseResponse::message_and_release(NexusMessage::Drag(DragMsg::Cancel))
+                    // Don't cancel — mouseDragged still fires outside the view
+                    // on macOS. Auto-scroll continues based on last known position.
+                    MouseResponse::none()
                 }
                 _ => MouseResponse::none(),
             })

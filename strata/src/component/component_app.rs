@@ -159,4 +159,8 @@ where
     ) -> Option<(String, crate::content_address::ContentAddress, f32)> {
         state.force_click_lookup(addr)
     }
+
+    fn on_tick(state: &mut C) -> Command<C::Message> {
+        state.on_tick()
+    }
 }

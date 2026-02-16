@@ -31,7 +31,7 @@ use crate::event_context::{
     ScrollDelta,
 };
 use crate::gpu::{ImageHandle, ImageStore, PendingImage, StrataPipeline};
-use crate::layout_snapshot::{HitResult, LayoutSnapshot};
+use crate::layout_snapshot::{CursorIcon, HitResult, LayoutSnapshot};
 use crate::primitives::{Color, Point, Rect};
 
 /// Error type for shell operations.
@@ -109,6 +109,8 @@ struct WindowState<A: StrataApp> {
     command_rx: std::sync::mpsc::Receiver<A::Message>,
     window: *mut AnyObject, // Weak back-pointer to NSWindow (prevent retain cycle)
     current_title: String, // Cached to avoid NSString allocation + ObjC call every tick
+    current_cursor: CursorIcon, // Cached to avoid redundant NSCursor calls
+    last_tick_time: Instant, // Rate-limit on_tick to ~60fps
     pending_window_resize: Option<(f32, f32)>, // Deferred setContentSize (avoid reentrant borrow)
     poll_timer: *mut c_void, // CFRunLoopTimerRef for main-thread polling (invalidated on close)
     transactional_present: bool, // When true, render_if_needed uses presentsWithTransaction
@@ -221,16 +223,37 @@ fn open_new_window_with_state<A: StrataApp>(
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let config = &globals.config;
 
-    // Create NSWindow.
-    let (win_w, win_h) = config.window_size;
-    let content_rect = NSRect::new(
-        NSPoint::new(200.0, 200.0),
-        NSSize::new(win_w as f64, win_h as f64),
-    );
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::Resizable
         | NSWindowStyleMask::Miniaturizable;
+
+    // Size the window to 50% of the screen in each dimension (quarter of
+    // screen area), matching the macOS corner-snap size. The target is the
+    // frame size (including title bar), so we convert to content size via
+    // contentRectForFrameRect:styleMask: to avoid being a title bar taller.
+    let (win_w, win_h) = unsafe {
+        let screen_class = AnyClass::get("NSScreen").unwrap();
+        let main_screen: *mut AnyObject = msg_send![screen_class, mainScreen];
+        if !main_screen.is_null() {
+            let visible: NSRect = msg_send![main_screen, visibleFrame];
+            let frame_rect = NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(visible.size.width * 0.5, visible.size.height * 0.5),
+            );
+            let window_class = AnyClass::get("NSWindow").unwrap();
+            let content: NSRect = msg_send![window_class,
+                contentRectForFrameRect: frame_rect
+                styleMask: style];
+            (content.size.width as f32, content.size.height as f32)
+        } else {
+            config.window_size
+        }
+    };
+    let content_rect = NSRect::new(
+        NSPoint::new(200.0, 200.0),
+        NSSize::new(win_w as f64, win_h as f64),
+    );
 
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -293,13 +316,18 @@ fn open_new_window_with_state<A: StrataApp>(
 
     let window_ptr = &*window as *const NSWindow as *mut AnyObject;
 
+    // Read the app's initial zoom level so the window is sized correctly.
+    // base_size is the logical (unzoomed) content area; window_size = base_size * zoom.
+    let initial_zoom = A::zoom_level(&app_state);
+    let (base_w, base_h) = (win_w / initial_zoom, win_h / initial_zoom);
+
     let mut win_state = WindowState::<A> {
         app: app_state,
         shared: globals.shared.clone(),
         capture: CaptureState::None,
         window_size: (win_w, win_h),
-        base_size: (win_w, win_h),
-        current_zoom: 1.0,
+        base_size: (base_w, base_h),
+        current_zoom: initial_zoom,
         cursor_position: None,
         image_store,
         cached_snapshot: None,
@@ -315,6 +343,8 @@ fn open_new_window_with_state<A: StrataApp>(
         command_rx,
         window: window_ptr,
         current_title: String::new(),
+        current_cursor: CursorIcon::Arrow,
+        last_tick_time: Instant::now(),
         pending_window_resize: None,
         poll_timer: std::ptr::null_mut(),
         transactional_present: false,
@@ -490,6 +520,21 @@ fn create_view_and_layers(
         let view_ref: &NSView =
             &*((&*view) as *const AnyObject as *const NSView);
         window.setContentView(Some(view_ref));
+    }
+
+    // Add NSTrackingArea for mouseMoved/mouseEntered/mouseExited.
+    // NSTrackingInVisibleRect auto-adjusts to view bounds on resize.
+    unsafe {
+        let flags: usize = 0x01 | 0x02 | 0x80 | 0x200; // enteredAndExited | mouseMoved | activeAlways | inVisibleRect
+        let tracking_class = AnyClass::get("NSTrackingArea").unwrap();
+        let tracking_area: *mut AnyObject = msg_send![tracking_class, alloc];
+        let tracking_area: *mut AnyObject = msg_send![tracking_area,
+            initWithRect: NSRect::ZERO
+            options: flags
+            owner: &*view
+            userInfo: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![&*view, addTrackingArea: tracking_area];
     }
 
     Ok(ViewState {
@@ -913,6 +958,19 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
 
         if let Some(msg) = response.message {
             process_message::<A>(&mut state, msg);
+        }
+
+        // Update system cursor based on hover target.
+        if let Some(snapshot) = &state.cached_snapshot {
+            let icon = if let Some(source) = state.capture.captured_by() {
+                snapshot.cursor_for_capture(source)
+            } else {
+                adjusted_cursor.map(|p| snapshot.cursor_at(p)).unwrap_or_default()
+            };
+            if icon != state.current_cursor {
+                state.current_cursor = icon;
+                crate::platform::set_cursor(icon);
+            }
         }
     }
     flush_pending_resize::<A>(state_cell);
@@ -1925,6 +1983,16 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 }
             }
 
+            // Call on_tick at ~60fps for periodic effects (auto-scroll, etc.).
+            if state.last_tick_time.elapsed().as_millis() >= 16 {
+                state.last_tick_time = Instant::now();
+                let cmd = A::on_tick(&mut state.app);
+                let rt = state.tokio_rt.clone();
+                let tx = state.command_tx.clone();
+                spawn_commands(&rt, cmd, tx);
+                state.needs_render = true;
+            }
+
             // Periodic re-render for cursor blink (toggles every 500ms).
             if state.last_render_time.elapsed().as_millis() >= 500 {
                 state.needs_render = true;
@@ -1949,6 +2017,21 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             // Render after flush so zoom changes take effect immediately.
             let Ok(mut state) = state_cell.try_borrow_mut() else { return };
             render_if_needed::<A>(&mut state);
+
+            // Update cursor after render (widgets may have shifted under cursor).
+            if let (Some(pos), Some(snapshot)) = (state.cursor_position, state.cached_snapshot.as_ref()) {
+                let zoom = state.current_zoom;
+                let adjusted = Point::new(pos.x / zoom, pos.y / zoom);
+                let icon = if let Some(source) = state.capture.captured_by() {
+                    snapshot.cursor_for_capture(source)
+                } else {
+                    snapshot.cursor_at(adjusted)
+                };
+                if icon != state.current_cursor {
+                    state.current_cursor = icon;
+                    crate::platform::set_cursor(icon);
+                }
+            }
         });
     }
 

@@ -919,6 +919,27 @@ unsafe fn configure_layer_for_resize(layer: *mut AnyObject, bg_cg_color: CGColor
 
 
 // =============================================================================
+// System Cursor
+// =============================================================================
+
+/// Set the system cursor to match a CursorIcon.
+pub fn set_cursor(icon: crate::layout_snapshot::CursorIcon) {
+    use crate::layout_snapshot::CursorIcon;
+    let cls = AnyClass::get("NSCursor").unwrap();
+    unsafe {
+        let cursor: *mut AnyObject = match icon {
+            CursorIcon::Arrow => msg_send![cls, arrowCursor],
+            CursorIcon::Text => msg_send![cls, IBeamCursor],
+            CursorIcon::Pointer => msg_send![cls, pointingHandCursor],
+            CursorIcon::Grab => msg_send![cls, openHandCursor],
+            CursorIcon::Grabbing => msg_send![cls, closedHandCursor],
+            CursorIcon::Copy => msg_send![cls, dragCopyCursor],
+        };
+        let _: () = msg_send![cursor, set];
+    }
+}
+
+// =============================================================================
 // Native Menu Bar (make_menu_item helper)
 // =============================================================================
 

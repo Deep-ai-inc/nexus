@@ -870,6 +870,18 @@ impl LayoutSnapshot {
         }
     }
 
+    /// Resolve the cursor icon during a capture (drag).
+    ///
+    /// Looks up the hint for the captured source: Grab → Grabbing (active drag),
+    /// no hint (content) → Text (text selection).
+    pub fn cursor_for_capture(&self, source: SourceId) -> CursorIcon {
+        match self.cursor_hints.get(&source) {
+            Some(CursorIcon::Grab) => CursorIcon::Grabbing,
+            Some(icon) => *icon,
+            None => CursorIcon::Text, // Content capture = text selection
+        }
+    }
+
     /// Compute the position of an overlay anchored to a widget.
     ///
     /// Returns `None` if the widget ID is not registered.

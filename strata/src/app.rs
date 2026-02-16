@@ -446,6 +446,12 @@ pub trait StrataApp: Sized + 'static {
     fn zoom_level(_state: &Self::State) -> f32 {
         1.0
     }
+
+    /// Called by the native backend at ~60fps. Use for periodic effects like
+    /// auto-scroll during drag selection.
+    fn on_tick(_state: &mut Self::State) -> Command<Self::Message> {
+        Command::none()
+    }
 }
 
 /// Request to start an OS-level outbound drag.

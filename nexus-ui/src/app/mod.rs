@@ -347,10 +347,12 @@ impl Component for NexusState {
             self.agent.subscription(),
         ];
 
-        // Timer ticks are no longer needed — the native backend renders
-        // continuously and polls subscriptions on a timer.
-
         Subscription::batch(subs)
+    }
+
+    fn on_tick(&mut self) -> strata::Command<NexusMessage> {
+        self.on_output_arrived();
+        strata::Command::none()
     }
 
     fn selection(&self) -> Option<&strata::Selection> {
@@ -491,7 +493,7 @@ impl RootComponent for NexusState {
             kernel,
             kernel_tx,
 
-            zoom_level: 1.0,
+            zoom_level: 0.85,
 
             last_edit_time: Instant::now(),
             exit_requested: false,
