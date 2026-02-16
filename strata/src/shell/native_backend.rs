@@ -136,8 +136,130 @@ static mut CREATE_WINDOW_FN: Option<fn()> = None;
 /// Number of open windows. When decremented to 0, app stays alive for dock reopen.
 static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Cascade position for new windows (each new window offsets from the previous).
-static mut CASCADE_POINT: NSPoint = NSPoint::new(0.0, 0.0);
+
+// ============================================================================
+// Window Sizing & Positioning
+// ============================================================================
+
+/// Compute the initial content rect for a new window.
+///
+/// Size: 50% of the screen in each dimension (matching macOS corner-snap).
+/// Position: near the mouse cursor, preferring empty space over existing windows.
+fn compute_window_rect(style: NSWindowStyleMask, config: &AppConfig) -> (NSRect, f32, f32) {
+    unsafe {
+        let screen_class = AnyClass::get("NSScreen").unwrap();
+        let event_class = AnyClass::get("NSEvent").unwrap();
+        let window_class = AnyClass::get("NSWindow").unwrap();
+
+        // Find the screen containing the mouse cursor.
+        let mouse: NSPoint = msg_send![event_class, mouseLocation];
+        let screens: *mut AnyObject = msg_send![screen_class, screens];
+        let screen_count: usize = msg_send![screens, count];
+        let mut screen: *mut AnyObject = msg_send![screen_class, mainScreen];
+        for i in 0..screen_count {
+            let s: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            let f: NSRect = msg_send![s, frame];
+            if mouse.x >= f.origin.x && mouse.x < f.origin.x + f.size.width
+                && mouse.y >= f.origin.y && mouse.y < f.origin.y + f.size.height
+            {
+                screen = s;
+                break;
+            }
+        }
+        if screen.is_null() {
+            let r = NSRect::new(
+                NSPoint::new(200.0, 200.0),
+                NSSize::new(config.window_size.0 as f64, config.window_size.1 as f64),
+            );
+            return (r, config.window_size.0, config.window_size.1);
+        }
+
+        let visible: NSRect = msg_send![screen, visibleFrame];
+
+        // Window frame = 50% of visible screen in each dimension.
+        // Convert to content size (subtracts title bar height).
+        let frame_w = visible.size.width * 0.5;
+        let frame_h = visible.size.height * 0.5;
+        let frame_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(frame_w, frame_h));
+        let content: NSRect = msg_send![window_class,
+            contentRectForFrameRect: frame_rect styleMask: style];
+        let win_w = content.size.width;
+        let win_h = content.size.height;
+
+        // Gather frames of existing visible windows in our app as obstacles.
+        let app: *mut AnyObject = msg_send![
+            AnyClass::get("NSApplication").unwrap(), sharedApplication];
+        let windows: *mut AnyObject = msg_send![app, windows];
+        let win_count: usize = msg_send![windows, count];
+        let mut obstacles = Vec::new();
+        for i in 0..win_count {
+            let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+            let vis: bool = msg_send![w, isVisible];
+            if vis {
+                let f: NSRect = msg_send![w, frame];
+                obstacles.push(f);
+            }
+        }
+
+        // Candidate positions: the 4 screen corners plus centered on mouse.
+        // With heavy overlap penalty, windows naturally fill corners first
+        // (exclusion principle), using mouse proximity as tiebreaker.
+        let vx = visible.origin.x;
+        let vy = visible.origin.y;
+        let vr = vx + visible.size.width;
+        let vt = vy + visible.size.height;
+
+        let candidates = [
+            NSPoint::new(vx, vt - frame_h),             // top-left
+            NSPoint::new(vr - frame_w, vt - frame_h),   // top-right
+            NSPoint::new(vx, vy),                        // bottom-left
+            NSPoint::new(vr - frame_w, vy),              // bottom-right
+            // Centered on mouse (clamped below)
+            NSPoint::new(mouse.x - frame_w / 2.0, mouse.y - frame_h / 2.0),
+        ];
+
+        let window_area = frame_w * frame_h;
+        let mut best_origin = candidates[0];
+        let mut best_score = f64::MAX;
+
+        for origin in candidates {
+            let x = origin.x.max(vx).min(vr - frame_w);
+            let y = origin.y.max(vy).min(vt - frame_h);
+
+            // Overlap fraction (0.0 = no overlap, 1.0 = fully covered).
+            let mut overlap = 0.0_f64;
+            for ob in &obstacles {
+                let iw = ((x + frame_w).min(ob.origin.x + ob.size.width)
+                    - x.max(ob.origin.x)).max(0.0);
+                let ih = ((y + frame_h).min(ob.origin.y + ob.size.height)
+                    - y.max(ob.origin.y)).max(0.0);
+                overlap += iw * ih;
+            }
+            let overlap_frac = overlap / window_area;
+
+            // Normalized distance (0.0 = on mouse, 1.0 = opposite corner).
+            let cx = x + frame_w / 2.0;
+            let cy = y + frame_h / 2.0;
+            let diag = (visible.size.width.powi(2) + visible.size.height.powi(2)).sqrt();
+            let dist = ((cx - mouse.x).powi(2) + (cy - mouse.y).powi(2)).sqrt() / diag;
+
+            // Overlap dominates: any overlap outweighs any distance.
+            let score = overlap_frac * 10.0 + dist;
+            if score < best_score {
+                best_score = score;
+                best_origin = NSPoint::new(x, y);
+            }
+        }
+
+        // best_origin is the frame origin; initWithContentRect wants content origin.
+        // They differ by the title bar. Convert using contentRectForFrameRect.
+        let best_frame = NSRect::new(best_origin, NSSize::new(frame_w, frame_h));
+        let best_content: NSRect = msg_send![window_class,
+            contentRectForFrameRect: best_frame styleMask: style];
+
+        (best_content, win_w as f32, win_h as f32)
+    }
+}
 
 // ============================================================================
 // Public API
@@ -228,32 +350,10 @@ fn open_new_window_with_state<A: StrataApp>(
         | NSWindowStyleMask::Resizable
         | NSWindowStyleMask::Miniaturizable;
 
-    // Size the window to 50% of the screen in each dimension (quarter of
-    // screen area), matching the macOS corner-snap size. The target is the
-    // frame size (including title bar), so we convert to content size via
-    // contentRectForFrameRect:styleMask: to avoid being a title bar taller.
-    let (win_w, win_h) = unsafe {
-        let screen_class = AnyClass::get("NSScreen").unwrap();
-        let main_screen: *mut AnyObject = msg_send![screen_class, mainScreen];
-        if !main_screen.is_null() {
-            let visible: NSRect = msg_send![main_screen, visibleFrame];
-            let frame_rect = NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(visible.size.width * 0.5, visible.size.height * 0.5),
-            );
-            let window_class = AnyClass::get("NSWindow").unwrap();
-            let content: NSRect = msg_send![window_class,
-                contentRectForFrameRect: frame_rect
-                styleMask: style];
-            (content.size.width as f32, content.size.height as f32)
-        } else {
-            config.window_size
-        }
-    };
-    let content_rect = NSRect::new(
-        NSPoint::new(200.0, 200.0),
-        NSSize::new(win_w as f64, win_h as f64),
-    );
+    // Size and position the window using gravitational best-fit:
+    // - Size: 50% of screen in each dimension (quarter of screen area)
+    // - Position: near the mouse cursor, avoiding overlap with existing windows
+    let (content_rect, win_w, win_h) = compute_window_rect(style, config);
 
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -377,8 +477,6 @@ fn open_new_window_with_state<A: StrataApp>(
     let poll_timer = install_main_thread_timer::<A>(win_state_ptr);
     unsafe { (*win_state_ptr).borrow_mut().poll_timer = poll_timer; }
 
-    // Cascade window position and show.
-    unsafe { CASCADE_POINT = window.cascadeTopLeftFromPoint(CASCADE_POINT); }
     window.makeKeyAndOrderFront(None);
 
     WINDOW_COUNT.fetch_add(1, Ordering::Relaxed);
