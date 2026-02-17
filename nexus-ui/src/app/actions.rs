@@ -144,35 +144,54 @@ impl NexusState {
                 }
             }
 
+            // Check for image file URLs (e.g. file copied from Finder).
+            // arboard::get_image() would return the file's Finder icon, not
+            // the actual image content, so we read the file from disk instead.
+            if let Some(path) = strata::platform::clipboard_image_file_path() {
+                if self.attach_image_file(&path, images) {
+                    return;
+                }
+            }
+
             if let Ok(img) = clipboard.get_image() {
                 let width = img.width as u32;
                 let height = img.height as u32;
                 let rgba_data = img.bytes.into_owned();
-
-                let mut png_data = Vec::new();
-                if let Some(img_buf) =
-                    image::RgbaImage::from_raw(width, height, rgba_data.clone())
-                {
-                    let _ = img_buf.write_to(
-                        &mut std::io::Cursor::new(&mut png_data),
-                        image::ImageFormat::Png,
-                    );
-                }
-
-                if !png_data.is_empty() {
-                    let handle = images.load_rgba(width, height, rgba_data);
-                    self.input.add_attachment(super::Attachment {
-                        data: png_data,
-                        image_handle: handle,
-                        width,
-                        height,
-                    });
-                }
+                self.attach_rgba(width, height, rgba_data, images);
             } else if let Ok(text) = clipboard.get_text() {
                 if !text.is_empty() {
                     self.input.paste_text(&text);
                 }
             }
+        }
+    }
+
+    /// Read an image file from disk and attach it.  Returns true on success.
+    fn attach_image_file(&mut self, path: &std::path::Path, images: &mut ImageStore) -> bool {
+        let Ok(img) = image::open(path) else { return false };
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        self.attach_rgba(width, height, rgba.into_raw(), images);
+        true
+    }
+
+    /// Convert raw RGBA data to a PNG attachment and register it.
+    fn attach_rgba(&mut self, width: u32, height: u32, rgba_data: Vec<u8>, images: &mut ImageStore) {
+        let mut png_data = Vec::new();
+        if let Some(img_buf) = image::RgbaImage::from_raw(width, height, rgba_data.clone()) {
+            let _ = img_buf.write_to(
+                &mut std::io::Cursor::new(&mut png_data),
+                image::ImageFormat::Png,
+            );
+        }
+        if !png_data.is_empty() {
+            let handle = images.load_rgba(width, height, rgba_data);
+            self.input.add_attachment(super::Attachment {
+                data: png_data,
+                image_handle: handle,
+                width,
+                height,
+            });
         }
     }
 

@@ -388,6 +388,67 @@ pub fn start_drag(source: &DragSource) -> Result<(), String> {
     }
 }
 
+/// Read file URLs from the general pasteboard and return the first path that
+/// points to an image file.  Returns `None` when the clipboard doesn't
+/// contain a file URL or the file isn't an image.
+pub fn clipboard_image_file_path() -> Option<PathBuf> {
+    use objc2_app_kit::NSPasteboard;
+
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        let items = pb.pasteboardItems()?;
+
+        // Debug: log all pasteboard types so we can diagnose mismatches.
+        #[cfg(debug_assertions)]
+        for i in 0..items.len() {
+            let item: &NSPasteboardItem = &items[i];
+            let types = item.types();
+            let type_strs: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+            eprintln!("[paste] item {i} types: {type_strs:?}");
+        }
+
+        for i in 0..items.len() {
+            let item: &NSPasteboardItem = &items[i];
+            if let Some(path) = file_url_from_item(item) {
+                if is_image_extension(&path) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn file_url_from_item(item: &NSPasteboardItem) -> Option<PathBuf> {
+    let url_str = unsafe { item.stringForType(NSPasteboardTypeFileURL) }?;
+
+    // macOS may return a file-reference URL (file:///.file/id=...) instead of
+    // a path-based URL.  Resolve it via NSURL.filePathURL → .path.
+    unsafe {
+        let ns_url_str = NSString::from_str(&url_str.to_string());
+        let url: Option<Retained<NSURL>> = msg_send_id![
+            NSURL::class(), URLWithString: &*ns_url_str
+        ];
+        let url = url?;
+        // filePathURL resolves file-reference URLs to path-based URLs.
+        let path_url: Option<Retained<NSURL>> = msg_send_id![&url, filePathURL];
+        let path_url = path_url.as_ref().unwrap_or(&url);
+        let ns_path: Option<Retained<NSString>> = msg_send_id![path_url, path];
+        let path = PathBuf::from(ns_path?.to_string());
+        #[cfg(debug_assertions)]
+        eprintln!("[paste] resolved path = {path:?}");
+        Some(path)
+    }
+}
+
+fn is_image_extension(path: &Path) -> bool {
+    let ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(e) => e.to_ascii_lowercase(),
+        None => return false,
+    };
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif" | "heic" | "svg")
+}
+
 /// Set a file URL on a pasteboard item.
 fn set_file_url_on_pasteboard(pb_item: &NSPasteboardItem, path: &Path) -> Result<(), String> {
     let path_str = path.to_str().ok_or("Non-UTF8 path")?;
