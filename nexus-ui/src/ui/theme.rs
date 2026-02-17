@@ -3,7 +3,7 @@
 use strata::primitives::Color;
 
 // Backgrounds (darker charcoal matching Claude Code)
-pub const BG_APP: Color = Color { r: 0.07, g: 0.07, b: 0.08, a: 1.0 };
+pub const BG_APP: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 pub const BG_BLOCK: Color = Color { r: 0.09, g: 0.09, b: 0.1, a: 1.0 };
 pub const BG_INPUT: Color = Color { r: 0.08, g: 0.08, b: 0.09, a: 1.0 };
 
