@@ -471,6 +471,7 @@ fn render_terminal(snapshot: &mut LayoutSnapshot, t: TerminalElement, origin: Po
         rows_content,
     );
     grid_layout.clip_rect = snapshot.current_clip();
+    grid_layout.cursor = t.cursor;
     snapshot.register_source(t.source_id, SourceLayout::grid(grid_layout));
 }
 

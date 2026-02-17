@@ -536,6 +536,33 @@ pub struct GridRow {
     pub runs: Vec<TextRun>,
 }
 
+/// Terminal cursor shape (from DECSCUSR escape sequence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridCursorShape {
+    /// Solid block covering the entire cell.
+    Block,
+    /// Hollow block outline.
+    HollowBlock,
+    /// Vertical bar at the left edge of the cell.
+    Beam,
+    /// Horizontal line at the bottom of the cell.
+    Underline,
+}
+
+/// Terminal cursor for grid rendering.
+#[derive(Debug, Clone, Copy)]
+pub struct GridCursor {
+    pub col: u16,
+    pub row: u16,
+    pub shape: GridCursorShape,
+    /// Character under the cursor (for inverse rendering).
+    pub ch: char,
+    /// Packed fg color of cell under cursor.
+    pub fg: u32,
+    /// Packed bg color of cell under cursor (0 = default/transparent).
+    pub bg: u32,
+}
+
 /// Layout information for grid content (terminals).
 #[derive(Debug, Clone)]
 pub struct GridLayout {
@@ -559,6 +586,9 @@ pub struct GridLayout {
 
     /// Clip rectangle for this grid (from container clipping).
     pub clip_rect: Option<Rect>,
+
+    /// Terminal cursor, or None if hidden.
+    pub cursor: Option<GridCursor>,
 }
 
 impl GridLayout {
@@ -572,6 +602,7 @@ impl GridLayout {
             rows,
             rows_content: Vec::new(),
             clip_rect: None,
+            cursor: None,
         }
     }
 
@@ -592,6 +623,7 @@ impl GridLayout {
             rows,
             rows_content,
             clip_rect: None,
+            cursor: None,
         }
     }
 

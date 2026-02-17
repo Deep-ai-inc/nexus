@@ -7,7 +7,7 @@ mod grid;
 mod parser;
 mod cell;
 
-pub use grid::TerminalGrid;
+pub use grid::{CursorShape, TerminalGrid};
 pub use parser::TerminalParser;
 pub use cell::{Cell, CellFlags, Color, UnderlineStyle};
 

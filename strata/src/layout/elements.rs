@@ -194,6 +194,8 @@ pub struct TerminalElement {
     pub(crate) content_hash: u64,
     /// Row content for rendering — each row is a list of styled runs.
     pub(crate) row_content: Vec<Vec<crate::layout_snapshot::TextRun>>,
+    /// Terminal cursor, or None if hidden.
+    pub(crate) cursor: Option<crate::layout_snapshot::GridCursor>,
 }
 
 impl TerminalElement {
@@ -207,6 +209,7 @@ impl TerminalElement {
             cell_height: 18.0,
             content_hash: 0,
             row_content: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -226,6 +229,12 @@ impl TerminalElement {
     /// Set content hash for cache invalidation.
     pub fn content_hash(mut self, hash: u64) -> Self {
         self.content_hash = hash;
+        self
+    }
+
+    /// Set the terminal cursor. Pass `None` to hide.
+    pub fn cursor(mut self, cursor: Option<crate::layout_snapshot::GridCursor>) -> Self {
+        self.cursor = cursor;
         self
     }
 

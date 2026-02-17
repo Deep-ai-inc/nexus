@@ -1,7 +1,7 @@
 //! Platform-specific functionality.
 //!
-//! Provides native OS integration that Iced doesn't expose directly,
-//! such as initiating outbound drag operations and Quick Look previews.
+//! Provides native OS integration such as initiating outbound drag
+//! operations, Quick Look previews, and cursor management.
 
 #[cfg(target_os = "macos")]
 pub mod macos;

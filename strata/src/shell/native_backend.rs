@@ -1777,6 +1777,50 @@ fn populate_pipeline(
                 }
                 let grid_base_y = grid_layout.bounds.y * scale;
                 pipeline.gather_grid_rows(grid_base_y, cell_h, grid_layout.rows_content.len(), clip_to_gpu(grid_clip, scale));
+
+                // Draw terminal cursor, clipped to the grid rect.
+                if let Some(ref cursor) = grid_layout.cursor {
+                    let cursor_start = pipeline.instance_count();
+                    use crate::layout_snapshot::GridCursorShape;
+                    let cx = (grid_layout.bounds.x + cursor.col as f32 * grid_layout.cell_width) * scale;
+                    let cy = (grid_layout.bounds.y + cursor.row as f32 * grid_layout.cell_height) * scale;
+                    let cursor_fg = if cursor.fg != 0 {
+                        Color::unpack(cursor.fg)
+                    } else {
+                        Color::rgb(0.9, 0.9, 0.9)
+                    };
+                    let cursor_bg = if cursor.bg != 0 {
+                        Color::unpack(cursor.bg)
+                    } else {
+                        Color::rgb(0.12, 0.12, 0.12)
+                    };
+
+                    match cursor.shape {
+                        GridCursorShape::Block => {
+                            // Solid block: fill with fg color, redraw char in bg color.
+                            pipeline.add_solid_rect(cx, cy, cell_w, cell_h, cursor_fg);
+                            if cursor.ch != ' ' && cursor.ch != '\0' {
+                                let mut ch_buf = [0u8; 4];
+                                let ch_str = cursor.ch.encode_utf8(&mut ch_buf);
+                                pipeline.add_text_grid(ch_str, cx, cy, cursor_bg, BASE_FONT_SIZE * scale, false, false, font_system);
+                            }
+                        }
+                        GridCursorShape::HollowBlock => {
+                            let t = scale.max(1.0);
+                            pipeline.add_solid_rect(cx, cy, cell_w, t, cursor_fg);               // top
+                            pipeline.add_solid_rect(cx, cy + cell_h - t, cell_w, t, cursor_fg);   // bottom
+                            pipeline.add_solid_rect(cx, cy, t, cell_h, cursor_fg);                // left
+                            pipeline.add_solid_rect(cx + cell_w - t, cy, t, cell_h, cursor_fg);   // right
+                        }
+                        GridCursorShape::Beam => {
+                            pipeline.add_solid_rect(cx, cy, (2.0 * scale).max(1.0), cell_h, cursor_fg);
+                        }
+                        GridCursorShape::Underline => {
+                            pipeline.add_solid_rect(cx, cy + cell_h - (2.0 * scale).max(1.0), cell_w, (2.0 * scale).max(1.0), cursor_fg);
+                        }
+                    }
+                    maybe_clip(pipeline, cursor_start, grid_clip, scale);
+                }
             }
         }
     }
@@ -2091,10 +2135,6 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 state.needs_render = true;
             }
 
-            // Periodic re-render for cursor blink (toggles every 500ms).
-            if state.last_render_time.elapsed().as_millis() >= 500 {
-                state.needs_render = true;
-            }
 
             // Update window title only when changed (avoids NSString alloc + ObjC call per tick).
             let new_title = A::title(&state.app);

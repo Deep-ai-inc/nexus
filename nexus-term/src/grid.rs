@@ -4,6 +4,16 @@ use std::cell::Cell as StdCell;
 
 use crate::cell::Cell;
 
+/// Terminal cursor shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorShape {
+    Block,
+    HollowBlock,
+    Beam,
+    Underline,
+    Hidden,
+}
+
 /// A terminal grid containing rows of cells.
 #[derive(Debug, Clone)]
 pub struct TerminalGrid {
@@ -19,6 +29,8 @@ pub struct TerminalGrid {
     cursor_row: u16,
     /// Whether cursor is visible.
     cursor_visible: bool,
+    /// Cursor shape.
+    cursor_shape: CursorShape,
     /// Cached content height (last non-empty row + 1).
     /// Uses Cell for interior mutability since this is computed lazily.
     content_rows_cache: StdCell<Option<u16>>,
@@ -35,6 +47,7 @@ impl TerminalGrid {
             cursor_col: 0,
             cursor_row: 0,
             cursor_visible: true,
+            cursor_shape: CursorShape::Block,
             content_rows_cache: StdCell::new(None),
         }
     }
@@ -176,6 +189,16 @@ impl TerminalGrid {
     /// Set cursor visibility.
     pub fn set_cursor_visible(&mut self, visible: bool) {
         self.cursor_visible = visible;
+    }
+
+    /// Get cursor shape.
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.cursor_shape
+    }
+
+    /// Set cursor shape.
+    pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.cursor_shape = shape;
     }
 
     /// Clear the entire grid.

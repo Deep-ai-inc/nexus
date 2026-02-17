@@ -235,8 +235,39 @@ fn build_terminal_content<'a>(
     content_rows: u16,
 ) -> Column<'a> {
     let source_id = ids::shell_term(block.id);
+    let cursor_info = if block.is_running() && grid.cursor_shape() != nexus_term::CursorShape::Hidden {
+        let (c, r) = grid.cursor();
+        if r < content_rows {
+            let cell = grid.get(c, r);
+            let (ch, fg, bg) = if let Some(cell) = cell {
+                let fg = term_color_to_strata(cell.fg).pack();
+                let bg = if matches!(cell.bg, nexus_term::Color::Default) {
+                    0u32
+                } else {
+                    term_color_to_strata(cell.bg).pack()
+                };
+                (cell.c, fg, bg)
+            } else {
+                (' ', Color::rgb(0.9, 0.9, 0.9).pack(), 0u32)
+            };
+            use strata::layout_snapshot::{GridCursor, GridCursorShape};
+            let shape = match grid.cursor_shape() {
+                nexus_term::CursorShape::Block => GridCursorShape::Block,
+                nexus_term::CursorShape::HollowBlock => GridCursorShape::HollowBlock,
+                nexus_term::CursorShape::Beam => GridCursorShape::Beam,
+                nexus_term::CursorShape::Underline => GridCursorShape::Underline,
+                nexus_term::CursorShape::Hidden => unreachable!(),
+            };
+            Some(GridCursor { col: c, row: r, shape, ch, fg, bg })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut term = TerminalElement::new(source_id, cols, content_rows)
-        .cell_size(8.4, 18.0);
+        .cell_size(8.4, 18.0)
+        .cursor(cursor_info);
 
     let default_fg_packed = Color::rgb(0.9, 0.9, 0.9).pack();
     let default_bg_packed: u32 = 0;

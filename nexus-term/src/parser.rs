@@ -151,9 +151,17 @@ impl TerminalParser {
             grid.set(col, row, cell);
         }
 
-        // Set cursor
+        // Set cursor position and shape.
         let cursor = term_content.cursor;
         grid.set_cursor(cursor.point.column.0 as u16, cursor.point.line.0 as u16);
+        let shape = match cursor.shape {
+            alacritty_terminal::vte::ansi::CursorShape::Block => crate::grid::CursorShape::Block,
+            alacritty_terminal::vte::ansi::CursorShape::HollowBlock => crate::grid::CursorShape::HollowBlock,
+            alacritty_terminal::vte::ansi::CursorShape::Beam => crate::grid::CursorShape::Beam,
+            alacritty_terminal::vte::ansi::CursorShape::Underline => crate::grid::CursorShape::Underline,
+            alacritty_terminal::vte::ansi::CursorShape::Hidden => crate::grid::CursorShape::Hidden,
+        };
+        grid.set_cursor_shape(shape);
 
         grid
     }
@@ -218,6 +226,17 @@ impl TerminalParser {
         let cursor_point = grid.cursor.point;
         let cursor_row = (cursor_point.line.0 + history_lines as i32) as u16;
         result.set_cursor(cursor_point.column.0 as u16, cursor_row.min(total_to_render.saturating_sub(1) as u16));
+
+        // Set cursor shape (considering visibility via renderable_content).
+        let cursor_shape = self.term.renderable_content().cursor.shape;
+        let shape = match cursor_shape {
+            alacritty_terminal::vte::ansi::CursorShape::Block => crate::grid::CursorShape::Block,
+            alacritty_terminal::vte::ansi::CursorShape::HollowBlock => crate::grid::CursorShape::HollowBlock,
+            alacritty_terminal::vte::ansi::CursorShape::Beam => crate::grid::CursorShape::Beam,
+            alacritty_terminal::vte::ansi::CursorShape::Underline => crate::grid::CursorShape::Underline,
+            alacritty_terminal::vte::ansi::CursorShape::Hidden => crate::grid::CursorShape::Hidden,
+        };
+        result.set_cursor_shape(shape);
 
         result
     }

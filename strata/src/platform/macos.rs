@@ -5,7 +5,7 @@
 //! - Quick Look preview using QLPreviewPanel with proper delegate
 //!
 //! Uses `[NSApp currentEvent]` and `[[NSApp mainWindow] contentView]` to
-//! initiate OS-level drags without needing Iced to expose its NSView/NSEvent.
+//! initiate OS-level drags via the native NSView/NSEvent API.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, Once, mpsc};
