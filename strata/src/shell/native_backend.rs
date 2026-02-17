@@ -710,6 +710,8 @@ fn register_strata_view_class() -> &'static AnyClass {
                 Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(right_mouse_dragged)), c"v@:@");
             add_method_raw(cls_ptr, sel!(scrollWheel:),
                 Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(scroll_wheel)), c"v@:@");
+            add_method_raw(cls_ptr, sel!(performKeyEquivalent:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject) -> Bool, unsafe extern "C" fn()>(perform_key_equivalent)), c"B@:@");
             add_method_raw(cls_ptr, sel!(keyDown:),
                 Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(key_down)), c"v@:@");
             add_method_raw(cls_ptr, sel!(keyUp:),
@@ -884,6 +886,30 @@ extern "C" fn mouse_entered(this: &AnyObject, _sel: Sel, _event: *mut AnyObject)
 
 extern "C" fn mouse_exited(this: &AnyObject, _sel: Sel, _event: *mut AnyObject) {
     dispatch_mouse(this, MouseEvent::CursorLeft);
+}
+
+/// Handle Cmd+key shortcuts that macOS intercepts before `keyDown:`.
+/// Cmd+. is the standard "Cancel" shortcut — AppKit eats it in the
+/// responder chain so it never reaches `keyDown:`.  We claim it here
+/// and return YES to prevent AppKit from consuming it.
+extern "C" fn perform_key_equivalent(this: &AnyObject, _sel: Sel, event: *mut AnyObject) -> Bool {
+    let event = unsafe { event_ref(event) };
+    let flags = unsafe { event.modifierFlags() };
+    if flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand) {
+        let chars = unsafe { event.charactersIgnoringModifiers() };
+        if let Some(s) = chars {
+            let s = s.to_string();
+            // Only intercept keys that AppKit would eat before keyDown:.
+            // Most Cmd+key combos reach keyDown: fine; Cmd+. does not.
+            if s == "." {
+                if let Some(ke) = convert_ns_key_event(event, true) {
+                    dispatch_key(this, ke);
+                    return Bool::YES;
+                }
+            }
+        }
+    }
+    Bool::NO
 }
 
 extern "C" fn key_down(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
