@@ -31,6 +31,7 @@ pub struct NexusInputBar<'a> {
     pub last_exit_code: Option<i32>,
     pub cursor_visible: bool,
     pub line_count: usize,
+    pub zoom: f32,
 }
 
 impl<'a> Widget<'a> for NexusInputBar<'a> {
@@ -56,11 +57,15 @@ impl<'a> Widget<'a> for NexusInputBar<'a> {
             Some(_) => Color::rgb(0.863, 0.196, 0.196),        // bright red
         };
 
+        // Corner radius in physical pixels so it stays constant across zoom
+        // levels and concentric with the macOS window corner radius.
+        let cr = 8.0 / self.zoom;
+
         Row::new()
             .padding_custom(Padding::new(4.0, 6.0, 4.0, 6.0))
             .spacing(6.0)
             .background(theme::BG_INPUT)
-            .corner_radius(6.0)
+            .corner_radius(cr)
             .border(theme::BORDER_INPUT, 1.0)
             .width(Length::Fill)
             .cross_align(CrossAxisAlignment::Center)
