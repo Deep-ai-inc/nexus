@@ -453,11 +453,8 @@ Subscribe to external event streams:
 
 ```rust
 fn subscription(state: &Self::State) -> Subscription<Self::Message> {
-    // Timer subscription via iced
-    Subscription::from_iced(
-        iced::time::every(Duration::from_secs(1))
-            .map(|_| Message::Tick)
-    )
+    // Subscribe to a tokio broadcast channel
+    Subscription::channel(my_receiver, |msg| Message::Event(msg))
 }
 ```
 

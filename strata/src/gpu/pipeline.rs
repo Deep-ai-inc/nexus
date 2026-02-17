@@ -455,7 +455,7 @@ impl StrataPipeline {
         color_attach.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
         color_attach.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
         color_attach.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        // Alpha blend uses One (not SourceAlpha) to match wgpu's ALPHA_BLENDING.
+        // Alpha blend uses One (not SourceAlpha) for correct compositing.
         // With SourceAlpha the output alpha becomes α² + dst*(1-α), dropping below
         // 1.0 at anti-aliased glyph edges and making the window semi-transparent.
         color_attach.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);

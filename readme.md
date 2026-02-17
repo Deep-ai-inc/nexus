@@ -78,7 +78,7 @@ The difference is invisible until you need it:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  PRESENTATION                                                   │
-│  strata            Custom GPU rendering engine (Iced, WGPU)   │
+│  strata            Custom GPU rendering engine (Metal)          │
 │    GPU pipeline, glyph atlas, text engine (cosmic-text)       │
 │                                                                 │
 │  nexus-ui          Nexus shell frontend (depends on strata)    │
@@ -127,7 +127,7 @@ Data flow:
 
 **Native commands** (ls, git, ps, etc.) return structured `Value` types.
 **Legacy commands** (vim, htop, etc.) run in a PTY with full terminal emulation.
-**The UI** renders both seamlessly through Strata, a custom GPU rendering engine built on Iced with its own pipeline, glyph atlas, and text shaping via cosmic-text.
+**The UI** renders both seamlessly through Strata, a custom GPU rendering engine with its own Metal pipeline, glyph atlas, and text shaping via cosmic-text.
 
 ## Status
 
@@ -215,7 +215,7 @@ cargo llvm-cov --lcov --output-path lcov.info
 
 ### Strata Demo
 
-**Strata** is its own workspace crate — a custom GPU rendering engine with its own pipeline and text shaping, built on Iced's windowing infrastructure. To run its demo:
+**Strata** is its own workspace crate — a custom GPU rendering engine with its own Metal pipeline, text shaping, and native macOS windowing. To run its demo:
 
 ```bash
 cargo run -p nexus-ui -- --demo

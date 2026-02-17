@@ -95,7 +95,7 @@ Text editor-style input with proper cursor movement, selections, and multi-line 
 
 **Solution:** Native GUI with proper text shaping (using system text layout engine). Character widths calculated correctly using Unicode width properties.
 
-**Status:** ⚠️ Partial. Iced handles basic text well. Need to verify emoji and CJK rendering in tables.
+**Status:** ⚠️ Partial. Strata handles basic text well. Need to verify emoji and CJK rendering in tables.
 
 **Implementation:**
 - [ ] Test emoji rendering in output
@@ -418,7 +418,7 @@ Cmd+Shift+V opens a searchable clipboard history. Entries from structured copies
 **Status:** 🔨 Planned.
 
 **Implementation:**
-- [ ] Verify Iced accessibility support
+- [ ] Verify Strata accessibility support
 - [ ] Proper ARIA-like roles for custom widgets
 - [ ] Tables announced correctly
 - [ ] Screen reader testing
