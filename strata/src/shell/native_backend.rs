@@ -826,6 +826,22 @@ fn event_position(event: &NSEvent, view: &AnyObject) -> Point {
     }
 }
 
+/// Scale a MouseEvent's position from physical to logical coordinates.
+fn scale_mouse_event(event: MouseEvent, zoom: f32) -> MouseEvent {
+    let scale = |p: Point| Point::new(p.x / zoom, p.y / zoom);
+    match event {
+        MouseEvent::ButtonPressed { button, position } =>
+            MouseEvent::ButtonPressed { button, position: scale(position) },
+        MouseEvent::ButtonReleased { button, position } =>
+            MouseEvent::ButtonReleased { button, position: scale(position) },
+        MouseEvent::CursorMoved { position } =>
+            MouseEvent::CursorMoved { position: scale(position) },
+        MouseEvent::WheelScrolled { delta, position } =>
+            MouseEvent::WheelScrolled { delta, position: scale(position) },
+        other => other,
+    }
+}
+
 /// Cast raw event pointer to &NSEvent reference (safe for ObjC callback args).
 unsafe fn event_ref(raw: *mut AnyObject) -> &'static NSEvent {
     unsafe { &*(raw as *const NSEvent) }
@@ -1108,7 +1124,15 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
             return;
         }
 
-        let response = A::on_mouse(&state.app, strata_event, hit, &state.capture);
+        // Convert event positions from physical to logical coordinates.
+        // Layout and hit-testing operate in logical space; without this,
+        // scrollbar drag and widget interactions are offset when zoom != 1.0.
+        let logical_event = if zoom != 1.0 {
+            scale_mouse_event(strata_event, zoom)
+        } else {
+            strata_event
+        };
+        let response = A::on_mouse(&state.app, logical_event, hit, &state.capture);
 
         match response.capture {
             CaptureRequest::Capture(source) => state.capture = CaptureState::Captured(source),
