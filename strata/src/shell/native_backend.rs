@@ -110,7 +110,8 @@ struct WindowState<A: StrataApp> {
     window: *mut AnyObject, // Weak back-pointer to NSWindow (prevent retain cycle)
     current_title: String, // Cached to avoid NSString allocation + ObjC call every tick
     current_cursor: CursorIcon, // Cached to avoid redundant NSCursor calls
-    last_tick_time: Instant, // Rate-limit on_tick to ~60fps
+    last_tick_time: Instant, // Rate-limit on_tick to display refresh rate
+    tick_interval_ms: u64,   // Display refresh interval (e.g. 8 for 120Hz, 16 for 60Hz)
     pending_window_resize: Option<(f32, f32)>, // Deferred setContentSize (avoid reentrant borrow)
     poll_timer: *mut c_void, // CFRunLoopTimerRef for main-thread polling (invalidated on close)
     transactional_present: bool, // When true, render_if_needed uses presentsWithTransaction
@@ -445,6 +446,13 @@ fn open_new_window_with_state<A: StrataApp>(
         current_title: String::new(),
         current_cursor: CursorIcon::Arrow,
         last_tick_time: Instant::now(),
+        tick_interval_ms: {
+            let screen: *mut AnyObject = unsafe { msg_send![&*window, screen] };
+            let max_fps: isize = if !screen.is_null() {
+                unsafe { msg_send![screen, maximumFramesPerSecond] }
+            } else { 0 };
+            if max_fps > 0 { (1000 / max_fps) as u64 } else { 16 }
+        },
         pending_window_resize: None,
         poll_timer: std::ptr::null_mut(),
         transactional_present: false,
@@ -2183,10 +2191,10 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 }
             }
 
-            // Call on_tick at ~60fps for periodic effects (auto-scroll, etc.).
-            // Only flag a render when on_tick reports state actually changed —
-            // avoids a full scene build + GPU pass every 16ms when idle.
-            if state.last_tick_time.elapsed().as_millis() >= 16 {
+            // Call on_tick at the display's refresh rate for periodic effects
+            // (spring animation, auto-scroll, output polling). Only flag a
+            // render when on_tick reports state actually changed.
+            if state.last_tick_time.elapsed().as_millis() >= state.tick_interval_ms as u128 {
                 state.last_tick_time = Instant::now();
                 if A::on_tick(&mut state.app) {
                     state.needs_render = true;

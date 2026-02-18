@@ -108,9 +108,11 @@ pub struct NexusState {
     pub drop_highlight: Option<message::DropZone>,
     pub(crate) drag: crate::features::selection::drag::DragState,
 
-    // --- FPS tracking (Cell for interior mutability in view()) ---
+    // --- Render tracking ---
     last_frame: Cell<Instant>,
     fps_smooth: Cell<f32>,
+    /// Cached cursor blink state — on_tick only re-renders when it transitions.
+    last_cursor_blink: bool,
     pub context: NexusContext,
 
     /// Debug mode for layout visualization (toggle with Cmd+Shift+D).
@@ -360,7 +362,13 @@ impl Component for NexusState {
         let auto_scrolling = self.drag.auto_scroll.get().is_some();
         self.on_output_arrived();
         let spring_animating = self.scroll.tick_overscroll();
-        output_dirty || spring_animating || auto_scrolling
+
+        // Cursor blink: only re-render on the 500ms transition, not every tick.
+        let cursor_now = self.cursor_visible();
+        let cursor_changed = cursor_now != self.last_cursor_blink;
+        self.last_cursor_blink = cursor_now;
+
+        output_dirty || spring_animating || auto_scrolling || cursor_changed
     }
 
     fn selection(&self) -> Option<&strata::Selection> {
@@ -509,6 +517,7 @@ impl RootComponent for NexusState {
             drag: crate::features::selection::drag::DragState::new(),
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
+            last_cursor_blink: true,
             context,
             #[cfg(debug_assertions)]
             debug_layout: false,

@@ -260,7 +260,10 @@ impl ScrollState {
                 self.gesture_active = true;
                 if self.animating {
                     // Bounce spring is already running — momentum has been
-                    // absorbed. Ignore further deltas; the spring handles it.
+                    // absorbed. Advance the spring to the current time so this
+                    // render shows the correct position (analytical evaluation
+                    // is idempotent — calling it at any frequency is fine).
+                    self.tick_spring_back();
                     return;
                 }
 

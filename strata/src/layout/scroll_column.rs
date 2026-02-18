@@ -498,15 +498,17 @@ impl<'a> ScrollColumn<'a> {
         // Clamp scroll offset and record max for app-side clamping
         let max_scroll = (total_content_height - viewport_h).max(0.0);
         ctx.snapshot.set_scroll_limit(self.id, max_scroll);
-        // Allow unclamped offset for overscroll visual displacement;
-        // scrollbar thumb uses the clamped value.
-        let offset = self.scroll_offset;
-        let clamped_offset = offset.clamp(0.0, max_scroll);
+        let clamped_offset = self.scroll_offset.clamp(0.0, max_scroll);
+        // Overscroll displacement comes from ScrollState directly, not
+        // from the offset value (which can be a f32::MAX sentinel for
+        // "snap to bottom"). This keeps viewport positioning correct
+        // while allowing the rubber-band visual shift.
+        let overscroll = self.state_ref.map(|s| s.overscroll).unwrap_or(0.0);
+        let viewport_top = clamped_offset + overscroll;
 
         // Position pass with virtualization
         let mut virtual_y = self.padding.top;
-        let viewport_top = offset;
-        let viewport_bottom = offset + viewport_h;
+        let viewport_bottom = viewport_top + viewport_h;
 
         for (i, child) in self.children.into_iter().enumerate() {
             let h = child_heights[i];
@@ -515,7 +517,7 @@ impl<'a> ScrollColumn<'a> {
 
             // Only render children that intersect the viewport
             if child_bottom > viewport_top && child_top < viewport_bottom {
-                let screen_y = bounds.y + child_top - offset;
+                let screen_y = bounds.y + child_top - viewport_top;
 
                 // Skip spacers (no rendering needed)
                 match &child {
