@@ -155,7 +155,11 @@ fn debounced_content_rows(block: &Block, grid: &nexus_term::TerminalGrid) -> u16
             block.peak_content_rows.store(content_rows, std::sync::atomic::Ordering::Relaxed);
             content_rows
         } else if content_rows < peak / 2 {
-            peak
+            // Cap at grid's actual row count — the PTY app may have cleared
+            // scrollback, shrinking the grid below the old peak.
+            let capped = peak.min(grid.rows());
+            block.peak_content_rows.store(capped, std::sync::atomic::Ordering::Relaxed);
+            capped
         } else {
             block.peak_content_rows.store(content_rows, std::sync::atomic::Ordering::Relaxed);
             content_rows
