@@ -1151,16 +1151,18 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
         }
 
         // Update system cursor based on hover target.
+        // Always call set_cursor — AppKit resets the cursor via cursor-rect
+        // evaluation (on frame changes, focus changes, etc.) which can silently
+        // undo our [NSCursor set] between events. Without re-asserting every
+        // move, the dedup would see "same icon" and skip, leaving the arrow.
         if let Some(snapshot) = &state.cached_snapshot {
             let icon = if let Some(source) = state.capture.captured_by() {
                 snapshot.cursor_for_capture(source)
             } else {
                 adjusted_cursor.map(|p| snapshot.cursor_at(p)).unwrap_or_default()
             };
-            if icon != state.current_cursor {
-                state.current_cursor = icon;
-                crate::platform::set_cursor(icon);
-            }
+            state.current_cursor = icon;
+            crate::platform::set_cursor(icon);
         }
     }
     flush_pending_resize::<A>(state_cell);
@@ -2247,6 +2249,7 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             render_if_needed::<A>(&mut state);
 
             // Update cursor after render (widgets may have shifted under cursor).
+            // Always re-assert — AppKit can reset cursor between timer ticks.
             if let (Some(pos), Some(snapshot)) = (state.cursor_position, state.cached_snapshot.as_ref()) {
                 let zoom = state.current_zoom;
                 let adjusted = Point::new(pos.x / zoom, pos.y / zoom);
@@ -2255,10 +2258,8 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 } else {
                     snapshot.cursor_at(adjusted)
                 };
-                if icon != state.current_cursor {
-                    state.current_cursor = icon;
-                    crate::platform::set_cursor(icon);
-                }
+                state.current_cursor = icon;
+                crate::platform::set_cursor(icon);
             }
         });
     }
