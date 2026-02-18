@@ -872,7 +872,36 @@ extern "C" fn scroll_wheel(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
     let has_precise: Bool = unsafe { msg_send![event, hasPreciseScrollingDeltas] };
 
     let delta = if has_precise.as_bool() {
-        ScrollDelta::Pixels { x: dx as f32, y: dy as f32 }
+        // Read NSEvent phase and momentumPhase as raw bitmasks.
+        // NSEventPhase: Began=1, Changed=2, Stationary=4, Ended=8, Cancelled=16, MayBegin=32
+        let phase_raw: usize = unsafe { msg_send![event, phase] };
+        let momentum_raw: usize = unsafe { msg_send![event, momentumPhase] };
+
+        // When a new finger touch interrupts ongoing momentum, macOS sends
+        // momentumPhase=Ended AND phase=Began/Changed on the same event.
+        // Detect this overlap first so we don't lose the new gesture start.
+        let phase = if (momentum_raw == 8 || momentum_raw == 16)
+            && (phase_raw == 1 || phase_raw == 2)
+        {
+            // New gesture interrupting momentum — treat as Contact
+            Some(crate::event_context::ScrollPhase::Contact)
+        } else if momentum_raw == 8 || momentum_raw == 16 {
+            // Momentum ended or cancelled
+            Some(crate::event_context::ScrollPhase::Ended)
+        } else if momentum_raw != 0 {
+            // Momentum began or changed
+            Some(crate::event_context::ScrollPhase::Momentum)
+        } else if phase_raw == 8 || phase_raw == 16 {
+            // Gesture ended or cancelled, no momentum follows
+            Some(crate::event_context::ScrollPhase::Ended)
+        } else if phase_raw != 0 {
+            // Finger on trackpad (began or changed)
+            Some(crate::event_context::ScrollPhase::Contact)
+        } else {
+            None
+        };
+
+        ScrollDelta::Pixels { x: dx as f32, y: dy as f32, phase }
     } else {
         ScrollDelta::Lines { x: dx as f32, y: dy as f32 }
     };

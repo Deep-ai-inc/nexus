@@ -357,6 +357,7 @@ impl Component for NexusState {
 
     fn on_tick(&mut self) -> strata::Command<NexusMessage> {
         self.on_output_arrived();
+        self.scroll.tick_overscroll();
         strata::Command::none()
     }
 

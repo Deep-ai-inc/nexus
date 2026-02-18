@@ -4,21 +4,27 @@
 //! Eliminates duplicated scroll logic when apps have multiple scroll panels.
 
 use std::cell::Cell;
+use std::time::Instant;
 
 use crate::app::MouseResponse;
 use crate::content_address::SourceId;
-use crate::event_context::{CaptureState, MouseButton, MouseEvent, ScrollDelta};
+use crate::event_context::{CaptureState, MouseButton, MouseEvent, ScrollDelta, ScrollPhase};
 use crate::layout_snapshot::{HitResult, LayoutSnapshot, ScrollTrackInfo};
 use crate::primitives::{Point, Rect};
 
 /// Grab tolerance for scrollbar thumb clicks (absorbs float rounding).
 const GRAB_TOLERANCE: f32 = 4.0;
 
+/// Maximum visual overscroll displacement in pixels.
+/// Overscroll asymptotically approaches this limit and never exceeds it.
+const MAX_OVERSCROLL: f32 = 100.0;
+
 /// An action on a scroll container, produced by event handling.
 #[derive(Debug, Clone)]
 pub enum ScrollAction {
     /// Scroll by a delta (positive = scroll content up / towards start).
-    ScrollBy(f32),
+    /// `phase` carries trackpad gesture phase for overscroll/momentum.
+    ScrollBy { delta: f32, phase: Option<ScrollPhase> },
     /// Start dragging the scrollbar thumb at this mouse Y.
     DragStart(f32),
     /// Continue dragging the scrollbar thumb to this mouse Y.
@@ -54,6 +60,20 @@ pub struct ScrollState {
     id: SourceId,
     /// The SourceId for the scrollbar thumb widget.
     thumb_id: SourceId,
+
+    // --- Overscroll / rubber-band state ---
+    /// Displacement beyond scroll bounds (neg = past top, pos = past bottom).
+    pub overscroll: f32,
+    /// True during Contact or Momentum phases.
+    gesture_active: bool,
+    /// True while the spring-back animation is running.
+    pub animating: bool,
+    /// Start time of the current spring animation.
+    spring_start: Instant,
+    /// Initial overscroll when the spring started (C1 in analytical solution).
+    spring_x0: f32,
+    /// Initial velocity when the spring started (used to compute C2).
+    spring_v0: f32,
 }
 
 impl ScrollState {
@@ -67,6 +87,12 @@ impl ScrollState {
             bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
             id: SourceId::new(),
             thumb_id: SourceId::new(),
+            overscroll: 0.0,
+            gesture_active: false,
+            animating: false,
+            spring_start: Instant::now(),
+            spring_x0: 0.0,
+            spring_v0: 0.0,
         }
     }
 
@@ -80,6 +106,12 @@ impl ScrollState {
             bounds: Cell::new(Rect::new(0.0, 0.0, 0.0, 0.0)),
             id,
             thumb_id,
+            overscroll: 0.0,
+            gesture_active: false,
+            animating: false,
+            spring_start: Instant::now(),
+            spring_x0: 0.0,
+            spring_v0: 0.0,
         }
     }
 
@@ -100,7 +132,13 @@ impl ScrollState {
     /// Apply a scroll action (call from update()).
     pub fn apply(&mut self, action: ScrollAction) {
         match action {
-            ScrollAction::ScrollBy(delta) => self.scroll_by(delta),
+            ScrollAction::ScrollBy { delta, phase } => {
+                if phase.is_some() {
+                    self.scroll_with_phase(delta, phase);
+                } else {
+                    self.scroll_by(delta);
+                }
+            }
             ScrollAction::DragStart(mouse_y) => self.start_drag(mouse_y),
             ScrollAction::DragMove(mouse_y) => self.drag_to(mouse_y),
             ScrollAction::DragEnd => self.end_drag(),
@@ -145,6 +183,188 @@ impl ScrollState {
     /// End the thumb drag.
     pub fn end_drag(&mut self) {
         self.grab_offset = 0.0;
+    }
+
+    // =====================================================================
+    // Overscroll / rubber-band
+    // =====================================================================
+
+    /// Effective scroll offset including overscroll displacement.
+    /// Use this for layout positioning instead of `offset` directly.
+    pub fn effective_offset(&self) -> f32 {
+        self.offset + self.overscroll
+    }
+
+    /// Reset overscroll state (call when snapping to bottom, clearing, etc.)
+    pub fn reset_overscroll(&mut self) {
+        self.overscroll = 0.0;
+        self.gesture_active = false;
+        self.animating = false;
+        self.spring_x0 = 0.0;
+        self.spring_v0 = 0.0;
+    }
+
+    /// Phase-aware scroll: allows overscroll with rubber-band resistance
+    /// at boundaries during trackpad/momentum gestures.
+    ///
+    /// Contact (finger): incremental rubber-band with 1:1 pull-back.
+    /// Momentum: on boundary impact, starts a spring-bounce immediately
+    /// with the impact velocity. All further momentum deltas are ignored —
+    /// the spring handles the animation. No more "pinning" at max overscroll.
+    fn scroll_with_phase(&mut self, delta: f32, phase: Option<ScrollPhase>) {
+        let max = self.max.get();
+
+        match phase {
+            Some(ScrollPhase::Contact) => {
+                self.gesture_active = true;
+                self.animating = false; // Kill momentum/bounce on touch
+
+                // Snap small overscroll to zero on finger touch — prevents
+                // entering overscroll interaction mode for residual amounts
+                // left by momentum grazing the boundary or spring settling.
+                if self.overscroll.abs() < 15.0 && self.overscroll != 0.0 {
+                    self.overscroll = 0.0;
+                }
+
+                if self.overscroll != 0.0 {
+                    // Finger is down while overscrolled (caught mid-bounce or
+                    // dragging past edge). Give 1:1 control when pulling back
+                    // toward bounds, resistance only when stretching further.
+                    let pulling_back = (self.overscroll > 0.0 && delta > 0.0)
+                        || (self.overscroll < 0.0 && delta < 0.0);
+
+                    if pulling_back {
+                        self.overscroll -= delta;
+                        // If we crossed zero, put the remainder into normal scroll
+                        if (self.overscroll > 0.0) != (delta < 0.0) {
+                            // sign didn't flip — still overscrolled, done
+                        } else {
+                            // Crossed zero: leftover goes into normal offset
+                            let leftover = self.overscroll;
+                            self.overscroll = 0.0;
+                            self.offset = (self.offset + leftover).clamp(0.0, max);
+                        }
+                    } else {
+                        // Stretching further: factor=1.0 (no boundary discontinuity)
+                        self.overscroll -= apply_resistance(delta, self.overscroll, 1.0);
+                    }
+                } else {
+                    self.apply_contact_scroll(delta, max);
+                }
+            }
+            Some(ScrollPhase::Momentum) => {
+                // Must set gesture_active BEFORE the animating check — otherwise
+                // momentum events that return early never set it, and the spring
+                // settle code sees gesture_active=false and clears animating,
+                // letting the next momentum event trigger a second bounce.
+                self.gesture_active = true;
+                if self.animating {
+                    // Bounce spring is already running — momentum has been
+                    // absorbed. Ignore further deltas; the spring handles it.
+                    return;
+                }
+
+                // Normal in-bounds scrolling until we hit a boundary
+                let new_offset = self.offset - delta;
+                if new_offset < 0.0 {
+                    // Hit top boundary — start spring bounce
+                    self.offset = 0.0;
+                    let excess = -new_offset;
+                    self.overscroll = -(excess.min(MAX_OVERSCROLL));
+                    self.start_spring(self.overscroll, (-delta * 20.0).clamp(-3000.0, 3000.0));
+                } else if new_offset > max {
+                    // Hit bottom boundary — start spring bounce
+                    self.offset = max;
+                    let excess = new_offset - max;
+                    self.overscroll = excess.min(MAX_OVERSCROLL);
+                    self.start_spring(self.overscroll, (-delta * 20.0).clamp(-3000.0, 3000.0));
+                } else {
+                    self.offset = new_offset;
+                }
+            }
+            Some(ScrollPhase::Ended) => {
+                // Apply final delta if significant (Ended can carry movement)
+                if delta.abs() > 0.1 && !self.animating {
+                    self.offset = (self.offset - delta).clamp(0.0, max);
+                }
+
+                self.gesture_active = false;
+                if self.overscroll.abs() > 0.5 {
+                    if !self.animating {
+                        // Finger released while overscrolled — start spring from rest
+                        self.start_spring(self.overscroll, 0.0);
+                    }
+                    // If already animating (momentum bounce), let it continue
+                } else {
+                    self.overscroll = 0.0;
+                    self.animating = false;
+                }
+            }
+            None => {
+                // No phase info — hard clamp (mouse wheel, keyboard)
+                self.scroll_by(delta);
+            }
+        }
+    }
+
+    /// Contact (finger) scroll with boundary-to-overscroll transition.
+    /// Uses factor=1.0 so there's no velocity discontinuity at the boundary.
+    fn apply_contact_scroll(&mut self, delta: f32, max: f32) {
+        let new_offset = self.offset - delta;
+        if new_offset < 0.0 {
+            self.offset = 0.0;
+            let excess = -new_offset;
+            self.overscroll -= apply_resistance(excess, self.overscroll, 1.0);
+        } else if new_offset > max {
+            self.offset = max;
+            let excess = new_offset - max;
+            self.overscroll += apply_resistance(excess, self.overscroll, 1.0);
+        } else {
+            self.offset = new_offset;
+        }
+    }
+
+    /// Start a spring-back animation from the given initial conditions.
+    fn start_spring(&mut self, x0: f32, v0: f32) {
+        self.spring_x0 = x0;
+        self.spring_v0 = v0;
+        self.spring_start = Instant::now();
+        self.animating = true;
+    }
+
+    /// Advance the spring-back animation by one tick.
+    /// Returns `true` if the animation is still running and needs another tick.
+    ///
+    /// Uses the **analytical** critically-damped solution instead of numerical
+    /// integration. This guarantees zero oscillation — the position is computed
+    /// exactly from `(C1 + C2*t) * e^(-γt)`, which mathematically never
+    /// crosses zero when the initial conditions have the same sign.
+    pub fn tick_spring_back(&mut self) -> bool {
+        if !self.animating {
+            return false;
+        }
+
+        // Critically damped: γ = friction/(2*mass) = 40/2 = 20
+        // x(t) = (C1 + C2*t) * e^(-γt)
+        // where C1 = x0, C2 = v0 + γ*x0
+        let gamma = 20.0_f32;
+        let t = self.spring_start.elapsed().as_secs_f32();
+        let c1 = self.spring_x0;
+        let c2 = self.spring_v0 + gamma * self.spring_x0;
+
+        self.overscroll = (c1 + c2 * t) * (-gamma * t).exp();
+
+        if self.overscroll.abs() < 0.5 {
+            self.overscroll = 0.0;
+            // Only clear animating if the gesture is done. Keeping it true
+            // during an active gesture prevents remaining momentum events
+            // from re-triggering a new bounce.
+            if !self.gesture_active {
+                self.animating = false;
+            }
+            return false;
+        }
+        true
     }
 
     // =====================================================================
@@ -210,11 +430,11 @@ impl ScrollState {
             }
             MouseEvent::WheelScrolled { delta, position } => {
                 if self.contains(*position) {
-                    let dy = match delta {
-                        ScrollDelta::Lines { y, .. } => y * 40.0,
-                        ScrollDelta::Pixels { y, .. } => *y,
+                    let (dy, phase) = match delta {
+                        ScrollDelta::Lines { y, .. } => (y * 40.0, None),
+                        ScrollDelta::Pixels { y, phase, .. } => (*y, *phase),
                     };
-                    return Some(MouseResponse::message(ScrollAction::ScrollBy(dy)));
+                    return Some(MouseResponse::message(ScrollAction::ScrollBy { delta: dy, phase }));
                 }
                 None
             }
@@ -246,6 +466,22 @@ impl ScrollState {
     pub fn contains(&self, point: Point) -> bool {
         self.bounds.get().contains_xy(point.x, point.y)
     }
+}
+
+/// Rubber-band resistance capped at MAX_OVERSCROLL.
+///
+/// `factor` controls the initial coefficient at the boundary:
+///   - 1.0 for finger (seamless transition, no velocity discontinuity)
+///   - 0.4 for momentum (inertia dies quickly at the edge)
+///
+/// Uses quadratic decay: `factor * (1 - (|os|/MAX_OVERSCROLL)²)`.
+/// Starts at `factor` when overscroll=0, decays to 0 at MAX_OVERSCROLL.
+/// This provides a natural hard cap without a jarring stop.
+fn apply_resistance(delta: f32, current_overscroll: f32, factor: f32) -> f32 {
+    let abs_os = current_overscroll.abs();
+    let ratio = (abs_os / MAX_OVERSCROLL).min(1.0);
+    let coeff = factor * (1.0 - ratio * ratio);
+    delta * coeff
 }
 
 impl Default for ScrollState {
@@ -307,7 +543,7 @@ mod tests {
     fn apply_scroll_by() {
         let mut state = ScrollState::new();
         state.max.set(100.0);
-        state.apply(ScrollAction::ScrollBy(-30.0));
+        state.apply(ScrollAction::ScrollBy { delta: -30.0, phase: None });
         assert_eq!(state.offset, 30.0);
     }
 
@@ -332,7 +568,7 @@ mod tests {
     fn scroll_action_debug() {
         // Ensure ScrollAction variants can be debug printed
         let actions = [
-            ScrollAction::ScrollBy(10.0),
+            ScrollAction::ScrollBy { delta: 10.0, phase: None },
             ScrollAction::DragStart(50.0),
             ScrollAction::DragMove(60.0),
             ScrollAction::DragEnd,

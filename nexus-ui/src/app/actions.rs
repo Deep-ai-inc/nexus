@@ -44,7 +44,7 @@ impl NexusState {
 
         // Auto-scroll during active drag/selection
         if let Some(delta) = self.drag.auto_scroll.get() {
-            self.scroll.apply_user_scroll(strata::ScrollAction::ScrollBy(-delta));
+            self.scroll.apply_user_scroll(strata::ScrollAction::ScrollBy { delta: -delta, phase: None });
         }
     }
 

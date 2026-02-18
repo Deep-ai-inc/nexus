@@ -856,16 +856,16 @@ impl StrataApp for DemoApp {
                 (Key::Character(c), true) if c == "c" => return Some(DemoMessage::Copy),
                 (Key::Named(NamedKey::Escape), _) => return Some(DemoMessage::ClearSelection),
                 (Key::Named(NamedKey::ArrowUp), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(60.0)));
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy { delta: 60.0, phase: None }));
                 }
                 (Key::Named(NamedKey::ArrowDown), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(-60.0)));
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy { delta: -60.0, phase: None }));
                 }
                 (Key::Named(NamedKey::PageUp), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(300.0)));
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy { delta: 300.0, phase: None }));
                 }
                 (Key::Named(NamedKey::PageDown), _) => {
-                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy(-300.0)));
+                    return Some(DemoMessage::LeftScroll(ScrollAction::ScrollBy { delta: -300.0, phase: None }));
                 }
                 _ => {}
             }

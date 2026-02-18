@@ -139,7 +139,7 @@ impl<'a> ScrollColumn<'a> {
             id: state.id(),
             thumb_id: state.thumb_id(),
             children: Vec::new(),
-            scroll_offset: state.offset,
+            scroll_offset: state.effective_offset(),
             spacing: 0.0,
             padding: Padding::default(),
             background: None,
@@ -498,7 +498,10 @@ impl<'a> ScrollColumn<'a> {
         // Clamp scroll offset and record max for app-side clamping
         let max_scroll = (total_content_height - viewport_h).max(0.0);
         ctx.snapshot.set_scroll_limit(self.id, max_scroll);
-        let offset = self.scroll_offset.clamp(0.0, max_scroll);
+        // Allow unclamped offset for overscroll visual displacement;
+        // scrollbar thumb uses the clamped value.
+        let offset = self.scroll_offset;
+        let clamped_offset = offset.clamp(0.0, max_scroll);
 
         // Position pass with virtualization
         let mut virtual_y = self.padding.top;
@@ -538,7 +541,7 @@ impl<'a> ScrollColumn<'a> {
         // Draw scrollbar thumb if content overflows
         if total_content_height > viewport_h {
             let thumb_h = ((viewport_h / total_content_height) * viewport_h).max(20.0);
-            let scroll_pct = if max_scroll > 0.0 { offset / max_scroll } else { 0.0 };
+            let scroll_pct = if max_scroll > 0.0 { clamped_offset / max_scroll } else { 0.0 };
             let scroll_available = viewport_h - thumb_h;
             let thumb_y = bounds.y + scroll_pct * scroll_available;
             let thumb_visual = Rect::new(bounds.x + bounds.width - 8.0, thumb_y, 6.0, thumb_h);

@@ -48,6 +48,7 @@ impl ScrollModel {
     /// so the layout engine clamps to the true new bottom.
     pub fn snap_to_bottom(&mut self) {
         self.target = ScrollTarget::Bottom;
+        self.state.reset_overscroll();
     }
 
     /// Navigate to a specific block. Sets target to Block(id).
@@ -60,6 +61,7 @@ impl ScrollModel {
     pub fn reset(&mut self) {
         self.state.offset = 0.0;
         self.target = ScrollTarget::Bottom;
+        self.state.reset_overscroll();
     }
 
     /// Apply a user scroll action (wheel, scrollbar drag, etc.).
@@ -82,6 +84,11 @@ impl ScrollModel {
             // arriving doesn't yank the viewport away from the target.
             self.target = ScrollTarget::None;
         }
+    }
+
+    /// Advance the spring-back animation. Returns true if still animating.
+    pub fn tick_overscroll(&mut self) -> bool {
+        self.state.tick_spring_back()
     }
 
     pub fn sync_from_snapshot(&self, snapshot: &mut LayoutSnapshot) {
@@ -154,7 +161,7 @@ mod tests {
         model.target = ScrollTarget::Bottom;
         model.state.max.set(1000.0);
 
-        model.apply_user_scroll(ScrollAction::ScrollBy(100.0));
+        model.apply_user_scroll(ScrollAction::ScrollBy { delta: 100.0, phase: None });
 
         // Should break the bottom lock
         assert_eq!(model.target, ScrollTarget::None);
@@ -167,7 +174,7 @@ mod tests {
         model.state.offset = 500.0;
         model.state.max.set(1000.0);
 
-        model.apply_user_scroll(ScrollAction::ScrollBy(-100.0));
+        model.apply_user_scroll(ScrollAction::ScrollBy { delta: -100.0, phase: None });
 
         // Target should remain None
         assert_eq!(model.target, ScrollTarget::None);

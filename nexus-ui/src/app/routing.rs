@@ -295,10 +295,10 @@ fn route_block_navigation(
 fn route_global_fallback(key: &Key) -> Option<NexusMessage> {
     match key {
         Key::Named(NamedKey::PageUp) => {
-            Some(NexusMessage::Scroll(ScrollAction::ScrollBy(300.0)))
+            Some(NexusMessage::Scroll(ScrollAction::ScrollBy { delta: 300.0, phase: None }))
         }
         Key::Named(NamedKey::PageDown) => {
-            Some(NexusMessage::Scroll(ScrollAction::ScrollBy(-300.0)))
+            Some(NexusMessage::Scroll(ScrollAction::ScrollBy { delta: -300.0, phase: None }))
         }
         _ => None,
     }

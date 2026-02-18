@@ -38,7 +38,7 @@ mod scroll_model_tests {
         assert_eq!(model.target, ScrollTarget::Bottom);
 
         // Simulate user scrolling (e.g., mouse wheel)
-        model.apply_user_scroll(ScrollAction::ScrollBy(-10.0));
+        model.apply_user_scroll(ScrollAction::ScrollBy { delta: -10.0, phase: None });
 
         // Should break out of Bottom mode into free scroll
         assert_eq!(model.target, ScrollTarget::None);

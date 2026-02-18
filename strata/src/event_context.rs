@@ -180,6 +180,17 @@ pub enum FileDropEvent {
     HoverLeft,
 }
 
+/// Phase of a scroll gesture (trackpad or momentum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollPhase {
+    /// Finger on trackpad (NSEventPhase began/changed).
+    Contact,
+    /// OS momentum after finger lift (momentumPhase began/changed).
+    Momentum,
+    /// Gesture or momentum finished.
+    Ended,
+}
+
 /// Scroll delta types.
 #[derive(Debug, Clone, Copy)]
 pub enum ScrollDelta {
@@ -187,7 +198,7 @@ pub enum ScrollDelta {
     Lines { x: f32, y: f32 },
 
     /// Scroll by pixels (smooth, e.g., trackpad).
-    Pixels { x: f32, y: f32 },
+    Pixels { x: f32, y: f32, phase: Option<ScrollPhase> },
 }
 
 /// Keyboard modifier keys.
