@@ -211,6 +211,12 @@ impl ScrollState {
     fn scroll_with_phase(&mut self, delta: f32, phase: Option<ScrollPhase>) {
         let max = self.max.get();
 
+        // Re-clamp offset to current bounds. Content may have resized
+        // since the last scroll event, leaving offset beyond the new max.
+        // Without this, stale offset creates spurious overscroll on the
+        // next delta (momentum or contact), causing a visible jump.
+        self.offset = self.offset.clamp(0.0, max);
+
         match phase {
             Some(ScrollPhase::Contact) => {
                 self.gesture_active = true;
@@ -393,6 +399,7 @@ impl ScrollState {
             MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
                 position,
+                ..
             } => {
                 if let Some(HitResult::Widget(id)) = hit {
                     if *id == self.thumb_id {
