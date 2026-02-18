@@ -7,4 +7,4 @@ mod glyph_atlas;
 mod pipeline;
 
 pub use glyph_atlas::{GlyphAtlas, SizeMetrics, metrics_for_size};
-pub use pipeline::{GpuInstance, ImageHandle, ImageStore, LineStyle, PendingImage, StrataPipeline, SELECTION_COLOR, is_box_drawing, is_block_element, is_custom_drawn};
+pub use pipeline::{GpuInstance, ImageHandle, ImageStore, LineStyle, PendingImage, StrataPipeline, SELECTION_COLOR, GRID_SELECTION_BG, GRID_SELECTION_FG, is_box_drawing, is_block_element, is_custom_drawn};

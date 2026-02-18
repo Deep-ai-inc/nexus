@@ -1474,6 +1474,121 @@ impl LayoutSnapshot {
         rects
     }
 
+    /// Returns selection bounds for text items only (skips grids).
+    /// Used for the transparent selection overlay — grid selections use
+    /// opaque background + white text rendering instead.
+    pub fn text_selection_bounds(&self, selection: &Selection) -> Vec<(Rect, Option<Rect>)> {
+        let (start, end) = self.normalize_selection(selection);
+        let mut rects = Vec::new();
+
+        let sources = selection.sources(&self.source_ordering);
+
+        for source_id in sources {
+            let Some(layout) = self.sources.get(&source_id) else {
+                continue;
+            };
+
+            let start_order = self.source_ordering.position(&start.source_id);
+            let end_order = self.source_ordering.position(&end.source_id);
+            let current_order = self.source_ordering.position(&source_id);
+
+            let (Some(start_order), Some(end_order), Some(current_order)) =
+                (start_order, end_order, current_order)
+            else {
+                continue;
+            };
+
+            let clip = layout.clip_rect;
+
+            // Fast path: entire source is selected
+            let fully_before_start = current_order > start_order
+                || (current_order == start_order
+                    && start.item_index == 0
+                    && start.content_offset == 0);
+            let fully_after_end = current_order < end_order
+                || (current_order == end_order
+                    && end.item_index >= layout.items.len());
+
+            if fully_before_start && fully_after_end {
+                // Only include if this source has text items
+                let has_text = layout.items.iter().any(|i| matches!(i, ItemLayout::Text(_)));
+                if has_text {
+                    rects.push((layout.bounds, clip));
+                }
+            } else {
+                for (item_index, item) in layout.items.iter().enumerate() {
+                    if matches!(item, ItemLayout::Grid(_)) {
+                        continue; // Skip grids
+                    }
+                    let item_rects = self.selection_bounds_for_item(
+                        &source_id,
+                        item_index,
+                        item,
+                        &start,
+                        &end,
+                        current_order,
+                        start_order,
+                        end_order,
+                    );
+                    rects.extend(item_rects.into_iter().map(|r| (r, clip)));
+                }
+            }
+        }
+
+        rects
+    }
+
+    /// Returns the selected cell offset range `[start, end)` for a grid item
+    /// within a selection. Returns `None` if the selection doesn't overlap.
+    ///
+    /// Used by the renderer to apply opaque selection background + white text
+    /// overlay on terminal grids.
+    pub fn grid_selection_offsets(
+        &self,
+        source_id: &SourceId,
+        item_index: usize,
+        cell_count: usize,
+        selection: &Selection,
+    ) -> Option<(usize, usize)> {
+        if selection.is_collapsed() {
+            return None;
+        }
+
+        let (start, end) = self.normalize_selection(selection);
+
+        let start_order = self.source_ordering.position(&start.source_id)?;
+        let end_order = self.source_ordering.position(&end.source_id)?;
+        let current_order = self.source_ordering.position(source_id)?;
+
+        // Compute start offset within this grid item
+        let sel_start = if *source_id == start.source_id && item_index == start.item_index {
+            start.content_offset
+        } else if current_order > start_order
+            || (*source_id == start.source_id && item_index > start.item_index)
+        {
+            0 // This item is fully after selection start
+        } else {
+            return None; // Before selection
+        };
+
+        // Compute end offset within this grid item
+        let sel_end = if *source_id == end.source_id && item_index == end.item_index {
+            end.content_offset
+        } else if current_order < end_order
+            || (*source_id == end.source_id && item_index < end.item_index)
+        {
+            cell_count // This item is fully before selection end
+        } else {
+            return None; // After selection
+        };
+
+        if sel_start >= sel_end {
+            return None;
+        }
+
+        Some((sel_start, sel_end))
+    }
+
     // =========================================================================
     // Debug Visualization (compiled out in release)
     // =========================================================================

@@ -232,11 +232,28 @@ struct Globals {
 }
 
 /// Default selection highlight color (blue with transparency).
+/// Used for non-grid (text) selection overlays.
 pub const SELECTION_COLOR: Color = Color {
     r: 0.3,
     g: 0.5,
     b: 0.8,
     a: 0.35,
+};
+
+/// Opaque selection background for terminal grids (iTerm2-style).
+pub const GRID_SELECTION_BG: Color = Color {
+    r: 0.17,
+    g: 0.34,
+    b: 0.59,
+    a: 1.0,
+};
+
+/// Selection foreground for terminal grids (white text).
+pub const GRID_SELECTION_FG: Color = Color {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 1.0,
 };
 
 /// No-clip sentinel value.
