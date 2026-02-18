@@ -15,9 +15,6 @@ use crate::primitives::{Point, Rect};
 /// Grab tolerance for scrollbar thumb clicks (absorbs float rounding).
 const GRAB_TOLERANCE: f32 = 4.0;
 
-/// Maximum visual overscroll displacement in pixels.
-/// Overscroll asymptotically approaches this limit and never exceeds it.
-const MAX_OVERSCROLL: f32 = 100.0;
 
 /// An action on a scroll container, produced by event handling.
 #[derive(Debug, Clone)]
@@ -272,14 +269,12 @@ impl ScrollState {
                 if new_offset < 0.0 {
                     // Hit top boundary — start spring bounce
                     self.offset = 0.0;
-                    let excess = -new_offset;
-                    self.overscroll = -(excess.min(MAX_OVERSCROLL));
+                    self.overscroll = new_offset; // negative (past top)
                     self.start_spring(self.overscroll, (-delta * 20.0).clamp(-3000.0, 3000.0));
                 } else if new_offset > max {
                     // Hit bottom boundary — start spring bounce
                     self.offset = max;
-                    let excess = new_offset - max;
-                    self.overscroll = excess.min(MAX_OVERSCROLL);
+                    self.overscroll = new_offset - max;
                     self.start_spring(self.overscroll, (-delta * 20.0).clamp(-3000.0, 3000.0));
                 } else {
                     self.offset = new_offset;
@@ -347,10 +342,11 @@ impl ScrollState {
             return false;
         }
 
-        // Critically damped: γ = friction/(2*mass) = 40/2 = 20
+        // Critically damped: γ = friction/(2*mass)
         // x(t) = (C1 + C2*t) * e^(-γt)
         // where C1 = x0, C2 = v0 + γ*x0
-        let gamma = 20.0_f32;
+        // Lower γ = slower, more luxurious return.
+        let gamma = 12.0_f32;
         let t = self.spring_start.elapsed().as_secs_f32();
         let c1 = self.spring_x0;
         let c2 = self.spring_v0 + gamma * self.spring_x0;
@@ -471,18 +467,15 @@ impl ScrollState {
     }
 }
 
-/// Rubber-band resistance capped at MAX_OVERSCROLL.
+/// Rubber-band resistance with a fixed overscroll limit.
 ///
-/// `factor` controls the initial coefficient at the boundary:
-///   - 1.0 for finger (seamless transition, no velocity discontinuity)
-///   - 0.4 for momentum (inertia dies quickly at the edge)
-///
-/// Uses quadratic decay: `factor * (1 - (|os|/MAX_OVERSCROLL)²)`.
-/// Starts at `factor` when overscroll=0, decays to 0 at MAX_OVERSCROLL.
-/// This provides a natural hard cap without a jarring stop.
+/// Uses quadratic decay: `factor * (1 - (|os|/SCALE)²)`.  SCALE is a fixed
+/// constant (200pt) so the maximum overscroll distance is the same regardless
+/// of window size — matching native macOS/iOS behaviour.  Resistance starts
+/// at `factor` at the boundary and decays to 0 as overscroll approaches SCALE.
 fn apply_resistance(delta: f32, current_overscroll: f32, factor: f32) -> f32 {
-    let abs_os = current_overscroll.abs();
-    let ratio = (abs_os / MAX_OVERSCROLL).min(1.0);
+    const SCALE: f32 = 120.0; // max overscroll distance in logical points
+    let ratio = (current_overscroll.abs() / SCALE).min(1.0);
     let coeff = factor * (1.0 - ratio * ratio);
     delta * coeff
 }

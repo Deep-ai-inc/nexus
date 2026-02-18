@@ -542,10 +542,25 @@ impl<'a> ScrollColumn<'a> {
 
         // Draw scrollbar thumb if content overflows
         if total_content_height > viewport_h {
-            let thumb_h = ((viewport_h / total_content_height) * viewport_h).max(20.0);
+            let base_thumb_h = ((viewport_h / total_content_height) * viewport_h).max(20.0);
             let scroll_pct = if max_scroll > 0.0 { clamped_offset / max_scroll } else { 0.0 };
+
+            // Shrink thumb during overscroll (matches native macOS/iOS behavior).
+            // The thumb compresses proportionally to overscroll magnitude.
+            let abs_os = overscroll.abs();
+            let shrink = (abs_os * 1.5).min(base_thumb_h - 8.0).max(0.0);
+            let thumb_h = base_thumb_h - shrink;
+
             let scroll_available = viewport_h - thumb_h;
-            let thumb_y = bounds.y + scroll_pct * scroll_available;
+            let thumb_y = if overscroll < 0.0 {
+                // Past top: pin thumb to top edge
+                bounds.y
+            } else if overscroll > 0.0 {
+                // Past bottom: pin thumb to bottom edge
+                bounds.y + scroll_available
+            } else {
+                bounds.y + scroll_pct * scroll_available
+            };
             let thumb_visual = Rect::new(bounds.x + bounds.width - 8.0, thumb_y, 6.0, thumb_h);
 
             ctx.snapshot.primitives_mut().add_rounded_rect(
