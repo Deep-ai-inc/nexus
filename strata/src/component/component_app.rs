@@ -160,7 +160,7 @@ where
         state.force_click_lookup(addr)
     }
 
-    fn on_tick(state: &mut C) -> Command<C::Message> {
+    fn on_tick(state: &mut C) -> bool {
         state.on_tick()
     }
 }

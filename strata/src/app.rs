@@ -448,9 +448,11 @@ pub trait StrataApp: Sized + 'static {
     }
 
     /// Called by the native backend at ~60fps. Use for periodic effects like
-    /// auto-scroll during drag selection.
-    fn on_tick(_state: &mut Self::State) -> Command<Self::Message> {
-        Command::none()
+    /// auto-scroll during drag selection. Returns `true` if state changed and
+    /// a render is needed; `false` to skip the render (saves a full scene build
+    /// + GPU pass when the app is idle).
+    fn on_tick(_state: &mut Self::State) -> bool {
+        false
     }
 }
 

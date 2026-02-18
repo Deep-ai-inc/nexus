@@ -1112,6 +1112,12 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
             process_message::<A>(&mut state, msg);
         }
 
+        // Render synchronously — matches handle_key_event. Eliminates the
+        // timer delay (up to 1ms) for scroll and other mouse-driven updates.
+        if state.pending_window_resize.is_none() {
+            render_if_needed::<A>(&mut state);
+        }
+
         // Update system cursor based on hover target.
         if let Some(snapshot) = &state.cached_snapshot {
             let icon = if let Some(source) = state.capture.captured_by() {
@@ -1268,7 +1274,11 @@ fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
         // render_if_needed will build the scene at the correct size.
         state.needs_render = true;
     } else {
-        invalidate_and_request_render::<A>(state);
+        // Just flag dirty — render_if_needed (called by the event handler or
+        // timer callback) will build the scene once and render.  Avoids the
+        // double scene-build that invalidate_and_request_render + render_if_needed
+        // used to cause.
+        state.needs_render = true;
     }
 }
 
@@ -1288,12 +1298,6 @@ fn build_scene<A: StrataApp>(state: &WindowState<A>) -> Scene {
         pending_images: Vec::new(),
         pending_unloads: Vec::new(),
     }
-}
-
-fn invalidate_and_request_render<A: StrataApp>(state: &mut WindowState<A>) {
-    let scene = build_scene::<A>(state);
-    state.cached_snapshot = Some(scene.snapshot.clone());
-    state.needs_render = true;
 }
 
 /// Render a frame if `needs_render` is set.
@@ -2180,13 +2184,13 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             }
 
             // Call on_tick at ~60fps for periodic effects (auto-scroll, etc.).
+            // Only flag a render when on_tick reports state actually changed —
+            // avoids a full scene build + GPU pass every 16ms when idle.
             if state.last_tick_time.elapsed().as_millis() >= 16 {
                 state.last_tick_time = Instant::now();
-                let cmd = A::on_tick(&mut state.app);
-                let rt = state.tokio_rt.clone();
-                let tx = state.command_tx.clone();
-                spawn_commands(&rt, cmd, tx);
-                state.needs_render = true;
+                if A::on_tick(&mut state.app) {
+                    state.needs_render = true;
+                }
             }
 
 

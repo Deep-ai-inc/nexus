@@ -355,10 +355,12 @@ impl Component for NexusState {
         Subscription::batch(subs)
     }
 
-    fn on_tick(&mut self) -> strata::Command<NexusMessage> {
+    fn on_tick(&mut self) -> bool {
+        let output_dirty = self.shell.needs_redraw() || self.agent.needs_redraw();
+        let auto_scrolling = self.drag.auto_scroll.get().is_some();
         self.on_output_arrived();
-        self.scroll.tick_overscroll();
-        strata::Command::none()
+        let spring_animating = self.scroll.tick_overscroll();
+        output_dirty || spring_animating || auto_scrolling
     }
 
     fn selection(&self) -> Option<&strata::Selection> {

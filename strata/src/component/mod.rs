@@ -112,8 +112,9 @@ pub trait Component {
     }
 
     /// Called by the native backend at ~60fps. Use for periodic effects like
-    /// auto-scroll during drag selection.
-    fn on_tick(&mut self) -> Command<Self::Message> {
-        Command::none()
+    /// auto-scroll during drag selection. Returns `true` if state changed and
+    /// a render is needed.
+    fn on_tick(&mut self) -> bool {
+        false
     }
 }
