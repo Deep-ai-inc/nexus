@@ -407,6 +407,7 @@ impl StrataApp for DemoApp {
                     state.input.selection = None;
                     // Auto-scroll to bottom
                     state.left_scroll.offset = state.left_scroll.max.get();
+                    state.left_scroll.reset_overscroll();
                 }
             }
 
@@ -570,6 +571,28 @@ impl StrataApp for DemoApp {
         .build();
 
         // =================================================================
+        // BUILD TABLE (needs local String headers before main_row borrow)
+        // =================================================================
+        let arrow = if state.table_sort_asc { " \u{25B2}" } else { " \u{25BC}" };
+        let name_header: String = if state.table_sort_col == 0 { format!("NAME{}", arrow) } else { "NAME".into() };
+        let size_header: String = if state.table_sort_col == 1 { format!("SIZE{}", arrow) } else { "SIZE".into() };
+
+        let mut table = TableElement::new(SourceId::named("table"))
+            .column_sortable(&name_header, 140.0, SourceId::named("sort_name"))
+            .column_sortable(&size_header, 70.0, SourceId::named("sort_size"))
+            .column("TYPE", 70.0);
+
+        for &(name, size_str, _size_bytes, kind, name_color) in &state.table_rows {
+            table = table.row(vec![
+                TableCell { text: name.into(), lines: vec![name.into()], color: name_color, widget_id: None },
+                TableCell { text: size_str.into(), lines: vec![size_str.into()], color: colors::TEXT_SECONDARY, widget_id: None },
+                TableCell { text: kind.into(), lines: vec![kind.into()], color: colors::TEXT_MUTED, widget_id: None },
+            ]);
+        }
+
+        let anim_t = now.duration_since(state.start_time).as_secs_f32();
+
+        // =================================================================
         // MAIN LAYOUT: Row with two columns
         // =================================================================
         let main_row = Row::new()
@@ -581,11 +604,8 @@ impl StrataApp for DemoApp {
             // LEFT COLUMN: Chat History + Shell Block + Input Bar
             // =============================================================
             .push(
-                // Note: Using new() instead of from_state() here because the demo
-                // widgets use 'static lifetime. Use from_state() in real apps
-                // where the widget tree lifetime matches the state borrow.
                 ScrollColumn::new(state.left_scroll.id(), state.left_scroll.thumb_id())
-                    .scroll_offset(state.left_scroll.offset)
+                    .scroll_offset(state.left_scroll.effective_offset())
                     .spacing(16.0)
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -643,29 +663,9 @@ impl StrataApp for DemoApp {
             // =============================================================
             // RIGHT COLUMN: Component Catalog
             // =============================================================
-            .push({
-                let arrow = if state.table_sort_asc { " \u{25B2}" } else { " \u{25BC}" };
-                let name_header: String = if state.table_sort_col == 0 { format!("NAME{}", arrow) } else { "NAME".into() };
-                let size_header: String = if state.table_sort_col == 1 { format!("SIZE{}", arrow) } else { "SIZE".into() };
-
-                let mut table = TableElement::new(SourceId::named("table"))
-                    .column_sortable(&name_header, 140.0, SourceId::named("sort_name"))
-                    .column_sortable(&size_header, 70.0, SourceId::named("sort_size"))
-                    .column("TYPE", 70.0);
-
-                for &(name, size_str, _size_bytes, kind, name_color) in &state.table_rows {
-                    table = table.row(vec![
-                        TableCell { text: name.into(), lines: vec![name.into()], color: name_color, widget_id: None },
-                        TableCell { text: size_str.into(), lines: vec![size_str.into()], color: colors::TEXT_SECONDARY, widget_id: None },
-                        TableCell { text: kind.into(), lines: vec![kind.into()], color: colors::TEXT_MUTED, widget_id: None },
-                    ]);
-                }
-
-                // Note: Using new() instead of from_state() here because the demo
-                // widgets use 'static lifetime. Use from_state() in real apps
-                // where the widget tree lifetime matches the state borrow.
+            .push(
                 ScrollColumn::new(state.right_scroll.id(), state.right_scroll.thumb_id())
-                    .scroll_offset(state.right_scroll.offset)
+                    .scroll_offset(state.right_scroll.effective_offset())
                     .spacing(16.0)
                     .width(Length::Fixed(right_col_width))
                     .height(Length::Fill)
@@ -718,15 +718,14 @@ impl StrataApp for DemoApp {
                             .height(Length::Fixed(194.0)),
                     )
                     // Drawing styles with animation (drawn inline via Canvas)
-                    .push({
-                        let anim_t = now.duration_since(state.start_time).as_secs_f32();
+                    .push(
                         Canvas::new(move |bounds, p| draw_line_styles(bounds, p, anim_t))
                             .width(Length::Fill)
-                            .height(Length::Fixed(180.0))
-                    })
+                            .height(Length::Fixed(180.0)),
+                    )
                     // Table
-                    .push(Card::new("Table").push(table))
-            });
+                    .push(Card::new("Table").push(table)),
+            );
 
         // Use constraint-based layout API
         let mut ctx = LayoutContext::new(snapshot);
@@ -736,6 +735,7 @@ impl StrataApp for DemoApp {
         // Sync state helpers from layout snapshot
         state.left_scroll.sync_from_snapshot(snapshot);
         state.right_scroll.sync_from_snapshot(snapshot);
+
         state.input.sync_from_snapshot(snapshot);
         state.editor.sync_from_snapshot(snapshot);
 
@@ -873,8 +873,13 @@ impl StrataApp for DemoApp {
         None
     }
 
+    fn on_tick(state: &mut Self::State) -> bool {
+        let left = state.left_scroll.tick_spring_back();
+        let right = state.right_scroll.tick_spring_back();
+        left || right
+    }
+
     fn subscription(_state: &Self::State) -> Subscription<Self::Message> {
-        // Timer tick is no longer needed — the native backend renders continuously.
         Subscription::none()
     }
 

@@ -499,11 +499,13 @@ impl<'a> ScrollColumn<'a> {
         let max_scroll = (total_content_height - viewport_h).max(0.0);
         ctx.snapshot.set_scroll_limit(self.id, max_scroll);
         let clamped_offset = self.scroll_offset.clamp(0.0, max_scroll);
-        // Overscroll displacement comes from ScrollState directly, not
-        // from the offset value (which can be a f32::MAX sentinel for
-        // "snap to bottom"). This keeps viewport positioning correct
-        // while allowing the rubber-band visual shift.
-        let overscroll = self.state_ref.map(|s| s.overscroll).unwrap_or(0.0);
+        // Overscroll displacement: prefer ScrollState directly (handles
+        // f32::MAX "snap to bottom" sentinel correctly), fall back to
+        // deriving from the difference between raw and clamped offset
+        // (works when ScrollColumn is created with new() + effective_offset).
+        let overscroll = self.state_ref
+            .map(|s| s.overscroll)
+            .unwrap_or_else(|| self.scroll_offset - clamped_offset);
         let viewport_top = clamped_offset + overscroll;
 
         // Position pass with virtualization
