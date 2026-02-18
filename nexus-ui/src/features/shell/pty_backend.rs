@@ -161,6 +161,27 @@ fn csi_modified_tilde(code: &[u8], m: &strata::event_context::Modifiers) -> Vec<
     v
 }
 
+/// CSI u sequence for modified keys without a legacy encoding.
+///
+/// Format: `\x1b[ <unicode_codepoint> ; <modifier> u`
+///
+/// Part of the "fixterms" / Kitty keyboard protocol, widely supported
+/// by iTerm2, Kitty, WezTerm, Ghostty, and modern CLI tools.
+/// The `u` terminator avoids conflicts with legacy tilde/letter sequences.
+fn csi_u(codepoint: u32, m: &strata::event_context::Modifiers) -> Vec<u8> {
+    let p = modifier_param(m);
+    let cp = codepoint.to_string();
+    let mut v = Vec::with_capacity(cp.len() + 6);
+    v.extend_from_slice(b"\x1b[");
+    v.extend_from_slice(cp.as_bytes());
+    if p != 0 {
+        v.push(b';');
+        v.push(b'0' + p);
+    }
+    v.push(b'u');
+    v
+}
+
 /// SS3 sequence (used for F1-F4 unmodified, and application-mode arrows).
 fn ss3(suffix: u8) -> Vec<u8> {
     vec![0x1b, b'O', suffix]
@@ -176,27 +197,45 @@ fn encode_named(
 
     match named {
         // -- Simple keys (no CSI) ------------------------------------------
-        NamedKey::Enter => Some(vec![b'\r']),
-        NamedKey::Escape => Some(vec![0x1b]),
+        NamedKey::Enter => {
+            if has_mods {
+                Some(csi_u(13, m)) // CR codepoint
+            } else {
+                Some(vec![b'\r'])
+            }
+        }
+        NamedKey::Escape => {
+            if has_mods {
+                Some(csi_u(27, m)) // ESC codepoint
+            } else {
+                Some(vec![0x1b])
+            }
+        }
         NamedKey::Space => {
-            if m.ctrl {
-                Some(vec![0x00]) // Ctrl+Space = NUL
+            if m.ctrl && !m.shift && !m.alt {
+                Some(vec![0x00]) // Ctrl+Space = NUL (legacy)
+            } else if has_mods {
+                Some(csi_u(b' ' as u32, m))
             } else {
                 Some(vec![b' '])
             }
         }
         NamedKey::Backspace => {
-            if m.ctrl {
-                Some(vec![0x08]) // Ctrl+Backspace = BS
-            } else if m.alt {
-                Some(vec![0x1b, 0x7f]) // Alt+Backspace = ESC DEL
+            if m.ctrl && !m.shift && !m.alt {
+                Some(vec![0x08]) // Ctrl+Backspace = BS (legacy)
+            } else if m.alt && !m.shift && !m.ctrl {
+                Some(vec![0x1b, 0x7f]) // Alt+Backspace = ESC DEL (legacy)
+            } else if has_mods {
+                Some(csi_u(0x7f, m)) // Other combos via CSI u
             } else {
                 Some(vec![0x7f]) // Backspace = DEL
             }
         }
         NamedKey::Tab => {
-            if m.shift {
-                Some(vec![0x1b, b'[', b'Z']) // Shift+Tab = backtab
+            if m.shift && !m.alt && !m.ctrl {
+                Some(vec![0x1b, b'[', b'Z']) // Shift+Tab = backtab (legacy)
+            } else if has_mods {
+                Some(csi_u(b'\t' as u32, m))
             } else {
                 Some(vec![b'\t'])
             }
