@@ -362,7 +362,7 @@ impl NexusState {
         // Check shell blocks
         for block in &self.shell.blocks.blocks {
             if source_id == source_ids::shell_term(block.id) && block.structured_output.is_none() {
-                let grid = if block.parser.is_alternate_screen() || block.is_running() {
+                let grid = if block.parser.is_alternate_screen() {
                     block.parser.grid()
                 } else {
                     block.parser.grid_with_scrollback()

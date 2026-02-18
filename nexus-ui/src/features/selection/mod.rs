@@ -239,8 +239,8 @@ pub(crate) fn extract_block_text(
                 return Some(value.to_text());
             }
 
-            // Otherwise extract from terminal grid
-            let grid = if block.parser.is_alternate_screen() || block.is_running() {
+            // Otherwise extract from terminal grid (match view's grid selection)
+            let grid = if block.parser.is_alternate_screen() {
                 block.parser.grid()
             } else {
                 block.parser.grid_with_scrollback()
@@ -391,7 +391,9 @@ fn extract_shell_source(
     }
 
     if source_id == source_ids::shell_term(block.id) && block.structured_output.is_none() {
-        let grid = if block.parser.is_alternate_screen() || block.is_running() {
+        // Must match the view's grid selection (shell_block.rs build()) so that
+        // content_offset values from the layout snapshot are compatible.
+        let grid = if block.parser.is_alternate_screen() {
             block.parser.grid()
         } else {
             block.parser.grid_with_scrollback()
