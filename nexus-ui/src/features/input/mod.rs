@@ -447,7 +447,6 @@ impl InputWidget {
         cwd: &'a str,
         last_exit_code: Option<i32>,
         cursor_visible: bool,
-        zoom: f32,
     ) -> Column<'a> {
         let line_count = {
             // Use visual line count (accounts for soft wrapping) based on
@@ -458,20 +457,14 @@ impl InputWidget {
             count.max(1).min(6)
         };
 
-        col = col.push(
-            Column::new()
-                .padding_custom(Padding::new(2.0, 0.0, 0.0, 0.0))
-                .width(Length::Fill)
-                .push(NexusInputBar {
-                    input: &self.text_input,
-                    mode: self.mode,
-                    cwd,
-                    last_exit_code,
-                    cursor_visible,
-                    line_count,
-                    zoom,
-                }),
-        );
+        col = col.push(NexusInputBar {
+            input: &self.text_input,
+            mode: self.mode,
+            cwd,
+            last_exit_code,
+            cursor_visible,
+            line_count,
+        });
         col
     }
 

@@ -176,18 +176,21 @@ impl Component for NexusState {
         // Window safe-area insets: keep content clear of macOS rounded window
         // corners.  These are physical pixels divided by zoom so they stay
         // constant on screen regardless of zoom level.
+        // Only the scroll content gets side/top insets; the input bar is
+        // edge-to-edge with only bottom padding below it.
         let z = self.zoom_level;
-        let safe = Padding::new(2.0 / z, 4.0 / z, 4.0 / z, 4.0 / z);
+        let safe = Padding::new(2.0 / z, 4.0 / z, 0.0, 4.0 / z);
 
         let mut main_col = Column::new()
             .width(Length::Fixed(vw))
             .height(Length::Fixed(vh))
-            .padding_custom(Padding::new(safe.top, safe.right, safe.bottom, safe.left));
+            .padding_custom(Padding::new(0.0, 0.0, 4.0 / z, 0.0));
 
         main_col = main_col.push(
             Column::new()
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .padding_custom(safe)
                 .push(scroll),
         );
 

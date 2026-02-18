@@ -37,7 +37,7 @@ impl NexusState {
         // Input-owned sections: completion popup, history search, attachments, input bar
         col = self.input.layout_overlays(col);
         col = self.input.layout_attachments(col);
-        col = self.input.layout_input_bar(col, &self.cwd, self.shell.last_exit_code, cursor_visible, self.zoom_level);
+        col = self.input.layout_input_bar(col, &self.cwd, self.shell.last_exit_code, cursor_visible);
         col
     }
 
