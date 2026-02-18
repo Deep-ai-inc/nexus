@@ -487,9 +487,11 @@ impl ShellWidget {
         // Setting dirty would activate the 16ms tick, which fires yet
         // another redundant render with no new content.
 
-        // If no exit happened, scroll to bottom for output.
+        // Follow output only if already tailing (Bottom target).
+        // Don't force-scroll — the user may be reading history, or an
+        // interactive app (vim, htop) manages its own viewport.
         if !had_exit {
-            uctx.snap_to_bottom();
+            uctx.hint_bottom();
         }
     }
 
@@ -503,7 +505,7 @@ impl ShellWidget {
             block.version += 1;
         }
         self.terminal_dirty = true;
-        uctx.snap_to_bottom();
+        uctx.hint_bottom();
     }
 
     /// Handle PTY exit. Conditionally returns focus to input if the exited block was focused.
@@ -633,7 +635,7 @@ impl ShellWidget {
                 }
             }
             uctx.set_focus(Focus::Block(block_id));
-            uctx.snap_to_bottom();
+            uctx.hint_bottom();
             return;
         }
 
