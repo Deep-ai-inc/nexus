@@ -381,20 +381,9 @@ impl NexusState {
             if source_id == source_ids::table(block.id) {
                 if let Some(nexus_api::Value::Table { columns, rows }) = &block.structured_output {
                     // Build lines matching the table's register_source order:
-                    // headers (one per column), then data cells row-by-row, column-by-column.
-                    let mut lines = Vec::with_capacity(columns.len() + rows.len() * columns.len());
-                    for col in columns {
-                        let name = if block.table_sort.column == Some(lines.len()) {
-                            if block.table_sort.ascending {
-                                format!("{} \u{25B2}", col.name)
-                            } else {
-                                format!("{} \u{25BC}", col.name)
-                            }
-                        } else {
-                            col.name.clone()
-                        };
-                        lines.push(name);
-                    }
+                    // data cells only (row-by-row, column-by-column). Headers are
+                    // not registered as source items — they're display/sort-only.
+                    let mut lines = Vec::with_capacity(rows.len() * columns.len());
                     for row in rows {
                         for (col_idx, cell) in row.iter().enumerate() {
                             let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {

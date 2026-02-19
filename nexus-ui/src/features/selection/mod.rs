@@ -466,9 +466,19 @@ fn extract_shell_source(
 
     if source_id == source_ids::table(block.id) {
         if let Some(nexus_api::Value::Table { columns, rows }) = &block.structured_output {
-            let text = format_table_as_markdown(columns, rows);
-            let lines: Vec<&str> = text.lines().collect();
-            return Some(extract_multi_item_range(&lines, is_start, is_end, start, end));
+            // Build cell-level lines matching register_source order:
+            // data cells only (row-by-row, column-by-column).
+            let lines: Vec<String> = rows.iter().flat_map(|row| {
+                row.iter().enumerate().map(|(col_idx, cell)| {
+                    if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
+                        nexus_api::format_value_for_display(cell, fmt)
+                    } else {
+                        cell.to_text()
+                    }
+                })
+            }).collect();
+            let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            return Some(extract_multi_item_range(&line_refs, is_start, is_end, start, end));
         }
     }
 
@@ -683,9 +693,17 @@ fn extract_shell_source_rect(
 
     if source_id == source_ids::table(block.id) {
         if let Some(nexus_api::Value::Table { columns, rows }) = &block.structured_output {
-            let text = format_table_as_markdown(columns, rows);
-            let lines: Vec<&str> = text.lines().collect();
-            return Some(extract_multi_item_range_rect(&lines, is_start, is_end, start, end));
+            let lines: Vec<String> = rows.iter().flat_map(|row| {
+                row.iter().enumerate().map(|(col_idx, cell)| {
+                    if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
+                        nexus_api::format_value_for_display(cell, fmt)
+                    } else {
+                        cell.to_text()
+                    }
+                })
+            }).collect();
+            let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            return Some(extract_multi_item_range_rect(&line_refs, is_start, is_end, start, end));
         }
     }
 

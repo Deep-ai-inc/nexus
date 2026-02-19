@@ -689,6 +689,16 @@ pub struct SourceLayout {
     /// Clip rectangle inherited from the containing scroll container.
     /// Used to clip selection highlights so they don't overflow.
     pub clip_rect: Option<Rect>,
+
+    /// Logical index of `items[0]` in the full (non-virtualized) item list.
+    ///
+    /// Virtual containers (e.g. tables) only register visible items but need
+    /// stable `ContentAddress.item_index` values across scroll frames.
+    /// Set to `first_visible_row * num_columns` so that hit-testing returns
+    /// logical indices and selection bounds look up the correct physical item.
+    ///
+    /// Default is 0 (all items start at logical index 0).
+    pub item_index_offset: usize,
 }
 
 impl SourceLayout {
@@ -698,6 +708,7 @@ impl SourceLayout {
             bounds,
             items: Vec::new(),
             clip_rect: None,
+            item_index_offset: 0,
         }
     }
 
@@ -708,6 +719,7 @@ impl SourceLayout {
             bounds,
             items: vec![ItemLayout::Text(text_layout)],
             clip_rect: None,
+            item_index_offset: 0,
         }
     }
 
@@ -718,7 +730,32 @@ impl SourceLayout {
             bounds,
             items: vec![ItemLayout::Grid(grid_layout)],
             clip_rect: None,
+            item_index_offset: 0,
         }
+    }
+
+    /// Convert a logical item_index (as stored in ContentAddress) to a
+    /// physical index into `self.items`. Returns `None` if out of range.
+    pub fn physical_index(&self, logical_index: usize) -> Option<usize> {
+        logical_index
+            .checked_sub(self.item_index_offset)
+            .filter(|&i| i < self.items.len())
+    }
+
+    /// Convert a physical index (from enumerating `self.items`) to the
+    /// logical item_index used in ContentAddress.
+    pub fn logical_index(&self, physical_index: usize) -> usize {
+        physical_index + self.item_index_offset
+    }
+
+    /// Logical index of the first item (i.e. `item_index_offset`).
+    pub fn first_logical_index(&self) -> usize {
+        self.item_index_offset
+    }
+
+    /// Logical index one-past the last item.
+    pub fn end_logical_index(&self) -> usize {
+        self.item_index_offset + self.items.len()
     }
 }
 
@@ -1020,13 +1057,42 @@ impl LayoutSnapshot {
     /// If the source is already registered, new items are appended and bounds
     /// are expanded. This allows multiple widgets (e.g. per-line TextElements)
     /// to share a single source for cross-line selection.
-    pub fn register_source(&mut self, source_id: SourceId, mut layout: SourceLayout) {
+    pub fn register_source(&mut self, source_id: SourceId, layout: SourceLayout) {
+        self.register_source_inner(source_id, layout, None);
+    }
+
+    /// Register a source with a logical item-index offset.
+    ///
+    /// Virtual containers (e.g. tables that only render visible rows) use this
+    /// so that `ContentAddress.item_index` remains stable across scroll frames.
+    /// The offset is the logical index of the first physically-registered item
+    /// (typically `first_visible_row * num_columns`).
+    pub fn register_source_with_offset(
+        &mut self,
+        source_id: SourceId,
+        layout: SourceLayout,
+        item_offset: usize,
+    ) {
+        self.register_source_inner(source_id, layout, Some(item_offset));
+    }
+
+    fn register_source_inner(
+        &mut self,
+        source_id: SourceId,
+        mut layout: SourceLayout,
+        item_offset: Option<usize>,
+    ) {
         let clip = self.current_clip();
         layout.clip_rect = clip;
+        if let Some(offset) = item_offset {
+            layout.item_index_offset = offset;
+        }
         self.source_ordering.register(source_id);
         if let Some(existing) = self.sources.get_mut(&source_id) {
             existing.bounds = existing.bounds.union(&layout.bounds);
             existing.items.extend(layout.items);
+            // Offset is set on the first registration and preserved across merges.
+            // For virtual tables, all cells in a frame share the same offset.
             // When merging, intersect clips (both are in the same container,
             // but be safe for nested cases).
             existing.clip_rect = match (existing.clip_rect, clip) {
@@ -1117,7 +1183,7 @@ impl LayoutSnapshot {
                     }
                 };
 
-                return Some(HitResult::Content(ContentAddress::new(*source_id, item_index, content_offset)));
+                return Some(HitResult::Content(ContentAddress::new(*source_id, layout.logical_index(item_index), content_offset)));
             }
         }
 
@@ -1206,14 +1272,14 @@ impl LayoutSnapshot {
             }
         }
 
-        let (item_index, item, _) = best_item?;
+        let (phys_index, item, _) = best_item?;
 
         let content_offset = match item {
             ItemLayout::Text(text) => nearest_text_offset(text, x, y),
             ItemLayout::Grid(grid) => nearest_grid_offset(grid, x, y),
         };
 
-        Some(HitResult::Content(ContentAddress::new(source_id, item_index, content_offset)))
+        Some(HitResult::Content(ContentAddress::new(source_id, source_layout.logical_index(phys_index), content_offset)))
     }
 
     /// Get the screen bounds for a content address.
@@ -1221,7 +1287,8 @@ impl LayoutSnapshot {
     /// Returns the rectangle of the character or cell at the address.
     pub fn char_bounds(&self, addr: &ContentAddress) -> Option<Rect> {
         let layout = self.sources.get(&addr.source_id)?;
-        let item = layout.items.get(addr.item_index)?;
+        let phys = layout.physical_index(addr.item_index)?;
+        let item = layout.items.get(phys)?;
 
         match item {
             ItemLayout::Text(text_layout) => {
@@ -1516,11 +1583,11 @@ impl LayoutSnapshot {
             // Fast path: entire source is selected
             let fully_before_start = current_order > start_order
                 || (current_order == start_order
-                    && start.item_index == 0
+                    && start.item_index <= layout.first_logical_index()
                     && start.content_offset == 0);
             let fully_after_end = current_order < end_order
                 || (current_order == end_order
-                    && end.item_index >= layout.items.len());
+                    && end.item_index >= layout.end_logical_index());
 
             if fully_before_start && fully_after_end {
                 let has_text = layout.items.iter().any(|i| matches!(i, ItemLayout::Text(_)));
@@ -1528,13 +1595,14 @@ impl LayoutSnapshot {
                     rects.push((layout.bounds, clip));
                 }
             } else {
-                for (item_index, item) in layout.items.iter().enumerate() {
+                for (phys_idx, item) in layout.items.iter().enumerate() {
                     if matches!(item, ItemLayout::Grid(_)) {
                         continue;
                     }
+                    let logical_idx = layout.logical_index(phys_idx);
                     let item_rects = self.selection_bounds_for_item(
                         &source_id,
-                        item_index,
+                        logical_idx,
                         item,
                         &start,
                         &end,
@@ -1581,27 +1649,29 @@ impl LayoutSnapshot {
 
             let clip = layout.clip_rect;
 
-            for (item_index, item) in layout.items.iter().enumerate() {
+            for (phys_idx, item) in layout.items.iter().enumerate() {
                 let ItemLayout::Text(text_layout) = item else {
                     continue; // Skip grids
                 };
 
+                let logical_idx = layout.logical_index(phys_idx);
+
                 // Determine which lines are in the selection's row range.
                 // Reuse the same offset logic as selection_bounds_for_item.
-                let sel_start = if source_id == start.source_id && item_index == start.item_index {
+                let sel_start = if source_id == start.source_id && logical_idx == start.item_index {
                     start.content_offset
                 } else if current_order > start_order
-                    || (source_id == start.source_id && item_index > start.item_index)
+                    || (source_id == start.source_id && logical_idx > start.item_index)
                 {
                     0
                 } else {
                     continue; // Before selection
                 };
 
-                let sel_end = if source_id == end.source_id && item_index == end.item_index {
+                let sel_end = if source_id == end.source_id && logical_idx == end.item_index {
                     end.content_offset
                 } else if current_order < end_order
-                    || (source_id == end.source_id && item_index < end.item_index)
+                    || (source_id == end.source_id && logical_idx < end.item_index)
                 {
                     text_layout.char_count
                 } else {

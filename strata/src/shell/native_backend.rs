@@ -2005,7 +2005,8 @@ fn populate_pipeline(
     }
 
     for (source_id, source_layout) in snapshot.sources_in_order() {
-        for (item_index, item) in source_layout.items.iter().enumerate() {
+        for (phys_idx, item) in source_layout.items.iter().enumerate() {
+            let item_index = source_layout.logical_index(phys_idx);
             if let crate::layout_snapshot::ItemLayout::Grid(grid_layout) = item {
                 let grid_clip = &grid_layout.clip_rect;
                 let cell_w = grid_layout.cell_width * scale;

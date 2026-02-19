@@ -131,9 +131,9 @@ pub(crate) fn render_table(
         table.header_bg,
     );
 
-    // Header text + register sortable headers as widgets
+    // Header text + sortable widget registration (no source items — headers
+    // are interactive/display-only, not text-selectable)
     let mut col_x = x;
-    let char_width = 8.4_f32;
     for col in &table.columns {
         let tx = col_x + cell_pad;
         let ty = y + 4.0;
@@ -144,16 +144,6 @@ pub(crate) fn render_table(
             BASE_FONT_SIZE,
             hash_text(&col.name),
         );
-        // Register header text for selection
-        {
-            use crate::layout_snapshot::{SourceLayout, TextLayout};
-            let mut text_layout = TextLayout::simple(
-                col.name.clone(), table.header_text_color.pack(),
-                tx, ty, char_width, table.line_height,
-            );
-            text_layout.bounds.width = text_layout.bounds.width.max(col.width - cell_pad);
-            snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
-        }
         if let Some(sort_id) = col.sort_id {
             snapshot.register_widget(sort_id, Rect::new(col_x, y, col.width, table.header_height));
             snapshot.set_cursor_hint(sort_id, CursorIcon::Pointer);
@@ -172,17 +162,66 @@ pub(crate) fn render_table(
 
     // Data rows — variable height based on wrapped line count
     let data_y = sep_y + 1.0;
-    let mut ry = data_y;
     let char_width = 8.4_f32;
     // Get clip bounds for row-level culling (from parent ScrollColumn)
     let clip_bounds = snapshot.primitives().current_clip_bounds();
+
+    // Pre-compute row y-positions (needed for both source registration and rendering)
+    let mut row_y_positions: Vec<f32> = Vec::with_capacity(table.rows.len());
+    {
+        let mut ry = data_y;
+        for row in &table.rows {
+            row_y_positions.push(ry);
+            ry += table.row_height_for(row);
+        }
+    }
+
+    // Register source items for ALL rows so ContentAddress.item_index
+    // remains stable across scroll frames. Only primitive rendering below
+    // is culled to the visible region.
+    {
+        use crate::layout_snapshot::{SourceLayout, TextLayout};
+        for (row_idx, row) in table.rows.iter().enumerate() {
+            let ry = row_y_positions[row_idx];
+            let mut col_x = x;
+            for (col_idx, cell) in row.iter().enumerate() {
+                if col_idx < table.columns.len() {
+                    if cell.lines.len() <= 1 {
+                        let text = if cell.lines.len() == 1 { &cell.lines[0] } else { &cell.text };
+                        let tx = col_x + cell_pad;
+                        let ty = ry + 2.0;
+                        let mut text_layout = TextLayout::simple(
+                            text.clone(), cell.color.pack(),
+                            tx, ty, char_width, table.line_height,
+                        );
+                        text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
+                        snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
+                    } else {
+                        for (line_idx, line) in cell.lines.iter().enumerate() {
+                            let tx = col_x + cell_pad;
+                            let ly = ry + 2.0 + line_idx as f32 * table.line_height;
+                            let mut text_layout = TextLayout::simple(
+                                line.clone(), cell.color.pack(),
+                                tx, ly, char_width, table.line_height,
+                            );
+                            text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
+                            snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
+                        }
+                    }
+                    col_x += table.columns[col_idx].width;
+                }
+            }
+        }
+    }
+
+    // Render only visible rows (primitives + widgets)
     for (row_idx, row) in table.rows.iter().enumerate() {
+        let ry = row_y_positions[row_idx];
         let rh = table.row_height_for(row);
 
         // Cull rows entirely outside the clip region (viewport)
         if let Some(clip) = clip_bounds {
             if ry + rh < clip.y || ry > clip.y + clip.height {
-                ry += rh;
                 continue;
             }
         }
@@ -213,21 +252,10 @@ pub(crate) fn render_table(
                         BASE_FONT_SIZE,
                         hash_text(text),
                     );
-                    // Register clickable cell as widget (text-width only)
                     if let Some(wid) = cell.widget_id {
                         let text_rect = Rect::new(tx, ty, text_width, table.line_height);
                         snapshot.register_widget(wid, text_rect);
                         snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
-                    }
-                    // Register for text selection (anchors are both clickable and selectable)
-                    {
-                        use crate::layout_snapshot::{SourceLayout, TextLayout};
-                        let mut text_layout = TextLayout::simple(
-                            text.clone(), cell.color.pack(),
-                            tx, ty, char_width, table.line_height,
-                        );
-                        text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
-                        snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
                     }
                 } else {
                     // Multi-line wrapped cell
@@ -244,18 +272,7 @@ pub(crate) fn render_table(
                             BASE_FONT_SIZE,
                             hash_text(line),
                         );
-                        // Register for text selection (anchors are both clickable and selectable)
-                        {
-                            use crate::layout_snapshot::{SourceLayout, TextLayout};
-                            let mut text_layout = TextLayout::simple(
-                                line.clone(), cell.color.pack(),
-                                tx, ly, char_width, table.line_height,
-                            );
-                            text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
-                            snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
-                        }
                     }
-                    // Register clickable cell as widget covering all lines
                     if let Some(wid) = cell.widget_id {
                         let tx = col_x + cell_pad;
                         let ty = ry + 2.0;
@@ -267,8 +284,6 @@ pub(crate) fn render_table(
                 col_x += table.columns[col_idx].width;
             }
         }
-
-        ry += rh;
     }
 }
 
@@ -369,8 +384,10 @@ pub(crate) fn render_virtual_table(
         table.header_bg,
     );
 
-    // Header text + register sortable headers
+    // Header text + sortable widget registration (no source items — headers
+    // are interactive/display-only, not text-selectable)
     let mut col_x = x;
+    let num_cols = table.columns.len();
     for col in &table.columns {
         let tx = col_x + cell_pad;
         let ty = y + 4.0;
@@ -381,15 +398,6 @@ pub(crate) fn render_virtual_table(
             BASE_FONT_SIZE,
             hash_text(&col.name),
         );
-        {
-            use crate::layout_snapshot::{SourceLayout, TextLayout};
-            let mut text_layout = TextLayout::simple(
-                col.name.clone(), table.header_text_color.pack(),
-                tx, ty, char_width, table.line_height,
-            );
-            text_layout.bounds.width = text_layout.bounds.width.max(col.width - cell_pad);
-            snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
-        }
         if let Some(sort_id) = col.sort_id {
             snapshot.register_widget(sort_id, Rect::new(col_x, y, col.width, table.header_height));
             snapshot.set_cursor_hint(sort_id, CursorIcon::Pointer);
@@ -422,7 +430,34 @@ pub(crate) fn render_virtual_table(
         (0, table.rows.len())
     };
 
-    // Render only visible rows
+    // Register source items for VISIBLE rows only, with an offset so that
+    // ContentAddress.item_index = row * num_cols + col stays stable across
+    // scroll frames. The item_index_offset tells the snapshot "items[0]
+    // corresponds to logical index first_visible * num_cols".
+    {
+        use crate::layout_snapshot::{SourceLayout, TextLayout};
+        let item_offset = first_visible * num_cols;
+        for row_idx in first_visible..last_visible {
+            let row = &table.rows[row_idx];
+            let ry = data_y + row_idx as f32 * table.row_height;
+            let mut col_x = x;
+            for (col_idx, cell) in row.iter().enumerate() {
+                if col_idx < num_cols {
+                    let tx = col_x + cell_pad;
+                    let ty = ry + 2.0;
+                    let mut text_layout = TextLayout::simple(
+                        cell.text.clone(), cell.color.pack(),
+                        tx, ty, char_width, table.line_height,
+                    );
+                    text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
+                    snapshot.register_source_with_offset(table.source_id, SourceLayout::text(text_layout), item_offset);
+                    col_x += table.columns[col_idx].width;
+                }
+            }
+        }
+    }
+
+    // Render only visible rows (primitives + widgets)
     for row_idx in first_visible..last_visible {
         let row = &table.rows[row_idx];
         let ry = data_y + row_idx as f32 * table.row_height;
@@ -454,15 +489,6 @@ pub(crate) fn render_virtual_table(
                     let text_rect = Rect::new(tx, ty, text_width, table.line_height);
                     snapshot.register_widget(wid, text_rect);
                     snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
-                }
-                {
-                    use crate::layout_snapshot::{SourceLayout, TextLayout};
-                    let mut text_layout = TextLayout::simple(
-                        cell.text.clone(), cell.color.pack(),
-                        tx, ty, char_width, table.line_height,
-                    );
-                    text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
-                    snapshot.register_source(table.source_id, SourceLayout::text(text_layout));
                 }
                 col_x += table.columns[col_idx].width;
             }
