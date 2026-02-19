@@ -74,7 +74,7 @@ pub mod frame_timing;
 
 // Re-export core types
 pub use primitives::{Color, Rect, Size, Constraints, Point};
-pub use content_address::{ContentAddress, SourceId, Selection, SourceOrdering};
+pub use content_address::{ContentAddress, SourceId, Selection, SelectionShape, SourceOrdering};
 pub use layout_snapshot::{Anchor, CursorIcon, Decoration, HitResult, LayoutSnapshot, ScrollTrackInfo, SourceLayout, ItemLayout, TextLayout, GridLayout, GridRow, TextRun, RunStyle, UnderlineStyle};
 pub use event_context::{
     CaptureState, Event, EventContext, FileDropEvent, Key, KeyEvent, Modifiers, MouseButton,

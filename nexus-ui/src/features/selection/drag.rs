@@ -133,6 +133,8 @@ pub enum SelectMode {
     Word,
     /// Triple-click: line-level selection.
     Line,
+    /// Alt+click: rectangular/column selection.
+    Rect,
 }
 
 impl Default for SelectMode {
@@ -423,7 +425,7 @@ pub fn route_drag_mouse(
                 MouseEvent::CursorMoved { position, .. } => {
                     update_auto_scroll(auto_scroll, scroll_bounds, position);
                     if let Some(HitResult::Content(addr)) = hit {
-                        MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(addr)))
+                        MouseResponse::message(NexusMessage::Selection(SelectionMsg::Extend(addr, *position)))
                     } else {
                         MouseResponse::none()
                     }
@@ -472,12 +474,17 @@ pub fn route_text_selection_start(
     click_tracker: &ClickTracker,
     hit: Option<HitResult>,
     position: Point,
+    modifiers: strata::Modifiers,
 ) -> Option<MouseResponse<NexusMessage>> {
     if let Some(HitResult::Content(addr)) = hit {
-        let mode = click_tracker.register_click(position, std::time::Instant::now());
+        let mode = if modifiers.alt {
+            SelectMode::Rect
+        } else {
+            click_tracker.register_click(position, std::time::Instant::now())
+        };
         let capture_source = addr.source_id;
         Some(MouseResponse::message_and_capture(
-            NexusMessage::Drag(DragMsg::StartSelecting(addr, mode)),
+            NexusMessage::Drag(DragMsg::StartSelecting(addr, mode, position)),
             capture_source,
         ))
     } else {

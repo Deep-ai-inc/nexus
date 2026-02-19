@@ -143,12 +143,14 @@ pub enum MouseEvent {
     ButtonPressed {
         button: MouseButton,
         position: Point,
+        modifiers: Modifiers,
     },
 
     /// Mouse button released.
     ButtonReleased {
         button: MouseButton,
         position: Point,
+        modifiers: Modifiers,
     },
 
     /// Mouse cursor moved.

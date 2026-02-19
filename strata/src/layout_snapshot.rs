@@ -1073,6 +1073,8 @@ impl LayoutSnapshot {
         //    These take precedence over content to ensure clickability even
         //    when overlapping with selectable text.  Large container widgets
         //    (scroll areas) are deferred to step 3.
+        //    NOTE: This threshold is also used in handle_mouse_event's gap-click
+        //    fallback to decide which widgets "claim" clicks. Keep in sync.
         const INTERACTIVE_MAX_AREA: f32 = 40_000.0; // ~200x200
         let mut best_widget: Option<(SourceId, f32)> = None;
         for (id, rect) in &self.widget_bounds {
@@ -1478,6 +1480,17 @@ impl LayoutSnapshot {
     /// Used for the transparent selection overlay — grid selections use
     /// opaque background + white text rendering instead.
     pub fn text_selection_bounds(&self, selection: &Selection) -> Vec<(Rect, Option<Rect>)> {
+        use crate::content_address::SelectionShape;
+        match selection.shape {
+            SelectionShape::Linear => self.linear_text_selection_bounds(selection),
+            SelectionShape::Rectangular { x_min, x_max } => {
+                self.rect_text_selection_bounds(selection, x_min, x_max)
+            }
+        }
+    }
+
+    /// Linear text selection bounds — standard anchor-to-focus rendering.
+    fn linear_text_selection_bounds(&self, selection: &Selection) -> Vec<(Rect, Option<Rect>)> {
         let (start, end) = self.normalize_selection(selection);
         let mut rects = Vec::new();
 
@@ -1510,7 +1523,6 @@ impl LayoutSnapshot {
                     && end.item_index >= layout.items.len());
 
             if fully_before_start && fully_after_end {
-                // Only include if this source has text items
                 let has_text = layout.items.iter().any(|i| matches!(i, ItemLayout::Text(_)));
                 if has_text {
                     rects.push((layout.bounds, clip));
@@ -1518,7 +1530,7 @@ impl LayoutSnapshot {
             } else {
                 for (item_index, item) in layout.items.iter().enumerate() {
                     if matches!(item, ItemLayout::Grid(_)) {
-                        continue; // Skip grids
+                        continue;
                     }
                     let item_rects = self.selection_bounds_for_item(
                         &source_id,
@@ -1531,6 +1543,183 @@ impl LayoutSnapshot {
                         end_order,
                     );
                     rects.extend(item_rects.into_iter().map(|r| (r, clip)));
+                }
+            }
+        }
+
+        rects
+    }
+
+    /// Rectangular text selection bounds — character-snapped per-line rects.
+    /// Each line's highlight snaps to the character edges that overlap the
+    /// [x_min, x_max] visual column band.
+    fn rect_text_selection_bounds(
+        &self,
+        selection: &Selection,
+        x_min: f32,
+        x_max: f32,
+    ) -> Vec<(Rect, Option<Rect>)> {
+        let (start, end) = self.normalize_selection(selection);
+        let mut rects = Vec::new();
+
+        let sources = selection.sources(&self.source_ordering);
+
+        for source_id in sources {
+            let Some(layout) = self.sources.get(&source_id) else {
+                continue;
+            };
+
+            let start_order = self.source_ordering.position(&start.source_id);
+            let end_order = self.source_ordering.position(&end.source_id);
+            let current_order = self.source_ordering.position(&source_id);
+
+            let (Some(start_order), Some(end_order), Some(current_order)) =
+                (start_order, end_order, current_order)
+            else {
+                continue;
+            };
+
+            let clip = layout.clip_rect;
+
+            for (item_index, item) in layout.items.iter().enumerate() {
+                let ItemLayout::Text(text_layout) = item else {
+                    continue; // Skip grids
+                };
+
+                // Determine which lines are in the selection's row range.
+                // Reuse the same offset logic as selection_bounds_for_item.
+                let sel_start = if source_id == start.source_id && item_index == start.item_index {
+                    start.content_offset
+                } else if current_order > start_order
+                    || (source_id == start.source_id && item_index > start.item_index)
+                {
+                    0
+                } else {
+                    continue; // Before selection
+                };
+
+                let sel_end = if source_id == end.source_id && item_index == end.item_index {
+                    end.content_offset
+                } else if current_order < end_order
+                    || (source_id == end.source_id && item_index < end.item_index)
+                {
+                    text_layout.char_count
+                } else {
+                    continue; // After selection
+                };
+
+                if sel_start >= sel_end {
+                    continue;
+                }
+
+                let start_line = text_layout.line_for_offset(sel_start);
+                let end_line = text_layout.line_for_offset(sel_end.saturating_sub(1));
+
+                for line in start_line..=end_line {
+                    if let Some(r) = Self::rect_text_line_bounds(text_layout, line, x_min, x_max) {
+                        rects.push((r, clip));
+                    }
+                }
+            }
+        }
+
+        rects
+    }
+
+    /// Compute character-snapped selection bounds for one text line
+    /// within a rectangular selection's [x_min, x_max] visual column band.
+    fn rect_text_line_bounds(
+        text_layout: &TextLayout,
+        line: usize,
+        x_min: f32,
+        x_max: f32,
+    ) -> Option<Rect> {
+        let (line_start, line_end) = text_layout.line_range(line);
+        let has_widths = !text_layout.char_widths.is_empty();
+        let fa = text_layout.fallback_advance;
+
+        let mut rect_left = f32::MAX;
+        let mut rect_right = f32::MIN;
+
+        for i in line_start..line_end {
+            let pos = text_layout.char_positions.get(i).copied().unwrap_or(0.0);
+            let w = if has_widths {
+                text_layout.char_widths.get(i).copied().unwrap_or(fa)
+            } else {
+                text_layout.char_positions.get(i + 1)
+                    .map(|&next| (next - pos).abs())
+                    .unwrap_or(fa)
+            };
+            let char_left = text_layout.bounds.x + pos.min(pos + w);
+            let char_right = text_layout.bounds.x + pos.max(pos + w);
+
+            // Include this character if its visual range overlaps [x_min, x_max]
+            if char_right > x_min && char_left < x_max {
+                rect_left = rect_left.min(char_left);
+                rect_right = rect_right.max(char_right);
+            }
+        }
+
+        if rect_left >= rect_right {
+            return None;
+        }
+
+        Some(Rect {
+            x: rect_left,
+            y: text_layout.bounds.y + text_layout.line_y(line),
+            width: rect_right - rect_left,
+            height: text_layout.line_height,
+        })
+    }
+
+    /// Returns rectangles filling vertical gaps between selected sources.
+    /// These fill the spaces between content blocks during selection,
+    /// matching browser-style selection behavior.
+    pub fn selection_gap_rects(&self, selection: &Selection) -> Vec<(Rect, Option<Rect>)> {
+        use crate::content_address::SelectionShape;
+
+        let sources = selection.sources(&self.source_ordering);
+        if sources.len() < 2 {
+            return Vec::new();
+        }
+
+        let mut rects = Vec::new();
+
+        for pair in sources.windows(2) {
+            let (prev_id, next_id) = (pair[0], pair[1]);
+            let (Some(prev_layout), Some(next_layout)) = (
+                self.sources.get(&prev_id),
+                self.sources.get(&next_id),
+            ) else {
+                continue;
+            };
+
+            let prev_bottom = prev_layout.bounds.y + prev_layout.bounds.height;
+            let next_top = next_layout.bounds.y;
+            let gap = next_top - prev_bottom;
+
+            if gap > 0.0 {
+                let (x, width) = match selection.shape {
+                    SelectionShape::Rectangular { x_min, x_max } => (x_min, x_max - x_min),
+                    SelectionShape::Linear => {
+                        // Use the wider of the two sources for gap width
+                        let x = prev_layout.bounds.x.min(next_layout.bounds.x);
+                        let right = (prev_layout.bounds.x + prev_layout.bounds.width)
+                            .max(next_layout.bounds.x + next_layout.bounds.width);
+                        (x, right - x)
+                    }
+                };
+
+                if width > 0.0 {
+                    rects.push((
+                        Rect {
+                            x,
+                            y: prev_bottom,
+                            width,
+                            height: gap,
+                        },
+                        prev_layout.clip_rect,
+                    ));
                 }
             }
         }

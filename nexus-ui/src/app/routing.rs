@@ -354,10 +354,10 @@ pub(super) fn on_mouse(
     if let MouseEvent::ButtonPressed {
         button: MouseButton::Left,
         position,
-        ..
+        modifiers,
     } = &event
     {
-        return route_left_click(state, hit, *position);
+        return route_left_click(state, hit, *position, *modifiers);
     }
 
     MouseResponse::none()
@@ -368,6 +368,7 @@ fn route_left_click(
     state: &NexusState,
     hit: Option<HitResult>,
     position: strata::primitives::Point,
+    modifiers: strata::Modifiers,
 ) -> MouseResponse<NexusMessage> {
     // Context menu item click (transient UI)
     if let Some(msg) = route_context_menu_click(state, &hit) {
@@ -392,7 +393,7 @@ fn route_left_click(
     }
     // Text content selection
     if let Some(r) = crate::features::selection::drag::route_text_selection_start(
-        &state.drag.click_tracker, hit.clone(), position,
+        &state.drag.click_tracker, hit.clone(), position, modifiers,
     ) {
         return r;
     }

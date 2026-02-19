@@ -790,6 +790,7 @@ impl TextInputState {
             MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
                 position,
+                ..
             } => {
                 if let Some(HitResult::Widget(id)) = hit {
                     if *id == self.id {

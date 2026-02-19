@@ -196,6 +196,7 @@ impl StrataWidget<TerminalMessage> for TerminalWidget {
             Event::Mouse(MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
                 position,
+                ..
             }) => {
                 if let Some(crate::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {
                     if addr.source_id == self.source_id {

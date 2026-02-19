@@ -95,8 +95,8 @@ impl NexusState {
             }
             NexusMessage::Selection(m) => {
                 let snap_content = match &m {
-                    super::message::SelectionMsg::Extend(addr)
-                    | super::message::SelectionMsg::Start(addr, _) => {
+                    super::message::SelectionMsg::Extend(addr, _)
+                    | super::message::SelectionMsg::Start(addr, _, _) => {
                         self.build_snap_content(addr.source_id)
                     }
                     _ => None,
@@ -257,7 +257,7 @@ impl NexusState {
                     intent,
                 };
             }
-            DragMsg::StartSelecting(addr, mode) => {
+            DragMsg::StartSelecting(addr, mode, position) => {
                 // If the click landed on a shell block, focus it so keyboard
                 // input flows to its PTY.
                 if let Some(block_id) = self.shell.block_for_source(addr.source_id) {
@@ -266,7 +266,7 @@ impl NexusState {
                 // Immediate Active — no Pending hysteresis for raw text clicks.
                 let snap_content = self.build_snap_content(addr.source_id);
                 self.selection.update(
-                    super::message::SelectionMsg::Start(addr.clone(), mode),
+                    super::message::SelectionMsg::Start(addr.clone(), mode, position),
                     ctx,
                     snap_content.as_ref(),
                 );
@@ -317,7 +317,7 @@ impl NexusState {
                             PendingIntent::SelectionDrag { origin_addr, .. } => {
                                 // Click inside selection without drag → clear selection, place caret
                                 self.selection.update(
-                                    super::message::SelectionMsg::Start(origin_addr, crate::features::selection::drag::SelectMode::Char),
+                                    super::message::SelectionMsg::Start(origin_addr, crate::features::selection::drag::SelectMode::Char, strata::primitives::Point::ORIGIN),
                                     ctx,
                                     None,
                                 );

@@ -202,25 +202,50 @@ impl Hash for ContentAddress {
     }
 }
 
+/// Selection shape determines how the anchor-focus range is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SelectionShape {
+    /// Standard linear selection from anchor to focus in document order.
+    Linear,
+    /// Rectangular/column selection. Visual x-coordinates define the column range,
+    /// while anchor/focus define the row range.
+    Rectangular { x_min: f32, x_max: f32 },
+}
+
+impl Default for SelectionShape {
+    fn default() -> Self {
+        Self::Linear
+    }
+}
+
 /// A selection defined by two content addresses.
 ///
 /// The selection spans from `anchor` (where the selection started) to `focus`
 /// (the current cursor position). These may be in any order - use `normalized()`
 /// to get them in document order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Selection {
     /// The starting point of the selection (where the user clicked).
     pub anchor: ContentAddress,
 
     /// The current endpoint of the selection (where the cursor is now).
     pub focus: ContentAddress,
+
+    /// Shape of the selection (linear or rectangular).
+    pub shape: SelectionShape,
 }
 
 impl Selection {
-    /// Create a new selection.
+    /// Create a new linear selection.
     #[inline]
-    pub const fn new(anchor: ContentAddress, focus: ContentAddress) -> Self {
-        Self { anchor, focus }
+    pub fn new(anchor: ContentAddress, focus: ContentAddress) -> Self {
+        Self { anchor, focus, shape: SelectionShape::Linear }
+    }
+
+    /// Create a new selection with a specific shape.
+    #[inline]
+    pub fn with_shape(anchor: ContentAddress, focus: ContentAddress, shape: SelectionShape) -> Self {
+        Self { anchor, focus, shape }
     }
 
     /// Create a collapsed selection (cursor position, no actual selection).
@@ -229,6 +254,7 @@ impl Selection {
         Self {
             anchor: position.clone(),
             focus: position,
+            shape: SelectionShape::Linear,
         }
     }
 

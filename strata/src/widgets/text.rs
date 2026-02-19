@@ -135,6 +135,7 @@ impl StrataWidget<TextMessage> for TextWidget {
             Event::Mouse(MouseEvent::ButtonPressed {
                 button: MouseButton::Left,
                 position,
+                ..
             }) => {
                 // Hit-test to find cursor position
                 if let Some(crate::layout_snapshot::HitResult::Content(addr)) = ctx.layout.hit_test(*position) {

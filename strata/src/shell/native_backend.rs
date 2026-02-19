@@ -830,10 +830,10 @@ fn event_position(event: &NSEvent, view: &AnyObject) -> Point {
 fn scale_mouse_event(event: MouseEvent, zoom: f32) -> MouseEvent {
     let scale = |p: Point| Point::new(p.x / zoom, p.y / zoom);
     match event {
-        MouseEvent::ButtonPressed { button, position } =>
-            MouseEvent::ButtonPressed { button, position: scale(position) },
-        MouseEvent::ButtonReleased { button, position } =>
-            MouseEvent::ButtonReleased { button, position: scale(position) },
+        MouseEvent::ButtonPressed { button, position, modifiers } =>
+            MouseEvent::ButtonPressed { button, position: scale(position), modifiers },
+        MouseEvent::ButtonReleased { button, position, modifiers } =>
+            MouseEvent::ButtonReleased { button, position: scale(position), modifiers },
         MouseEvent::CursorMoved { position } =>
             MouseEvent::CursorMoved { position: scale(position) },
         MouseEvent::WheelScrolled { delta, position } =>
@@ -850,13 +850,15 @@ unsafe fn event_ref(raw: *mut AnyObject) -> &'static NSEvent {
 extern "C" fn mouse_down(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
     let event = unsafe { event_ref(event) };
     let pos = event_position(event, this);
-    dispatch_mouse(this, MouseEvent::ButtonPressed { button: MouseButton::Left, position: pos });
+    let mods = convert_ns_modifiers(event);
+    dispatch_mouse(this, MouseEvent::ButtonPressed { button: MouseButton::Left, position: pos, modifiers: mods });
 }
 
 extern "C" fn mouse_up(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
     let event = unsafe { event_ref(event) };
     let pos = event_position(event, this);
-    dispatch_mouse(this, MouseEvent::ButtonReleased { button: MouseButton::Left, position: pos });
+    let mods = convert_ns_modifiers(event);
+    dispatch_mouse(this, MouseEvent::ButtonReleased { button: MouseButton::Left, position: pos, modifiers: mods });
 }
 
 extern "C" fn mouse_dragged(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
@@ -874,13 +876,15 @@ extern "C" fn mouse_moved(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
 extern "C" fn right_mouse_down(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
     let event = unsafe { event_ref(event) };
     let pos = event_position(event, this);
-    dispatch_mouse(this, MouseEvent::ButtonPressed { button: MouseButton::Right, position: pos });
+    let mods = convert_ns_modifiers(event);
+    dispatch_mouse(this, MouseEvent::ButtonPressed { button: MouseButton::Right, position: pos, modifiers: mods });
 }
 
 extern "C" fn right_mouse_up(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
     let event = unsafe { event_ref(event) };
     let pos = event_position(event, this);
-    dispatch_mouse(this, MouseEvent::ButtonReleased { button: MouseButton::Right, position: pos });
+    let mods = convert_ns_modifiers(event);
+    dispatch_mouse(this, MouseEvent::ButtonReleased { button: MouseButton::Right, position: pos, modifiers: mods });
 }
 
 extern "C" fn right_mouse_dragged(this: &AnyObject, _sel: Sel, event: *mut AnyObject) {
@@ -1110,17 +1114,50 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
         let zoom = state.current_zoom;
         let adjusted_cursor = state.cursor_position.map(|p| Point::new(p.x / zoom, p.y / zoom));
 
+        // HACK: Area-based heuristic to decide whether a widget "claims" a click
+        // or lets it pass through to nearest_content for browser-style gap selection.
+        //
+        // The right solution is a proper event bubbling/capturing system (like the
+        // DOM): events dispatch to the most specific target, which can handle them
+        // or let them propagate up to parent containers. Each widget would declare
+        // whether it's interactive (claims clicks) or a passive layout container
+        // (lets clicks pass through to content beneath it).
+        //
+        // What we do instead: use the widget's screen area as a proxy. Small widgets
+        // (< 40k sq px — buttons, inputs, pills) are assumed interactive. Large
+        // widgets (scroll areas, panels) are assumed to be passive containers. This
+        // breaks if:
+        //   - A large widget IS interactive (e.g., a big custom canvas)
+        //   - A small widget is NOT interactive (unlikely but possible)
+        //   - Widget sizes change dynamically across the threshold
+        //
+        // The 40k threshold mirrors INTERACTIVE_MAX_AREA in hit_test_xy(). If that
+        // changes, this must change too.
         let hit = state.cached_snapshot.as_ref().and_then(|snapshot| {
             let raw_hit = adjusted_cursor.and_then(|pos| snapshot.hit_test(pos));
-            if state.capture.is_captured() && !matches!(&raw_hit, Some(HitResult::Content(_))) {
+            let claims_click = match &raw_hit {
+                Some(HitResult::Content(_)) => true,
+                Some(HitResult::Widget(id)) => {
+                    const INTERACTIVE_MAX_AREA: f32 = 40_000.0; // keep in sync with hit_test_xy
+                    snapshot.widget_bounds(id)
+                        .map(|r| r.width * r.height <= INTERACTIVE_MAX_AREA)
+                        .unwrap_or(false)
+                }
+                None => false,
+            };
+            let needs_fallback = state.capture.is_captured()
+                || (matches!(&strata_event, MouseEvent::ButtonPressed { .. }) && !claims_click);
+            if needs_fallback {
                 adjusted_cursor.and_then(|pos| snapshot.nearest_content(pos.x, pos.y)).or(raw_hit)
             } else {
                 raw_hit
             }
         });
 
+        let is_button_pressed = matches!(strata_event, MouseEvent::ButtonPressed { .. });
         let is_cursor_moved = matches!(strata_event, MouseEvent::CursorMoved { .. });
-        if !hit.is_some() && !state.capture.is_captured() && !is_cursor_moved {
+        let is_scroll = matches!(strata_event, MouseEvent::WheelScrolled { .. });
+        if !hit.is_some() && !state.capture.is_captured() && !is_cursor_moved && !is_button_pressed {
             return;
         }
 
@@ -1144,9 +1181,12 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
             process_message::<A>(&mut state, msg);
         }
 
-        // Render synchronously — matches handle_key_event. Eliminates the
-        // timer delay (up to 1ms) for scroll and other mouse-driven updates.
-        if state.pending_window_resize.is_none() {
+        // Render synchronously for non-scroll events (clicks, drags, etc.)
+        // where immediate visual feedback matters. Scroll events are deferred
+        // to the tick-rate render in the timer callback — rendering on every
+        // WheelScrolled would cause double-renders per vsync when PTY batches
+        // also trigger renders, creating choppy frame pacing.
+        if !is_scroll && state.pending_window_resize.is_none() {
             render_if_needed::<A>(&mut state);
         }
 
@@ -1796,13 +1836,29 @@ fn render_grid_selection(
     let (end_col, end_row) = grid_layout.offset_to_grid(sel_end.saturating_sub(1));
     let last_row = (end_row as usize).min(grid_layout.rows_content.len().saturating_sub(1));
 
+    // For rectangular selection, compute fixed column range from x-coordinates
+    let rect_col_range = if let crate::content_address::SelectionShape::Rectangular { x_min, x_max } = selection.shape {
+        let col_start = ((x_min - grid_layout.bounds.x) / grid_layout.cell_width).floor().max(0.0) as usize;
+        let col_end = ((x_max - grid_layout.bounds.x) / grid_layout.cell_width).ceil().min(cols as f32) as usize;
+        Some((col_start, col_end))
+    } else {
+        None
+    };
+
     for row_idx in (start_row as usize)..=last_row {
         let row = &grid_layout.rows_content[row_idx];
         let row_y = base_y + row_idx as f32 * grid_layout.cell_height * scale;
 
         // Selected column range for this row [start, end)
-        let row_sel_start = if row_idx == start_row as usize { start_col as usize } else { 0 };
-        let row_sel_end = if row_idx == end_row as usize { end_col as usize + 1 } else { cols };
+        let (row_sel_start, row_sel_end) = if let Some((cs, ce)) = rect_col_range {
+            // Rectangular: every row gets the same column range
+            (cs, ce)
+        } else {
+            // Linear: first/last rows may be partial
+            let rs = if row_idx == start_row as usize { start_col as usize } else { 0 };
+            let re = if row_idx == end_row as usize { end_col as usize + 1 } else { cols };
+            (rs, re)
+        };
 
         // 1. Opaque selection background (clipped to grid)
         let bg_inst = pipeline.instance_count();
@@ -2054,6 +2110,13 @@ fn populate_pipeline(
     if let Some(sel) = selection {
         if !sel.is_collapsed() {
             for (r, clip) in &snapshot.text_selection_bounds(sel) {
+                let start = pipeline.instance_count();
+                let scaled = Rect { x: r.x * scale, y: r.y * scale, width: r.width * scale, height: r.height * scale };
+                pipeline.add_solid_rects(&[scaled], crate::gpu::SELECTION_COLOR);
+                maybe_clip(pipeline, start, clip, scale);
+            }
+            // Gap-filling rects between selected sources
+            for (r, clip) in &snapshot.selection_gap_rects(sel) {
                 let start = pipeline.instance_count();
                 let scaled = Rect { x: r.x * scale, y: r.y * scale, width: r.width * scale, height: r.height * scale };
                 pipeline.add_solid_rects(&[scaled], crate::gpu::SELECTION_COLOR);
@@ -2352,13 +2415,13 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             // Call on_tick at the display's refresh rate for periodic effects
             // (spring animation, auto-scroll, output polling). Only flag a
             // render when on_tick reports state actually changed.
-            if state.last_tick_time.elapsed().as_millis() >= state.tick_interval_ms as u128 {
+            let at_tick = state.last_tick_time.elapsed().as_millis() >= state.tick_interval_ms as u128;
+            if at_tick {
                 state.last_tick_time = Instant::now();
                 if A::on_tick(&mut state.app) {
                     state.needs_render = true;
                 }
             }
-
 
             // Update window title only when changed (avoids NSString alloc + ObjC call per tick).
             let new_title = A::title(&state.app);
@@ -2376,9 +2439,16 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             drop(state);
             flush_pending_resize::<A>(state_cell);
 
-            // Render after flush so zoom changes take effect immediately.
+            // Render at display refresh rate only. Scroll events and PTY
+            // batches update state above but don't render immediately —
+            // this single render-per-vsync combines all changes, avoiding
+            // the double-render choppiness of event-driven rendering.
+            // Key events still render synchronously in handle_key_event
+            // for lowest typing latency.
             let Ok(mut state) = state_cell.try_borrow_mut() else { return };
-            render_if_needed::<A>(&mut state);
+            if at_tick {
+                render_if_needed::<A>(&mut state);
+            }
 
             // Update cursor after render (widgets may have shifted under cursor).
             // Always re-assert — AppKit can reset cursor between timer ticks.

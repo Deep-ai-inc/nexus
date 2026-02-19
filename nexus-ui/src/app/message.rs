@@ -95,7 +95,8 @@ pub enum DragMsg {
     /// Begin a pending interaction (mouse down on draggable/ambiguous element).
     Start(crate::features::selection::drag::PendingIntent, strata::primitives::Point),
     /// Begin text selection immediately (no hysteresis — raw text click).
-    StartSelecting(ContentAddress, crate::features::selection::drag::SelectMode),
+    /// The Point is the visual mouse position (needed for rectangular selection).
+    StartSelecting(ContentAddress, crate::features::selection::drag::SelectMode, strata::primitives::Point),
     /// Mouse moved past the 5px threshold — hand off to OS native drag.
     Activate(strata::primitives::Point),
     /// Drag cancelled (mouse released before threshold, or Escape).
@@ -204,8 +205,8 @@ pub enum AgentMsg {
 
 #[derive(Debug, Clone)]
 pub enum SelectionMsg {
-    Start(ContentAddress, crate::features::selection::drag::SelectMode),
-    Extend(ContentAddress),
+    Start(ContentAddress, crate::features::selection::drag::SelectMode, strata::primitives::Point),
+    Extend(ContentAddress, strata::primitives::Point),
     End,
     Clear,
 }
