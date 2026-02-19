@@ -669,13 +669,31 @@ impl StrataPipeline {
         }
     }
 
-    /// Gather all cached grid rows into the instance buffer.
+    /// Gather cached grid rows into the instance buffer, culling rows outside
+    /// the clip viewport.
     ///
-    /// For each row, copies cached instances with the absolute Y offset
-    /// (`base_y + row_idx * cell_h`) and optional clip rect applied in a
-    /// single pass (fused copy + transform for better cache locality).
+    /// For each **visible** row, copies cached instances with the absolute Y
+    /// offset (`base_y + row_idx * cell_h`) and clip rect applied in a single
+    /// pass (fused copy + transform for better cache locality).
+    ///
+    /// Rows whose bottom edge is above `clip.y` or whose top edge is below
+    /// `clip.y + clip.h` are skipped entirely, avoiding thousands of useless
+    /// instance copies for long terminal blocks.
     pub fn gather_grid_rows(&mut self, base_y: f32, cell_h: f32, num_rows: usize, clip: Option<[f32; 4]>) {
-        for row_idx in 0..num_rows.min(self.grid_row_cache.len()) {
+        let num_rows = num_rows.min(self.grid_row_cache.len());
+
+        // Compute visible row range from clip rect (viewport culling).
+        let (first_row, last_row) = if let Some(c) = clip {
+            let clip_top = c[1];
+            let clip_bottom = c[1] + c[3];
+            let first = ((clip_top - base_y) / cell_h).floor().max(0.0) as usize;
+            let last = ((clip_bottom - base_y) / cell_h).ceil().max(0.0) as usize;
+            (first.min(num_rows), last.min(num_rows))
+        } else {
+            (0, num_rows)
+        };
+
+        for row_idx in first_row..last_row {
             if let Some(cached) = &self.grid_row_cache[row_idx] {
                 if cached.instances.is_empty() {
                     continue;

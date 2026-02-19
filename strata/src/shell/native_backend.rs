@@ -2013,7 +2013,22 @@ fn populate_pipeline(
                 let cell_h = grid_layout.cell_height * scale;
                 pipeline.ensure_grid_cache(grid_layout.cols, grid_layout.rows_content.len(), grid_layout.bounds.x);
 
-                for (row_idx, row) in grid_layout.rows_content.iter().enumerate() {
+                // Row-level viewport culling: only hash/render rows that
+                // intersect the clip rect. For a 5000-row terminal with
+                // ~45 visible rows this skips >99% of per-row work.
+                let num_rows = grid_layout.rows_content.len();
+                let (first_vis, last_vis) = if let Some(ref clip) = *grid_clip {
+                    let first = ((clip.y - grid_layout.bounds.y) / grid_layout.cell_height)
+                        .floor().max(0.0) as usize;
+                    let last = ((clip.y + clip.height - grid_layout.bounds.y) / grid_layout.cell_height)
+                        .ceil().max(0.0) as usize;
+                    (first.min(num_rows), last.min(num_rows))
+                } else {
+                    (0, num_rows)
+                };
+
+                for row_idx in first_vis..last_vis {
+                    let row = &grid_layout.rows_content[row_idx];
                     if row.runs.is_empty() { continue; }
                     let signature = hash_grid_row(row);
                     let Some(build_start) = pipeline.begin_grid_row(row_idx, signature) else { continue; };
