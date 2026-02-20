@@ -218,6 +218,12 @@ impl NexusState {
             return Command::message(NexusMessage::ClearScreen);
         }
 
+        // Append to native shell history (before execution, for crash safety).
+        // Records both kernel and PTY commands.
+        if !is_agent {
+            self.kernel.blocking_lock().append_history(&text);
+        }
+
         self.input.reset_history_nav();
 
         if is_agent {

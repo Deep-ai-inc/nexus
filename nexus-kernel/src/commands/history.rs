@@ -1,9 +1,9 @@
-//! history - Command history with full-text search.
+//! history - Command history from native shell history file.
 //!
-//! Uses SQLite for persistent, searchable command history.
+//! Reads from ~/.zsh_history or ~/.bash_history (auto-detected).
 
 use super::{CommandContext, NexusCommand};
-use crate::persistence::Store;
+use crate::shell_history::ShellHistory;
 use nexus_api::Value;
 
 pub struct HistoryCommand;
@@ -51,59 +51,33 @@ impl NexusCommand for HistoryCommand {
             limit = 10000; // Large limit for "all"
         }
 
-        // Open the store (read-only connection)
-        let store = match Store::open_default() {
-            Ok(s) => s,
-            Err(e) => {
+        // Open native shell history (read-only snapshot)
+        let hist = match ShellHistory::open() {
+            Some(h) => h,
+            None => {
                 return Ok(Value::Error {
                     code: 1,
-                    message: format!("Failed to open history database: {}", e),
+                    message: "Could not detect shell history file".to_string(),
                 });
             }
         };
 
         // Search or list history
         let entries = if let Some(query) = search_query {
-            // Full-text search
-            match store.search_history(&query, limit) {
-                Ok(e) => e,
-                Err(e) => {
-                    return Ok(Value::Error {
-                        code: 1,
-                        message: format!("Search failed: {}", e),
-                    });
-                }
-            }
+            hist.search(&query, limit)
         } else {
-            // Recent history
-            match store.get_recent_history(limit) {
-                Ok(e) => e,
-                Err(e) => {
-                    return Ok(Value::Error {
-                        code: 1,
-                        message: format!("Failed to get history: {}", e),
-                    });
-                }
-            }
+            hist.recent(limit)
         };
 
         // Convert to structured output
         let rows: Vec<Vec<Value>> = entries
             .iter()
             .map(|entry| {
-                vec![
-                    Value::Int(entry.id),
-                    Value::String(entry.command.clone()),
-                    entry.exit_code.map(|c| Value::Int(c as i64)).unwrap_or(Value::Unit),
-                    entry.duration_ms
-                        .map(|d| Value::String(format_duration(d)))
-                        .unwrap_or(Value::Unit),
-                    Value::String(format_relative_time(entry.timestamp)),
-                ]
+                vec![Value::String(entry.command.clone())]
             })
             .collect();
 
-        Ok(Value::table(vec!["id", "command", "exit", "duration", "when"], rows))
+        Ok(Value::table(vec!["command"], rows))
     }
 }
 
@@ -142,51 +116,19 @@ impl NexusCommand for FcCommand {
     }
 }
 
-/// Format duration in human-readable form.
-fn format_duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{}ms", ms)
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        let minutes = ms / 60_000;
-        let seconds = (ms % 60_000) / 1000;
-        format!("{}m{}s", minutes, seconds)
-    }
-}
-
-/// Format timestamp as relative time.
-fn format_relative_time(timestamp: chrono::DateTime<chrono::Utc>) -> String {
-    let now = chrono::Utc::now();
-    let diff = now.signed_duration_since(timestamp);
-
-    if diff.num_seconds() < 60 {
-        "just now".to_string()
-    } else if diff.num_minutes() < 60 {
-        format!("{}m ago", diff.num_minutes())
-    } else if diff.num_hours() < 24 {
-        format!("{}h ago", diff.num_hours())
-    } else if diff.num_days() < 7 {
-        format!("{}d ago", diff.num_days())
-    } else {
-        timestamp.format("%Y-%m-%d").to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_format_duration() {
-        assert_eq!(format_duration(50), "50ms");
-        assert_eq!(format_duration(1500), "1.5s");
-        assert_eq!(format_duration(65000), "1m5s");
-    }
-
-    #[test]
     fn test_history_command_name() {
         let cmd = HistoryCommand;
         assert_eq!(cmd.name(), "history");
+    }
+
+    #[test]
+    fn test_fc_command_name() {
+        let cmd = FcCommand;
+        assert_eq!(cmd.name(), "fc");
     }
 }

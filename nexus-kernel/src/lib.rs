@@ -5,7 +5,8 @@
 //! - Evaluator (AST walker)
 //! - State management
 //! - In-process commands (ls, cat, etc.)
-//! - Persistence (SQLite-backed history and sessions)
+//! - Persistence (SQLite-backed sessions and blocks)
+//! - Native shell history integration
 //! - Tab completion
 
 pub mod commands;
@@ -14,6 +15,7 @@ pub mod eval;
 pub mod parser;
 pub mod persistence;
 pub mod process;
+pub mod shell_history;
 
 mod error;
 mod state;
@@ -23,7 +25,8 @@ pub use completion::{Completion, CompletionEngine, CompletionKind};
 pub use error::ShellError;
 pub use eval::is_builtin;
 pub use parser::Parser;
-pub use persistence::{HistoryEntry, Store};
+pub use persistence::Store;
+pub use shell_history::{ShellHistory, ShellHistoryEntry};
 pub use state::{ShellState, TrapAction};
 
 /// Check if a word is a shell keyword that tree-sitter parses as a statement
@@ -59,10 +62,12 @@ pub struct Kernel {
     event_tx: broadcast::Sender<ShellEvent>,
     parser: parser::Parser,
     commands: CommandRegistry,
-    /// SQLite-backed persistence for history and sessions.
+    /// SQLite-backed persistence for sessions and blocks.
     store: Option<Store>,
     /// Current session ID.
     session_id: Option<i64>,
+    /// Native shell history (reads/writes ~/.zsh_history or ~/.bash_history).
+    shell_history: Option<ShellHistory>,
 }
 
 impl Kernel {
@@ -85,6 +90,12 @@ impl Kernel {
             }
         };
 
+        // Try to open native shell history (non-fatal if it fails)
+        let shell_history = ShellHistory::open();
+        if shell_history.is_none() {
+            tracing::warn!("Could not detect shell history file; history will be in-memory only");
+        }
+
         let kernel = Self {
             state: ShellState::new()?,
             event_tx,
@@ -92,6 +103,7 @@ impl Kernel {
             commands: CommandRegistry::new(),
             store,
             session_id,
+            shell_history,
         };
         Ok((kernel, event_rx))
     }
@@ -172,7 +184,6 @@ impl Kernel {
     ) -> anyhow::Result<i32> {
         // Handle pipeline continuation: `| cmd` becomes `_ | cmd`
         let processed_input = preprocess_input(input);
-        let start = std::time::Instant::now();
 
         let ast = self.parser.parse(&processed_input)?;
         let exit_code = eval::execute_with_block_id(
@@ -182,19 +193,6 @@ impl Kernel {
             &self.commands,
             block_id,
         )?;
-
-        // Save to history (non-blocking, ignore errors)
-        let duration_ms = start.elapsed().as_millis() as u64;
-        if let Some(store) = &self.store {
-            let cwd = self.state.cwd.display().to_string();
-            let _ = store.add_history(
-                input.trim(),
-                &cwd,
-                Some(exit_code),
-                Some(duration_ms),
-                self.session_id,
-            );
-        }
 
         Ok(exit_code)
     }
@@ -228,24 +226,34 @@ impl Kernel {
         engine.complete(input, cursor)
     }
 
-    /// Search command history using full-text search.
+    /// Search command history using substring matching on native shell history.
     ///
     /// Returns matching history entries, most recent first.
-    pub fn search_history(&self, query: &str, limit: usize) -> Vec<persistence::HistoryEntry> {
-        self.store
+    pub fn search_history(&self, query: &str, limit: usize) -> Vec<ShellHistoryEntry> {
+        self.shell_history
             .as_ref()
-            .and_then(|store| store.search_history(query, limit).ok())
+            .map(|h| h.search(query, limit))
             .unwrap_or_default()
     }
 
-    /// Get recent command history.
+    /// Get recent command history from native shell history.
     ///
-    /// Returns the most recent commands, newest first.
-    pub fn get_recent_history(&self, limit: usize) -> Vec<persistence::HistoryEntry> {
-        self.store
+    /// Returns the most recent commands, newest last (chronological order).
+    pub fn get_recent_history(&self, limit: usize) -> Vec<ShellHistoryEntry> {
+        self.shell_history
             .as_ref()
-            .and_then(|store| store.get_recent_history(limit).ok())
+            .map(|h| h.recent(limit))
             .unwrap_or_default()
+    }
+
+    /// Append a command to native shell history.
+    ///
+    /// Called from the UI on submit (before execution) so both kernel and PTY
+    /// commands are recorded, and commands survive crashes.
+    pub fn append_history(&mut self, command: &str) {
+        if let Some(h) = &mut self.shell_history {
+            h.append(command);
+        }
     }
 }
 

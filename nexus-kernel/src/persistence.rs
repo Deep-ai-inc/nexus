@@ -1,11 +1,11 @@
-//! SQLite-backed persistence for sessions, commands, and outputs.
+//! SQLite-backed persistence for sessions and blocks.
 //!
-//! This module provides the foundation for:
-//! - Infinite command history with full-text search
+//! This module provides:
 //! - Session persistence (resume where you left off)
 //! - Block/output storage (infinite scrollback)
-//! - Cross-session sync
-//! - Command frequency tracking for smart suggestions
+//!
+//! Command history has moved to [`crate::shell_history`] which reads/writes
+//! the user's native shell history file.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -19,18 +19,6 @@ const SCHEMA_VERSION: i32 = 1;
 /// The persistence store backed by SQLite.
 pub struct Store {
     conn: Connection,
-}
-
-/// A stored command entry.
-#[derive(Debug, Clone)]
-pub struct HistoryEntry {
-    pub id: i64,
-    pub command: String,
-    pub cwd: String,
-    pub exit_code: Option<i32>,
-    pub duration_ms: Option<u64>,
-    pub timestamp: DateTime<Utc>,
-    pub session_id: Option<i64>,
 }
 
 /// A stored session.
@@ -140,39 +128,6 @@ impl Store {
                 cwd TEXT NOT NULL
             );
 
-            -- Command history with full-text search
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                command TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                exit_code INTEGER,
-                duration_ms INTEGER,
-                timestamp TEXT NOT NULL,
-                session_id INTEGER,
-                FOREIGN KEY (session_id) REFERENCES sessions(id)
-            );
-
-            -- Full-text search index for history
-            CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
-                command,
-                content='history',
-                content_rowid='id'
-            );
-
-            -- Triggers to keep FTS in sync
-            CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
-                INSERT INTO history_fts(rowid, command) VALUES (new.id, new.command);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
-                INSERT INTO history_fts(history_fts, rowid, command) VALUES('delete', old.id, old.command);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS history_au AFTER UPDATE ON history BEGIN
-                INSERT INTO history_fts(history_fts, rowid, command) VALUES('delete', old.id, old.command);
-                INSERT INTO history_fts(rowid, command) VALUES (new.id, new.command);
-            END;
-
             -- Blocks table (command + structured output)
             CREATE TABLE IF NOT EXISTS blocks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,8 +143,6 @@ impl Store {
 
             -- Index for fast session lookup
             CREATE INDEX IF NOT EXISTS idx_blocks_session ON blocks(session_id);
-            CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id);
-            CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp DESC);
 
             -- Set schema version
             INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1');
@@ -244,110 +197,6 @@ impl Store {
                 },
             )
             .optional()
-            .map_err(Into::into)
-    }
-
-    // =========================================================================
-    // History operations
-    // =========================================================================
-
-    /// Add a command to history.
-    pub fn add_history(
-        &self,
-        command: &str,
-        cwd: &str,
-        exit_code: Option<i32>,
-        duration_ms: Option<u64>,
-        session_id: Option<i64>,
-    ) -> Result<i64> {
-        let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT INTO history (command, cwd, exit_code, duration_ms, timestamp, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![command, cwd, exit_code, duration_ms.map(|d| d as i64), now, session_id],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Search history using full-text search.
-    pub fn search_history(&self, query: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT h.id, h.command, h.cwd, h.exit_code, h.duration_ms, h.timestamp, h.session_id
-             FROM history h
-             JOIN history_fts fts ON h.id = fts.rowid
-             WHERE history_fts MATCH ?1
-             ORDER BY h.timestamp DESC
-             LIMIT ?2"
-        )?;
-
-        let entries = stmt
-            .query_map(params![query, limit as i64], |row| {
-                Ok(HistoryEntry {
-                    id: row.get(0)?,
-                    command: row.get(1)?,
-                    cwd: row.get(2)?,
-                    exit_code: row.get(3)?,
-                    duration_ms: row.get::<_, Option<i64>>(4)?.map(|d| d as u64),
-                    timestamp: parse_datetime(row.get::<_, String>(5)?),
-                    session_id: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(entries)
-    }
-
-    /// Get recent history entries.
-    pub fn get_recent_history(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, command, cwd, exit_code, duration_ms, timestamp, session_id
-             FROM history
-             ORDER BY timestamp DESC
-             LIMIT ?1"
-        )?;
-
-        let entries = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok(HistoryEntry {
-                    id: row.get(0)?,
-                    command: row.get(1)?,
-                    cwd: row.get(2)?,
-                    exit_code: row.get(3)?,
-                    duration_ms: row.get::<_, Option<i64>>(4)?.map(|d| d as u64),
-                    timestamp: parse_datetime(row.get::<_, String>(5)?),
-                    session_id: row.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(entries)
-    }
-
-    /// Get command frequency (for suggestions).
-    pub fn get_command_frequency(&self, prefix: &str, limit: usize) -> Result<Vec<(String, i64)>> {
-        let pattern = format!("{}%", prefix);
-        let mut stmt = self.conn.prepare(
-            "SELECT command, COUNT(*) as freq
-             FROM history
-             WHERE command LIKE ?1
-             GROUP BY command
-             ORDER BY freq DESC
-             LIMIT ?2"
-        )?;
-
-        let results = stmt
-            .query_map(params![pattern, limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(results)
-    }
-
-    /// Get total history count.
-    pub fn history_count(&self) -> Result<i64> {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
             .map_err(Into::into)
     }
 
@@ -434,50 +283,6 @@ fn parse_datetime(s: String) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_create_and_search_history() {
-        let store = Store::open_in_memory().unwrap();
-
-        // Start a session
-        let session_id = store.start_session("/home/user").unwrap();
-
-        // Add some history
-        store.add_history("ls -la", "/home/user", Some(0), Some(50), Some(session_id)).unwrap();
-        store.add_history("git status", "/home/user", Some(0), Some(100), Some(session_id)).unwrap();
-        store.add_history("git commit -m 'test'", "/home/user", Some(0), Some(200), Some(session_id)).unwrap();
-
-        // Search for git commands
-        let results = store.search_history("git", 10).unwrap();
-        assert_eq!(results.len(), 2);
-
-        // Get recent history
-        let recent = store.get_recent_history(10).unwrap();
-        assert_eq!(recent.len(), 3);
-        assert_eq!(recent[0].command, "git commit -m 'test'"); // Most recent first
-    }
-
-    #[test]
-    fn test_command_frequency() {
-        let store = Store::open_in_memory().unwrap();
-
-        // Add repeated commands
-        for _ in 0..5 {
-            store.add_history("git status", "/", None, None, None).unwrap();
-        }
-        for _ in 0..3 {
-            store.add_history("git commit", "/", None, None, None).unwrap();
-        }
-        store.add_history("ls", "/", None, None, None).unwrap();
-
-        // Get frequency for git commands
-        let freq = store.get_command_frequency("git", 10).unwrap();
-        assert_eq!(freq.len(), 2);
-        assert_eq!(freq[0].0, "git status");
-        assert_eq!(freq[0].1, 5);
-        assert_eq!(freq[1].0, "git commit");
-        assert_eq!(freq[1].1, 3);
-    }
 
     #[test]
     fn test_blocks() {

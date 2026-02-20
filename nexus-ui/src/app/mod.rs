@@ -61,8 +61,8 @@ pub struct Attachment {
 ///
 /// Deliberately minimal — only truly global state lives here.
 /// Each window gets its own Kernel (own CWD, variables, last_output).
-/// History/persistence is naturally shared because all Kernels open
-/// the same SQLite file.
+/// History is naturally shared because all Kernels read/write the same
+/// native shell history file.
 #[derive(Clone)]
 pub struct NexusShared {
     /// Global block ID counter — ensures unique IDs across all windows.
@@ -468,15 +468,15 @@ impl RootComponent for NexusState {
 
     fn create(shared: &NexusShared, _images: &mut ImageStore) -> (Self, Command<NexusMessage>) {
         // Each window gets its own Kernel — full CWD/variable/output isolation.
-        // History is naturally shared (all kernels open the same SQLite file).
+        // History is naturally shared (all kernels read the same shell history file).
         let (mut kernel, kernel_rx) = Kernel::new().expect("Failed to create kernel");
         let kernel_tx = kernel.event_sender().clone();
 
         let command_history: Vec<String> = kernel
-            .store()
-            .and_then(|store| store.get_recent_history(1000).ok())
-            .map(|entries| entries.into_iter().rev().map(|e| e.command).collect())
-            .unwrap_or_default();
+            .get_recent_history(1000)
+            .into_iter()
+            .map(|e| e.command)
+            .collect();
 
         // Each window starts in $HOME. The process-level CWD is not meaningful
         // in multi-window mode — each window tracks its own CWD independently.
