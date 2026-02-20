@@ -1157,7 +1157,7 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
         let is_button_pressed = matches!(strata_event, MouseEvent::ButtonPressed { .. });
         let is_cursor_moved = matches!(strata_event, MouseEvent::CursorMoved { .. });
         let is_scroll = matches!(strata_event, MouseEvent::WheelScrolled { .. });
-        if !hit.is_some() && !state.capture.is_captured() && !is_cursor_moved && !is_button_pressed {
+        if !hit.is_some() && !state.capture.is_captured() && !is_cursor_moved && !is_button_pressed && !is_scroll {
             return;
         }
 

@@ -463,9 +463,14 @@ impl ScrollState {
         if let Some(track) = snapshot.scroll_track(&self.id) {
             self.track.set(Some(*track));
         }
-        if let Some(bounds) = snapshot.widget_bounds(&self.id) {
-            self.bounds.set(bounds);
-        }
+        // Always update bounds — reset to zero when the scroll container is
+        // absent from the current layout.  Without this, dismissed popups
+        // (completion, history search) retain stale bounds that silently
+        // consume WheelScrolled events via `contains()`, blocking the main
+        // scroll handler.
+        self.bounds.set(
+            snapshot.widget_bounds(&self.id).unwrap_or(Rect::ZERO),
+        );
     }
 
     /// Check if a point is within this scroll container's bounds.
