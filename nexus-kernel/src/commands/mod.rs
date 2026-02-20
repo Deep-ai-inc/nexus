@@ -3,26 +3,35 @@
 //! Commands implemented here run within the shell process (no fork/exec),
 //! return structured `Value` data, and can leverage full GUI capabilities.
 
+mod base64_cmd;
 mod basic;
 mod cat;
+mod chmod;
+mod clip;
 mod date;
 mod df;
+mod diff;
 mod du;
 mod env;
 mod find;
 mod fs;
 mod grep;
+mod hash;
 mod head;
+mod help;
 mod history;
 mod iterators;
 mod jobs;
 mod json;
 mod less;
+mod link;
 mod ls;
 mod man;
 mod math;
+mod open;
 mod path;
 mod prev;
+mod printf;
 pub(crate) mod ps;
 mod registry;
 mod select;
@@ -97,6 +106,11 @@ pub fn unregister_cancel(block_id: BlockId) {
 pub trait NexusCommand: Send + Sync {
     /// The command name (e.g., "ls", "cat", "grep")
     fn name(&self) -> &'static str;
+
+    /// One-line description for `help` output. Empty string = undocumented.
+    fn description(&self) -> &'static str {
+        ""
+    }
 
     /// Execute the command with the given arguments.
     fn execute(&self, args: &[String], ctx: &mut CommandContext) -> anyhow::Result<Value>;

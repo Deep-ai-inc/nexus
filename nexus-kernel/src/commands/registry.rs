@@ -4,20 +4,26 @@ use super::NexusCommand;
 use std::collections::HashMap;
 
 // Import all commands
+use super::base64_cmd::Base64Command;
 use super::basic::{
     EchoCommand, FalseCommand, HostnameCommand, PwdCommand, SleepCommand, TrueCommand,
     WhoamiCommand, YesCommand,
 };
 use super::cat::CatCommand;
+use super::chmod::ChmodCommand;
+use super::clip::ClipCommand;
 use super::date::DateCommand;
 use super::df::DfCommand;
+use super::diff::DiffCommand;
 use super::du::DuCommand;
 use super::env::{EnvCommand, ExportCommand, PrintenvCommand, UnsetCommand};
 use super::find::FindCommand;
 use super::fs::{CpCommand, MkdirCommand, MvCommand, RmCommand, RmdirCommand, TouchCommand};
 use super::grep::GrepCommand;
+use super::hash::{HashCommand, Md5sumCommand, Sha256sumCommand};
 use super::less::LessCommand;
 use super::head::HeadCommand;
+use super::help::HelpCommand;
 use super::history::{FcCommand, HistoryCommand};
 use super::iterators::{
     AllCommand, AnyCommand, EachCommand, FilterCommand, GroupByCommand, MapCommand, ReduceCommand,
@@ -25,11 +31,14 @@ use super::iterators::{
 };
 use super::jobs::{BgCommand, FgCommand, JobsCommand, WaitCommand};
 use super::json::{FromJsonCommand, GetCommand, ToJsonCommand};
+use super::link::LnCommand;
 use super::ls::LsCommand;
 use super::man::ManCommand;
 use super::math::{AvgCommand, CountCommand, MaxCommand, MinCommand, SumCommand};
+use super::open::OpenCommand;
 use super::path::{BasenameCommand, DirnameCommand, ExtnameCommand, RealpathCommand, StemCommand};
 use super::prev::{OutputsCommand, Prev1Command, Prev2Command, Prev3Command, PrevCommand};
+use super::printf::PrintfCommand;
 use super::ps::PsCommand;
 use super::select::{
     CompactCommand, EnumerateCommand, FirstCommand, FlattenCommand, LastCommand, NthCommand,
@@ -164,6 +173,8 @@ impl CommandRegistry {
         registry.register(RmdirCommand);
         registry.register(CpCommand);
         registry.register(MvCommand);
+        registry.register(ChmodCommand);
+        registry.register(LnCommand);
 
         // I/O
         registry.register(TeeCommand);
@@ -185,6 +196,7 @@ impl CommandRegistry {
         // Command lookup
         registry.register(WhichCommand);
         registry.register(TypeCommand);
+        registry.register(HelpCommand);
 
         // Persistent memory - access previous outputs
         registry.register(PrevCommand);    // _ - last output
@@ -198,6 +210,22 @@ impl CommandRegistry {
         registry.register(TopCommand);
         registry.register(ManCommand);
         registry.register(TreeCommand);
+
+        // Clipboard & desktop
+        registry.register(ClipCommand);
+        registry.register(OpenCommand);
+
+        // Encoding & hashing
+        registry.register(Base64Command);
+        registry.register(HashCommand);
+        registry.register(Md5sumCommand);
+        registry.register(Sha256sumCommand);
+
+        // File comparison
+        registry.register(DiffCommand);
+
+        // Formatted output
+        registry.register(PrintfCommand);
 
         // Testing
         registry.register(UnicodeStressCommand);
@@ -241,7 +269,7 @@ mod tests {
         let registry = CommandRegistry::new();
         // Should have many commands registered
         let count = registry.names().count();
-        assert!(count > 70, "Expected 70+ commands, got {}", count);
+        assert!(count > 80, "Expected 80+ commands, got {}", count);
     }
 
     #[test]
