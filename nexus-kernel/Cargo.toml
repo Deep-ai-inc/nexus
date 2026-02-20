@@ -19,7 +19,6 @@ base64 = { workspace = true }
 gethostname = { workspace = true }
 rand = { workspace = true }
 filetime = { workspace = true }
-git2 = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
 

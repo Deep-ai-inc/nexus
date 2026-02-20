@@ -272,24 +272,6 @@ fn test_words_sort_join() {
     t.expect_string("echo 'cherry apple banana' | words | sort | join ' '", "apple banana cherry");
 }
 
-#[test]
-fn test_tr_uppercase() {
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'hello' | tr '[:lower:]' '[:upper:]'", "HELLO");
-}
-
-#[test]
-fn test_tr_delete() {
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'hello world' | tr -d 'lo'", "he wrd");
-}
-
-#[test]
-fn test_rev_string() {
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'hello' | rev", "olleh");
-}
-
 // ============================================================================
 // Selection pipelines
 // ============================================================================
@@ -510,32 +492,6 @@ fn test_wc_chars() {
 // cut pipelines
 // ============================================================================
 
-#[test]
-fn test_cut_fields() {
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'a:b:c:d' | cut -d: -f2", "b");
-}
-
-#[test]
-fn test_cut_characters() {
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'hello' | cut -c1-3", "hel");
-}
-
-// ============================================================================
-// nl (number lines) pipelines
-// ============================================================================
-
-#[test]
-fn test_nl_basic() {
-    let mut t = PipelineTest::new();
-    let (columns, rows) = t.expect_table("echo 'a\nb\nc' | lines | nl");
-    assert_eq!(columns.len(), 2);
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0][0], Value::Int(1));
-    assert_eq!(rows[0][1], Value::String("a".to_string()));
-}
-
 // ============================================================================
 // tee-like behavior (passthrough)
 // ============================================================================
@@ -676,43 +632,6 @@ fn test_top_n_pattern() {
     // Pattern: sort -rn | head -3 (top 3 items)
     let mut t = PipelineTest::new();
     t.expect_int("seq 1 100 | sort -rn | head -3 | count", 3);
-}
-
-// --- CSV/delimited data processing ---
-
-#[test]
-fn test_csv_extract_column() {
-    // Pattern: cut -d',' -f2 (extract second column from CSV)
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'name,age,city' | cut -d, -f2", "age");
-}
-
-#[test]
-fn test_csv_column_unique_values() {
-    // Pattern: cut -f2 | sort | uniq (unique values in column)
-    let mut t = PipelineTest::new();
-    let csv = "alice,NY\nbob,CA\ncharlie,NY\ndave,TX";
-    t.expect_int(&format!("echo '{}' | lines | cut -d, -f2 | sort | uniq | count", csv), 3);
-}
-
-#[test]
-fn test_csv_filter_and_extract() {
-    // Pattern: grep pattern | cut -f1 (filter rows then extract column)
-    let mut t = PipelineTest::new();
-    let csv = "alice,yes\nbob,no\ncharlie,yes";
-    let items = t.expect_list(&format!("echo '{}' | lines | grep yes | cut -d, -f1", csv));
-    // Should get alice and charlie (both have 'yes')
-    assert_eq!(items.len(), 2);
-}
-
-// --- Text transformation pipelines ---
-
-#[test]
-fn test_normalize_and_dedupe() {
-    // Pattern: tr '[:upper:]' '[:lower:]' | sort | uniq (normalize case, dedupe)
-    let mut t = PipelineTest::new();
-    let data = "Apple\napple\nAPPLE\nBanana";
-    t.expect_int(&format!("echo '{}' | lines | tr '[:upper:]' '[:lower:]' | sort | uniq | count", data), 2);
 }
 
 #[test]
@@ -953,22 +872,6 @@ fn test_large_pipeline_chain() {
     t.expect_int("seq 1 1000 | head -500 | tail -250 | sort -rn | head -100 | count", 100);
 }
 
-// --- String manipulation chains ---
-
-#[test]
-fn test_string_reverse_chain() {
-    // rev | rev should give original
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'hello' | rev | rev", "hello");
-}
-
-#[test]
-fn test_string_transform_chain() {
-    // Multiple transformations
-    let mut t = PipelineTest::new();
-    t.expect_string("echo 'HELLO WORLD' | tr '[:upper:]' '[:lower:]' | tr ' ' '-'", "hello-world");
-}
-
 // --- Date/time pipelines ---
 
 #[test]
@@ -1024,45 +927,6 @@ fn test_ls_filter_by_extension() {
     assert!(value.is_some());
 }
 
-// --- Tac (reverse lines) ---
-
-#[test]
-fn test_tac_reverse_lines() {
-    // Pattern: tac (reverse line order)
-    let mut t = PipelineTest::new();
-    let items = t.expect_list("echo 'a\nb\nc' | lines | tac");
-    assert_eq!(items.len(), 3);
-    // First item should be 'c' (last line reversed to first)
-    let first = items[0].to_string();
-    assert!(first.contains('c'), "Expected 'c' first after tac, got {}", first);
-}
-
-#[test]
-fn test_tac_combined_with_head() {
-    // Pattern: tac | head (last N lines in reverse)
-    let mut t = PipelineTest::new();
-    t.expect_int("seq 1 10 | tac | head -3 | count", 3);
-}
-
-// --- Number lines (nl) ---
-
-#[test]
-fn test_nl_numbers_lines() {
-    // Pattern: nl (number lines)
-    let mut t = PipelineTest::new();
-    let (_columns, rows) = t.expect_table("echo 'first\nsecond\nthird' | lines | nl");
-    assert_eq!(rows.len(), 3);
-}
-
-#[test]
-fn test_nl_with_grep() {
-    // Pattern: nl | grep (find line numbers of matches)
-    let mut t = PipelineTest::new();
-    let (_columns, rows) = t.expect_table("echo 'apple\nbanana\napricot' | lines | nl | grep apple");
-    // Only line 1 contains "apple" (apricot doesn't contain "apple")
-    assert_eq!(rows.len(), 1);
-}
-
 // --- Flatten nested structures ---
 
 #[test]
@@ -1100,37 +964,6 @@ fn test_compact_with_split() {
     // Pattern: split | compact (split and remove empties)
     let mut t = PipelineTest::new();
     t.expect_int("echo 'a::b:::c' | split ':' | compact | count", 3);
-}
-
-// --- Complex real-world combinations ---
-
-#[test]
-fn test_log_analysis_pipeline() {
-    // Realistic log analysis: extract, filter, aggregate
-    let mut t = PipelineTest::new();
-    let log = "2024-01-01 ERROR db connection failed
-2024-01-01 INFO request processed
-2024-01-02 ERROR timeout
-2024-01-02 ERROR db connection failed
-2024-01-02 INFO request processed";
-
-    // Count unique error messages
-    t.expect_int(&format!(
-        "echo '{}' | lines | grep ERROR | cut -d' ' -f3- | sort | uniq | count",
-        log
-    ), 2);
-}
-
-#[test]
-fn test_data_cleanup_pipeline() {
-    // Pattern: Clean up messy data
-    let mut t = PipelineTest::new();
-    // Lowercase, sort, dedupe (no whitespace in input)
-    let data = "Apple\nBANANA\napple\nCherry\nBANANA";
-    t.expect_int(&format!(
-        "echo '{}' | lines | tr '[:upper:]' '[:lower:]' | sort | uniq | count",
-        data
-    ), 3);
 }
 
 #[test]

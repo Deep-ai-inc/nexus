@@ -9,23 +9,14 @@ use super::basic::{
     WhoamiCommand, YesCommand,
 };
 use super::cat::CatCommand;
-use super::cmp::CmpCommand;
-use super::curl::CurlCommand;
-use super::cut::CutCommand;
 use super::date::DateCommand;
 use super::df::DfCommand;
-use super::dig::DigCommand;
 use super::du::DuCommand;
 use super::env::{EnvCommand, ExportCommand, PrintenvCommand, UnsetCommand};
 use super::find::FindCommand;
 use super::fs::{CpCommand, MkdirCommand, MvCommand, RmCommand, RmdirCommand, TouchCommand};
-use super::git::{
-    GitAddCommand, GitBranchCommand, GitCommand, GitCommitCommand, GitDiffCommand,
-    GitLogCommand, GitRemoteCommand, GitStashCommand, GitStatusCommand,
-};
 use super::grep::GrepCommand;
 use super::less::LessCommand;
-use super::hash::HashCommand;
 use super::head::HeadCommand;
 use super::history::{FcCommand, HistoryCommand};
 use super::iterators::{
@@ -34,17 +25,12 @@ use super::iterators::{
 };
 use super::jobs::{BgCommand, FgCommand, JobsCommand, WaitCommand};
 use super::json::{FromJsonCommand, GetCommand, ToJsonCommand};
-use super::links::{LinkCommand, LnCommand, UnlinkCommand};
 use super::ls::LsCommand;
 use super::man::ManCommand;
 use super::math::{AvgCommand, CountCommand, MaxCommand, MinCommand, SumCommand};
-use super::nl::NlCommand;
 use super::path::{BasenameCommand, DirnameCommand, ExtnameCommand, RealpathCommand, StemCommand};
-use super::perms::{ChgrpCommand, ChmodCommand, ChownCommand};
-use super::ping::PingCommand;
 use super::prev::{OutputsCommand, Prev1Command, Prev2Command, Prev3Command, PrevCommand};
-use super::printf::PrintfCommand;
-use super::rev::{RevCommand, TacCommand};
+use super::ps::PsCommand;
 use super::select::{
     CompactCommand, EnumerateCommand, FirstCommand, FlattenCommand, LastCommand, NthCommand,
     ReverseCommand, SkipCommand, TakeCommand,
@@ -52,7 +38,6 @@ use super::select::{
 use super::seq::SeqCommand;
 use super::shuf::ShufCommand;
 use super::signal::KillCommand;
-use super::ps::PsCommand;
 use super::sort::SortCommand;
 use super::system::{TtyCommand, UmaskCommand, UnameCommand};
 use super::split::{
@@ -60,12 +45,9 @@ use super::split::{
 };
 use super::tail::TailCommand;
 use super::tee::TeeCommand;
-use super::times::TimesCommand;
 use super::top::TopCommand;
 use super::tree::TreeCommand;
-use super::ulimit::UlimitCommand;
 use super::unicode_stress::UnicodeStressCommand;
-use super::tr::TrCommand;
 use super::uniq::UniqCommand;
 use super::wc::WcCommand;
 use super::which::{TypeCommand, WhichCommand};
@@ -103,11 +85,6 @@ impl CommandRegistry {
         registry.register(SortCommand);
         registry.register(UniqCommand);
         registry.register(WcCommand);
-        registry.register(CutCommand);
-        registry.register(TrCommand);
-        registry.register(RevCommand);
-        registry.register(TacCommand);
-        registry.register(NlCommand);
 
         // Math/aggregation
         registry.register(SumCommand);
@@ -170,9 +147,6 @@ impl CommandRegistry {
         // Date/time
         registry.register(DateCommand);
 
-        // Formatting
-        registry.register(PrintfCommand);
-
         // Job control
         registry.register(JobsCommand);
         registry.register(FgCommand);
@@ -191,16 +165,6 @@ impl CommandRegistry {
         registry.register(CpCommand);
         registry.register(MvCommand);
 
-        // Permissions
-        registry.register(ChmodCommand);
-        registry.register(ChownCommand);
-        registry.register(ChgrpCommand);
-
-        // Links
-        registry.register(LnCommand);
-        registry.register(LinkCommand);
-        registry.register(UnlinkCommand);
-
         // I/O
         registry.register(TeeCommand);
 
@@ -208,7 +172,6 @@ impl CommandRegistry {
         registry.register(TtyCommand);
         registry.register(UnameCommand);
         registry.register(UmaskCommand);
-        registry.register(CmpCommand);
 
         // Disk usage
         registry.register(DuCommand);
@@ -216,9 +179,6 @@ impl CommandRegistry {
 
         // Resource/process info
         registry.register(PsCommand);
-        registry.register(UlimitCommand);
-        registry.register(TimesCommand);
-        registry.register(HashCommand);
         registry.register(FcCommand);
         registry.register(HistoryCommand);
 
@@ -233,11 +193,6 @@ impl CommandRegistry {
         registry.register(Prev3Command);   // _3 - third most recent
         registry.register(OutputsCommand); // outputs - list recent outputs
 
-        // Network commands
-        registry.register(PingCommand);
-        registry.register(CurlCommand);
-        registry.register(DigCommand);
-
         // Interactive viewers
         registry.register(LessCommand);
         registry.register(TopCommand);
@@ -246,17 +201,6 @@ impl CommandRegistry {
 
         // Testing
         registry.register(UnicodeStressCommand);
-
-        // Git commands (native, structured output)
-        registry.register(GitCommand);  // Main dispatcher: git <subcommand>
-        registry.register(GitStatusCommand);
-        registry.register(GitLogCommand);
-        registry.register(GitBranchCommand);
-        registry.register(GitDiffCommand);
-        registry.register(GitAddCommand);
-        registry.register(GitCommitCommand);
-        registry.register(GitRemoteCommand);
-        registry.register(GitStashCommand);
 
         registry
     }
@@ -297,7 +241,7 @@ mod tests {
         let registry = CommandRegistry::new();
         // Should have many commands registered
         let count = registry.names().count();
-        assert!(count > 100, "Expected 100+ commands, got {}", count);
+        assert!(count > 70, "Expected 70+ commands, got {}", count);
     }
 
     #[test]
@@ -318,15 +262,6 @@ mod tests {
         assert!(registry.contains("cat"));
         assert!(registry.contains("grep"));
         assert!(registry.contains("pwd"));
-    }
-
-    #[test]
-    fn test_registry_contains_git_commands() {
-        let registry = CommandRegistry::new();
-        assert!(registry.contains("git"));
-        assert!(registry.contains("git-status"));
-        assert!(registry.contains("git-log"));
-        assert!(registry.contains("git-branch"));
     }
 
     #[test]
@@ -375,7 +310,7 @@ mod tests {
         let names: Vec<&str> = registry.names().collect();
         assert!(names.contains(&"echo"));
         assert!(names.contains(&"ls"));
-        assert!(names.contains(&"git"));
+        assert!(names.contains(&"grep"));
     }
 
     #[test]
