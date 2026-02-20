@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 use nexus_api::BlockId;
-use strata::{LayoutSnapshot, ScrollAction, ScrollState};
+use strata::{LayoutSnapshot, ScrollAction, ScrollPhase, ScrollState};
 
 /// Where the viewport wants to be.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,12 +67,40 @@ impl ScrollModel {
     /// Apply a user scroll action (wheel, scrollbar drag, etc.).
     /// If locked to Bottom, sync offset to the real max first (since view()
     /// uses f32::MAX) and break the lock so the delta applies correctly.
+    /// After the action, re-engage Bottom if the user scrolled near the max.
     pub fn apply_user_scroll(&mut self, action: ScrollAction) {
+        let can_reengage = match &action {
+            // Discrete wheel ticks and gesture end — interaction is over.
+            ScrollAction::ScrollBy { phase: None | Some(ScrollPhase::Ended), .. } => true,
+            // Scrollbar release.
+            ScrollAction::DragEnd => true,
+            // Mid-gesture: contact, momentum, drag move/start — don't lock.
+            _ => false,
+        };
         if self.target == ScrollTarget::Bottom {
             self.state.offset = self.state.max.get();
             self.target = ScrollTarget::None;
         }
         self.state.apply(action);
+        if can_reengage {
+            self.maybe_reengage_bottom();
+        }
+    }
+
+    /// Re-engage Bottom follow mode when the user has scrolled to (or very
+    /// near) the maximum offset. A small tolerance absorbs sub-pixel rounding
+    /// so the user doesn't have to hit the exact bottom.
+    fn maybe_reengage_bottom(&mut self) {
+        const TOLERANCE: f32 = 5.0;
+        // Don't interfere with active rubber-band / momentum bounce.
+        if self.state.animating || self.state.overscroll != 0.0 {
+            return;
+        }
+        let max = self.state.max.get();
+        // Guard against the initial f32::MAX sentinel before the first layout.
+        if max < f32::MAX / 2.0 && (max - self.state.offset) <= TOLERANCE {
+            self.target = ScrollTarget::Bottom;
+        }
     }
 
     /// Apply deferred offset from Block(id) resolution.
@@ -176,10 +204,52 @@ mod tests {
 
         model.apply_user_scroll(ScrollAction::ScrollBy { delta: -100.0, phase: None });
 
-        // Target should remain None
+        // Target should remain None (still far from bottom)
         assert_eq!(model.target, ScrollTarget::None);
         // Offset should change
         assert_eq!(model.state.offset, 600.0);
+    }
+
+    #[test]
+    fn test_scroll_to_bottom_reengages_follow() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::None;
+        model.state.offset = 995.0;
+        model.state.max.set(1000.0);
+
+        // Scroll down past max (clamps to 1000, within tolerance)
+        model.apply_user_scroll(ScrollAction::ScrollBy { delta: -50.0, phase: None });
+
+        assert_eq!(model.state.offset, 1000.0);
+        assert_eq!(model.target, ScrollTarget::Bottom);
+    }
+
+    #[test]
+    fn test_scroll_near_bottom_reengages_follow() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::None;
+        model.state.offset = 993.0;
+        model.state.max.set(1000.0);
+
+        // Scroll down to within tolerance (998 is within 5px of 1000)
+        model.apply_user_scroll(ScrollAction::ScrollBy { delta: -5.0, phase: None });
+
+        assert_eq!(model.state.offset, 998.0);
+        assert_eq!(model.target, ScrollTarget::Bottom);
+    }
+
+    #[test]
+    fn test_scroll_not_close_enough_stays_free() {
+        let mut model = ScrollModel::new();
+        model.target = ScrollTarget::None;
+        model.state.offset = 980.0;
+        model.state.max.set(1000.0);
+
+        // Scroll down a bit but still >5px from bottom
+        model.apply_user_scroll(ScrollAction::ScrollBy { delta: -5.0, phase: None });
+
+        assert_eq!(model.state.offset, 985.0);
+        assert_eq!(model.target, ScrollTarget::None);
     }
 
     #[test]
