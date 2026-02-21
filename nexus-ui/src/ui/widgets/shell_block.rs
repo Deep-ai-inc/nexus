@@ -11,7 +11,7 @@ use crate::data::Block;
 use crate::features::shell::ClickAction;
 use crate::utils::ids;
 use crate::ui::theme;
-use super::{render_native_value, term_color_to_strata};
+use super::{render_native_value, term_color_to_strata, TableLayoutCache};
 use strata::content_address::SourceId;
 use strata::gpu::ImageHandle;
 use strata::layout::{
@@ -40,6 +40,8 @@ pub struct ShellBlockWidget<'a> {
     /// Unified click registry — populated during rendering so click/drag
     /// handling can do O(1) lookups without re-iterating the Value tree.
     pub(crate) click_registry: &'a RefCell<HashMap<SourceId, ClickAction>>,
+    /// Table geometry cache — populated during rendering for cell hit-testing.
+    pub(crate) table_layout_cache: &'a TableLayoutCache,
 }
 
 impl<'a> Widget<'a> for ShellBlockWidget<'a> {
@@ -73,12 +75,12 @@ impl<'a> Widget<'a> for ShellBlockWidget<'a> {
         // Render output: live_value replaces structured_output when present (e.g. top),
         // otherwise show structured_output (e.g. ls, git status).
         if let Some(ref latest) = block.live_value {
-            content = render_native_value(content, latest, block, self.image_info, self.click_registry);
+            content = render_native_value(content, latest, block, self.image_info, self.click_registry, self.table_layout_cache);
         } else if let Some(value) = &block.structured_output {
-            content = render_native_value(content, value, block, self.image_info, self.click_registry);
+            content = render_native_value(content, value, block, self.image_info, self.click_registry, self.table_layout_cache);
         }
 
-        content = build_event_log(content, block, self.image_info, self.click_registry);
+        content = build_event_log(content, block, self.image_info, self.click_registry, self.table_layout_cache);
 
         if block.structured_output.is_none() && block.live_value.is_none() && block.event_log.is_empty() && content_rows > 0 {
             content = build_terminal_content(content, block, &grid, cols, content_rows);
@@ -176,6 +178,7 @@ fn build_event_log<'a>(
     block: &'a Block,
     image_info: Option<(ImageHandle, u32, u32)>,
     click_registry: &'a RefCell<HashMap<SourceId, ClickAction>>,
+    table_layout_cache: &'a TableLayoutCache,
 ) -> Column<'a> {
     if block.event_log.is_empty() {
         return content;
@@ -201,7 +204,7 @@ fn build_event_log<'a>(
     }
 
     if let Some(latest) = block.event_log.back() {
-        content = render_native_value(content, latest, block, image_info, click_registry);
+        content = render_native_value(content, latest, block, image_info, click_registry, table_layout_cache);
     }
 
     content

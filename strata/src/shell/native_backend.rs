@@ -1205,6 +1205,20 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
             crate::platform::set_cursor(icon);
         }
     }
+
+    // Show deferred native context menu OUTSIDE the borrow — NSMenu blocks
+    // the run loop, and re-entrant events would panic on borrow_mut().
+    if let Some(menu) = crate::platform::take_native_menu_request() {
+        let selection = crate::platform::show_context_menu(&menu.items, menu.x, menu.y);
+        if let Some(idx) = selection {
+            let mut state = state_cell.borrow_mut();
+            if let Some(msg) = A::on_native_menu_result(&mut state.app, idx) {
+                process_message::<A>(&mut state, msg);
+                render_if_needed::<A>(&mut state);
+            }
+        }
+    }
+
     flush_pending_resize::<A>(state_cell);
 }
 

@@ -154,6 +154,10 @@ pub enum ShellMsg {
     KernelEvent(nexus_api::ShellEvent),
     KillBlock(BlockId),
     SortTable(BlockId, usize),
+    /// Apply or clear a column filter on a table block.
+    FilterTable(BlockId, usize, Option<crate::data::ColumnFilter>),
+    /// Clear all filters on a table block.
+    ClearAllFilters(BlockId),
     OpenAnchor(BlockId, AnchorAction),
     /// Toggle directory expansion in tree view.
     ToggleTreeExpand(BlockId, PathBuf),
@@ -267,5 +271,7 @@ impl ViewerMsg {
 pub enum ContextMenuMsg {
     Show(f32, f32, Vec<ContextMenuItem>, ContextTarget),
     Action(ContextMenuItem),
+    /// Action with target preserved (from deferred native menu callback).
+    ActionWithTarget(ContextMenuItem, ContextTarget),
     Dismiss,
 }

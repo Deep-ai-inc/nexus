@@ -32,6 +32,7 @@ use strata::layout_snapshot::CursorIcon;
 
 use color::file_entry_color;
 use domain::{render_domain_value, render_file_entries};
+pub(crate) use table::TableLayoutCache;
 use table::render_table;
 
 const IMAGE_MAX_W: f32 = 600.0;
@@ -56,6 +57,7 @@ pub(crate) fn render_native_value<'a>(
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
     click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
+    table_layout_cache: &TableLayoutCache,
 ) -> Column<'a> {
     let block_id = block.id;
     match value {
@@ -99,7 +101,7 @@ pub(crate) fn render_native_value<'a>(
         }
 
         Value::Table { columns, rows } => {
-            render_table(parent, columns, rows, block, click_registry)
+            render_table(parent, columns, rows, block, click_registry, table_layout_cache)
         }
 
         Value::List(items) => {
@@ -137,7 +139,7 @@ pub(crate) fn render_native_value<'a>(
                 ));
                 if has_structured {
                     for item in items {
-                        parent = render_native_value(parent, item, block, None, click_registry);
+                        parent = render_native_value(parent, item, block, None, click_registry, table_layout_cache);
                     }
                     parent
                 } else {
@@ -163,6 +165,7 @@ pub(crate) fn render_native_value<'a>(
                 block_id,
                 action: value_to_anchor_action(value),
                 drag_payload: DragPayload::FilePath(entry.path.clone()),
+                table_cell: None,
             });
             let source_id = ids::native(block_id);
             parent.push(
@@ -188,7 +191,7 @@ pub(crate) fn render_native_value<'a>(
         }
 
         Value::Domain(domain) => {
-            render_domain_value(parent, domain, block, image_info, click_registry)
+            render_domain_value(parent, domain, block, image_info, click_registry, table_layout_cache)
         }
 
         Value::Error { message, .. } => {

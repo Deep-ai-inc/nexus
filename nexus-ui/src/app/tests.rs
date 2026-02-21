@@ -279,43 +279,11 @@ mod focus_tests {
 #[cfg(test)]
 mod transient_ui_tests {
     use crate::ui::transient::TransientUi;
-    use crate::ui::context_menu::{ContextMenuItem, ContextTarget};
 
     #[test]
-    fn new_transient_ui_has_no_context_menu() {
+    fn new_transient_ui_has_no_overlay() {
         let ui = TransientUi::new();
-        assert!(ui.context_menu().is_none());
-    }
-
-    #[test]
-    fn show_context_menu_makes_it_visible() {
-        let mut ui = TransientUi::new();
-        ui.show_context_menu(
-            100.0,
-            200.0,
-            vec![ContextMenuItem::Copy, ContextMenuItem::Paste],
-            ContextTarget::Input,
-        );
-
-        let menu = ui.context_menu().expect("menu should be visible");
-        assert_eq!(menu.x, 100.0);
-        assert_eq!(menu.y, 200.0);
-        assert_eq!(menu.items.len(), 2);
-    }
-
-    #[test]
-    fn dismiss_context_menu_hides_it() {
-        let mut ui = TransientUi::new();
-        ui.show_context_menu(
-            100.0,
-            200.0,
-            vec![ContextMenuItem::Copy],
-            ContextTarget::Input,
-        );
-        assert!(ui.context_menu().is_some());
-
-        ui.dismiss_context_menu();
-        assert!(ui.context_menu().is_none());
+        assert!(!ui.has_overlay());
     }
 }
 

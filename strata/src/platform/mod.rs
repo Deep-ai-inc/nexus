@@ -7,7 +7,7 @@
 pub mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{start_drag, preview_file, preview_file_with_rect, close_quicklook, preview_file_with_local_rect, install_reopen_handler, take_reopen_receiver, setup_menu_bar, show_definition, install_force_click_handler, take_force_click_receiver, setup_force_click_monitor, set_cursor, clipboard_image_file_path};
+pub use macos::{start_drag, preview_file, preview_file_with_rect, close_quicklook, preview_file_with_local_rect, install_reopen_handler, take_reopen_receiver, setup_menu_bar, show_definition, install_force_click_handler, take_force_click_receiver, setup_force_click_monitor, set_cursor, clipboard_image_file_path, show_context_menu, NativeMenuItem};
 
 #[cfg(not(target_os = "macos"))]
 pub fn start_drag(_source: &crate::app::DragSource) -> Result<(), String> {
@@ -50,3 +50,45 @@ pub fn setup_force_click_monitor() {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn set_cursor(_icon: crate::layout_snapshot::CursorIcon) {}
+
+#[cfg(not(target_os = "macos"))]
+pub struct NativeMenuItem {
+    pub label: String,
+    pub shortcut: String,
+    pub separator: bool,
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn show_context_menu(_items: &[NativeMenuItem], _x: f32, _y: f32) -> Option<usize> {
+    None
+}
+
+// =============================================================================
+// Deferred native menu request (thread-local)
+// =============================================================================
+
+use std::cell::RefCell;
+
+/// A pending native menu request, stored in a thread-local so it can be
+/// shown outside the app state borrow (NSMenu blocks the run loop).
+pub struct PendingNativeMenu {
+    pub items: Vec<NativeMenuItem>,
+    pub x: f32,
+    pub y: f32,
+}
+
+thread_local! {
+    static PENDING_NATIVE_MENU: RefCell<Option<PendingNativeMenu>> = const { RefCell::new(None) };
+}
+
+/// Store a native menu request to be shown after the current event is processed.
+pub fn request_native_menu(items: Vec<NativeMenuItem>, x: f32, y: f32) {
+    PENDING_NATIVE_MENU.with(|cell| {
+        *cell.borrow_mut() = Some(PendingNativeMenu { items, x, y });
+    });
+}
+
+/// Take the pending native menu request (if any).
+pub fn take_native_menu_request() -> Option<PendingNativeMenu> {
+    PENDING_NATIVE_MENU.with(|cell| cell.borrow_mut().take())
+}

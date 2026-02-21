@@ -11,7 +11,7 @@ use crate::ui::widgets::JobBar;
 
 use crate::features::selection::drag::PendingIntent;
 use super::message::{
-    AgentMsg, ContextMenuMsg, DragMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg, ViewerMsg,
+    AgentMsg, DragMsg, InputMsg, NexusMessage, SelectionMsg, ShellMsg, ViewerMsg,
 };
 use crate::utils::ids as source_ids;
 use super::NexusState;
@@ -235,9 +235,6 @@ fn route_global_shortcut(
 fn route_escape(state: &NexusState) -> Option<NexusMessage> {
     strata::platform::close_quicklook();
 
-    if state.transient.context_menu().is_some() {
-        return Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss));
-    }
     if state.agent.is_active() {
         return Some(NexusMessage::Agent(AgentMsg::Interrupt));
     }
@@ -370,10 +367,6 @@ fn route_left_click(
     position: strata::primitives::Point,
     modifiers: strata::Modifiers,
 ) -> MouseResponse<NexusMessage> {
-    // Context menu item click (transient UI)
-    if let Some(msg) = route_context_menu_click(state, &hit) {
-        return MouseResponse::message(msg);
-    }
     // Selection drag (click inside existing selection) — but NOT on multi-clicks,
     // which should pass through to route_text_selection_start for word/line snap.
     if !state.drag.click_tracker.would_be_multi_click(position) {
@@ -505,11 +498,27 @@ fn route_right_click(
 
     // Content area right-click — delegate to children
     if let Some(HitResult::Content(addr)) = hit {
-        if let Some(msg) = state.shell.context_menu_for_source(addr.source_id, x, y) {
+        if let Some(msg) = state.shell.context_menu_for_source(addr.source_id, Some(addr.item_index), x, y) {
             return MouseResponse::message(NexusMessage::ContextMenu(msg));
         }
         if let Some(msg) = state.agent.context_menu_for_source(addr.source_id, x, y) {
             return MouseResponse::message(NexusMessage::ContextMenu(msg));
+        }
+    }
+
+    // Widget area right-click (e.g., anchor cells in tables, file entries)
+    if let Some(HitResult::Widget(wid)) = hit {
+        // Try anchor-specific context menu first (file actions, table cell menu)
+        if let Some(msg) = state.shell.context_menu_for_anchor(*wid, x, y) {
+            return MouseResponse::message(NexusMessage::ContextMenu(msg));
+        }
+        // Fall back to block-level menu for non-anchor widgets
+        let block_id = state.shell.block_for_source(*wid)
+            .or_else(|| state.shell.block_for_anchor(*wid));
+        if let Some(block_id) = block_id {
+            if let Some(msg) = state.shell.context_menu_for_source(source_ids::native(block_id), None, x, y) {
+                return MouseResponse::message(NexusMessage::ContextMenu(msg));
+            }
         }
     }
 
@@ -527,29 +536,7 @@ fn route_right_click(
 }
 
 fn route_hover(state: &NexusState, hit: &Option<HitResult>) {
-    // Context menu hover (transient UI — stays at root)
-    if let Some(menu) = state.transient.context_menu() {
-        let idx = if let Some(HitResult::Widget(id)) = hit {
-            (0..menu.items.len()).find(|i| *id == source_ids::ctx_menu_item(*i))
-        } else {
-            None
-        };
-        menu.hovered_item.set(idx);
-    }
-
     // Input-owned hover tracking (completion, history search)
     state.input.on_hover(hit);
-}
-
-fn route_context_menu_click(state: &NexusState, hit: &Option<HitResult>) -> Option<NexusMessage> {
-    let menu = state.transient.context_menu()?;
-    if let Some(HitResult::Widget(id)) = hit {
-        for (i, item) in menu.items.iter().enumerate() {
-            if *id == source_ids::ctx_menu_item(i) {
-                return Some(NexusMessage::ContextMenu(ContextMenuMsg::Action(item.clone())));
-            }
-        }
-    }
-    Some(NexusMessage::ContextMenu(ContextMenuMsg::Dismiss))
 }
 

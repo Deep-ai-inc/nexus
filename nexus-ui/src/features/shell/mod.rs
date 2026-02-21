@@ -20,7 +20,7 @@ use strata::{ImageStore, Subscription};
 use strata::content_address::SourceId;
 
 use crate::data::Focus;
-use crate::ui::widgets::{JobBar, ShellBlockWidget, ShellBlockMessage};
+use crate::ui::widgets::{JobBar, ShellBlockWidget, ShellBlockMessage, TableLayoutCache};
 
 use self::block_manager::BlockManager;
 use crate::data::jobs::JobManager;
@@ -42,6 +42,8 @@ pub(crate) struct AnchorEntry {
     pub block_id: BlockId,
     pub action: AnchorAction,
     pub drag_payload: crate::features::selection::drag::DragPayload,
+    /// For anchors inside a table: (row_index, col_index) into the raw rows.
+    pub table_cell: Option<(usize, usize)>,
 }
 
 /// Unified click action — resolved during rendering, dispatched on click.
@@ -82,6 +84,10 @@ pub(crate) struct ShellWidget {
     /// Keyed by SourceId, provides O(1) lookup for anchors and tree toggles.
     pub(crate) click_registry: RefCell<HashMap<SourceId, ClickAction>>,
 
+    /// Table geometry cache — populated during view(), used for cell hit-testing
+    /// (right-click context menus on table cells). Same lifecycle as click_registry.
+    pub(crate) table_layout_cache: TableLayoutCache,
+
     // --- Subscription channel (kernel events) ---
     kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
 }
@@ -97,6 +103,7 @@ impl ShellWidget {
             terminal_dirty: false,
             last_exit_code: None,
             click_registry: RefCell::new(HashMap::new()),
+            table_layout_cache: RefCell::new(HashMap::new()),
             kernel_rx,
         }
     }
@@ -106,10 +113,11 @@ impl ShellWidget {
         self.terminal_dirty
     }
 
-    /// Clear the click registry. Called at the start of each view() pass
-    /// before blocks re-populate it.
+    /// Clear transient per-frame caches. Called at the start of each view() pass
+    /// before blocks re-populate them.
     pub fn clear_click_registry(&self) {
         self.click_registry.borrow_mut().clear();
+        self.table_layout_cache.borrow_mut().clear();
     }
 
     // ---- View contributions ----
@@ -128,6 +136,7 @@ impl ShellWidget {
             image_info: self.blocks.image_info(block.id),
             is_focused,
             click_registry: &self.click_registry,
+            table_layout_cache: &self.table_layout_cache,
         })
     }
 
@@ -219,35 +228,147 @@ impl ShellWidget {
     pub fn context_menu_for_source(
         &self,
         source_id: SourceId,
+        item_index: Option<usize>,
         x: f32,
         y: f32,
     ) -> Option<ContextMenuMsg> {
         let block_id = self.block_for_source(source_id)?;
-        let block = self.blocks.get(block_id);
+        let block = self.blocks.get(block_id)?;
 
-        let mut items = vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll];
-
-        if let Some(block) = block {
-            // Offer CopyCommand for any block with a command
-            if !block.command.is_empty() {
-                items.push(ContextMenuItem::CopyCommand);
-            }
-            // Offer structured export for table output
-            if let Some(Value::Table { .. }) = &block.structured_output {
-                items.push(ContextMenuItem::CopyAsTsv);
-                items.push(ContextMenuItem::CopyAsJson);
-            }
-            // Offer CopyOutput for finished blocks
-            if !block.is_running() {
-                items.push(ContextMenuItem::CopyOutput);
-            }
-            // Offer Rerun for finished blocks
-            if !block.is_running() && !block.command.is_empty() {
-                items.push(ContextMenuItem::Rerun);
+        // Check if this is a table cell click — if so, try cell-specific menu
+        if source_id == source_ids::table(block_id) {
+            if let Some(menu) = self.context_menu_for_table_cell(block, item_index, x, y) {
+                return Some(menu);
             }
         }
 
+        let mut items = vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll];
+
+        // Offer CopyCommand for any block with a command
+        if !block.command.is_empty() {
+            items.push(ContextMenuItem::CopyCommand);
+        }
+        // Offer structured export for table output
+        if let Some(Value::Table { .. }) = &block.structured_output {
+            items.push(ContextMenuItem::CopyAsTsv);
+            items.push(ContextMenuItem::CopyAsJson);
+        }
+        // Offer CopyOutput for finished blocks
+        if !block.is_running() {
+            items.push(ContextMenuItem::CopyOutput);
+        }
+        // Offer Rerun for finished blocks
+        if !block.is_running() && !block.command.is_empty() {
+            items.push(ContextMenuItem::Rerun);
+        }
+
         Some(ContextMenuMsg::Show(x, y, items, ContextTarget::Block(block_id)))
+    }
+
+    /// Return the number of columns in a block's table output (0 if not a table).
+    fn table_num_cols(&self, block: &Block) -> usize {
+        match &block.live_value {
+            Some(Value::Table { columns, .. }) => columns.len(),
+            _ => match &block.structured_output {
+                Some(Value::Table { columns, .. }) => columns.len(),
+                _ => 0,
+            },
+        }
+    }
+
+    /// Build a cell-specific context menu for a table cell right-click.
+    /// Uses the ContentAddress item_index (row * num_cols + col) to identify the cell.
+    fn context_menu_for_table_cell(
+        &self,
+        block: &Block,
+        item_index: Option<usize>,
+        x: f32,
+        y: f32,
+    ) -> Option<ContextMenuMsg> {
+        // Find the table (live_value takes precedence over structured_output)
+        let (columns, rows) = match &block.live_value {
+            Some(Value::Table { columns, rows }) => (columns, rows),
+            _ => match &block.structured_output {
+                Some(Value::Table { columns, rows }) => (columns, rows),
+                _ => return None,
+            },
+        };
+        let num_cols = columns.len();
+        if num_cols == 0 {
+            return None;
+        }
+
+        // Determine (row, col) from item_index.
+        // Without item_index we can't reliably identify the cell (window coords
+        // would need table-local conversion accounting for scroll offset), so
+        // fall back to the block-level context menu instead.
+        let idx = item_index?;
+        let (row, col) = (idx / num_cols, idx % num_cols);
+
+        if row >= rows.len() || col >= num_cols {
+            return None;
+        }
+
+        let cell_value = rows.get(row)?.get(col)?;
+        let cell_text = cell_value.to_text();
+
+        let mut items = Vec::new();
+
+        // Value-type-specific actions
+        match cell_value {
+            Value::Path(p) => {
+                items.push(ContextMenuItem::QuickLook(p.clone()));
+                items.push(ContextMenuItem::Open(p.clone()));
+                items.push(ContextMenuItem::CopyPath(p.clone()));
+                items.push(ContextMenuItem::RevealInFinder(p.clone()));
+            }
+            Value::FileEntry(entry) => {
+                items.push(ContextMenuItem::QuickLook(entry.path.clone()));
+                items.push(ContextMenuItem::Open(entry.path.clone()));
+                items.push(ContextMenuItem::CopyPath(entry.path.clone()));
+                items.push(ContextMenuItem::RevealInFinder(entry.path.clone()));
+            }
+            _ => {}
+        }
+
+        // Common cell actions
+        items.push(ContextMenuItem::CopyCellValue(cell_text.clone()));
+        items.push(ContextMenuItem::Copy);
+        items.push(ContextMenuItem::SelectAll);
+
+        // Table-level actions
+        items.push(ContextMenuItem::CopyAsTsv);
+        items.push(ContextMenuItem::CopyAsJson);
+
+        // Filter actions
+        if !cell_text.is_empty() {
+            items.push(ContextMenuItem::FilterByValue { value: cell_text.clone(), col });
+            items.push(ContextMenuItem::ExcludeValue { value: cell_text, col });
+        }
+        // Clear filter actions (only shown when filters are active)
+        if block.table_filter.filters.contains_key(&col) {
+            items.push(ContextMenuItem::ClearColumnFilter(block.id, col));
+        }
+        if block.table_filter.is_active() {
+            items.push(ContextMenuItem::ClearAllFilters(block.id));
+        }
+
+        // Block-level actions
+        if !block.command.is_empty() {
+            items.push(ContextMenuItem::CopyCommand);
+        }
+        if !block.is_running() {
+            items.push(ContextMenuItem::CopyOutput);
+        }
+        if !block.is_running() && !block.command.is_empty() {
+            items.push(ContextMenuItem::Rerun);
+        }
+
+        Some(ContextMenuMsg::Show(x, y, items, ContextTarget::TableCell {
+            block_id: block.id,
+            row,
+            col,
+        }))
     }
 
     /// Build a fallback context menu (last block) for right-click on empty area.
@@ -258,6 +379,73 @@ impl ShellWidget {
             vec![ContextMenuItem::Copy, ContextMenuItem::SelectAll],
             ContextTarget::Block(block.id),
         ))
+    }
+
+    /// Resolve an anchor widget ID to its block_id via the click registry.
+    pub fn block_for_anchor(&self, id: SourceId) -> Option<BlockId> {
+        let registry = self.click_registry.borrow();
+        match registry.get(&id)? {
+            ClickAction::Anchor(entry) => Some(entry.block_id),
+            ClickAction::TreeToggle { block_id, .. } => Some(*block_id),
+        }
+    }
+
+    /// Build a context menu for a right-click on an anchor widget (file path, process, etc.).
+    /// For anchors inside a table, delegates to the table cell menu which has
+    /// file actions + filter/export items. For non-table anchors, builds a
+    /// standalone file/value menu.
+    pub fn context_menu_for_anchor(&self, id: SourceId, x: f32, y: f32) -> Option<ContextMenuMsg> {
+        let registry = self.click_registry.borrow();
+        let entry = match registry.get(&id)? {
+            ClickAction::Anchor(entry) => entry,
+            _ => return None,
+        };
+        let block_id = entry.block_id;
+
+        // For table anchors, delegate to the table cell menu — it already
+        // handles FileEntry/Path values and includes filter/export items.
+        if let Some((row, col)) = entry.table_cell {
+            let block = self.blocks.get(block_id)?;
+            let num_cols = self.table_num_cols(block);
+            if num_cols > 0 {
+                let item_index = row * num_cols + col;
+                drop(registry); // release borrow before calling into table cell menu
+                return self.context_menu_for_table_cell(block, Some(item_index), x, y);
+            }
+        }
+
+        // Non-table anchor: build a standalone menu from the action
+        let block = self.blocks.get(block_id)?;
+        let mut items = Vec::new();
+
+        match &entry.action {
+            AnchorAction::QuickLook(p) | AnchorAction::Open(p) | AnchorAction::RevealPath(p) => {
+                items.push(ContextMenuItem::QuickLook(p.clone()));
+                items.push(ContextMenuItem::Open(p.clone()));
+                items.push(ContextMenuItem::CopyPath(p.clone()));
+                items.push(ContextMenuItem::RevealInFinder(p.clone()));
+            }
+            AnchorAction::OpenUrl(url) => {
+                items.push(ContextMenuItem::CopyCellValue(url.clone()));
+            }
+            AnchorAction::CopyToClipboard(text) => {
+                items.push(ContextMenuItem::CopyCellValue(text.clone()));
+            }
+        }
+
+        items.push(ContextMenuItem::Copy);
+        items.push(ContextMenuItem::SelectAll);
+        if !block.command.is_empty() {
+            items.push(ContextMenuItem::CopyCommand);
+        }
+        if !block.is_running() {
+            items.push(ContextMenuItem::CopyOutput);
+        }
+        if !block.is_running() && !block.command.is_empty() {
+            items.push(ContextMenuItem::Rerun);
+        }
+
+        Some(ContextMenuMsg::Show(x, y, items, ContextTarget::Block(block_id)))
     }
 
     /// Handle a click on an anchor widget. Returns None if not an anchor we own.
@@ -388,6 +576,8 @@ impl ShellWidget {
                 }
             }
             ShellMsg::SortTable(block_id, col_idx) => { self.sort_table(block_id, col_idx); }
+            ShellMsg::FilterTable(block_id, col, filter) => { self.filter_table(block_id, col, filter); }
+            ShellMsg::ClearAllFilters(block_id) => { self.clear_all_filters(block_id); }
             ShellMsg::OpenAnchor(_, _) => {
                 // Handled at the root level in state_update.rs
             }
@@ -712,6 +902,8 @@ impl ShellWidget {
                             Self::sort_rows(rows, col_idx, ascending);
                         }
                     }
+                    // Reapply filter to the new data
+                    block.recompute_filtered_indices();
                 } else {
                     block.event_log.push_back(update);
                     while block.event_log.len() > 1000 {
@@ -741,6 +933,26 @@ impl ShellWidget {
             if let Some(Value::Table { ref mut rows, .. }) = block.live_value {
                 Self::sort_rows(rows, col_idx, ascending);
             }
+            // Recompute filtered indices to respect new sort order
+            block.recompute_filtered_indices();
+        }
+    }
+
+    /// Apply or clear a column filter on a table block.
+    fn filter_table(&mut self, block_id: BlockId, col: usize, filter: Option<crate::data::ColumnFilter>) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            block.table_filter.set(col, filter);
+            block.recompute_filtered_indices();
+            block.version += 1;
+        }
+    }
+
+    /// Clear all filters on a table block.
+    fn clear_all_filters(&mut self, block_id: BlockId) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            block.table_filter.clear();
+            block.filtered_row_indices = None;
+            block.version += 1;
         }
     }
 

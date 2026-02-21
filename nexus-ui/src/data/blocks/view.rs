@@ -7,6 +7,87 @@ use nexus_api::{BlockId, FileEntry};
 
 use super::enums::ProcSort;
 
+/// A filter predicate for a single table column.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnFilter {
+    /// Text contains substring (case-insensitive).
+    Contains(String),
+    /// Exact match on display text.
+    Equals(String),
+    /// Exclude exact match on display text.
+    NotEquals(String),
+}
+
+impl ColumnFilter {
+    /// Test whether a cell's display text passes this filter.
+    pub fn matches(&self, text: &str) -> bool {
+        match self {
+            ColumnFilter::Contains(needle) => {
+                // Case-insensitive contains without allocating lowercase copies.
+                let needle_lower: Vec<u8> = needle.bytes().map(|b| b.to_ascii_lowercase()).collect();
+                text.as_bytes()
+                    .windows(needle_lower.len())
+                    .any(|window| {
+                        window.iter().zip(&needle_lower).all(|(a, b)| a.to_ascii_lowercase() == *b)
+                    })
+            }
+            ColumnFilter::Equals(s) => text == s,
+            ColumnFilter::NotEquals(s) => text != s,
+        }
+    }
+
+    /// Test whether a Value passes this filter, avoiding allocation when possible.
+    /// Falls back to `to_text()` for non-string Value variants.
+    pub fn matches_value(&self, value: &nexus_api::Value) -> bool {
+        match value {
+            nexus_api::Value::String(s) => self.matches(s),
+            other => self.matches(&other.to_text()),
+        }
+    }
+}
+
+/// Active column filters for a table block.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableFilter {
+    /// Active filters: column_index → filter predicate.
+    pub filters: HashMap<usize, ColumnFilter>,
+}
+
+impl TableFilter {
+    /// Set a filter on a column. Pass `None` to clear.
+    pub fn set(&mut self, col: usize, filter: Option<ColumnFilter>) {
+        match filter {
+            Some(f) => { self.filters.insert(col, f); }
+            None => { self.filters.remove(&col); }
+        }
+    }
+
+    /// Clear all filters.
+    pub fn clear(&mut self) {
+        self.filters.clear();
+    }
+
+    /// Whether any filters are active.
+    pub fn is_active(&self) -> bool {
+        !self.filters.is_empty()
+    }
+
+    /// Compute which row indices pass all active filters.
+    /// Each row is tested against every active column filter.
+    /// Uses `matches_value` to avoid allocation for String cells.
+    pub fn compute_indices(&self, rows: &[Vec<nexus_api::Value>]) -> Vec<usize> {
+        rows.iter().enumerate().filter_map(|(i, row)| {
+            for (&col, filter) in &self.filters {
+                match row.get(col) {
+                    Some(value) => if !filter.matches_value(value) { return None; }
+                    None => if !filter.matches("") { return None; }
+                }
+            }
+            Some(i)
+        }).collect()
+    }
+}
+
 /// Column sort state for table output. Clicking the same column header
 /// toggles ascending/descending; clicking a different column resets to ascending.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -341,6 +422,108 @@ impl ViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========== ColumnFilter tests ==========
+
+    #[test]
+    fn test_column_filter_contains_case_insensitive() {
+        let f = ColumnFilter::Contains("hello".into());
+        assert!(f.matches("Hello World"));
+        assert!(f.matches("say hello"));
+        assert!(!f.matches("goodbye"));
+    }
+
+    #[test]
+    fn test_column_filter_equals() {
+        let f = ColumnFilter::Equals("foo".into());
+        assert!(f.matches("foo"));
+        assert!(!f.matches("Foo"));
+        assert!(!f.matches("foobar"));
+    }
+
+    #[test]
+    fn test_column_filter_not_equals() {
+        let f = ColumnFilter::NotEquals("foo".into());
+        assert!(!f.matches("foo"));
+        assert!(f.matches("bar"));
+        assert!(f.matches("Foo"));
+    }
+
+    // ========== TableFilter tests ==========
+
+    #[test]
+    fn test_table_filter_default_inactive() {
+        let f = TableFilter::default();
+        assert!(!f.is_active());
+    }
+
+    #[test]
+    fn test_table_filter_set_and_clear() {
+        let mut f = TableFilter::default();
+        f.set(0, Some(ColumnFilter::Equals("test".into())));
+        assert!(f.is_active());
+        assert!(f.filters.contains_key(&0));
+
+        f.set(0, None);
+        assert!(!f.is_active());
+    }
+
+    #[test]
+    fn test_table_filter_clear_all() {
+        let mut f = TableFilter::default();
+        f.set(0, Some(ColumnFilter::Equals("a".into())));
+        f.set(1, Some(ColumnFilter::Contains("b".into())));
+        assert_eq!(f.filters.len(), 2);
+
+        f.clear();
+        assert!(!f.is_active());
+        assert!(f.filters.is_empty());
+    }
+
+    #[test]
+    fn test_table_filter_compute_indices() {
+        use nexus_api::Value;
+        let f = TableFilter {
+            filters: [(0, ColumnFilter::Equals("foo".into()))].into_iter().collect(),
+        };
+        let rows = vec![
+            vec![Value::String("foo".into()), Value::Int(1)],
+            vec![Value::String("bar".into()), Value::Int(2)],
+            vec![Value::String("foo".into()), Value::Int(3)],
+        ];
+        let indices = f.compute_indices(&rows);
+        assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_table_filter_compute_indices_multi_column() {
+        use nexus_api::Value;
+        let f = TableFilter {
+            filters: [
+                (0, ColumnFilter::Equals("foo".into())),
+                (1, ColumnFilter::Contains("x".into())),
+            ].into_iter().collect(),
+        };
+        let rows = vec![
+            vec![Value::String("foo".into()), Value::String("ax".into())],
+            vec![Value::String("foo".into()), Value::String("by".into())],
+            vec![Value::String("bar".into()), Value::String("cx".into())],
+        ];
+        let indices = f.compute_indices(&rows);
+        assert_eq!(indices, vec![0]); // only row 0 matches both filters
+    }
+
+    #[test]
+    fn test_table_filter_compute_indices_empty_filter() {
+        use nexus_api::Value;
+        let f = TableFilter::default();
+        let rows = vec![
+            vec![Value::String("a".into())],
+            vec![Value::String("b".into())],
+        ];
+        let indices = f.compute_indices(&rows);
+        assert_eq!(indices, vec![0, 1]); // all rows pass
+    }
 
     // ========== TableSort tests ==========
 

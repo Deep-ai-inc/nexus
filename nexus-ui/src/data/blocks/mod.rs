@@ -6,6 +6,6 @@ mod enums;
 mod events;
 
 pub use model::{Block, UnifiedBlock, UnifiedBlockRef};
-pub use view::{ViewState, FileTreeState, TableSort};
+pub use view::{ViewState, FileTreeState, ColumnFilter, TableFilter, TableSort};
 pub use enums::{Focus, InputMode, ProcSort};
 pub use events::PtyEvent;

@@ -8,5 +8,5 @@ pub mod jobs;
 pub mod providers;
 pub mod context;
 
-pub use blocks::{Block, FileTreeState, Focus, InputMode, ProcSort, PtyEvent, TableSort, UnifiedBlock, UnifiedBlockRef, ViewState};
+pub use blocks::{Block, ColumnFilter, FileTreeState, Focus, InputMode, ProcSort, PtyEvent, TableFilter, TableSort, UnifiedBlock, UnifiedBlockRef, ViewState};
 pub use jobs::{VisualJob, VisualJobState};

@@ -14,7 +14,7 @@ mod welcome;
 pub use shell_block::{ShellBlockWidget, ShellBlockMessage};
 pub use tool::{ToolWidget, ToolMessage};
 pub use agent_block::{AgentBlockWidget, AgentBlockMessage};
-pub(crate) use value_renderer::{render_native_value, term_color_to_strata};
+pub(crate) use value_renderer::{render_native_value, term_color_to_strata, TableLayoutCache};
 pub use input::{NexusInputBar, CompletionPopup, HistorySearchBar};
 pub use job_bar::JobBar;
 pub use welcome::WelcomeScreen;

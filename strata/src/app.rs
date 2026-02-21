@@ -447,6 +447,13 @@ pub trait StrataApp: Sized + 'static {
         1.0
     }
 
+    /// Called when the user selects an item from a deferred native context menu.
+    /// The app should map the index back to the original menu items and return
+    /// the appropriate message to dispatch.
+    fn on_native_menu_result(_state: &mut Self::State, _index: usize) -> Option<Self::Message> {
+        None
+    }
+
     /// Called by the native backend at ~60fps. Use for periodic effects like
     /// auto-scroll during drag selection. Returns `true` if state changed and
     /// a render is needed; `false` to skip the render (saves a full scene build

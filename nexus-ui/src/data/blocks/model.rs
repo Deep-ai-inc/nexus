@@ -9,7 +9,7 @@ use nexus_term::TerminalParser;
 
 use crate::data::agent_block::AgentBlock;
 use super::enums::ProcSort;
-use super::view::{ViewState, FileTreeState, TableSort};
+use super::view::{ViewState, FileTreeState, TableFilter, TableSort};
 
 /// A display item in the main scrollable view. Shell and Agent blocks are
 /// interleaved in ascending `BlockId` order; the ID determines position.
@@ -69,6 +69,12 @@ pub struct Block {
     pub structured_output: Option<Value>,
     /// Sort state for table output.
     pub table_sort: TableSort,
+    /// Active column filters for table output.
+    pub table_filter: TableFilter,
+    /// Pre-computed row indices that pass the current filter.
+    /// `None` means no filter is active (show all rows).
+    /// Respects current sort order — recomputed on filter or sort change.
+    pub filtered_row_indices: Option<Vec<usize>>,
     /// Whether output contained "permission denied".
     pub has_permission_denied: bool,
     /// Whether output contained "command not found".
@@ -104,6 +110,8 @@ impl Block {
             version: 0,
             structured_output: None,
             table_sort: TableSort::new(),
+            table_filter: TableFilter::default(),
+            filtered_row_indices: None,
             has_permission_denied: false,
             has_command_not_found: false,
             event_log: VecDeque::new(),
@@ -223,6 +231,24 @@ impl Block {
             return true;
         }
         false
+    }
+
+    /// Recompute `filtered_row_indices` from the current filter and sort state.
+    /// Call this after any filter or sort change.
+    pub fn recompute_filtered_indices(&mut self) {
+        if !self.table_filter.is_active() {
+            self.filtered_row_indices = None;
+            return;
+        }
+        // Find the table rows (live_value takes precedence)
+        let rows = match &self.live_value {
+            Some(Value::Table { rows, .. }) => rows,
+            _ => match &self.structured_output {
+                Some(Value::Table { rows, .. }) => rows,
+                _ => { self.filtered_row_indices = None; return; }
+            },
+        };
+        self.filtered_row_indices = Some(self.table_filter.compute_indices(rows));
     }
 
     /// Sort rows in a table Value (if it is a Table).

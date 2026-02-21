@@ -111,6 +111,12 @@ pub trait Component {
         None
     }
 
+    /// Called when the user selects an item from a deferred native context menu.
+    /// Return a message to dispatch, or None if dismissed.
+    fn on_native_menu_result(&mut self, _index: usize) -> Option<Self::Message> {
+        None
+    }
+
     /// Called by the native backend at ~60fps. Use for periodic effects like
     /// auto-scroll during drag selection. Returns `true` if state changed and
     /// a render is needed.

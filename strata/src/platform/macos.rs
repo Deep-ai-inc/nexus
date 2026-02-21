@@ -1001,6 +1001,104 @@ pub fn set_cursor(icon: crate::layout_snapshot::CursorIcon) {
 }
 
 // =============================================================================
+// Native Context Menu
+// =============================================================================
+
+/// Menu item descriptor for `show_context_menu`.
+pub struct NativeMenuItem {
+    pub label: String,
+    pub shortcut: String,
+    /// If true, renders as a separator instead of a clickable item.
+    pub separator: bool,
+}
+
+/// Global storage for the selected menu item index.
+/// Safe because context menus are synchronous and only run on the main thread.
+static CONTEXT_MENU_SELECTION: Mutex<Option<usize>> = Mutex::new(None);
+
+declare_class!(
+    struct ContextMenuTarget;
+
+    unsafe impl ClassType for ContextMenuTarget {
+        type Super = NSObject;
+        type Mutability = mutability::InteriorMutable;
+        const NAME: &'static str = "NexusContextMenuTarget";
+    }
+
+    impl DeclaredClass for ContextMenuTarget {
+        type Ivars = ();
+    }
+
+    unsafe impl ContextMenuTarget {
+        #[method(menuItemClicked:)]
+        fn menu_item_clicked(&self, sender: &NSMenuItem) {
+            let tag = unsafe { sender.tag() };
+            if let Ok(mut sel) = CONTEXT_MENU_SELECTION.lock() {
+                *sel = Some(tag as usize);
+            }
+        }
+    }
+);
+
+/// Show a native macOS context menu at the given position (top-left origin).
+///
+/// Blocks the run loop until the user selects an item or dismisses the menu.
+/// Returns the index of the selected item, or `None` if dismissed.
+///
+/// Coordinates are in the app's logical coordinate system (top-left origin,
+/// matching the layout system). Internally converted to NSView's bottom-left
+/// origin for `popUpMenuPositioningItem:atLocation:inView:`.
+pub fn show_context_menu(items: &[NativeMenuItem], x: f32, y: f32) -> Option<usize> {
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+    let window = unsafe { app.keyWindow().or_else(|| app.mainWindow())? };
+    let content_view = window.contentView()?;
+
+    // Reset selection state
+    if let Ok(mut sel) = CONTEXT_MENU_SELECTION.lock() {
+        *sel = None;
+    }
+
+    let target: Retained<ContextMenuTarget> = unsafe { msg_send_id![mtm.alloc::<ContextMenuTarget>(), init] };
+
+    let menu = NSMenu::new(mtm);
+    unsafe { menu.setAutoenablesItems(false) };
+
+    for (i, item) in items.iter().enumerate() {
+        if item.separator {
+            let sep: Retained<NSMenuItem> = unsafe { msg_send_id![NSMenuItem::class(), separatorItem] };
+            menu.addItem(&sep);
+            continue;
+        }
+
+        let title = NSString::from_str(&item.label);
+        let key = NSString::from_str(&item.shortcut);
+        let menu_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                mtm.alloc(),
+                &title,
+                Some(sel!(menuItemClicked:)),
+                &key,
+            )
+        };
+        unsafe { menu_item.setTarget(Some(&target)) };
+        unsafe { menu_item.setTag(i as isize) };
+        menu.addItem(&menu_item);
+    }
+
+    // Our coordinates are already in the view's coordinate system (top-left origin,
+    // since isFlipped returns YES). No Y-flip needed.
+    let location = NSPoint::new(x as f64, y as f64);
+
+    // popUpMenuPositioningItem:atLocation:inView: blocks until dismissed
+    let _: bool = unsafe {
+        msg_send![&*menu, popUpMenuPositioningItem: std::ptr::null::<AnyObject>(), atLocation: location, inView: &*content_view]
+    };
+
+    CONTEXT_MENU_SELECTION.lock().ok().and_then(|sel| *sel)
+}
+
+// =============================================================================
 // Native Menu Bar (make_menu_item helper)
 // =============================================================================
 

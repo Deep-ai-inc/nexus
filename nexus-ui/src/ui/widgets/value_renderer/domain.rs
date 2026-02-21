@@ -19,7 +19,7 @@ use strata::layout_snapshot::CursorIcon;
 use strata::primitives::Color;
 
 use super::color::file_entry_color;
-use super::render_native_value;
+use super::{render_native_value, TableLayoutCache};
 
 const PROGRESS_BAR_LEN: usize = 40;
 const WATERFALL_BAR_LEN: usize = 40;
@@ -37,6 +37,7 @@ pub(super) fn render_domain_value<'a>(
     block: &Block,
     image_info: Option<(ImageHandle, u32, u32)>,
     click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
+    table_layout_cache: &TableLayoutCache,
 ) -> Column<'a> {
     use nexus_api::DomainValue;
     let block_id = block.id;
@@ -159,7 +160,7 @@ pub(super) fn render_domain_value<'a>(
                     return render_diff_viewer(parent, items, *scroll_line, *current_file, collapsed_indices, source_id);
                 }
             }
-            render_native_value(parent, &req.content, block, image_info, click_registry)
+            render_native_value(parent, &req.content, block, image_info, click_registry, table_layout_cache)
         }
 
         DomainValue::BlobChunk(chunk) => {
@@ -448,6 +449,7 @@ pub(super) fn render_file_entries<'a>(
             block_id,
             action: value_to_anchor_action(&file_value),
             drag_payload: DragPayload::FilePath(entry.path.clone()),
+            table_cell: None,
         });
         *anchor_idx += 1;
 

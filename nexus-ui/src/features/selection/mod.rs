@@ -329,6 +329,15 @@ pub(crate) fn extract_block_text(
         ContextTarget::Input => {
             if input_text.is_empty() { None } else { Some(input_text.to_string()) }
         }
+        ContextTarget::TableCell { block_id, .. } => {
+            // For table cell targets, fall back to the block's full output
+            let block = bm.get(*block_id)?;
+            if let Some(ref value) = block.structured_output {
+                Some(value.to_text())
+            } else {
+                None
+            }
+        }
     }
 }
 

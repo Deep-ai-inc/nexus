@@ -793,6 +793,10 @@ pub struct LayoutSnapshot {
     /// Used for hit-testing non-content areas (buttons, panels) and overlay anchoring.
     widget_bounds: HashMap<SourceId, Rect>,
 
+    /// Overlay widget bounds — checked FIRST in hit-testing, before content and regular widgets.
+    /// Use for context menus, popovers, and other transient UI that must intercept all events.
+    overlay_widget_bounds: HashMap<SourceId, Rect>,
+
     /// Max scroll values for ScrollColumn containers.
     /// Written during layout, readable by the app to clamp scroll offsets.
     scroll_limits: HashMap<SourceId, f32>,
@@ -842,6 +846,7 @@ impl LayoutSnapshot {
             primitives: PrimitiveBatch::new(),
             overlay_primitives: PrimitiveBatch::new(),
             widget_bounds: HashMap::new(),
+            overlay_widget_bounds: HashMap::new(),
             scroll_limits: HashMap::new(),
             scroll_tracks: HashMap::new(),
             cursor_hints: HashMap::new(),
@@ -864,6 +869,7 @@ impl LayoutSnapshot {
         self.primitives.clear();
         self.overlay_primitives.clear();
         self.widget_bounds.clear();
+        self.overlay_widget_bounds.clear();
         self.scroll_limits.clear();
         self.scroll_tracks.clear();
         self.cursor_hints.clear();
@@ -916,9 +922,15 @@ impl LayoutSnapshot {
         self.widget_bounds.insert(id, bounds);
     }
 
-    /// Get the bounds of a registered widget.
+    /// Register an overlay widget — hit-tested BEFORE content and regular widgets.
+    /// Use for context menus, popovers, and other transient UI that must intercept events.
+    pub fn register_overlay_widget(&mut self, id: SourceId, bounds: Rect) {
+        self.overlay_widget_bounds.insert(id, bounds);
+    }
+
+    /// Get the bounds of a registered widget (checks overlay first, then regular).
     pub fn widget_bounds(&self, id: &SourceId) -> Option<Rect> {
-        self.widget_bounds.get(id).copied()
+        self.overlay_widget_bounds.get(id).or_else(|| self.widget_bounds.get(id)).copied()
     }
 
     /// Set a cursor hint for a widget. Called during layout by framework containers.
@@ -1135,6 +1147,14 @@ impl LayoutSnapshot {
 
     /// Hit test with separate x, y coordinates.
     pub fn hit_test_xy(&self, x: f32, y: f32) -> Option<HitResult> {
+        // 0. Highest priority: Overlay widgets (context menus, popovers).
+        //    These always beat content and regular widgets regardless of size.
+        for (id, rect) in &self.overlay_widget_bounds {
+            if rect.contains_xy(x, y) {
+                return Some(HitResult::Widget(*id));
+            }
+        }
+
         // 1. Priority: Small interactive widgets (buttons, sort headers).
         //    These take precedence over content to ensure clickability even
         //    when overlapping with selectable text.  Large container widgets

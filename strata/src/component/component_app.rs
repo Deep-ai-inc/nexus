@@ -163,4 +163,8 @@ where
     fn on_tick(state: &mut C) -> bool {
         state.on_tick()
     }
+
+    fn on_native_menu_result(state: &mut C, index: usize) -> Option<C::Message> {
+        state.on_native_menu_result(index)
+    }
 }

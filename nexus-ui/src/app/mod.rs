@@ -14,7 +14,6 @@ mod view;
 mod tests;
 
 use message::{NexusMessage, InputMsg};
-use crate::ui::context_menu::render_context_menu;
 use crate::features::input::InputWidget;
 use crate::ui::scroll::ScrollModel;
 use crate::features::selection::SelectionWidget;
@@ -107,6 +106,9 @@ pub struct NexusState {
     pub exit_requested: bool,
     pub drop_highlight: Option<message::DropZone>,
     pub(crate) drag: crate::features::selection::drag::DragState,
+
+    /// Pending native menu items + target, stored for on_native_menu_result callback.
+    pub(crate) pending_menu_items: Option<(Vec<crate::ui::context_menu::ContextMenuItem>, crate::ui::context_menu::ContextTarget)>,
 
     // --- Render tracking ---
     last_frame: Cell<Instant>,
@@ -232,10 +234,6 @@ impl Component for NexusState {
                 let max = self.scroll.state.max.get();
                 self.scroll.pending_offset.set(Some(target_offset.min(max)));
             }
-        }
-
-        if let Some(menu) = self.transient.context_menu() {
-            render_context_menu(snapshot, menu);
         }
 
         // Drop target highlight
@@ -382,6 +380,14 @@ impl Component for NexusState {
         self.zoom_level
     }
 
+    fn on_native_menu_result(&mut self, index: usize) -> Option<NexusMessage> {
+        let (items, target) = self.pending_menu_items.take()?;
+        let item = items.into_iter().nth(index)?;
+        Some(NexusMessage::ContextMenu(
+            message::ContextMenuMsg::ActionWithTarget(item, target),
+        ))
+    }
+
     fn force_click_lookup(
         &self,
         addr: &strata::content_address::ContentAddress,
@@ -518,6 +524,7 @@ impl RootComponent for NexusState {
             exit_requested: false,
             drop_highlight: None,
             drag: crate::features::selection::drag::DragState::new(),
+            pending_menu_items: None,
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             last_cursor_blink: true,

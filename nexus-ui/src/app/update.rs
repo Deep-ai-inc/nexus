@@ -605,20 +605,35 @@ impl NexusState {
     fn dispatch_context_menu(&mut self, msg: ContextMenuMsg) -> Command<NexusMessage> {
         match msg {
             ContextMenuMsg::Show(x, y, items, target) => {
-                self.transient.show_context_menu(x, y, items, target);
+                // Build native menu items
+                let native_items: Vec<strata::platform::NativeMenuItem> = items.iter().map(|item| {
+                    strata::platform::NativeMenuItem {
+                        label: item.label().to_string(),
+                        shortcut: String::new(),
+                        separator: false,
+                    }
+                }).collect();
+
+                // Convert from layout space (zoomed) to view coordinates
+                let z = self.zoom_level;
+                let vx = x * z;
+                let vy = y * z;
+
+                // Store items + target for on_native_menu_result callback
+                self.pending_menu_items = Some((items, target));
+
+                // Defer the native menu to show after the state borrow is released
+                // (NSMenu blocks the run loop, causing re-entrant borrow panics)
+                strata::platform::request_native_menu(native_items, vx, vy);
                 Command::none()
             }
-            ContextMenuMsg::Action(item) => self.exec_context_menu_item(item),
-            ContextMenuMsg::Dismiss => {
-                self.transient.dismiss_context_menu();
-                Command::none()
-            }
+            ContextMenuMsg::Action(item) => self.exec_context_menu_item(item, None),
+            ContextMenuMsg::ActionWithTarget(item, target) => self.exec_context_menu_item(item, Some(target)),
+            ContextMenuMsg::Dismiss => Command::none(),
         }
     }
 
-    fn exec_context_menu_item(&mut self, item: ContextMenuItem) -> Command<NexusMessage> {
-        let target = self.transient.context_menu().map(|m| m.target.clone());
-        self.transient.dismiss_context_menu();
+    fn exec_context_menu_item(&mut self, item: ContextMenuItem, target: Option<ContextTarget>) -> Command<NexusMessage> {
         match item {
             ContextMenuItem::Copy => {
                 // First try to copy the selected text (respects user's selection)
@@ -667,7 +682,8 @@ impl NexusState {
                 Some(ContextTarget::Input) | None => {
                     self.input.text_input.select_all();
                 }
-                Some(ContextTarget::Block(_)) | Some(ContextTarget::AgentBlock(_)) => {
+                Some(ContextTarget::Block(_)) | Some(ContextTarget::AgentBlock(_))
+                | Some(ContextTarget::TableCell { .. }) => {
                     self.selection
                         .select_all(&self.shell.blocks.blocks, &self.agent.blocks);
                 }
@@ -730,6 +746,33 @@ impl NexusState {
                     .arg(&path)
                     .spawn();
             }
+            ContextMenuItem::CopyCellValue(text) => {
+                Self::set_clipboard_text(&text);
+            }
+            ContextMenuItem::FilterByValue { value, col } => {
+                if let Some(block_id) = self.target_shell_block_id(&target) {
+                    return Command::message(NexusMessage::Shell(
+                        ShellMsg::FilterTable(block_id, col, Some(crate::data::ColumnFilter::Equals(value)))
+                    ));
+                }
+            }
+            ContextMenuItem::ExcludeValue { value, col } => {
+                if let Some(block_id) = self.target_shell_block_id(&target) {
+                    return Command::message(NexusMessage::Shell(
+                        ShellMsg::FilterTable(block_id, col, Some(crate::data::ColumnFilter::NotEquals(value)))
+                    ));
+                }
+            }
+            ContextMenuItem::ClearColumnFilter(block_id, col) => {
+                return Command::message(NexusMessage::Shell(
+                    ShellMsg::FilterTable(block_id, col, None)
+                ));
+            }
+            ContextMenuItem::ClearAllFilters(block_id) => {
+                return Command::message(NexusMessage::Shell(
+                    ShellMsg::ClearAllFilters(block_id)
+                ));
+            }
         }
         Command::none()
     }
@@ -737,9 +780,17 @@ impl NexusState {
     /// Resolve a context target to the shell block it refers to.
     fn target_shell_block<'a>(&'a self, target: &Option<ContextTarget>) -> Option<&'a crate::data::Block> {
         match target {
-            Some(ContextTarget::Block(id)) => {
+            Some(ContextTarget::Block(id)) | Some(ContextTarget::TableCell { block_id: id, .. }) => {
                 self.shell.blocks.get(*id)
             }
+            _ => None,
+        }
+    }
+
+    /// Resolve a context target to its block ID.
+    fn target_shell_block_id(&self, target: &Option<ContextTarget>) -> Option<nexus_api::BlockId> {
+        match target {
+            Some(ContextTarget::Block(id)) | Some(ContextTarget::TableCell { block_id: id, .. }) => Some(*id),
             _ => None,
         }
     }
