@@ -5,11 +5,15 @@
 //! for large datasets.
 
 use crate::content_address::SourceId;
+use crate::gpu::ImageHandle;
 use crate::layout_snapshot::{CursorIcon, LayoutSnapshot};
 use crate::primitives::{Color, Rect, Size};
 
 use super::elements::{unicode_display_width, hash_text};
 use super::length::BASE_FONT_SIZE;
+
+/// Dot radius for Badge cells.
+const BADGE_DOT_RADIUS: f32 = 4.0;
 
 // =========================================================================
 // TableColumn and TableCell
@@ -291,11 +295,45 @@ pub(crate) fn render_table(
 // VirtualTableElement (O(visible) rendering)
 // =========================================================================
 
-/// A lightweight cell for virtual tables — just the pre-formatted text, no wrapping yet.
+/// Content variants for virtual table cells.
+pub enum CellContent {
+    /// Plain text (existing fast path).
+    Text(String),
+    /// Colored dot indicator followed by text.
+    Badge { dot_color: Color, text: String },
+    /// Inline image thumbnail.
+    Image { handle: ImageHandle, width: u32, height: u32 },
+}
+
+/// A lightweight cell for virtual tables.
 pub struct VirtualCell {
-    pub text: String,
+    pub content: CellContent,
+    /// Text color (Text/Badge) or tint (Image).
     pub color: Color,
     pub widget_id: Option<SourceId>,
+}
+
+impl VirtualCell {
+    /// Plain text cell (backward-compatible constructor).
+    pub fn text(text: String, color: Color) -> Self {
+        Self { content: CellContent::Text(text), color, widget_id: None }
+    }
+
+    /// Badge cell: colored dot + text label.
+    pub fn badge(dot_color: Color, text: String, text_color: Color) -> Self {
+        Self { content: CellContent::Badge { dot_color, text }, color: text_color, widget_id: None }
+    }
+
+    /// Image cell: inline thumbnail.
+    pub fn image(handle: ImageHandle, width: u32, height: u32) -> Self {
+        Self { content: CellContent::Image { handle, width, height }, color: Color::WHITE, widget_id: None }
+    }
+
+    /// Set widget ID (makes cell clickable).
+    pub fn with_widget_id(mut self, id: SourceId) -> Self {
+        self.widget_id = Some(id);
+        self
+    }
 }
 
 /// A virtual table that only materializes visible rows during rendering.
@@ -445,13 +483,35 @@ pub(crate) fn render_virtual_table(
                 if col_idx < num_cols {
                     let tx = col_x + cell_pad;
                     let ty = ry + 2.0;
-                    let mut text_layout = TextLayout::simple(
-                        cell.text.clone(), cell.color.pack(),
-                        tx, ty, char_width, table.line_height,
-                    );
-                    text_layout.bounds.width = text_layout.bounds.width.max(table.columns[col_idx].width - cell_pad);
-                    snapshot.register_source_with_offset(table.source_id, SourceLayout::text(text_layout), item_offset);
-                    col_x += table.columns[col_idx].width;
+                    let col_w = table.columns[col_idx].width;
+                    match &cell.content {
+                        CellContent::Text(text) => {
+                            let mut text_layout = TextLayout::simple(
+                                text.clone(), cell.color.pack(),
+                                tx, ty, char_width, table.line_height,
+                            );
+                            text_layout.bounds.width = text_layout.bounds.width.max(col_w - cell_pad);
+                            snapshot.register_source_with_offset(table.source_id, SourceLayout::text(text_layout), item_offset);
+                        }
+                        CellContent::Badge { text, .. } => {
+                            let badge_offset = BADGE_DOT_RADIUS * 2.0 + BASE_FONT_SIZE * 0.3;
+                            let mut text_layout = TextLayout::simple(
+                                text.clone(), cell.color.pack(),
+                                tx + badge_offset, ty, char_width, table.line_height,
+                            );
+                            text_layout.bounds.width = text_layout.bounds.width.max(col_w - cell_pad - badge_offset);
+                            snapshot.register_source_with_offset(table.source_id, SourceLayout::text(text_layout), item_offset);
+                        }
+                        CellContent::Image { .. } => {
+                            // Images are not text-selectable; register empty placeholder for stable item indexing
+                            let text_layout = TextLayout::simple(
+                                String::new(), cell.color.pack(),
+                                tx, ty, char_width, table.line_height,
+                            );
+                            snapshot.register_source_with_offset(table.source_id, SourceLayout::text(text_layout), item_offset);
+                        }
+                    }
+                    col_x += col_w;
                 }
             }
         }
@@ -477,20 +537,73 @@ pub(crate) fn render_virtual_table(
             if col_idx < table.columns.len() {
                 let tx = col_x + cell_pad;
                 let ty = ry + 2.0;
-                let text_width = unicode_display_width(&cell.text) * char_width;
-                snapshot.primitives_mut().add_text_cached(
-                    cell.text.clone(),
-                    Point::new(tx, ty),
-                    cell.color,
-                    BASE_FONT_SIZE,
-                    hash_text(&cell.text),
-                );
-                if let Some(wid) = cell.widget_id {
-                    let text_rect = Rect::new(tx, ty, text_width, table.line_height);
-                    snapshot.register_widget(wid, text_rect);
-                    snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                let col_w = table.columns[col_idx].width;
+                match &cell.content {
+                    CellContent::Text(text) => {
+                        let text_width = unicode_display_width(text) * char_width;
+                        snapshot.primitives_mut().add_text_cached(
+                            text.clone(),
+                            Point::new(tx, ty),
+                            cell.color,
+                            BASE_FONT_SIZE,
+                            hash_text(text),
+                        );
+                        if let Some(wid) = cell.widget_id {
+                            let text_rect = Rect::new(tx, ty, text_width, table.line_height);
+                            snapshot.register_widget(wid, text_rect);
+                            snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                        }
+                    }
+                    CellContent::Badge { dot_color, text } => {
+                        // Dot: vertically centered on text
+                        let dot_center_y = ty + table.line_height / 2.0;
+                        snapshot.primitives_mut().add_circle(
+                            Point::new(tx + BADGE_DOT_RADIUS, dot_center_y),
+                            BADGE_DOT_RADIUS,
+                            *dot_color,
+                        );
+                        // Text: offset past the dot
+                        let badge_offset = BADGE_DOT_RADIUS * 2.0 + BASE_FONT_SIZE * 0.3;
+                        let text_x = tx + badge_offset;
+                        let text_width = unicode_display_width(text) * char_width;
+                        snapshot.primitives_mut().add_text_cached(
+                            text.clone(),
+                            Point::new(text_x, ty),
+                            cell.color,
+                            BASE_FONT_SIZE,
+                            hash_text(text),
+                        );
+                        if let Some(wid) = cell.widget_id {
+                            let total_w = badge_offset + text_width;
+                            let hit_rect = Rect::new(tx, ty, total_w, table.line_height);
+                            snapshot.register_widget(wid, hit_rect);
+                            snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                        }
+                    }
+                    CellContent::Image { handle, width, height } => {
+                        // Scale to fit row_height minus padding, preserving aspect ratio
+                        let max_h = table.row_height - 4.0;
+                        let max_w = col_w - cell_pad * 2.0;
+                        let scale = (max_h / *height as f32)
+                            .min(max_w / *width as f32)
+                            .min(1.0);
+                        let img_w = *width as f32 * scale;
+                        let img_h = *height as f32 * scale;
+                        let img_y = ry + (table.row_height - img_h) / 2.0;
+                        snapshot.primitives_mut().add_image(
+                            Rect::new(tx, img_y, img_w, img_h),
+                            *handle,
+                            2.0,
+                            cell.color,
+                        );
+                        if let Some(wid) = cell.widget_id {
+                            let hit_rect = Rect::new(tx, img_y, img_w, img_h);
+                            snapshot.register_widget(wid, hit_rect);
+                            snapshot.set_cursor_hint(wid, CursorIcon::Pointer);
+                        }
+                    }
                 }
-                col_x += table.columns[col_idx].width;
+                col_x += col_w;
             }
         }
     }

@@ -18,6 +18,8 @@ pub(crate) struct BlockManager {
     block_index: HashMap<BlockId, usize>,
     /// Decoded image handles keyed by block ID: (handle, width, height).
     pub image_handles: HashMap<BlockId, (ImageHandle, u32, u32)>,
+    /// Decoded image handles for table cells: (block_id, data_row_index, col_index) → (handle, w, h).
+    pub table_cell_images: HashMap<(BlockId, usize, usize), (ImageHandle, u32, u32)>,
 }
 
 impl BlockManager {
@@ -26,6 +28,7 @@ impl BlockManager {
             blocks: Vec::new(),
             block_index: HashMap::new(),
             image_handles: HashMap::new(),
+            table_cell_images: HashMap::new(),
         }
     }
 
@@ -65,6 +68,19 @@ impl BlockManager {
         self.image_handles.get(&id).copied()
     }
 
+    /// Store a decoded image handle for a specific table cell.
+    pub fn store_table_cell_image(
+        &mut self,
+        block_id: BlockId,
+        row: usize,
+        col: usize,
+        handle: ImageHandle,
+        w: u32,
+        h: u32,
+    ) {
+        self.table_cell_images.insert((block_id, row, col), (handle, w, h));
+    }
+
     /// The last block, if any.
     pub fn last(&self) -> Option<&Block> {
         self.blocks.last()
@@ -79,5 +95,6 @@ impl BlockManager {
         self.blocks.clear();
         self.block_index.clear();
         self.image_handles.clear();
+        self.table_cell_images.clear();
     }
 }

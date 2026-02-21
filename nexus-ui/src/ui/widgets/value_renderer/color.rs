@@ -64,13 +64,37 @@ pub(super) fn value_text_color(value: &Value) -> Color {
     }
 }
 
-/// Get display color for a file entry.
+/// Badge dot color for a file type indicator.
+///
+/// The dot communicates *what kind of thing* this is — each type gets a
+/// unique, maximally distinct hue so users can scan a listing at a glance.
+pub(super) fn file_type_dot_color(ft: &FileType) -> Color {
+    match ft {
+        FileType::Directory  => Color::rgb(0.35, 0.55, 1.0),  // blue
+        FileType::Symlink    => Color::rgb(0.0, 0.85, 0.85),  // cyan
+        FileType::Fifo       => Color::rgb(0.95, 0.75, 0.1),  // amber
+        FileType::Socket     => Color::rgb(0.85, 0.35, 0.85), // magenta
+        FileType::BlockDevice => Color::rgb(0.95, 0.55, 0.15),// orange
+        FileType::CharDevice => Color::rgb(0.75, 0.45, 0.15), // brown-orange
+        FileType::File       => Color::rgb(0.55, 0.55, 0.6),  // gray
+        FileType::Unknown    => Color::rgb(0.4, 0.4, 0.42),   // dim gray
+    }
+}
+
+/// Text color for a file entry.
+///
+/// The text color communicates *attributes* — executable, hidden, symlink —
+/// complementing the dot which already encodes the type.
 pub(super) fn file_entry_color(entry: &FileEntry) -> Color {
     match entry.file_type {
-        FileType::Directory => Color::rgb(0.4, 0.6, 1.0),
-        FileType::Symlink => Color::rgb(0.4, 0.9, 0.9),
-        _ if entry.permissions & 0o111 != 0 => Color::rgb(0.4, 0.9, 0.4),
-        _ => Color::rgb(0.8, 0.8, 0.8),
+        FileType::Directory => Color::rgb(0.45, 0.65, 1.0),            // bold blue
+        FileType::Symlink   => Color::rgb(0.4, 0.88, 0.88),           // cyan
+        FileType::Fifo | FileType::Socket
+            | FileType::BlockDevice | FileType::CharDevice
+                            => Color::rgb(0.9, 0.75, 0.3),            // warm yellow
+        _ if entry.is_hidden => Color::rgb(0.5, 0.5, 0.52),           // dimmed
+        _ if entry.permissions & 0o111 != 0 => Color::rgb(0.4, 0.9, 0.4), // green = executable
+        _ => Color::rgb(0.82, 0.82, 0.82),                            // neutral light
     }
 }
 

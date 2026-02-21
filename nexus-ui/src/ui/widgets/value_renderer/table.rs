@@ -14,7 +14,7 @@ use crate::utils::ids;
 use strata::content_address::SourceId;
 use strata::layout::{Column, VirtualCell, VirtualTableElement};
 
-use super::color::value_text_color;
+use super::color::{file_type_dot_color, value_text_color};
 use super::is_anchor_value;
 
 const TABLE_CHAR_W: f32 = 8.4;
@@ -53,6 +53,7 @@ pub(super) fn render_table<'a>(
     block: &Block,
     click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
     table_layout_cache: &TableLayoutCache,
+    _table_cell_images: &std::collections::HashMap<(nexus_api::BlockId, usize, usize), (strata::ImageHandle, u32, u32)>,
 ) -> Column<'a> {
     let block_id = block.id;
     let _t0 = std::time::Instant::now();
@@ -140,11 +141,7 @@ pub(super) fn render_table<'a>(
             None => continue,
         };
         let cells: Vec<VirtualCell> = row.iter().enumerate().map(|(col_idx, cell)| {
-            let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
-                format_value_for_display(cell, fmt)
-            } else {
-                cell.to_text()
-            };
+            // Anchor registration (clickable cells)
             let widget_id = if is_anchor_value(cell) {
                 let id = ids::anchor(block_id, anchor_idx);
                 register_anchor(click_registry, id, AnchorEntry {
@@ -162,11 +159,27 @@ pub(super) fn render_table<'a>(
             } else {
                 None
             };
-            VirtualCell {
-                text,
-                color: value_text_color(cell),
-                widget_id,
+
+            // Build rich cell content based on value type
+            let mut vcell = match cell {
+                Value::FileEntry(entry) => {
+                    let dot_color = file_type_dot_color(&entry.file_type);
+                    VirtualCell::badge(dot_color, entry.name.clone(), value_text_color(cell))
+                }
+                _ => {
+                    let text = if let Some(fmt) = columns.get(col_idx).and_then(|c| c.format) {
+                        format_value_for_display(cell, fmt)
+                    } else {
+                        cell.to_text()
+                    };
+                    VirtualCell::text(text, value_text_color(cell))
+                }
+            };
+
+            if let Some(id) = widget_id {
+                vcell = vcell.with_widget_id(id);
             }
+            vcell
         }).collect();
         table = table.row(cells);
     }

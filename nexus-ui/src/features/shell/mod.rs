@@ -137,6 +137,7 @@ impl ShellWidget {
             is_focused,
             click_registry: &self.click_registry,
             table_layout_cache: &self.table_layout_cache,
+            table_cell_images: &self.blocks.table_cell_images,
         })
     }
 
@@ -842,6 +843,25 @@ impl ShellWidget {
         if let Value::Table { ref rows, .. } = value {
             if rows.len() > 100 {
                 strata::frame_timing::enable();
+            }
+            // Eagerly decode image media in table cells (capped to prevent UI freeze)
+            const MAX_EAGER_TABLE_IMAGES: usize = 20;
+            let mut decoded_count = 0usize;
+            'outer: for (row_idx, row) in rows.iter().enumerate() {
+                for (col_idx, cell) in row.iter().enumerate() {
+                    if decoded_count >= MAX_EAGER_TABLE_IMAGES { break 'outer; }
+                    if let Value::Media { data, content_type, .. } = cell {
+                        if content_type.starts_with("image/") {
+                            if let Ok(img) = image::load_from_memory(data) {
+                                let rgba = img.to_rgba8();
+                                let (w, h) = rgba.dimensions();
+                                let handle = images.load_rgba(w, h, rgba.into_raw());
+                                self.blocks.store_table_cell_image(block_id, row_idx, col_idx, handle, w, h);
+                                decoded_count += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(block) = self.blocks.get_mut(block_id) {

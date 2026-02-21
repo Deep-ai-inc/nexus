@@ -51,7 +51,7 @@ pub use scroll_column::ScrollColumn;
 pub use row::Row;
 pub use column::Column;
 pub use text_input::TextInputElement;
-pub use table::{TableElement, TableColumn, TableCell, VirtualTableElement, VirtualCell};
+pub use table::{TableElement, TableColumn, TableCell, VirtualTableElement, VirtualCell, CellContent};
 pub use canvas::Canvas;
 pub use list_view::ListView;
 pub use primitives::{LineStyle, PrimitiveBatch};

@@ -38,6 +38,7 @@ pub(super) fn render_domain_value<'a>(
     image_info: Option<(ImageHandle, u32, u32)>,
     click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
     table_layout_cache: &TableLayoutCache,
+    table_cell_images: &std::collections::HashMap<(nexus_api::BlockId, usize, usize), (ImageHandle, u32, u32)>,
 ) -> Column<'a> {
     use nexus_api::DomainValue;
     let block_id = block.id;
@@ -160,7 +161,7 @@ pub(super) fn render_domain_value<'a>(
                     return render_diff_viewer(parent, items, *scroll_line, *current_file, collapsed_indices, source_id);
                 }
             }
-            render_native_value(parent, &req.content, block, image_info, click_registry, table_layout_cache)
+            render_native_value(parent, &req.content, block, image_info, click_registry, table_layout_cache, table_cell_images)
         }
 
         DomainValue::BlobChunk(chunk) => {

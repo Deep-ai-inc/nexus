@@ -58,6 +58,7 @@ pub(crate) fn render_native_value<'a>(
     image_info: Option<(ImageHandle, u32, u32)>,
     click_registry: &RefCell<HashMap<SourceId, ClickAction>>,
     table_layout_cache: &TableLayoutCache,
+    table_cell_images: &HashMap<(nexus_api::BlockId, usize, usize), (ImageHandle, u32, u32)>,
 ) -> Column<'a> {
     let block_id = block.id;
     match value {
@@ -101,7 +102,7 @@ pub(crate) fn render_native_value<'a>(
         }
 
         Value::Table { columns, rows } => {
-            render_table(parent, columns, rows, block, click_registry, table_layout_cache)
+            render_table(parent, columns, rows, block, click_registry, table_layout_cache, table_cell_images)
         }
 
         Value::List(items) => {
@@ -139,7 +140,7 @@ pub(crate) fn render_native_value<'a>(
                 ));
                 if has_structured {
                     for item in items {
-                        parent = render_native_value(parent, item, block, None, click_registry, table_layout_cache);
+                        parent = render_native_value(parent, item, block, None, click_registry, table_layout_cache, table_cell_images);
                     }
                     parent
                 } else {
@@ -191,7 +192,7 @@ pub(crate) fn render_native_value<'a>(
         }
 
         Value::Domain(domain) => {
-            render_domain_value(parent, domain, block, image_info, click_registry, table_layout_cache)
+            render_domain_value(parent, domain, block, image_info, click_registry, table_layout_cache, table_cell_images)
         }
 
         Value::Error { message, .. } => {
