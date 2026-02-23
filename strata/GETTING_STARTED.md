@@ -15,7 +15,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-strata = { git = "https://github.com/Deep-ai-inc/nexus" }
+strata = { git = "https://github.com/Deep-ai-inc/nexus", tag = "v0.2.0" }
 ```
 
 ## Minimal App
