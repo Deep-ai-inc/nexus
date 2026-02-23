@@ -789,6 +789,13 @@ pub struct LayoutSnapshot {
     /// Use for popups, context menus, tooltips that must appear above all content.
     overlay_primitives: PrimitiveBatch,
 
+    /// When true, `primitives_mut()` and `register_widget()` redirect to the
+    /// overlay batch and overlay widget bounds. This lets the entire layout system
+    /// (containers, text elements, buttons, tables) render into the overlay layer
+    /// without any per-element changes. Enable with `set_overlay_mode(true)` before
+    /// laying out a modal/dialog, then disable after.
+    overlay_mode: bool,
+
     /// Bounds of widgets registered with an ID.
     /// Used for hit-testing non-content areas (buttons, panels) and overlay anchoring.
     widget_bounds: HashMap<SourceId, Rect>,
@@ -845,6 +852,7 @@ impl LayoutSnapshot {
             foreground_decorations: Vec::new(),
             primitives: PrimitiveBatch::new(),
             overlay_primitives: PrimitiveBatch::new(),
+            overlay_mode: false,
             widget_bounds: HashMap::new(),
             overlay_widget_bounds: HashMap::new(),
             scroll_limits: HashMap::new(),
@@ -868,6 +876,7 @@ impl LayoutSnapshot {
         self.foreground_decorations.clear();
         self.primitives.clear();
         self.overlay_primitives.clear();
+        self.overlay_mode = false;
         self.widget_bounds.clear();
         self.overlay_widget_bounds.clear();
         self.scroll_limits.clear();
@@ -901,12 +910,42 @@ impl LayoutSnapshot {
         &mut self.overlay_primitives
     }
 
+    /// Enable or disable overlay mode.
+    ///
+    /// When enabled, `primitives_mut()` redirects to the overlay primitive batch
+    /// and `register_widget()` redirects to overlay widget bounds. This allows
+    /// the entire layout system (containers, text, buttons, tables, canvases)
+    /// to render into the overlay layer using normal `layout_with_constraints()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Main content (renders normally)
+    /// main_layout.layout_with_constraints(&mut ctx, constraints, Point::ORIGIN);
+    ///
+    /// // Modal dialog (renders on top of everything)
+    /// snapshot.set_overlay_mode(true);
+    /// dialog.layout_with_constraints(&mut LayoutContext::new(snapshot), constraints, Point::ORIGIN);
+    /// snapshot.set_overlay_mode(false);
+    /// ```
+    pub fn set_overlay_mode(&mut self, overlay: bool) {
+        self.overlay_mode = overlay;
+    }
+
+    /// Check if overlay mode is currently active.
+    pub fn is_overlay_mode(&self) -> bool {
+        self.overlay_mode
+    }
+
     /// Get mutable access to the primitive batch.
     ///
     /// This is the fast path for direct GPU instance creation.
     /// Primitives added here bypass the widget system entirely.
     pub fn primitives_mut(&mut self) -> &mut PrimitiveBatch {
-        &mut self.primitives
+        if self.overlay_mode {
+            &mut self.overlay_primitives
+        } else {
+            &mut self.primitives
+        }
     }
 
     /// Get the current clip rect from the primitive batch's clip stack.
@@ -914,12 +953,22 @@ impl LayoutSnapshot {
     /// Used by layout containers to propagate clip info to non-primitive
     /// render paths (e.g., GridLayout for terminal content).
     pub fn current_clip(&self) -> Option<Rect> {
-        self.primitives.current_clip_public()
+        if self.overlay_mode {
+            self.overlay_primitives.current_clip_public()
+        } else {
+            self.primitives.current_clip_public()
+        }
     }
 
     /// Register a widget with its bounds for hit-testing and overlay anchoring.
+    ///
+    /// In overlay mode, widgets are registered as overlay widgets (hit-tested first).
     pub fn register_widget(&mut self, id: SourceId, bounds: Rect) {
-        self.widget_bounds.insert(id, bounds);
+        if self.overlay_mode {
+            self.overlay_widget_bounds.insert(id, bounds);
+        } else {
+            self.widget_bounds.insert(id, bounds);
+        }
     }
 
     /// Register an overlay widget — hit-tested BEFORE content and regular widgets.
