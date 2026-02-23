@@ -2176,6 +2176,27 @@ fn populate_pipeline(
         pipeline.add_border(prim.rect.x * scale, prim.rect.y * scale, prim.rect.width * scale, prim.rect.height * scale, prim.corner_radius * scale, prim.border_width * scale, prim.color);
         maybe_clip(pipeline, start, &prim.clip_rect, scale);
     }
+    for prim in &overlays.circles {
+        let start = pipeline.instance_count();
+        pipeline.add_circle(prim.center.x * scale, prim.center.y * scale, prim.radius * scale, prim.color);
+        maybe_clip(pipeline, start, &prim.clip_rect, scale);
+    }
+    for prim in &overlays.lines {
+        let start = pipeline.instance_count();
+        pipeline.add_line_styled(prim.p1.x * scale, prim.p1.y * scale, prim.p2.x * scale, prim.p2.y * scale, prim.thickness * scale, prim.color, convert_line_style(prim.style));
+        maybe_clip(pipeline, start, &prim.clip_rect, scale);
+    }
+    for prim in &overlays.polylines {
+        let start = pipeline.instance_count();
+        let scaled_points: Vec<[f32; 2]> = prim.points.iter().map(|p| [p.x * scale, p.y * scale]).collect();
+        pipeline.add_polyline_styled(&scaled_points, prim.thickness * scale, prim.color, convert_line_style(prim.style));
+        maybe_clip(pipeline, start, &prim.clip_rect, scale);
+    }
+    for prim in &overlays.images {
+        let start = pipeline.instance_count();
+        pipeline.add_image(prim.rect.x * scale, prim.rect.y * scale, prim.rect.width * scale, prim.rect.height * scale, prim.handle, prim.corner_radius * scale, prim.tint);
+        maybe_clip(pipeline, start, &prim.clip_rect, scale);
+    }
     for prim in &overlays.text_runs {
         let start = pipeline.instance_count();
         pipeline.add_text_styled(&prim.text, prim.position.x * scale, prim.position.y * scale, prim.color, prim.font_size * scale, prim.bold, prim.italic, font_system);
