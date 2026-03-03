@@ -1727,7 +1727,24 @@ fn test_classify_external_commands_as_pty() {
     assert_eq!(kernel.classify_command("cargo build"), CommandClassification::Pty);
     assert_eq!(kernel.classify_command("npm install"), CommandClassification::Pty);
     assert_eq!(kernel.classify_command("htop"), CommandClassification::Pty);
-    assert_eq!(kernel.classify_command("ssh user@host"), CommandClassification::Pty);
+    assert_eq!(kernel.classify_command("ssh user@host"), CommandClassification::RemoteTransport);
+}
+
+#[test]
+fn test_classify_remote_transport() {
+    let (kernel, _rx) = Kernel::new().expect("Failed to create kernel");
+    // SSH with destination → RemoteTransport
+    assert_eq!(kernel.classify_command("ssh user@host"), CommandClassification::RemoteTransport);
+    assert_eq!(kernel.classify_command("ssh -p 2222 user@host"), CommandClassification::RemoteTransport);
+    assert_eq!(kernel.classify_command("ssh -i ~/.ssh/id_rsa user@host"), CommandClassification::RemoteTransport);
+    // docker exec → RemoteTransport
+    assert_eq!(kernel.classify_command("docker exec mycontainer"), CommandClassification::RemoteTransport);
+    // kubectl exec → RemoteTransport
+    assert_eq!(kernel.classify_command("kubectl exec mypod"), CommandClassification::RemoteTransport);
+    // ssh without destination → Pty (no args to connect to)
+    // docker (not exec) → Pty
+    assert_eq!(kernel.classify_command("docker ps"), CommandClassification::Pty);
+    assert_eq!(kernel.classify_command("docker build ."), CommandClassification::Pty);
 }
 
 #[test]

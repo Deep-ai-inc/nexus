@@ -1,0 +1,14 @@
+[package]
+name = "nexus-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nexus-api = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

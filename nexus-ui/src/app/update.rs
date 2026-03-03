@@ -77,6 +77,18 @@ impl NexusState {
                     self.exec_anchor_action(action);
                     return Command::none();
                 }
+                // Remote connection results are handled at the root level
+                let m = match m {
+                    ShellMsg::RemoteConnected { block_id, remote, env } => {
+                        self.handle_remote_connected(block_id, remote, env);
+                        return Command::none();
+                    }
+                    ShellMsg::RemoteConnectFailed { block_id, error } => {
+                        self.handle_remote_connect_failed(block_id, error);
+                        return Command::none();
+                    }
+                    other => other,
+                };
                 let (shell, mut uctx) = self.shell_ctx();
                 shell.update(m, &mut uctx, ctx.images);
                 let cmds = uctx.into_commands();
@@ -112,6 +124,36 @@ impl NexusState {
             NexusMessage::ContextMenu(m) => self.dispatch_context_menu(m),
             NexusMessage::Scroll(action) => { self.scroll.apply_user_scroll(action); Command::none() }
             NexusMessage::ScrollToJob(_) => { self.scroll.snap_to_bottom(); Command::none() }
+            NexusMessage::UnnestToLevel(level) => {
+                self.handle_unnest_to_level(level);
+                Command::none()
+            }
+            NexusMessage::RemoteStateChanged(state) => {
+                if let Some(ref mut remote) = self.remote {
+                    remote.state = state;
+                }
+                Command::none()
+            }
+            NexusMessage::RemoteReconnected {
+                request_tx,
+                rtt_ms,
+                last_seen_seq,
+                response_rx,
+                env,
+            } => {
+                if let Some(ref mut remote) = self.remote {
+                    if let Some(rx) = response_rx.lock().unwrap().take() {
+                        remote.swap_request_tx(request_tx);
+                        remote.rtt_ms = rtt_ms;
+                        remote.last_seen_seq = last_seen_seq;
+                        remote.response_rx = rx;
+                        remote.env = env;
+                        remote.state = crate::features::shell::remote::ConnectionState::Connected;
+                        remote.flush_queue();
+                    }
+                }
+                Command::none()
+            }
             NexusMessage::Copy => { self.copy_selection_or_input(); Command::none() }
             NexusMessage::Paste => { self.paste_from_clipboard(ctx.images); Command::none() }
             NexusMessage::ClearScreen => { self.clear_screen(); Command::none() }
@@ -124,7 +166,10 @@ impl NexusState {
                 self.set_focus(Focus::Input);
                 Command::none()
             }
-            NexusMessage::Tick => { self.on_output_arrived(); Command::none() }
+            NexusMessage::Tick => {
+                self.on_output_arrived();
+                self.check_reconnect()
+            }
             NexusMessage::FileDrop(m) => self.dispatch_file_drop(m),
             NexusMessage::Drag(m) => { self.dispatch_drag(m, ctx); Command::none() }
             NexusMessage::FocusPrevBlock => {
@@ -218,6 +263,17 @@ impl NexusState {
             return Command::message(NexusMessage::ClearScreen);
         }
 
+        // Handle "exit" when in remote mode — pop the backend stack.
+        if !is_agent && text.trim() == "exit" && self.remote.is_some() {
+            if let Some(mut remote) = self.remote.take() {
+                remote.shutdown();
+                // Restore local CWD
+                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                self.cwd = cwd;
+            }
+            return Command::none();
+        }
+
         // Append to native shell history (before execution, for crash safety).
         // Records both kernel and PTY commands.
         if !is_agent {
@@ -245,14 +301,195 @@ impl NexusState {
             let kernel = self.kernel.clone();
             let kernel_tx = self.kernel_tx.clone();
             let cwd = self.cwd.clone();
-            let (shell, mut uctx) = self.shell_ctx();
-            shell.execute(text, block_id, &cwd, &kernel, &kernel_tx, &mut uctx);
+            // Manual borrow splitting: shell_ctx() borrows scroll/focus/cwd/context,
+            // but we also need &mut remote which is a separate field.
+            let uctx = UpdateContext::new(
+                &mut self.scroll,
+                &mut self.focus,
+                &mut self.cwd,
+                &mut self.context,
+            );
+            let shell = &mut self.shell;
+            let remote = &mut self.remote;
+            let mut uctx = uctx;
+            let remote_transport = shell.execute(
+                text,
+                block_id,
+                &cwd,
+                &kernel,
+                &kernel_tx,
+                remote.as_mut(),
+                &mut uctx,
+            );
             let cmds = uctx.into_commands();
             sync_focus_flags(&self.focus, &mut self.input, &mut self.agent);
+
+            if let Some(ssh_command) = remote_transport {
+                // Remote transport command — spawn async connection task.
+                let kernel_tx = self.kernel_tx.clone();
+                let connect_cmd = Command::perform(async move {
+                    match Self::connect_remote(ssh_command, kernel_tx, block_id).await {
+                        Ok((remote, env)) => NexusMessage::Shell(ShellMsg::RemoteConnected {
+                            block_id,
+                            remote: std::sync::Arc::new(std::sync::Mutex::new(Some(remote))),
+                            env: Box::new(env),
+                        }),
+                        Err(e) => NexusMessage::Shell(ShellMsg::RemoteConnectFailed {
+                            block_id,
+                            error: e.to_string(),
+                        }),
+                    }
+                });
+                return Command::batch(vec![cmds, connect_cmd]);
+            }
+
             return cmds;
         }
 
         Command::none()
+    }
+
+    /// Async task to establish a remote connection.
+    async fn connect_remote(
+        ssh_command: String,
+        kernel_tx: tokio::sync::broadcast::Sender<nexus_api::ShellEvent>,
+        block_id: nexus_api::BlockId,
+    ) -> anyhow::Result<(
+        crate::features::shell::remote::RemoteBackend,
+        nexus_protocol::messages::EnvInfo,
+    )> {
+        // Parse the SSH command to extract destination, options, and extra args
+        let args = parse_ssh_args(&ssh_command);
+
+        // Deploy agent if needed (passes extra_args so custom SSH options work)
+        let agent_path = crate::features::shell::remote::deploy::ensure_deployed(
+            &args.destination,
+            args.port,
+            args.identity.as_deref(),
+            &args.extra_args,
+        )
+        .await?;
+
+        // Connect via SSH
+        let forwarded_env = collect_forwarded_env();
+        let (transport, env, session_token, request_tx) =
+            crate::features::shell::remote::transport::TransportHandle::connect_ssh(
+                &args.destination,
+                args.port,
+                args.identity.as_deref(),
+                &args.extra_args,
+                &agent_path,
+                forwarded_env,
+                kernel_tx.clone(),
+            )
+            .await?;
+
+        // Emit a synthetic CommandFinished for the ssh block
+        let _ = kernel_tx.send(nexus_api::ShellEvent::CommandFinished {
+            block_id,
+            exit_code: 0,
+            duration_ms: 0,
+        });
+
+        let remote = crate::features::shell::remote::RemoteBackend::new(
+            env.clone(),
+            session_token,
+            request_tx,
+            transport.rtt_ms,
+            transport.last_seen_seq,
+            transport.response_rx,
+        );
+
+        Ok((remote, env))
+    }
+
+    /// Handle a successful remote connection.
+    fn handle_remote_connected(
+        &mut self,
+        block_id: nexus_api::BlockId,
+        remote: std::sync::Arc<std::sync::Mutex<Option<crate::features::shell::remote::RemoteBackend>>>,
+        env: Box<nexus_protocol::messages::EnvInfo>,
+    ) {
+        // Take the remote backend out of the Arc<Mutex<Option<...>>>
+        let remote = remote.lock().unwrap().take();
+        if let Some(remote) = remote {
+            // Update CWD to remote CWD
+            self.cwd = env.cwd.display().to_string();
+            self.remote = Some(remote);
+            tracing::info!(
+                "connected to remote: {}@{} ({})",
+                env.user,
+                env.hostname,
+                env.cwd.display()
+            );
+        }
+    }
+
+    /// Check if we need to start a reconnection attempt.
+    /// Called on each Tick. Only triggers once (state transition Disconnected → Reconnecting).
+    fn check_reconnect(&mut self) -> Command<NexusMessage> {
+        use crate::features::shell::remote::ConnectionState;
+
+        let should_reconnect = self
+            .remote
+            .as_ref()
+            .map_or(false, |r| r.state == ConnectionState::Disconnected);
+
+        if !should_reconnect {
+            return Command::none();
+        }
+
+        // Transition to Reconnecting so we don't spawn multiple tasks
+        if let Some(ref mut remote) = self.remote {
+            remote.state = ConnectionState::Reconnecting;
+        }
+
+        // We need the SSH command to reconnect. For now, we don't store the original
+        // SSH command, so reconnection would need the environment info.
+        // Since the transport handle doesn't persist the destination, we can't
+        // reconnect without it. This is a limitation — for a full implementation,
+        // we'd store the SSH destination in RemoteBackend.
+        //
+        // For now, just set the state and let the user reconnect manually or
+        // use UnnestToLevel(0) to disconnect.
+        tracing::info!("remote connection lost, state set to Reconnecting");
+        Command::none()
+    }
+
+    /// Handle breadcrumb click: unnest to the specified depth.
+    fn handle_unnest_to_level(&mut self, level: usize) {
+        if level == 0 {
+            // Disconnect entirely
+            if let Some(mut remote) = self.remote.take() {
+                remote.shutdown();
+                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+                self.cwd = cwd;
+            }
+        } else if let Some(ref mut remote) = self.remote {
+            // Pop back to the target level by sending Unnest for each extra level
+            let current_depth = remote.backend_stack.len();
+            for _ in level..current_depth {
+                remote.unnest();
+            }
+        }
+    }
+
+    /// Handle a failed remote connection.
+    fn handle_remote_connect_failed(
+        &mut self,
+        block_id: nexus_api::BlockId,
+        error: String,
+    ) {
+        // Emit error as stderr on the block
+        let _ = self.kernel_tx.send(nexus_api::ShellEvent::StderrChunk {
+            block_id,
+            data: format!("Remote connection failed: {}\n", error).into_bytes(),
+        });
+        let _ = self.kernel_tx.send(nexus_api::ShellEvent::CommandFinished {
+            block_id,
+            exit_code: 1,
+            duration_ms: 0,
+        });
     }
 
     fn dispatch_drag(&mut self, msg: DragMsg, ctx: &mut strata::component::Ctx) {
@@ -823,4 +1060,109 @@ impl NexusState {
             block.update_viewer(&msg);
         }
     }
+}
+
+// =========================================================================
+// SSH argument parsing and env forwarding
+// =========================================================================
+
+/// Parsed SSH command arguments.
+struct SshArgs {
+    destination: String,
+    port: Option<u16>,
+    identity: Option<String>,
+    /// Extra args to pass through (e.g. `-o StrictHostKeyChecking=no`).
+    extra_args: Vec<String>,
+}
+
+/// Parse SSH command arguments to extract destination, port, identity, and extra args.
+fn parse_ssh_args(command: &str) -> SshArgs {
+    let mut words = command.split_whitespace();
+    let _ = words.next(); // skip "ssh"
+
+    let mut port: Option<u16> = None;
+    let mut identity: Option<String> = None;
+    let mut destination = String::new();
+    let mut extra_args: Vec<String> = Vec::new();
+    let mut skip_next = false;
+    let mut next_is_port = false;
+    let mut next_is_identity = false;
+
+    for word in words {
+        if skip_next {
+            extra_args.push(word.to_string());
+            skip_next = false;
+            continue;
+        }
+        if next_is_port {
+            port = word.parse().ok();
+            next_is_port = false;
+            continue;
+        }
+        if next_is_identity {
+            identity = Some(word.to_string());
+            next_is_identity = false;
+            continue;
+        }
+
+        if word == "-p" {
+            next_is_port = true;
+            continue;
+        }
+        if word == "-i" {
+            next_is_identity = true;
+            continue;
+        }
+        if word.starts_with('-') {
+            // Options that take a value — collect into extra_args
+            let takes_value = matches!(
+                word,
+                "-l" | "-o" | "-F" | "-J" | "-W" | "-b" | "-c" | "-D"
+                    | "-e" | "-I" | "-L" | "-m" | "-O" | "-Q" | "-R"
+                    | "-S" | "-w"
+            );
+            extra_args.push(word.to_string());
+            if takes_value {
+                skip_next = true;
+            }
+            continue;
+        }
+
+        // First non-option argument is the destination
+        if destination.is_empty() {
+            destination = word.to_string();
+        }
+        // Continue parsing — SSH allows options after the destination
+    }
+
+    SshArgs { destination, port, identity, extra_args }
+}
+
+/// Collect environment variables to forward to the remote agent.
+fn collect_forwarded_env() -> std::collections::HashMap<String, String> {
+    let keys = [
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EDITOR",
+        "VISUAL",
+        "LANG",
+    ];
+
+    let mut env = std::collections::HashMap::new();
+    for key in &keys {
+        if let Ok(val) = std::env::var(key) {
+            env.insert(key.to_string(), val);
+        }
+    }
+
+    // Forward LC_* variables
+    for (key, val) in std::env::vars() {
+        if key.starts_with("LC_") {
+            env.insert(key, val);
+        }
+    }
+
+    env
 }

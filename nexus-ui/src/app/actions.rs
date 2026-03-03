@@ -42,6 +42,11 @@ impl NexusState {
             self.scroll.hint_bottom();
         }
 
+        // Poll remote responses (ClassifyResult, CompleteResult, etc.)
+        if let Some(ref mut remote) = self.remote {
+            remote.poll_responses();
+        }
+
         // Auto-scroll during active drag/selection
         if let Some(delta) = self.drag.auto_scroll.get() {
             self.scroll.apply_user_scroll(strata::ScrollAction::ScrollBy { delta: -delta, phase: None });

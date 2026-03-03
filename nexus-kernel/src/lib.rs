@@ -38,11 +38,67 @@ fn is_shell_keyword(name: &str) -> bool {
     )
 }
 
+/// Check if a command is a remote transport command that should be intercepted
+/// by the UI to establish a remote connection.
+///
+/// Matches:
+/// - `ssh [args] destination` (but not `ssh-keygen`, `ssh-agent`, etc.)
+/// - `docker exec [args] container` / `docker run ... container`
+/// - `kubectl exec [args] pod`
+fn is_remote_transport(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    let first = match words.next() {
+        Some(w) => w,
+        None => return false,
+    };
+
+    match first {
+        "ssh" => {
+            // Bare `ssh` with at least a destination argument.
+            // Skip option-like args to find a positional (destination).
+            let mut has_destination = false;
+            let mut skip_next = false;
+            for arg in words {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    // Options that take a value (skip next arg)
+                    if matches!(
+                        arg,
+                        "-p" | "-i" | "-l" | "-o" | "-F" | "-J" | "-W" | "-b"
+                            | "-c" | "-D" | "-e" | "-I" | "-L" | "-m" | "-O"
+                            | "-Q" | "-R" | "-S" | "-w"
+                    ) {
+                        skip_next = true;
+                    }
+                    continue;
+                }
+                // First non-option is the destination
+                has_destination = true;
+                break;
+            }
+            has_destination
+        }
+        "docker" => {
+            // `docker exec` is a remote transport
+            matches!(words.next(), Some("exec"))
+        }
+        "kubectl" => {
+            // `kubectl exec` is a remote transport
+            matches!(words.next(), Some("exec"))
+        }
+        _ => false,
+    }
+}
+
 /// Classification of how a command should be executed.
 ///
 /// The UI uses this to decide whether to route through the kernel
-/// (for pipelines, native commands, builtins) or spawn a PTY directly
-/// (for single external commands that need interactive terminal).
+/// (for pipelines, native commands, builtins), spawn a PTY directly
+/// (for single external commands that need interactive terminal),
+/// or establish a remote connection (for ssh/docker/kubectl).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandClassification {
     /// Execute through kernel - pipelines, native commands, or shell builtins.
@@ -51,6 +107,10 @@ pub enum CommandClassification {
     /// Execute via PTY - single external commands that need interactive terminal.
     /// These are forked processes with raw terminal I/O.
     Pty,
+    /// Remote transport command (ssh, docker exec, kubectl exec).
+    /// The UI intercepts these to establish a remote connection instead
+    /// of spawning a local process.
+    RemoteTransport,
 }
 
 use nexus_api::ShellEvent;
@@ -128,6 +188,13 @@ impl Kernel {
     pub fn classify_command(&self, command: &str) -> CommandClassification {
         let has_pipe = command.contains('|');
         let first_word = command.split_whitespace().next().unwrap_or("");
+
+        // Remote transport commands are intercepted by the UI to establish
+        // remote connections instead of spawning local processes.
+        if is_remote_transport(command) {
+            return CommandClassification::RemoteTransport;
+        }
+
         let is_native = self.commands.contains(first_word);
         let is_shell_builtin = is_builtin(first_word);
         let is_keyword = is_shell_keyword(first_word);

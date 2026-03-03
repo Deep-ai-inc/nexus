@@ -40,6 +40,19 @@ pub enum NexusMessage {
     BlurAll,
     Tick,
     ScrollToJob(u32),
+    /// Unnest remote connection to the specified depth (0 = disconnect entirely).
+    UnnestToLevel(usize),
+    /// Remote connection state changed (from reconnect task).
+    RemoteStateChanged(crate::features::shell::remote::ConnectionState),
+    /// Reconnection succeeded — swap transport.
+    /// Uses Arc<Mutex<Option<...>>> pattern because Receiver isn't Clone.
+    RemoteReconnected {
+        request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
+        rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        response_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<nexus_protocol::messages::Response>>>>,
+        env: nexus_protocol::messages::EnvInfo,
+    },
     FileDrop(FileDropMsg),
     Drag(DragMsg),
 
@@ -163,6 +176,19 @@ pub enum ShellMsg {
     ToggleTreeExpand(BlockId, PathBuf),
     /// Load tree children for an expanded directory.
     TreeChildrenLoaded(BlockId, PathBuf, Vec<nexus_api::FileEntry>),
+    /// Remote agent connected successfully.
+    /// Uses `Arc<Mutex<Option<...>>>` because RemoteBackend isn't Clone.
+    /// The handler `.take()`s the value on first use.
+    RemoteConnected {
+        block_id: BlockId,
+        remote: std::sync::Arc<std::sync::Mutex<Option<crate::features::shell::remote::RemoteBackend>>>,
+        env: Box<nexus_protocol::messages::EnvInfo>,
+    },
+    /// Remote agent connection failed.
+    RemoteConnectFailed {
+        block_id: BlockId,
+        error: String,
+    },
 }
 
 /// Action to perform when a clickable anchor is activated.

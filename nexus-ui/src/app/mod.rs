@@ -98,6 +98,10 @@ pub struct NexusState {
     pub kernel: Arc<Mutex<Kernel>>,
     pub kernel_tx: broadcast::Sender<nexus_api::ShellEvent>,
 
+    // --- Remote ---
+    /// Active remote connection (if any).
+    pub(crate) remote: Option<crate::features::shell::remote::RemoteBackend>,
+
     // --- Layout ---
     pub zoom_level: f32,
 
@@ -517,6 +521,8 @@ impl RootComponent for NexusState {
             focus: Focus::Input,
             kernel,
             kernel_tx,
+
+            remote: None,
 
             zoom_level: 0.85,
 

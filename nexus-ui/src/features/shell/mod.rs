@@ -2,6 +2,7 @@
 
 pub(crate) mod block_manager;
 pub(crate) mod pty_backend;
+pub(crate) mod remote;
 pub(crate) mod shell_context;
 
 use std::cell::RefCell;
@@ -588,11 +589,17 @@ impl ShellWidget {
             ShellMsg::TreeChildrenLoaded(block_id, path, entries) => {
                 self.set_tree_children(block_id, path, entries);
             }
+            // Remote connection results are handled at the root level (update.rs)
+            ShellMsg::RemoteConnected { .. } | ShellMsg::RemoteConnectFailed { .. } => {}
         }
     }
 
-    /// Execute a command (kernel or external PTY).
+    /// Execute a command (kernel, external PTY, or remote transport).
     /// The orchestrator should handle "clear" before calling this.
+    ///
+    /// Returns `Some(command)` if the command is a `RemoteTransport` that
+    /// the orchestrator must handle (ssh/docker/kubectl connection).
+    /// Returns `None` if the command was handled normally.
     pub fn execute(
         &mut self,
         command: String,
@@ -600,16 +607,50 @@ impl ShellWidget {
         cwd: &str,
         kernel: &Arc<Mutex<Kernel>>,
         kernel_tx: &broadcast::Sender<ShellEvent>,
+        remote: Option<&mut crate::features::shell::remote::RemoteBackend>,
         uctx: &mut UpdateContext,
-    ) {
+    ) -> Option<String> {
         let trimmed = command.trim().to_string();
+
+        // If we're in remote mode, route through the remote backend
+        if let Some(remote) = remote {
+            // Even in remote mode, check if this is a transport command
+            // that should trigger nesting (ssh inside ssh)
+            let classification = kernel.blocking_lock().classify_command(&trimmed);
+            if classification == CommandClassification::RemoteTransport {
+                // Return for the orchestrator to handle as Nest
+                return Some(trimmed);
+            }
+
+            remote.execute(trimmed, block_id);
+            // Create a local block to track the remote command
+            let mut block = Block::new(block_id, command);
+            block.parser = self.pty.new_parser();
+            self.blocks.push(block);
+            uctx.snap_to_bottom();
+            return None;
+        }
 
         let classification = kernel.blocking_lock().classify_command(&trimmed);
 
-        if classification == CommandClassification::Kernel {
-            self.execute_kernel_command(trimmed, block_id, cwd, kernel, kernel_tx, uctx);
-        } else {
-            self.execute_pty_command(trimmed, block_id, cwd, uctx);
+        match classification {
+            CommandClassification::Kernel => {
+                self.execute_kernel_command(trimmed, block_id, cwd, kernel, kernel_tx, uctx);
+                None
+            }
+            CommandClassification::Pty => {
+                self.execute_pty_command(trimmed, block_id, cwd, uctx);
+                None
+            }
+            CommandClassification::RemoteTransport => {
+                // Create a block so the user sees the command while connecting
+                let mut block = Block::new(block_id, trimmed.clone());
+                block.parser = self.pty.new_parser();
+                self.blocks.push(block);
+                uctx.snap_to_bottom();
+                // Return the command for the orchestrator to handle
+                Some(trimmed)
+            }
         }
     }
 

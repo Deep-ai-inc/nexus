@@ -3,6 +3,7 @@
 //! Each widget handles its own view and (where applicable) update logic,
 //! keeping rendering code co-located with the data it operates on.
 
+mod breadcrumb;
 mod shell_block;
 mod tool;
 mod value_renderer;
@@ -18,3 +19,4 @@ pub(crate) use value_renderer::{render_native_value, term_color_to_strata, Table
 pub use input::{NexusInputBar, CompletionPopup, HistorySearchBar};
 pub use job_bar::JobBar;
 pub use welcome::WelcomeScreen;
+pub(crate) use breadcrumb::BreadcrumbBar;

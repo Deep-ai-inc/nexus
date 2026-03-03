@@ -29,6 +29,18 @@ impl NexusState {
         mut col: Column<'a>,
         cursor_visible: bool,
     ) -> Column<'a> {
+        // Breadcrumb bar (when connected to a remote)
+        if let Some(ref remote) = self.remote {
+            let rtt = remote.current_rtt_ms();
+            col = col.push(crate::ui::widgets::BreadcrumbBar {
+                local_host: "local",
+                stack: &remote.backend_stack,
+                state: remote.state,
+                rtt_ms: if rtt > 0 { Some(rtt) } else { None },
+                unnesting_to: None,
+            });
+        }
+
         // Job bar (shell-owned data, placed in overlay area)
         if let Some(job_bar) = self.shell.view_job_bar() {
             col = col.push(job_bar);
