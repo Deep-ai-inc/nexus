@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nexus_protocol::codec::{FrameCodec, FrameReader, FrameWriter};
-use nexus_protocol::messages::{EnvInfo, Request, Response};
+use nexus_protocol::messages::{EnvInfo, Request, Response, Transport};
 use nexus_protocol::{AgentCaps, ClientCaps, PROTOCOL_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
@@ -30,10 +30,117 @@ pub(crate) struct TransportHandle {
 }
 
 impl TransportHandle {
-    /// Spawn an SSH process and connect to the remote agent.
+    /// Connect to a remote agent via the given transport.
     ///
-    /// The SSH process is spawned with stdin/stdout connected to the agent binary.
-    /// Returns the transport handle and the remote environment info.
+    /// Dispatches to SSH, Docker, or kubectl based on the transport type.
+    pub async fn connect(
+        transport: &Transport,
+        agent_path: &str,
+        forwarded_env: HashMap<String, String>,
+        kernel_tx: broadcast::Sender<ShellEvent>,
+    ) -> Result<(Self, EnvInfo, [u8; 16], mpsc::UnboundedSender<super::RequestEnvelope>)> {
+        let mut child = match transport {
+            Transport::Ssh {
+                destination,
+                port,
+                identity,
+                extra_args,
+            } => {
+                let mut cmd = Command::new("ssh");
+                cmd.arg("-o").arg("BatchMode=yes");
+                cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+                if let Some(port) = port {
+                    cmd.arg("-p").arg(port.to_string());
+                }
+                if let Some(identity) = identity {
+                    cmd.arg("-i").arg(identity.as_str());
+                }
+                for arg in extra_args {
+                    cmd.arg(arg);
+                }
+                cmd.arg(destination);
+                cmd.arg(agent_path);
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                cmd.spawn()?
+            }
+            Transport::Docker { container, user } => {
+                let mut cmd = Command::new("docker");
+                cmd.arg("exec").arg("-i");
+                if let Some(user) = user {
+                    cmd.arg("-u").arg(user);
+                }
+                cmd.arg(container);
+                cmd.arg(agent_path);
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                cmd.spawn()?
+            }
+            Transport::Kubectl {
+                pod,
+                namespace,
+                container,
+            } => {
+                let mut cmd = Command::new("kubectl");
+                cmd.arg("exec").arg("-i");
+                if let Some(ns) = namespace {
+                    cmd.arg("-n").arg(ns);
+                }
+                if let Some(ctr) = container {
+                    cmd.arg("-c").arg(ctr);
+                }
+                cmd.arg(pod).arg("--").arg(agent_path);
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                cmd.spawn()?
+            }
+            Transport::Command { argv } => {
+                if argv.is_empty() {
+                    anyhow::bail!("empty command argv for transport");
+                }
+                let mut cmd = Command::new(&argv[0]);
+                for arg in &argv[1..] {
+                    cmd.arg(arg);
+                }
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                cmd.spawn()?
+            }
+        };
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to take child stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to take child stdout"))?;
+
+        let codec = FrameCodec::new(stdout, stdin);
+        let (reader, writer) = codec.into_parts();
+
+        let (env, session_token, _caps, request_tx, rtt_ms, last_seen_seq, response_rx) =
+            Self::handshake(reader, writer, forwarded_env, kernel_tx).await?;
+
+        Ok((
+            Self {
+                child,
+                rtt_ms,
+                last_seen_seq,
+                response_rx,
+            },
+            env,
+            session_token,
+            request_tx,
+        ))
+    }
+
+    /// Spawn an SSH process and connect to the remote agent (convenience wrapper).
     pub async fn connect_ssh(
         destination: &str,
         port: Option<u16>,

@@ -80,9 +80,23 @@ impl Agent {
         let next_seq = Arc::new(std::sync::atomic::AtomicU64::new(self.next_seq));
         let next_seq_clone = next_seq.clone();
         let ring_clone = ring_buffer.clone();
+        let ring_sender = ring_buffer.clone();
         let credits = self.credits.clone();
 
-        let event_task = tokio::spawn(async move {
+        // Two-stage event pipeline using RingBuffer as the queue:
+        //
+        // Stage 1 (collector): reads kernel events, assigns seq numbers,
+        //   pushes to ring buffer, and notifies the sender. Never blocks
+        //   on flow control — the ring buffer is always populated.
+        //
+        // Stage 2 (sender): wakes on Notify, drains unsent frames from
+        //   the ring buffer, acquires flow control credits, writes raw
+        //   frames to the wire. May block on credits without causing
+        //   event loss — the ring buffer retains everything.
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify_clone = notify.clone();
+
+        let collector_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
@@ -93,31 +107,50 @@ impl Agent {
                             event: event.clone(),
                         };
 
-                        // Buffer for resume
+                        // Always buffer for resume — never gated by flow control
                         {
                             let mut rb = ring_clone.lock().await;
                             rb.push(&resp);
                         }
 
-                        // Acquire flow control credits for data payloads
-                        let frame_size = nexus_protocol::codec::encode_payload(&resp)
-                            .map(|v| v.len())
-                            .unwrap_or(256);
-                        // Best-effort: try to acquire credits, but don't block
-                        // indefinitely if the client is gone. The writer lock
-                        // error will break us out.
-                        let _ = credits.acquire_many(frame_size as u32).await;
-
-                        // Send to client
-                        let mut w = event_writer.lock().await;
-                        if w.write(&resp, resp.priority()).await.is_err() {
-                            break;
-                        }
+                        // Wake the sender (non-blocking, never fails)
+                        notify_clone.notify_one();
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("event forwarder lagged by {n} events");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        let sender_task = tokio::spawn(async move {
+            let mut last_sent_seq: u64 = 0;
+
+            loop {
+                notify.notified().await;
+
+                // Drain all unsent frames from the ring buffer
+                let pending = {
+                    let rb = ring_sender.lock().await;
+                    rb.drain_since(last_sent_seq)
+                };
+
+                for (seq, payload) in pending {
+                    // Acquire flow control credits
+                    let frame_size = payload.len();
+                    let _ = credits.acquire_many(frame_size as u32).await;
+
+                    // Write raw frame (no re-serialization)
+                    let mut w = event_writer.lock().await;
+                    if w.write_raw(&payload, nexus_protocol::priority::INTERACTIVE)
+                        .await
+                        .is_err()
+                    {
+                        return; // Connection lost
+                    }
+
+                    last_sent_seq = seq;
                 }
             }
         });
@@ -306,7 +339,8 @@ impl Agent {
             }
         }
 
-        event_task.abort();
+        collector_task.abort();
+        sender_task.abort();
         self.pty_manager.shutdown_all();
         Ok(())
     }
@@ -402,11 +436,14 @@ impl Agent {
     ) {
         let kernel = self.kernel.clone();
 
-        // Execute on a blocking thread (same pattern as the UI)
-        std::thread::spawn(move || {
+        // Execute on the blocking thread pool — reuses the existing tokio
+        // runtime instead of spawning a new OS thread + reactor per command.
+        tokio::task::spawn_blocking(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
+                // Use Handle::block_on to access the async kernel lock from
+                // the blocking thread, without creating a new runtime.
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
                     let mut kernel = kernel.lock().await;
                     let _ = kernel.execute_with_block_id(&command, Some(block_id));
                 });
@@ -420,7 +457,6 @@ impl Agent {
                 } else {
                     "Command panicked (unknown error)".to_string()
                 };
-                // The kernel's event_tx handles emitting CommandFinished on error
                 tracing::error!("{error_msg}");
             }
         });

@@ -337,6 +337,11 @@ impl PtyManager {
     }
 
     /// Close a PTY session's master fd (sends EOF to child).
+    ///
+    /// SAFETY: `sessions.remove()` MUST happen before dropping I/O halves.
+    /// This ensures that a concurrent `resize()` call sees `None` in the
+    /// HashMap lookup (no-op) rather than using a dangling `master_raw_fd`
+    /// that the OS may have reassigned to another file.
     pub fn close(&mut self, block_id: BlockId) -> Result<()> {
         if let Some(session) = self.sessions.remove(&block_id) {
             // Drop write_half (releases one Arc ref from split)

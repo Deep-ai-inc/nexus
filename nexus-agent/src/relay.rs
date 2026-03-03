@@ -155,6 +155,16 @@ impl RelayState {
     }
 }
 
+/// Map `uname -m` output to the Rust target architecture string.
+fn uname_to_target_arch(uname: &str) -> &str {
+    match uname {
+        "x86_64" | "amd64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        "armv7l" | "armhf" => "arm",
+        other => other,
+    }
+}
+
 /// Detect remote architecture and deploy agent via SSH.
 /// Returns the path to the agent binary on the remote.
 async fn detect_and_deploy_agent_ssh(
@@ -173,7 +183,7 @@ async fn detect_and_deploy_agent_ssh(
     }
     cmd.arg(destination).arg("uname -m");
     let output = cmd.output().await?;
-    let arch = String::from_utf8(output.stdout)?.trim().to_string();
+    let remote_uname = String::from_utf8(output.stdout)?.trim().to_string();
 
     // Check if agent already deployed
     let agent_path = format!("~/.nexus/agent-{}", PROTOCOL_VERSION);
@@ -198,10 +208,23 @@ async fn detect_and_deploy_agent_ssh(
         }
     }
 
+    // Verify architecture compatibility before self-replicating.
+    // If the remote arch doesn't match our compile target, we can't
+    // just copy /proc/self/exe — it would be the wrong binary format.
+    let remote_arch = uname_to_target_arch(&remote_uname);
+    let my_arch = std::env::consts::ARCH; // e.g. "x86_64", "aarch64"
+    if remote_arch != my_arch {
+        anyhow::bail!(
+            "architecture mismatch: this agent is {my_arch} but remote is \
+             {remote_uname} ({remote_arch}). Cannot self-replicate across \
+             architectures. Deploy the correct agent binary manually or \
+             via the Nexus UI."
+        );
+    }
+
     // Self-replicate: read our own binary and upload
     #[cfg(target_os = "linux")]
     {
-        // On Linux: use /proc/self/exe
         let self_exe = tokio::fs::read("/proc/self/exe").await?;
         upload_binary_ssh(destination, port, identity, &self_exe, &agent_path).await?;
         return Ok(agent_path);
@@ -209,7 +232,6 @@ async fn detect_and_deploy_agent_ssh(
 
     #[cfg(not(target_os = "linux"))]
     {
-        // On macOS/other: read the current executable
         let exe_path = std::env::current_exe()?;
         let self_exe = tokio::fs::read(&exe_path).await?;
         upload_binary_ssh(destination, port, identity, &self_exe, &agent_path).await?;

@@ -198,6 +198,23 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
+    /// Write a pre-serialized payload (from `encode_payload`) with framing header.
+    ///
+    /// Used for replaying ring buffer contents without re-serialization.
+    pub async fn write_raw(&mut self, payload: &[u8], priority: u8) -> Result<(), CodecError> {
+        let len = payload.len() as u32;
+        if len > MAX_FRAME_SIZE {
+            return Err(CodecError::FrameTooLarge { size: len });
+        }
+        let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.push(priority);
+        frame.extend_from_slice(payload);
+        self.writer.write_all(&frame).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
     /// Enqueue a message for priority-aware sending.
     pub fn enqueue<T: Serialize>(&mut self, msg: &T, priority: u8) -> Result<(), CodecError> {
         let frame = encode_frame(msg, priority)?;

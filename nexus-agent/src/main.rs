@@ -47,6 +47,13 @@ fn main() {
         .or_else(|| std::env::var("NEXUS_AGENT_IDLE_TIMEOUT").ok()?.parse().ok())
         .unwrap_or(7 * 24 * 3600); // 7 days default
 
+    // Ensure TERM is set — the agent is launched via `ssh host agent-path`
+    // without a TTY, so TERM is unset. Child processes (top, vim, etc.) need it.
+    if std::env::var("TERM").is_err() {
+        // SAFETY: called before any threads are spawned (single-threaded at this point).
+        unsafe { std::env::set_var("TERM", "xterm-256color") };
+    }
+
     // Initialize tracing to stderr (stdout is the protocol channel)
     tracing_subscriber::fmt()
         .with_env_filter(

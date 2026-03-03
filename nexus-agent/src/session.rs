@@ -76,6 +76,17 @@ impl RingBuffer {
             .collect()
     }
 
+    /// Drain unsent frames: returns `(seq, payload_bytes)` for all frames
+    /// with seq > `last_sent_seq`. The caller writes these as raw frames
+    /// without re-serialization.
+    pub fn drain_since(&self, last_sent_seq: u64) -> Vec<(u64, Vec<u8>)> {
+        self.frames
+            .iter()
+            .filter(|(seq, _)| *seq > last_sent_seq)
+            .map(|(seq, data)| (*seq, data.clone()))
+            .collect()
+    }
+
     /// Get the highest sequence number in the buffer.
     pub fn latest_seq(&self) -> u64 {
         self.frames.back().map(|(seq, _)| *seq).unwrap_or(0)
