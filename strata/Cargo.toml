@@ -19,3 +19,8 @@ objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWindow", "NSV
 objc2-foundation = { version = "0.2", features = ["NSURL", "NSArray", "NSString", "NSGeometry", "NSThread", "NSEnumerator"] }
 metal = "0.29"
 core-graphics-types = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = "24"
+winit = "0.30"
+pollster = "0.4"

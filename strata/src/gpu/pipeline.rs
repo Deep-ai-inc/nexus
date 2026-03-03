@@ -1,4 +1,4 @@
-//! GPU Pipeline for Strata rendering.
+//! GPU Pipeline for Strata rendering (platform-independent).
 //!
 //! Unified ubershader pipeline that renders all 2D content in a single draw call.
 //! Uses the "white pixel" trick: a 1x1 white pixel at atlas (0,0) enables solid
@@ -17,15 +17,14 @@
 //! All modes support per-instance `clip_rect` for SDF-based clipping
 //! without breaking the single draw call.
 //!
-//! # Apple Silicon Optimization
-//!
-//! Uses `StorageMode::Shared` buffers for zero-copy uploads on unified memory (M1/M2/M3/M4).
+//! This module is platform-independent. GPU resource management (buffers,
+//! textures, render passes) is handled by backend-specific modules
+//! (`metal_pipeline` on macOS, `wgpu_pipeline` on Linux).
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::path::Path;
 use std::sync::Arc;
 
 use cosmic_text::{
@@ -35,7 +34,8 @@ use cosmic_text::{
 use lru::LruCache;
 
 /// Number of in-flight frames for triple-buffered dynamic buffers.
-const MAX_FRAMES_IN_FLIGHT: usize = 3;
+#[allow(dead_code)]
+pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 use super::glyph_atlas::GlyphAtlas;
 use crate::primitives::{Color, Rect};
@@ -139,7 +139,7 @@ impl ImageStore {
 
 /// Metadata for a loaded image within the image atlas.
 #[derive(Debug, Clone)]
-struct LoadedImage {
+pub(crate) struct LoadedImage {
     /// UV region in the image atlas (normalized 0–1).
     uv_tl: [f32; 2],
     uv_br: [f32; 2],
@@ -149,10 +149,12 @@ struct LoadedImage {
 }
 
 /// Image atlas — packs loaded images into a single RGBA texture using shelf packing.
-struct ImageAtlas {
-    texture: metal::Texture,
-    width: u32,
-    height: u32,
+///
+/// This struct manages the CPU-side data and metadata. GPU texture management
+/// is handled by the platform-specific backend.
+pub(crate) struct ImageAtlas {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Shelf packer state.
     cursor_x: u32,
     cursor_y: u32,
@@ -160,7 +162,35 @@ struct ImageAtlas {
     /// Raw RGBA pixel data (kept for atlas regrow/reupload).
     data: Vec<u8>,
     /// Loaded image metadata (`None` = unloaded / slot freed).
-    images: Vec<Option<LoadedImage>>,
+    pub(crate) images: Vec<Option<LoadedImage>>,
+    /// Position of the last placed image (for incremental texture upload).
+    last_placed: (u32, u32),
+}
+
+impl ImageAtlas {
+    /// Create a new empty image atlas (1x1 white pixel placeholder).
+    pub(crate) fn new() -> Self {
+        Self {
+            width: 1,
+            height: 1,
+            cursor_x: 0,
+            cursor_y: 0,
+            shelf_height: 0,
+            data: vec![255u8; 4],
+            images: Vec::new(),
+            last_placed: (0, 0),
+        }
+    }
+
+    /// Get the raw RGBA pixel data.
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Get the position of the last placed image.
+    pub(crate) fn last_placed(&self) -> (u32, u32) {
+        self.last_placed
+    }
 }
 
 /// Instance for GPU rendering (64 bytes — one cache line).
@@ -222,13 +252,13 @@ impl LineStyle {
 /// Uniform data for the shader.
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-struct Globals {
+pub(crate) struct Globals {
     /// Transform matrix (orthographic projection).
-    transform: [[f32; 4]; 4],  // 64 bytes
+    pub(crate) transform: [[f32; 4]; 4],  // 64 bytes
     /// Atlas size for UV normalization.
-    atlas_size: [f32; 2],      // 8 bytes
+    pub(crate) atlas_size: [f32; 2],      // 8 bytes
     /// Padding for alignment.
-    _padding: [f32; 2],        // 8 bytes
+    pub(crate) _padding: [f32; 2],        // 8 bytes
 }
 
 /// Default selection highlight color (blue with transparency).
@@ -292,29 +322,22 @@ struct CachedRow {
     atlas_gen: u32,
 }
 
-/// GPU pipeline for Strata rendering.
+/// GPU pipeline for Strata rendering (platform-independent).
 ///
 /// Uses a unified ubershader that renders all 2D primitives in one draw call.
 /// Instances are rendered in buffer order, enabling perfect Z-ordering.
+///
+/// GPU resource management (buffers, textures, render passes) is handled by
+/// backend-specific renderers (`MetalRenderer` / `WgpuRenderer`) that own
+/// a `StrataPipeline` and call its methods to build the instance buffer.
 pub struct StrataPipeline {
-    pipeline: metal::RenderPipelineState,
-    /// Triple-buffered globals uniform (one per in-flight frame).
-    globals_buffers: Vec<metal::Buffer>,
-    atlas_texture: metal::Texture,
-    atlas_sampler: metal::SamplerState,
-    /// Image atlas (separate texture from glyph atlas — full RGBA).
+    /// Image atlas (CPU-side data + metadata, no GPU texture).
     image_atlas: ImageAtlas,
-    image_sampler: metal::SamplerState,
-    /// Triple-buffered instance vertex buffer (one per in-flight frame).
-    instance_buffers: Vec<metal::Buffer>,
-    instance_capacity: usize,
     glyph_atlas: GlyphAtlas,
     /// All instances to render, in draw order.
     instances: Vec<GpuInstance>,
     /// Background color.
     background: Color,
-    /// Frame index for triple-buffer slot selection (frame_index % 3).
-    frame_index: u64,
     /// LRU shape cache: avoids re-shaping unchanged text each frame.
     /// Key is hash(text, font_size_bits), value is (atlas_generation, glyphs).
     /// When atlas generation mismatches, the entry is stale and must be rebuilt.
@@ -408,133 +431,16 @@ impl CharGlyphCache {
 }
 
 impl StrataPipeline {
-    /// Compile the Metal shader library. Call once at init, pass to `new()`.
-    pub fn compile_library(device: &metal::DeviceRef) -> metal::Library {
-        let options = metal::CompileOptions::new();
-        device
-            .new_library_with_source(include_str!("shaders/glyph.metal"), &options)
-            .expect("Failed to compile Metal shader")
-    }
-
-    /// Create a new pipeline with a pre-compiled shader library.
-    pub fn new(device: &metal::DeviceRef, library: &metal::Library, format: metal::MTLPixelFormat, font_size: f32, font_system: &mut FontSystem) -> Self {
-        let mut glyph_atlas = GlyphAtlas::new(font_size, font_system);
-        glyph_atlas.precache_ascii(font_system);
-
-        let vs_fn = library
-            .get_function("vs_main", None)
-            .expect("Missing vs_main");
-        let fs_fn = library
-            .get_function("fs_main", None)
-            .expect("Missing fs_main");
-
-        // Build vertex descriptor (9 attributes matching GpuInstance layout, buffer index 0)
-        let vertex_desc = metal::VertexDescriptor::new();
-        let layouts = vertex_desc.layouts();
-        let layout0 = layouts.object_at(0).unwrap();
-        layout0.set_stride(std::mem::size_of::<GpuInstance>() as u64);
-        layout0.set_step_function(metal::MTLVertexStepFunction::PerInstance);
-        layout0.set_step_rate(1);
-
-        let attrs = vertex_desc.attributes();
-        let attr_defs: [(u64, metal::MTLVertexFormat); 9] = [
-            (0, metal::MTLVertexFormat::Float2),   // pos
-            (8, metal::MTLVertexFormat::Float2),   // size
-            (16, metal::MTLVertexFormat::Float2),  // uv_tl
-            (24, metal::MTLVertexFormat::Float2),  // uv_br
-            (32, metal::MTLVertexFormat::UInt),    // color
-            (36, metal::MTLVertexFormat::UInt),    // mode
-            (40, metal::MTLVertexFormat::Float),   // corner_radius
-            (44, metal::MTLVertexFormat::UInt),    // texture_layer
-            (48, metal::MTLVertexFormat::Float4),  // clip_rect
-        ];
-        for (i, (offset, fmt)) in attr_defs.iter().enumerate() {
-            let a = attrs.object_at(i as u64).unwrap();
-            a.set_format(*fmt);
-            a.set_offset(*offset);
-            a.set_buffer_index(0);
-        }
-
-        // Build render pipeline descriptor
-        let rpd = metal::RenderPipelineDescriptor::new();
-        rpd.set_vertex_function(Some(&vs_fn));
-        rpd.set_fragment_function(Some(&fs_fn));
-        rpd.set_vertex_descriptor(Some(&vertex_desc));
-
-        // Color attachment with alpha blending
-        let color_attach = rpd
-            .color_attachments()
-            .object_at(0)
-            .unwrap();
-        color_attach.set_pixel_format(format);
-        color_attach.set_blending_enabled(true);
-        color_attach.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
-        color_attach.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-        color_attach.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
-        color_attach.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        // Alpha blend uses One (not SourceAlpha) for correct compositing.
-        // With SourceAlpha the output alpha becomes α² + dst*(1-α), dropping below
-        // 1.0 at anti-aliased glyph edges and making the window semi-transparent.
-        color_attach.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
-        color_attach.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-
-        let pipeline = device
-            .new_render_pipeline_state(&rpd)
-            .expect("Failed to create render pipeline state");
-
-        // Triple-buffered globals (uniform) buffers
-        let globals_size = std::mem::size_of::<Globals>() as u64;
-        let globals_buffers: Vec<metal::Buffer> = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| device.new_buffer(globals_size, metal::MTLResourceOptions::StorageModeShared))
-            .collect();
-
-        // Glyph atlas texture
-        let (atlas_width, atlas_height) = (glyph_atlas.atlas_width, glyph_atlas.atlas_height);
-        let atlas_texture = create_rgba_texture(device, atlas_width, atlas_height);
-
-        // Samplers (linear filtering)
-        let sampler_desc = metal::SamplerDescriptor::new();
-        sampler_desc.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
-        sampler_desc.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
-        let atlas_sampler = device.new_sampler(&sampler_desc);
-        let image_sampler = device.new_sampler(&sampler_desc);
-
-        // 1×1 white placeholder image atlas
-        let placeholder_texture = create_rgba_texture(device, 1, 1);
-        let white_pixel: [u8; 4] = [255, 255, 255, 255];
-        upload_texture_region(&placeholder_texture, 0, 0, 1, 1, &white_pixel, 4);
-
-        let image_atlas = ImageAtlas {
-            texture: placeholder_texture,
-            width: 1,
-            height: 1,
-            cursor_x: 0,
-            cursor_y: 0,
-            shelf_height: 0,
-            data: vec![255u8; 4],
-            images: Vec::new(),
-        };
-
-        // Triple-buffered instance buffers
-        let initial_capacity = 4096;
-        let instance_buf_size = (initial_capacity * std::mem::size_of::<GpuInstance>()) as u64;
-        let instance_buffers: Vec<metal::Buffer> = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|_| device.new_buffer(instance_buf_size, metal::MTLResourceOptions::StorageModeShared))
-            .collect();
-
+    /// Create a new pipeline with pre-created glyph atlas and image atlas.
+    ///
+    /// The glyph atlas should already have ASCII pre-cached.
+    /// GPU resource management is handled by the backend-specific renderer.
+    pub(crate) fn new(glyph_atlas: GlyphAtlas, image_atlas: ImageAtlas) -> Self {
         Self {
-            pipeline,
-            globals_buffers,
-            atlas_texture,
-            atlas_sampler,
             image_atlas,
-            image_sampler,
-            instance_buffers,
-            instance_capacity: initial_capacity,
             glyph_atlas,
             instances: Vec::new(),
             background: Color::BLACK,
-            frame_index: 0,
             shape_cache: LruCache::new(NonZeroUsize::new(16384).unwrap()),
             cache_hits: 0,
             cache_misses: 0,
@@ -546,6 +452,59 @@ impl StrataPipeline {
             grid_row_cache: Vec::new(),
             grid_cache_id: 0,
         }
+    }
+
+    // =========================================================================
+    // Accessors for backend renderers
+    // =========================================================================
+
+    /// Get a reference to the glyph atlas.
+    pub(crate) fn glyph_atlas(&self) -> &GlyphAtlas {
+        &self.glyph_atlas
+    }
+
+    /// Get a mutable reference to the glyph atlas.
+    pub(crate) fn glyph_atlas_mut(&mut self) -> &mut GlyphAtlas {
+        &mut self.glyph_atlas
+    }
+
+    /// Get a reference to the image atlas.
+    pub(crate) fn image_atlas(&self) -> &ImageAtlas {
+        &self.image_atlas
+    }
+
+    /// Get the current instance buffer.
+    pub(crate) fn instances(&self) -> &[GpuInstance] {
+        &self.instances
+    }
+
+    /// Truncate instances to a maximum count.
+    pub(crate) fn truncate_instances(&mut self, max: usize) {
+        if self.instances.len() > max {
+            self.instances.truncate(max);
+        }
+    }
+
+    /// Get the background color.
+    pub(crate) fn background(&self) -> Color {
+        self.background
+    }
+
+    /// Check if the image atlas needs to grow for an image of the given size.
+    pub(crate) fn image_atlas_needs_grow(&self, width: u32, height: u32) -> bool {
+        let atlas = &self.image_atlas;
+        let mut cx = atlas.cursor_x;
+        let mut cy = atlas.cursor_y;
+        let mut sh = atlas.shelf_height;
+        if cx + width > atlas.width {
+            cy += sh;
+            cx = 0;
+            sh = 0;
+        }
+        let _ = (cx, sh);
+        let needed_width = (cx + width).max(atlas.width);
+        let needed_height = cy + height;
+        needed_width > atlas.width || needed_height > atlas.height
     }
 
     // =========================================================================
@@ -960,23 +919,12 @@ impl StrataPipeline {
         });
     }
 
-    /// Load a PNG image and return a handle for rendering.
-    pub fn load_image_png(
+    /// Load raw RGBA pixel data into the image atlas (CPU-side).
+    ///
+    /// Returns a handle for rendering. The backend renderer is responsible for
+    /// uploading the data to the GPU texture.
+    pub(crate) fn load_image_rgba(
         &mut self,
-        device: &metal::DeviceRef,
-        path: &Path,
-    ) -> ImageHandle {
-        let img = image::open(path)
-            .unwrap_or_else(|e| panic!("Failed to load image {}: {}", path.display(), e))
-            .to_rgba8();
-        let (w, h) = img.dimensions();
-        self.load_image_rgba(device, w, h, &img.into_raw())
-    }
-
-    /// Load raw RGBA pixel data and return a handle for rendering.
-    pub fn load_image_rgba(
-        &mut self,
-        device: &metal::DeviceRef,
         width: u32,
         height: u32,
         data: &[u8],
@@ -998,7 +946,7 @@ impl StrataPipeline {
         if needed_width > atlas.width || needed_height > atlas.height {
             let new_width = needed_width.next_power_of_two().max(256);
             let new_height = needed_height.next_power_of_two().max(256);
-            self.grow_image_atlas(device, new_width, new_height);
+            self.grow_image_atlas(new_width, new_height);
         }
 
         let atlas = &mut self.image_atlas;
@@ -1014,8 +962,7 @@ impl StrataPipeline {
             atlas.data[dst_start..dst_end].copy_from_slice(&data[src_start..src_end]);
         }
 
-        // Upload the modified region to GPU (contiguous source data)
-        upload_texture_region(&atlas.texture, ax, ay, width, height, data, width * 4);
+        atlas.last_placed = (ax, ay);
 
         // Record UV region
         let uv_tl = [ax as f32 / atlas.width as f32, ay as f32 / atlas.height as f32];
@@ -1051,10 +998,12 @@ impl StrataPipeline {
         }
     }
 
-    /// Grow the image atlas to a new size, preserving existing data.
+    /// Grow the image atlas to a new size, preserving existing data (CPU-side only).
+    ///
+    /// The backend renderer is responsible for recreating the GPU texture
+    /// after calling this (detected via `image_atlas_needs_grow()`).
     fn grow_image_atlas(
         &mut self,
-        device: &metal::DeviceRef,
         new_width: u32,
         new_height: u32,
     ) {
@@ -1079,10 +1028,6 @@ impl StrataPipeline {
         atlas.data = new_data;
         atlas.width = new_width;
         atlas.height = new_height;
-
-        // Recreate GPU texture and upload entire atlas data
-        atlas.texture = create_rgba_texture(device, new_width, new_height);
-        upload_texture_region(&atlas.texture, 0, 0, new_width, new_height, &atlas.data, new_width * 4);
 
         // Recompute UV regions for all loaded images
         for slot in &mut atlas.images {
@@ -1725,210 +1670,6 @@ impl StrataPipeline {
         self.shape_cache.put(shape_key, (atlas_gen, Arc::new(shaped_glyphs)));
     }
 
-    // =========================================================================
-    // GPU upload and rendering
-    // =========================================================================
-
-    /// Prepare for rendering (upload data to GPU via unified memory).
-    ///
-    /// Writes globals and instance data directly into the current triple-buffer
-    /// slot. No staging belt or command encoder needed — Apple Silicon unified
-    /// memory makes CPU writes immediately visible to the GPU.
-    pub fn prepare(
-        &mut self,
-        device: &metal::DeviceRef,
-        viewport_width: f32,
-        viewport_height: f32,
-    ) {
-        // Check if glyph atlas was resized
-        if self.glyph_atlas.was_resized() {
-            self.recreate_atlas_texture(device);
-            self.glyph_atlas.ack_resize();
-            self.glyph_atlas.take_dirty_region();
-            self.invalidate_grid_row_cache();
-        } else if let Some(dirty) = self.glyph_atlas.take_dirty_region() {
-            self.upload_atlas_region(dirty);
-        }
-
-        let slot = (self.frame_index % MAX_FRAMES_IN_FLIGHT as u64) as usize;
-
-        // Write globals directly into the current slot's buffer
-        let globals = Globals {
-            transform: create_orthographic_matrix(viewport_width, viewport_height),
-            atlas_size: [
-                self.glyph_atlas.atlas_width as f32,
-                self.glyph_atlas.atlas_height as f32,
-            ],
-            _padding: [0.0, 0.0],
-        };
-        unsafe {
-            let dst = self.globals_buffers[slot].contents() as *mut u8;
-            std::ptr::copy_nonoverlapping(
-                bytemuck::bytes_of(&globals).as_ptr(),
-                dst,
-                std::mem::size_of::<Globals>(),
-            );
-        }
-
-        // Cap instance count (64 bytes each, 2M = 128 MB)
-        const MAX_INSTANCES: usize = 2 * 1024 * 1024;
-        if self.instances.len() > MAX_INSTANCES {
-            self.instances.truncate(MAX_INSTANCES);
-        }
-
-        // Resize all 3 instance buffers if needed
-        if self.instances.len() > self.instance_capacity {
-            self.instance_capacity = self.instances.len().next_power_of_two().min(MAX_INSTANCES);
-            let buf_size = (self.instance_capacity * std::mem::size_of::<GpuInstance>()) as u64;
-            self.instance_buffers = (0..MAX_FRAMES_IN_FLIGHT)
-                .map(|_| device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared))
-                .collect();
-        }
-
-        // Write instance data directly into the current slot's buffer
-        if !self.instances.is_empty() {
-            let src = bytemuck::cast_slice::<GpuInstance, u8>(&self.instances);
-            unsafe {
-                let dst = self.instance_buffers[slot].contents() as *mut u8;
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
-            }
-        }
-    }
-
-    /// Render all instances in a single draw call.
-    ///
-    /// Creates a render pass on the command buffer, sets all pipeline state,
-    /// and draws. The caller manages the command buffer lifecycle (present + commit).
-    pub fn render(
-        &self,
-        command_buffer: &metal::CommandBufferRef,
-        target: &metal::TextureRef,
-        clip_bounds: &crate::shell::ClipBounds,
-    ) {
-        // Convert sRGB background to linear for the clear color
-        fn srgb_to_linear(c: f32) -> f64 {
-            let c = c as f64;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        }
-
-        let rpd = metal::RenderPassDescriptor::new();
-        let color_attach = rpd.color_attachments().object_at(0).unwrap();
-        color_attach.set_texture(Some(target));
-        color_attach.set_load_action(metal::MTLLoadAction::Clear);
-        color_attach.set_store_action(metal::MTLStoreAction::Store);
-        color_attach.set_clear_color(metal::MTLClearColor::new(
-            srgb_to_linear(self.background.r),
-            srgb_to_linear(self.background.g),
-            srgb_to_linear(self.background.b),
-            self.background.a as f64,
-        ));
-
-        let encoder = command_buffer.new_render_command_encoder(&rpd);
-        encoder.set_scissor_rect(metal::MTLScissorRect {
-            x: clip_bounds.x as u64,
-            y: clip_bounds.y as u64,
-            width: clip_bounds.width as u64,
-            height: clip_bounds.height as u64,
-        });
-
-        if !self.instances.is_empty() {
-            let slot = (self.frame_index % MAX_FRAMES_IN_FLIGHT as u64) as usize;
-            encoder.set_render_pipeline_state(&self.pipeline);
-            encoder.set_vertex_buffer(0, Some(&self.instance_buffers[slot]), 0);
-            encoder.set_vertex_buffer(1, Some(&self.globals_buffers[slot]), 0);
-            encoder.set_fragment_buffer(0, Some(&self.globals_buffers[slot]), 0);
-            encoder.set_fragment_texture(0, Some(&self.atlas_texture));
-            encoder.set_fragment_sampler_state(0, Some(&self.atlas_sampler));
-            encoder.set_fragment_texture(1, Some(&self.image_atlas.texture));
-            encoder.set_fragment_sampler_state(1, Some(&self.image_sampler));
-            encoder.draw_primitives_instanced(
-                metal::MTLPrimitiveType::Triangle,
-                0,
-                6,
-                self.instances.len() as u64,
-            );
-        }
-
-        encoder.end_encoding();
-    }
-
-    /// Advance the triple-buffer frame index. Call after render + commit.
-    pub fn advance_frame(&mut self) {
-        self.frame_index += 1;
-    }
-
-    fn recreate_atlas_texture(&mut self, device: &metal::DeviceRef) {
-        let (width, height) = (self.glyph_atlas.atlas_width, self.glyph_atlas.atlas_height);
-        self.atlas_texture = create_rgba_texture(device, width, height);
-        self.upload_atlas_full();
-    }
-
-    /// Upload only the dirty region of the glyph atlas to the GPU.
-    fn upload_atlas_region(&self, region: (u32, u32, u32, u32)) {
-        let (min_x, min_y, max_x, max_y) = region;
-        let atlas_width = self.glyph_atlas.atlas_width;
-        let data = self.glyph_atlas.atlas_data();
-
-        // Pointer to the first pixel of the dirty rect within the full atlas data.
-        let byte_offset = ((min_y * atlas_width + min_x) * 4) as usize;
-
-        upload_texture_region(
-            &self.atlas_texture,
-            min_x, min_y,
-            max_x - min_x, max_y - min_y,
-            &data[byte_offset..],
-            atlas_width * 4, // stride = full atlas row width
-        );
-    }
-
-    /// Upload the entire glyph atlas (used after resize/recreate).
-    fn upload_atlas_full(&self) {
-        let atlas_width = self.glyph_atlas.atlas_width;
-        let atlas_height = self.glyph_atlas.atlas_height;
-        upload_texture_region(
-            &self.atlas_texture,
-            0, 0,
-            atlas_width, atlas_height,
-            self.glyph_atlas.atlas_data(),
-            atlas_width * 4,
-        );
-    }
-}
-
-// =============================================================================
-// Metal helpers
-// =============================================================================
-
-/// Create a 2D RGBA8 sRGB texture with shared storage (Apple Silicon unified memory).
-fn create_rgba_texture(device: &metal::DeviceRef, width: u32, height: u32) -> metal::Texture {
-    let desc = metal::TextureDescriptor::new();
-    desc.set_width(width as u64);
-    desc.set_height(height as u64);
-    desc.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm_sRGB);
-    desc.set_storage_mode(metal::MTLStorageMode::Shared);
-    desc.set_usage(metal::MTLTextureUsage::ShaderRead);
-    device.new_texture(&desc)
-}
-
-/// Upload a rectangle of pixel data to a Metal texture via `replace_region`.
-///
-/// Works directly for `StorageMode::Shared` — no blit encoder needed.
-fn upload_texture_region(
-    texture: &metal::TextureRef,
-    x: u32, y: u32,
-    width: u32, height: u32,
-    data: &[u8],
-    bytes_per_row: u32,
-) {
-    let region = metal::MTLRegion {
-        origin: metal::MTLOrigin { x: x as u64, y: y as u64, z: 0 },
-        size: metal::MTLSize { width: width as u64, height: height as u64, depth: 1 },
-    };
-    texture.replace_region(region, 0, data.as_ptr() as *const std::ffi::c_void, bytes_per_row as u64);
 }
 
 /// Create an orthographic projection matrix.
@@ -2154,7 +1895,7 @@ fn block_element_rect(ch: char) -> Option<(f32, f32, f32, f32)> {
     })
 }
 
-fn create_orthographic_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
+pub(crate) fn create_orthographic_matrix(width: f32, height: f32) -> [[f32; 4]; 4] {
     let left = 0.0;
     let right = width;
     let top = 0.0;

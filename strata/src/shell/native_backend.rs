@@ -30,7 +30,7 @@ use crate::event_context::{
     CaptureState, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey,
     ScrollDelta,
 };
-use crate::gpu::{ImageHandle, ImageStore, PendingImage, StrataPipeline};
+use crate::gpu::{ImageHandle, ImageStore, MetalRenderer, PendingImage, StrataPipeline};
 use crate::layout_snapshot::{CursorIcon, HitResult, LayoutSnapshot};
 use crate::primitives::{Color, Point, Rect};
 
@@ -55,7 +55,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Base font size in logical points.
-const BASE_FONT_SIZE: f32 = 14.0;
+use super::populate::BASE_FONT_SIZE;
 
 // ============================================================================
 // Scene (built each frame for rendering)
@@ -78,7 +78,7 @@ struct RenderResources {
     gpu: GpuState,
     /// Pre-compiled Metal shader library (compiled once, reused on pipeline recreation).
     library: metal::Library,
-    pipeline: StrataPipeline,
+    renderer: MetalRenderer,
     current_scale: f32,
 }
 
@@ -396,10 +396,10 @@ fn open_new_window_with_state<A: StrataApp>(
 
     // Compile Metal shader library and initialize pipeline.
     let scale = dpi_scale;
-    let library = StrataPipeline::compile_library(&gpu.device);
+    let library = MetalRenderer::compile_library(&gpu.device);
     let fs_mutex = crate::text_engine::get_font_system();
     let mut font_system = fs_mutex.lock().unwrap();
-    let pipeline = StrataPipeline::new(
+    let renderer = MetalRenderer::new(
         &gpu.device, &library, gpu.pixel_format,
         BASE_FONT_SIZE * scale, &mut font_system,
     );
@@ -408,7 +408,7 @@ fn open_new_window_with_state<A: StrataApp>(
     let render = RenderResources {
         gpu,
         library,
-        pipeline,
+        renderer,
         current_scale: scale,
     };
 
@@ -1608,7 +1608,7 @@ fn render_sync_to_overlay(
     let mut font_system = fs_mutex.lock().unwrap();
 
     if (res.current_scale - scale).abs() > 0.01 {
-        res.pipeline = StrataPipeline::new(
+        res.renderer = MetalRenderer::new(
             &gpu.device, &res.library, gpu.pixel_format,
             BASE_FONT_SIZE * scale, &mut font_system,
         );
@@ -1616,26 +1616,26 @@ fn render_sync_to_overlay(
     }
 
     for img in &scene.pending_images {
-        res.pipeline.load_image_rgba(&gpu.device, img.width, img.height, &img.data);
+        res.renderer.load_image_rgba(&gpu.device, img.width, img.height, &img.data);
     }
     for handle in &scene.pending_unloads {
-        res.pipeline.unload_image(*handle);
+        res.renderer.pipeline.unload_image(*handle);
     }
 
-    res.pipeline.clear();
-    res.pipeline.set_background(scene.background);
+    res.renderer.pipeline.clear();
+    res.renderer.pipeline.set_background(scene.background);
 
-    populate_pipeline(&mut res.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
+    super::populate::populate_pipeline(&mut res.renderer.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
     drop(font_system);
 
     // Prepare (writes directly to unified memory buffers)
-    res.pipeline.prepare(&gpu.device, gpu.surface_width as f32, gpu.surface_height as f32);
+    res.renderer.prepare(&gpu.device, gpu.surface_width as f32, gpu.surface_height as f32);
 
     // Render
     let cmd_buf = gpu.queue.new_command_buffer();
     let clip = ClipBounds { x: 0, y: 0, width: gpu.surface_width, height: gpu.surface_height };
-    res.pipeline.render(cmd_buf, drawable.texture(), &clip);
-    res.pipeline.advance_frame();
+    res.renderer.render(cmd_buf, drawable.texture(), &clip);
+    res.renderer.advance_frame();
 
     // Wait for GPU completion, then extract IOSurface
     cmd_buf.commit();
@@ -1673,7 +1673,7 @@ fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32, transa
     let mut font_system = fs_mutex.lock().unwrap();
 
     if (res.current_scale - scale).abs() > 0.01 {
-        res.pipeline = StrataPipeline::new(
+        res.renderer = MetalRenderer::new(
             &gpu.device, &res.library, gpu.pixel_format,
             BASE_FONT_SIZE * scale, &mut font_system,
         );
@@ -1681,26 +1681,26 @@ fn render_frame(res: &mut RenderResources, scene: &Scene, dpi_scale: f32, transa
     }
 
     for img in &scene.pending_images {
-        res.pipeline.load_image_rgba(&gpu.device, img.width, img.height, &img.data);
+        res.renderer.load_image_rgba(&gpu.device, img.width, img.height, &img.data);
     }
     for handle in &scene.pending_unloads {
-        res.pipeline.unload_image(*handle);
+        res.renderer.pipeline.unload_image(*handle);
     }
 
-    res.pipeline.clear();
-    res.pipeline.set_background(scene.background);
+    res.renderer.pipeline.clear();
+    res.renderer.pipeline.set_background(scene.background);
 
-    populate_pipeline(&mut res.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
+    super::populate::populate_pipeline(&mut res.renderer.pipeline, &scene.snapshot, scene.selection.as_ref(), scale, &mut font_system);
     drop(font_system);
 
     // Prepare (writes directly to unified memory buffers)
-    res.pipeline.prepare(&gpu.device, gpu.surface_width as f32, gpu.surface_height as f32);
+    res.renderer.prepare(&gpu.device, gpu.surface_width as f32, gpu.surface_height as f32);
 
     // Render
     let cmd_buf = gpu.queue.new_command_buffer();
     let clip = ClipBounds { x: 0, y: 0, width: gpu.surface_width, height: gpu.surface_height };
-    res.pipeline.render(cmd_buf, drawable.texture(), &clip);
-    res.pipeline.advance_frame();
+    res.renderer.render(cmd_buf, drawable.texture(), &clip);
+    res.renderer.advance_frame();
 
     if transactional {
         // Synchronous transactional present: the drawable is registered with the
