@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use nexus_api::BlockState;
 
-use crate::data::Block;
+use crate::data::{Block, ConnectProgress};
 use crate::features::shell::ClickAction;
 use crate::utils::ids;
 use crate::ui::theme;
@@ -74,18 +74,23 @@ impl<'a> Widget<'a> for ShellBlockWidget<'a> {
 
         content = content.push(build_header(block, self.kill_id, header_source));
 
-        // Render output: live_value replaces structured_output when present (e.g. top),
-        // otherwise show structured_output (e.g. ls, git status).
-        if let Some(ref latest) = block.live_value {
-            content = render_native_value(content, latest, block, self.image_info, self.click_registry, self.table_layout_cache, self.table_cell_images);
-        } else if let Some(value) = &block.structured_output {
-            content = render_native_value(content, value, block, self.image_info, self.click_registry, self.table_layout_cache, self.table_cell_images);
-        }
+        if let Some(ref cp) = block.connect_progress {
+            // Render connection progress overlay instead of terminal output
+            content = build_connect_progress(content, cp);
+        } else {
+            // Render output: live_value replaces structured_output when present (e.g. top),
+            // otherwise show structured_output (e.g. ls, git status).
+            if let Some(ref latest) = block.live_value {
+                content = render_native_value(content, latest, block, self.image_info, self.click_registry, self.table_layout_cache, self.table_cell_images);
+            } else if let Some(value) = &block.structured_output {
+                content = render_native_value(content, value, block, self.image_info, self.click_registry, self.table_layout_cache, self.table_cell_images);
+            }
 
-        content = build_event_log(content, block, self.image_info, self.click_registry, self.table_layout_cache, self.table_cell_images);
+            content = build_event_log(content, block, self.image_info, self.click_registry, self.table_layout_cache, self.table_cell_images);
 
-        if block.structured_output.is_none() && block.live_value.is_none() && block.event_log.is_empty() && content_rows > 0 {
-            content = build_terminal_content(content, block, &grid, cols, content_rows);
+            if block.structured_output.is_none() && block.live_value.is_none() && block.event_log.is_empty() && content_rows > 0 {
+                content = build_terminal_content(content, block, &grid, cols, content_rows);
+            }
         }
 
         // Exit code indicator for failed commands
@@ -367,6 +372,73 @@ fn build_terminal_content<'a>(
     }
 
     content.terminal(term)
+}
+
+/// Braille spinner characters — 10 frames at ~12.5 FPS via system time.
+const SPINNER_FRAMES: &[char] = &[
+    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}',
+    '\u{2826}', '\u{2827}', '\u{2807}', '\u{280F}',
+];
+
+/// Render connection progress overlay: spinner + stage + detail + optional progress bar.
+fn build_connect_progress<'a>(mut content: Column<'a>, cp: &ConnectProgress) -> Column<'a> {
+    // Spinner frame derived from system time for consistent animation
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = (millis / 80) as usize % SPINNER_FRAMES.len();
+    let spinner = SPINNER_FRAMES[frame];
+
+    // Spinner + stage text
+    content = content.push(
+        Row::new()
+            .spacing(8.0)
+            .cross_align(CrossAxisAlignment::Center)
+            .push(TextElement::new(spinner.to_string()).color(theme::RUNNING))
+            .push(TextElement::new(&cp.stage).color(Color::rgb(0.9, 0.9, 0.9))),
+    );
+
+    // Detail text (e.g. "12.5 MB")
+    if let Some(ref detail) = cp.detail {
+        content = content.push(
+            Row::new()
+                .push(TextElement::new("    ")) // indent to align with stage text
+                .push(TextElement::new(detail).color(theme::TEXT_MUTED)),
+        );
+    }
+
+    // Progress bar (when determinate)
+    if let Some(pct) = cp.progress {
+        let pct = pct.clamp(0.0, 1.0);
+        let bar_width: f32 = 200.0;
+        let filled_width = (bar_width * pct).max(1.0);
+        let remainder_width = (bar_width - filled_width).max(0.0);
+
+        let bar_filled = Row::new()
+            .width(Length::Fixed(filled_width))
+            .height(Length::Fixed(6.0))
+            .background(theme::RUNNING);
+
+        let bar_remainder = Row::new()
+            .width(Length::Fixed(remainder_width))
+            .height(Length::Fixed(6.0))
+            .background(Color::rgb(0.2, 0.2, 0.22));
+
+        let label = format!("{}%", (pct * 100.0) as u32);
+
+        content = content.push(
+            Row::new()
+                .spacing(8.0)
+                .cross_align(CrossAxisAlignment::Center)
+                .push(TextElement::new("  ")) // indent
+                .push(bar_filled)
+                .push(bar_remainder)
+                .push(TextElement::new(label).color(theme::TEXT_MUTED)),
+        );
+    }
+
+    content
 }
 
 // =========================================================================

@@ -61,6 +61,15 @@ pub enum ShellEvent {
         state: JobState,
     },
 
+    /// Progress update during remote connection establishment.
+    RemoteConnectProgress {
+        block_id: BlockId,
+        stage: String,
+        detail: Option<String>,
+        /// 0.0–1.0 for determinate progress, None for indeterminate.
+        progress: Option<f32>,
+    },
+
     /// Incremental streaming update from a long-running command.
     StreamingUpdate {
         block_id: BlockId,

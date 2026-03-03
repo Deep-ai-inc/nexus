@@ -12,7 +12,31 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use nexus_api::{BlockId, ShellEvent};
 use tokio::process::Command;
+use tokio::sync::broadcast;
+
+/// Reports connection progress to the UI via ShellEvent.
+#[derive(Clone)]
+pub(crate) struct ProgressReporter {
+    tx: broadcast::Sender<ShellEvent>,
+    block_id: BlockId,
+}
+
+impl ProgressReporter {
+    pub fn new(tx: broadcast::Sender<ShellEvent>, block_id: BlockId) -> Self {
+        Self { tx, block_id }
+    }
+
+    pub fn emit(&self, stage: &str, detail: Option<&str>, progress: Option<f32>) {
+        let _ = self.tx.send(ShellEvent::RemoteConnectProgress {
+            block_id: self.block_id,
+            stage: stage.to_string(),
+            detail: detail.map(|s| s.to_string()),
+            progress,
+        });
+    }
+}
 
 /// Build an SSH command with the standard options + user's extra args.
 fn ssh_command(
@@ -108,6 +132,7 @@ pub(crate) fn remote_agent_path() -> String {
 /// Upload an agent binary to the remote machine using atomic rename.
 ///
 /// Pipes the binary through SSH stdin to avoid argument length limits.
+/// Writes in 64KB chunks and reports upload progress.
 pub(crate) async fn upload_agent(
     destination: &str,
     port: Option<u16>,
@@ -115,10 +140,13 @@ pub(crate) async fn upload_agent(
     extra_args: &[String],
     local_binary_path: &str,
     remote_path: &str,
+    progress: &ProgressReporter,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
     let binary_data = tokio::fs::read(local_binary_path).await?;
+    let total = binary_data.len();
+    let size_mb = format!("{:.1} MB", total as f64 / (1024.0 * 1024.0));
 
     let script = format!(
         "mkdir -p ~/.nexus && cat > {rp}.tmp.$$ && chmod +x {rp}.tmp.$$ && mv -f {rp}.tmp.$$ {rp}",
@@ -133,8 +161,19 @@ pub(crate) async fn upload_agent(
 
     let mut child = cmd.spawn()?;
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(&binary_data).await?;
+
+    // Write in 64KB chunks with progress reporting
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut written = 0usize;
+    for chunk in binary_data.chunks(CHUNK_SIZE) {
+        stdin.write_all(chunk).await?;
+        written += chunk.len();
+        let pct = written as f32 / total as f32;
+        progress.emit("Uploading agent...", Some(&size_mb), Some(pct));
+    }
+
     drop(stdin); // close stdin so remote cat exits
+    progress.emit("Finalizing...", None, None);
 
     let output = child.wait_with_output().await?;
     if !output.status.success() {
@@ -185,19 +224,24 @@ pub(crate) async fn ensure_deployed(
     port: Option<u16>,
     identity: Option<&str>,
     extra_args: &[String],
+    progress: ProgressReporter,
 ) -> Result<String> {
     let remote_path = remote_agent_path();
 
     // Check if already deployed with correct version
+    progress.emit("Checking remote agent...", None, None);
     if check_deployed(destination, port, identity, extra_args, &remote_path).await? {
+        progress.emit("Agent up to date", None, None);
         return Ok(remote_path);
     }
 
     // Detect remote architecture
+    progress.emit("Detecting architecture...", None, None);
     let arch = detect_arch(destination, port, identity, extra_args).await?;
     let target = arch_to_target(&arch).ok_or_else(|| {
         anyhow::anyhow!("unsupported remote architecture: {arch}")
     })?;
+    progress.emit("Detected architecture", Some(target), None);
 
     // Find local agent binary
     let local_path = find_local_agent(target).ok_or_else(|| {
@@ -207,7 +251,7 @@ pub(crate) async fn ensure_deployed(
         )
     })?;
 
-    // Upload
+    // Upload with progress
     upload_agent(
         destination,
         port,
@@ -215,6 +259,7 @@ pub(crate) async fn ensure_deployed(
         extra_args,
         local_path.to_str().unwrap(),
         &remote_path,
+        &progress,
     )
     .await?;
 

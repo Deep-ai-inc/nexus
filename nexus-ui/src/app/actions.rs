@@ -42,6 +42,13 @@ impl NexusState {
             self.scroll.hint_bottom();
         }
 
+        // Bump version for blocks with active connection progress to drive spinner animation
+        for block in &mut self.shell.blocks.blocks {
+            if block.connect_progress.is_some() {
+                block.version += 1;
+            }
+        }
+
         // Poll remote responses (ClassifyResult, CompleteResult, etc.)
         if let Some(ref mut remote) = self.remote {
             remote.poll_responses();

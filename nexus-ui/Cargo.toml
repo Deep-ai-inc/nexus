@@ -20,6 +20,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
+tokio-util = "0.7"
 async-trait = "0.1"
 chrono = { workspace = true }
 portable-pty = { workspace = true }

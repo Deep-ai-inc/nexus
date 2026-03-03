@@ -101,6 +101,8 @@ pub struct NexusState {
     // --- Remote ---
     /// Active remote connection (if any).
     pub(crate) remote: Option<crate::features::shell::remote::RemoteBackend>,
+    /// Cancellation tokens for in-flight remote connection tasks, keyed by block_id.
+    pub(crate) connecting_tasks: std::collections::HashMap<nexus_api::BlockId, tokio_util::sync::CancellationToken>,
 
     // --- Layout ---
     pub zoom_level: f32,
@@ -364,6 +366,7 @@ impl Component for NexusState {
 
     fn on_tick(&mut self) -> bool {
         let output_dirty = self.shell.needs_redraw() || self.agent.needs_redraw();
+        let connecting = self.shell.blocks.blocks.iter().any(|b| b.connect_progress.is_some());
         let auto_scrolling = self.drag.auto_scroll.get().is_some();
         self.on_output_arrived();
         let spring_animating = self.scroll.tick_overscroll();
@@ -373,7 +376,7 @@ impl Component for NexusState {
         let cursor_changed = cursor_now != self.last_cursor_blink;
         self.last_cursor_blink = cursor_now;
 
-        output_dirty || spring_animating || auto_scrolling || cursor_changed
+        output_dirty || spring_animating || auto_scrolling || cursor_changed || connecting
     }
 
     fn selection(&self) -> Option<&strata::Selection> {
@@ -523,6 +526,7 @@ impl RootComponent for NexusState {
             kernel_tx,
 
             remote: None,
+            connecting_tasks: std::collections::HashMap::new(),
 
             zoom_level: 0.85,
 

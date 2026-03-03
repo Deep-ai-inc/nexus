@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, Mutex};
 use nexus_api::{BlockId, BlockState, DomainValue, ShellEvent, Value};
 use nexus_kernel::{CommandClassification, Kernel};
 
-use crate::data::{Block, PtyEvent};
+use crate::data::{Block, ConnectProgress, PtyEvent};
 use crate::infra::systems::{kernel_subscription, pty_subscription};
 use strata::{ImageStore, Subscription};
 use strata::content_address::SourceId;
@@ -806,6 +806,12 @@ impl ShellWidget {
             } => {
                 self.handle_streaming_update(block_id, seq, update, coalesce);
             }
+            ShellEvent::RemoteConnectProgress { block_id, stage, detail, progress } => {
+                if let Some(block) = self.blocks.get_mut(block_id) {
+                    block.connect_progress = Some(ConnectProgress { stage, detail, progress });
+                    block.version += 1;
+                }
+            }
             ShellEvent::CwdChanged { new, .. } => {
                 uctx.set_cwd(new);
             }
@@ -921,6 +927,7 @@ impl ShellWidget {
         let mut output = String::new();
         let mut has_viewer = false;
         if let Some(block) = self.blocks.get_mut(block_id) {
+            block.connect_progress = None;
             block.state = if exit_code == 0 {
                 BlockState::Success
             } else {

@@ -43,6 +43,14 @@ pub enum UnifiedBlockRef<'a> {
     Agent(&'a AgentBlock),
 }
 
+/// Progress state during remote connection establishment.
+#[derive(Debug, Clone)]
+pub struct ConnectProgress {
+    pub stage: String,
+    pub detail: Option<String>,
+    pub progress: Option<f32>,
+}
+
 /// A shell command block: user-typed command + its output.
 ///
 /// Output can take three mutually-exclusive forms, checked in priority order:
@@ -91,6 +99,8 @@ pub struct Block {
     pub file_tree: Option<FileTreeState>,
     /// OSC title set by the child process (via escape sequences).
     pub osc_title: Option<String>,
+    /// Remote connection progress overlay (spinner + stage text + progress bar).
+    pub connect_progress: Option<ConnectProgress>,
     /// High-water mark for content_rows, used to debounce shrink flicker
     /// on running blocks that do clear+reprint cycles (e.g. Claude Code).
     pub peak_content_rows: AtomicU16,
@@ -120,6 +130,7 @@ impl Block {
             view_state: None,
             file_tree: None,
             osc_title: None,
+            connect_progress: None,
             peak_content_rows: AtomicU16::new(0),
         }
     }

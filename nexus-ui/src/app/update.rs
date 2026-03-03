@@ -77,6 +77,12 @@ impl NexusState {
                     self.exec_anchor_action(action);
                     return Command::none();
                 }
+                // Cancel in-flight remote connections on kill or interrupt
+                if let ShellMsg::KillBlock(id) | ShellMsg::SendInterrupt(id) = &m {
+                    if let Some(cancel) = self.connecting_tasks.remove(id) {
+                        cancel.cancel();
+                    }
+                }
                 // Remote connection results are handled at the root level
                 let m = match m {
                     ShellMsg::RemoteConnected { block_id, remote, env } => {
@@ -327,8 +333,10 @@ impl NexusState {
             if let Some(ssh_command) = remote_transport {
                 // Remote transport command — spawn async connection task.
                 let kernel_tx = self.kernel_tx.clone();
+                let cancel = tokio_util::sync::CancellationToken::new();
+                self.connecting_tasks.insert(block_id, cancel.clone());
                 let connect_cmd = Command::perform(async move {
-                    match Self::connect_remote(ssh_command, kernel_tx, block_id).await {
+                    match Self::connect_remote(ssh_command, kernel_tx, block_id, cancel).await {
                         Ok((remote, env)) => NexusMessage::Shell(ShellMsg::RemoteConnected {
                             block_id,
                             remote: std::sync::Arc::new(std::sync::Mutex::new(Some(remote))),
@@ -351,40 +359,75 @@ impl NexusState {
 
     /// Async task to establish a remote connection.
     async fn connect_remote(
-        ssh_command: String,
+        command: String,
+        kernel_tx: tokio::sync::broadcast::Sender<nexus_api::ShellEvent>,
+        block_id: nexus_api::BlockId,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<(
+        crate::features::shell::remote::RemoteBackend,
+        nexus_protocol::messages::EnvInfo,
+    )> {
+        tokio::select! {
+            result = Self::connect_remote_inner(command, kernel_tx, block_id) => result,
+            _ = cancel.cancelled() => Err(anyhow::anyhow!("connection cancelled")),
+        }
+    }
+
+    /// Inner logic for remote connection (separated for cancellation wrapping).
+    async fn connect_remote_inner(
+        command: String,
         kernel_tx: tokio::sync::broadcast::Sender<nexus_api::ShellEvent>,
         block_id: nexus_api::BlockId,
     ) -> anyhow::Result<(
         crate::features::shell::remote::RemoteBackend,
         nexus_protocol::messages::EnvInfo,
     )> {
-        // Parse the SSH command to extract destination, options, and extra args
-        let args = parse_ssh_args(&ssh_command);
+        use crate::features::shell::remote::deploy::ProgressReporter;
 
-        // Deploy agent if needed (passes extra_args so custom SSH options work)
-        let agent_path = crate::features::shell::remote::deploy::ensure_deployed(
-            &args.destination,
-            args.port,
-            args.identity.as_deref(),
-            &args.extra_args,
-        )
-        .await?;
+        let progress = ProgressReporter::new(kernel_tx.clone(), block_id);
 
-        // Connect via SSH
+        let transport = parse_remote_command(&command)
+            .ok_or_else(|| anyhow::anyhow!("could not parse remote transport: {command}"))?;
+
+        // For SSH transports, deploy the agent binary first
+        let agent_path = match &transport {
+            nexus_protocol::messages::Transport::Ssh {
+                destination,
+                port,
+                identity,
+                extra_args,
+            } => {
+                crate::features::shell::remote::deploy::ensure_deployed(
+                    destination,
+                    *port,
+                    identity.as_deref(),
+                    extra_args,
+                    progress.clone(),
+                )
+                .await?
+            }
+            // Docker/kubectl: agent must already be at /tmp/nexus-agent
+            // (or deployed separately). Use a well-known path.
+            _ => {
+                progress.emit("Connecting...", None, None);
+                format!("~/.nexus/{}", crate::features::shell::remote::deploy::agent_binary_name())
+            }
+        };
+
+        progress.emit("Connecting...", None, None);
         let forwarded_env = collect_forwarded_env();
-        let (transport, env, session_token, request_tx) =
-            crate::features::shell::remote::transport::TransportHandle::connect_ssh(
-                &args.destination,
-                args.port,
-                args.identity.as_deref(),
-                &args.extra_args,
+        let (handle, env, session_token, request_tx) =
+            crate::features::shell::remote::transport::TransportHandle::connect(
+                &transport,
                 &agent_path,
                 forwarded_env,
                 kernel_tx.clone(),
             )
             .await?;
 
-        // Emit a synthetic CommandFinished for the ssh block
+        progress.emit("Connected", Some(&format!("{}@{}", env.user, env.hostname)), Some(1.0));
+
+        // Emit a synthetic CommandFinished for the connection block
         let _ = kernel_tx.send(nexus_api::ShellEvent::CommandFinished {
             block_id,
             exit_code: 0,
@@ -395,9 +438,9 @@ impl NexusState {
             env.clone(),
             session_token,
             request_tx,
-            transport.rtt_ms,
-            transport.last_seen_seq,
-            transport.response_rx,
+            handle.rtt_ms,
+            handle.last_seen_seq,
+            handle.response_rx,
         );
 
         Ok((remote, env))
@@ -410,6 +453,7 @@ impl NexusState {
         remote: std::sync::Arc<std::sync::Mutex<Option<crate::features::shell::remote::RemoteBackend>>>,
         env: Box<nexus_protocol::messages::EnvInfo>,
     ) {
+        self.connecting_tasks.remove(&block_id);
         // Take the remote backend out of the Arc<Mutex<Option<...>>>
         let remote = remote.lock().unwrap().take();
         if let Some(remote) = remote {
@@ -480,6 +524,7 @@ impl NexusState {
         block_id: nexus_api::BlockId,
         error: String,
     ) {
+        self.connecting_tasks.remove(&block_id);
         // Emit error as stderr on the block
         let _ = self.kernel_tx.send(nexus_api::ShellEvent::StderrChunk {
             block_id,
@@ -1063,30 +1108,33 @@ impl NexusState {
 }
 
 // =========================================================================
-// SSH argument parsing and env forwarding
+// Remote command parsing and env forwarding
 // =========================================================================
 
-/// Parsed SSH command arguments.
-struct SshArgs {
-    destination: String,
-    port: Option<u16>,
-    identity: Option<String>,
-    /// Extra args to pass through (e.g. `-o StrictHostKeyChecking=no`).
-    extra_args: Vec<String>,
+/// Parse a remote transport command into its protocol `Transport` enum.
+fn parse_remote_command(command: &str) -> Option<nexus_protocol::messages::Transport> {
+    let mut words = command.split_whitespace();
+    let first = words.next()?;
+
+    match first {
+        "ssh" => Some(parse_ssh_transport(words)),
+        "docker" => parse_docker_transport(words),
+        "kubectl" => parse_kubectl_transport(words),
+        _ => None,
+    }
 }
 
-/// Parse SSH command arguments to extract destination, port, identity, and extra args.
-fn parse_ssh_args(command: &str) -> SshArgs {
-    let mut words = command.split_whitespace();
-    let _ = words.next(); // skip "ssh"
-
+/// Parse `ssh [options] destination` into `Transport::Ssh`.
+fn parse_ssh_transport<'a>(
+    words: impl Iterator<Item = &'a str>,
+) -> nexus_protocol::messages::Transport {
     let mut port: Option<u16> = None;
     let mut identity: Option<String> = None;
     let mut destination = String::new();
     let mut extra_args: Vec<String> = Vec::new();
-    let mut skip_next = false;
     let mut next_is_port = false;
     let mut next_is_identity = false;
+    let mut skip_next = false;
 
     for word in words {
         if skip_next {
@@ -1114,7 +1162,6 @@ fn parse_ssh_args(command: &str) -> SshArgs {
             continue;
         }
         if word.starts_with('-') {
-            // Options that take a value — collect into extra_args
             let takes_value = matches!(
                 word,
                 "-l" | "-o" | "-F" | "-J" | "-W" | "-b" | "-c" | "-D"
@@ -1135,7 +1182,111 @@ fn parse_ssh_args(command: &str) -> SshArgs {
         // Continue parsing — SSH allows options after the destination
     }
 
-    SshArgs { destination, port, identity, extra_args }
+    nexus_protocol::messages::Transport::Ssh {
+        destination,
+        port,
+        identity,
+        extra_args,
+    }
+}
+
+/// Parse `docker exec [-u user] container` into `Transport::Docker`.
+fn parse_docker_transport<'a>(
+    words: impl Iterator<Item = &'a str>,
+) -> Option<nexus_protocol::messages::Transport> {
+    let words: Vec<&str> = words.collect();
+
+    // Must have "exec" as first subcommand
+    if words.first().copied() != Some("exec") {
+        return None;
+    }
+
+    let mut user: Option<String> = None;
+    let mut container = String::new();
+    let mut i = 1; // skip "exec"
+
+    while i < words.len() {
+        let word = words[i];
+        if word == "-u" || word == "--user" {
+            if i + 1 < words.len() {
+                user = Some(words[i + 1].to_string());
+                i += 2;
+                continue;
+            }
+        }
+        // Skip common flags
+        if word.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        // First non-flag is the container name
+        if container.is_empty() {
+            container = word.to_string();
+        }
+        i += 1;
+    }
+
+    if container.is_empty() {
+        return None;
+    }
+
+    Some(nexus_protocol::messages::Transport::Docker { container, user })
+}
+
+/// Parse `kubectl exec [-n ns] [-c container] pod` into `Transport::Kubectl`.
+fn parse_kubectl_transport<'a>(
+    words: impl Iterator<Item = &'a str>,
+) -> Option<nexus_protocol::messages::Transport> {
+    let words: Vec<&str> = words.collect();
+
+    if words.first().copied() != Some("exec") {
+        return None;
+    }
+
+    let mut namespace: Option<String> = None;
+    let mut container: Option<String> = None;
+    let mut pod = String::new();
+    let mut i = 1;
+
+    while i < words.len() {
+        let word = words[i];
+        if word == "-n" || word == "--namespace" {
+            if i + 1 < words.len() {
+                namespace = Some(words[i + 1].to_string());
+                i += 2;
+                continue;
+            }
+        }
+        if word == "-c" || word == "--container" {
+            if i + 1 < words.len() {
+                container = Some(words[i + 1].to_string());
+                i += 2;
+                continue;
+            }
+        }
+        if word == "--" {
+            i += 1;
+            break;
+        }
+        if word.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if pod.is_empty() {
+            pod = word.to_string();
+        }
+        i += 1;
+    }
+
+    if pod.is_empty() {
+        return None;
+    }
+
+    Some(nexus_protocol::messages::Transport::Kubectl {
+        pod,
+        namespace,
+        container,
+    })
 }
 
 /// Collect environment variables to forward to the remote agent.
