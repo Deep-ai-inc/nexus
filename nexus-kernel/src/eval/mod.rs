@@ -11,7 +11,7 @@ use tokio::sync::broadcast::Sender;
 
 use nexus_api::BlockId;
 
-use crate::commands::{CommandContext, CommandRegistry};
+use crate::commands::{register_cancel, unregister_cancel, CommandContext, CommandRegistry};
 use crate::parser::*;
 use crate::process;
 use crate::state::{get_or_create_block_id, ShellState};
@@ -259,8 +259,13 @@ fn execute_native(
         stdin: stdin_value,
     };
 
+    // Register cancel flag so the UI can cancel this command
+    register_cancel(block_id);
+
     // Execute the command
     let result = cmd.execute(args, &mut ctx);
+
+    unregister_cancel(block_id);
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -459,11 +464,16 @@ fn execute_external(
     let mut argv = vec![name.to_string()];
     argv.extend(args);
 
+    // Register cancel flag so the UI can cancel this command
+    register_cancel(block_id);
+
     // Spawn the process
     let handle = process::spawn(&argv, &state.cwd, &state.env, &env_overrides, redirects)?;
 
     // Wait for completion and stream output
     let exit_code = process::wait_with_events(handle, block_id, events)?;
+
+    unregister_cancel(block_id);
 
     Ok(exit_code)
 }

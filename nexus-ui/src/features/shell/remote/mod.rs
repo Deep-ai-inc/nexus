@@ -182,11 +182,15 @@ impl RemoteBackend {
     }
 
     /// Send a request to the remote agent (fire-and-forget).
+    ///
+    /// If the transport channel is closed, transitions to `Disconnected`.
     pub fn send(&mut self, request: Request) {
-        let _ = self.request_tx.send(RequestEnvelope {
+        if self.request_tx.send(RequestEnvelope {
             request,
             response_tx: None,
-        });
+        }).is_err() {
+            self.state = ConnectionState::Disconnected;
+        }
     }
 
     /// Execute a command on the remote agent.

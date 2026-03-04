@@ -97,6 +97,15 @@ pub fn cancel_block(block_id: BlockId) -> bool {
     }
 }
 
+/// Check if a block has been cancelled (read-only, does not set the flag).
+pub fn is_cancelled(block_id: BlockId) -> bool {
+    CANCEL_REGISTRY
+        .lock()
+        .unwrap()
+        .get(&block_id)
+        .map_or(false, |flag| flag.load(Ordering::Relaxed))
+}
+
 /// Remove a block from the cancel registry (called when command exits).
 pub fn unregister_cancel(block_id: BlockId) {
     CANCEL_REGISTRY.lock().unwrap().remove(&block_id);
@@ -163,6 +172,25 @@ mod cancel_tests {
 
         // Block should no longer be found
         assert!(!cancel_block(block_id));
+    }
+
+    #[test]
+    fn test_is_cancelled_reads_flag() {
+        let block_id = BlockId(10006);
+        let _flag = register_cancel(block_id);
+
+        // Not cancelled yet
+        assert!(!is_cancelled(block_id));
+
+        // Cancel it
+        cancel_block(block_id);
+        assert!(is_cancelled(block_id));
+
+        // Cleanup
+        unregister_cancel(block_id);
+
+        // Unregistered block returns false
+        assert!(!is_cancelled(block_id));
     }
 
     #[test]

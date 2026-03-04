@@ -19,6 +19,7 @@ use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use nexus_api::{BlockId, ShellEvent};
 
+use crate::commands::is_cancelled;
 use crate::parser::{Command, Redirect, RedirectOp};
 use crate::ShellState;
 
@@ -154,12 +155,18 @@ fn apply_redirects(redirects: &[Redirect]) -> anyhow::Result<()> {
 }
 
 /// Wait for a process to complete, emitting events for output.
+///
+/// Checks the cancel registry each iteration. On cancel:
+/// - Sends SIGTERM to the process
+/// - If still alive after ~100ms (10 iterations), sends SIGKILL
 pub fn wait_with_events(
     handle: ProcessHandle,
     block_id: BlockId,
     events: &Sender<ShellEvent>,
 ) -> anyhow::Result<i32> {
     let start = Instant::now();
+    // Track how many iterations since we sent SIGTERM for escalation to SIGKILL
+    let mut term_sent_iters: Option<u32> = None;
 
     if let Some(mut pty) = handle.pty {
         // Read from PTY and emit events
@@ -201,6 +208,24 @@ pub fn wait_with_events(
                     return Ok(128 + signal as i32);
                 }
                 WaitStatus::StillAlive => {
+                    // Check cancel flag
+                    if is_cancelled(block_id) {
+                        match term_sent_iters {
+                            None => {
+                                // First cancel check — send SIGTERM
+                                let _ = nix::sys::signal::kill(handle.pid, nix::sys::signal::Signal::SIGTERM);
+                                term_sent_iters = Some(0);
+                            }
+                            Some(n) if n >= 10 => {
+                                // ~100ms since SIGTERM — escalate to SIGKILL
+                                let _ = nix::sys::signal::kill(handle.pid, nix::sys::signal::Signal::SIGKILL);
+                            }
+                            Some(n) => {
+                                term_sent_iters = Some(n + 1);
+                            }
+                        }
+                    }
+
                     // Process still running, read available output
                     match pty.master.read(&mut buffer) {
                         Ok(0) => {
@@ -228,21 +253,49 @@ pub fn wait_with_events(
             }
         }
     } else {
-        // No PTY - just wait for the process
-        let status = waitpid(handle.pid, None)?;
-        let code = match status {
-            WaitStatus::Exited(_, code) => code,
-            WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
-            _ => 1,
-        };
-
-        let _ = events.send(ShellEvent::CommandFinished {
-            block_id,
-            exit_code: code,
-            duration_ms: start.elapsed().as_millis() as u64,
-        });
-
-        Ok(code)
+        // No PTY — poll loop so we can check cancellation
+        loop {
+            match waitpid(handle.pid, Some(WaitPidFlag::WNOHANG))? {
+                WaitStatus::Exited(_, code) => {
+                    let _ = events.send(ShellEvent::CommandFinished {
+                        block_id,
+                        exit_code: code,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                    return Ok(code);
+                }
+                WaitStatus::Signaled(_, signal, _) => {
+                    let code = 128 + signal as i32;
+                    let _ = events.send(ShellEvent::CommandFinished {
+                        block_id,
+                        exit_code: code,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                    return Ok(code);
+                }
+                WaitStatus::StillAlive => {
+                    // Check cancel flag
+                    if is_cancelled(block_id) {
+                        match term_sent_iters {
+                            None => {
+                                let _ = nix::sys::signal::kill(handle.pid, nix::sys::signal::Signal::SIGTERM);
+                                term_sent_iters = Some(0);
+                            }
+                            Some(n) if n >= 10 => {
+                                let _ = nix::sys::signal::kill(handle.pid, nix::sys::signal::Signal::SIGKILL);
+                            }
+                            Some(n) => {
+                                term_sent_iters = Some(n + 1);
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
     }
 }
 
