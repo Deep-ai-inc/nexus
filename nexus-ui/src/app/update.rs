@@ -396,6 +396,7 @@ impl NexusState {
                 // Outermost remote level — shutdown and disconnect
                 let mut remote = self.remote.take().unwrap();
                 remote.shutdown();
+                remote.kill_child_sync();
                 let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
                 self.cwd = cwd;
             } else {
@@ -549,7 +550,7 @@ impl NexusState {
 
         progress.emit("Connecting...", None, None);
         let forwarded_env = collect_forwarded_env();
-        let (handle, env, session_token, request_tx) =
+        let (handle, env, _session_token, request_tx) =
             crate::features::shell::remote::transport::TransportHandle::connect(
                 &transport,
                 &agent_path,
@@ -569,11 +570,11 @@ impl NexusState {
 
         let remote = crate::features::shell::remote::RemoteBackend::new(
             env.clone(),
-            session_token,
             request_tx,
             handle.rtt_ms,
             handle.last_seen_seq,
             handle.response_rx,
+            Some(handle.child),
         );
 
         Ok((remote, env))
@@ -606,6 +607,14 @@ impl NexusState {
     /// Called on each Tick. Only triggers once (state transition Disconnected → Reconnecting).
     fn check_reconnect(&mut self) -> Command<NexusMessage> {
         use crate::features::shell::remote::ConnectionState;
+
+        // Detect SSH child death → mark as Disconnected
+        if let Some(ref mut remote) = self.remote {
+            if remote.state == ConnectionState::Connected && !remote.check_child_alive() {
+                tracing::warn!("SSH child process died");
+                remote.state = ConnectionState::Disconnected;
+            }
+        }
 
         let should_reconnect = self
             .remote
@@ -640,6 +649,7 @@ impl NexusState {
             self.disconnect_confirm = None;
             if let Some(mut remote) = self.remote.take() {
                 remote.shutdown();
+                remote.kill_child_sync();
                 let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
                 self.cwd = cwd;
             }
@@ -1399,7 +1409,6 @@ fn parse_kubectl_transport<'a>(
             }
         }
         if word == "--" {
-            i += 1;
             break;
         }
         if word.starts_with('-') {

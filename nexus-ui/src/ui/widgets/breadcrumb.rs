@@ -39,7 +39,6 @@ impl<'a> Widget<'a> for BreadcrumbBar<'a> {
         // Connection health dot
         let dot_color = match self.state {
             ConnectionState::Connected => Color::rgb(0.3, 0.85, 0.3), // Green
-            ConnectionState::Connecting => Color::rgb(0.9, 0.7, 0.2), // Yellow
             ConnectionState::Reconnecting => Color::rgb(0.9, 0.5, 0.2), // Orange
             ConnectionState::Disconnected => Color::rgb(0.8, 0.2, 0.2), // Red
         };

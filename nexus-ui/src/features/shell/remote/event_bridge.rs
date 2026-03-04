@@ -69,7 +69,6 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
                 request: Request::GrantCredits {
                     bytes: GRANT_SIZE,
                 },
-                response_tx: None,
             });
         }
 

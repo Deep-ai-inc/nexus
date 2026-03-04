@@ -20,7 +20,7 @@ use nexus_api::ShellEvent;
 /// Handle to the remote transport (SSH child process + codec).
 pub(crate) struct TransportHandle {
     /// The SSH child process.
-    child: Child,
+    pub child: Child,
     /// Current RTT in milliseconds (0 = not yet measured).
     pub rtt_ms: Arc<AtomicU64>,
     /// Last seen event sequence number from the agent.
@@ -124,71 +124,6 @@ impl TransportHandle {
         let codec = FrameCodec::new(stdout, stdin);
         let (reader, writer) = codec.into_parts();
 
-        let (env, session_token, _caps, request_tx, rtt_ms, last_seen_seq, response_rx) =
-            Self::handshake(reader, writer, forwarded_env, kernel_tx).await?;
-
-        Ok((
-            Self {
-                child,
-                rtt_ms,
-                last_seen_seq,
-                response_rx,
-            },
-            env,
-            session_token,
-            request_tx,
-        ))
-    }
-
-    /// Spawn an SSH process and connect to the remote agent (convenience wrapper).
-    pub async fn connect_ssh(
-        destination: &str,
-        port: Option<u16>,
-        identity: Option<&str>,
-        extra_args: &[String],
-        agent_path: &str,
-        forwarded_env: HashMap<String, String>,
-        kernel_tx: broadcast::Sender<ShellEvent>,
-    ) -> Result<(Self, EnvInfo, [u8; 16], mpsc::UnboundedSender<super::RequestEnvelope>)> {
-        let mut cmd = Command::new("ssh");
-
-        // Basic SSH args
-        cmd.arg("-o").arg("BatchMode=yes"); // Don't prompt for password
-        cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-
-        if let Some(port) = port {
-            cmd.arg("-p").arg(port.to_string());
-        }
-        if let Some(identity) = identity {
-            cmd.arg("-i").arg(identity);
-        }
-        for arg in extra_args {
-            cmd.arg(arg);
-        }
-
-        cmd.arg(destination);
-        cmd.arg(agent_path);
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn()?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to take SSH stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to take SSH stdout"))?;
-
-        // Create codec over SSH stdin/stdout
-        let codec = FrameCodec::new(stdout, stdin);
-        let (reader, writer) = codec.into_parts();
-
-        // Perform handshake
         let (env, session_token, _caps, request_tx, rtt_ms, last_seen_seq, response_rx) =
             Self::handshake(reader, writer, forwarded_env, kernel_tx).await?;
 
@@ -313,7 +248,6 @@ impl TransportHandle {
         };
         let _ = request_tx.send(super::RequestEnvelope {
             request: initial_grant,
-            response_tx: None,
         });
 
         // Spawn ping loop for RTT tracking
@@ -332,7 +266,6 @@ impl TransportHandle {
                 if ping_tx
                     .send(super::RequestEnvelope {
                         request: Request::Ping { seq },
-                        response_tx: None,
                     })
                     .is_err()
                 {
@@ -352,14 +285,4 @@ impl TransportHandle {
         ))
     }
 
-    /// Kill the SSH process.
-    pub async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await?;
-        Ok(())
-    }
-
-    /// Check if the SSH process is still running.
-    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        Ok(self.child.try_wait()?)
-    }
 }

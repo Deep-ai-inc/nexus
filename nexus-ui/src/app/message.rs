@@ -20,6 +20,7 @@ use crate::ui::context_menu::{ContextMenuItem, ContextTarget};
 // =========================================================================
 
 #[derive(Debug, Clone)]
+#[allow(private_interfaces)]
 pub enum NexusMessage {
     Input(InputMsg),
     Shell(ShellMsg),
@@ -172,6 +173,7 @@ pub enum InputMsg {
 // =========================================================================
 
 #[derive(Debug, Clone)]
+#[allow(private_interfaces)]
 pub enum ShellMsg {
     PtyOutput(BlockId, Vec<u8>),
     PtyExited(BlockId, i32),

@@ -16,17 +16,15 @@ use std::sync::Arc;
 
 use nexus_api::BlockId;
 use nexus_protocol::messages::{
-    CommandClassification, CompletionItem, EnvInfo, HistoryEntry, Request,
-    Response, Transport,
+    CompletionItem, EnvInfo, HistoryEntry, Request, Response, Transport,
 };
 use tokio::sync::{mpsc, oneshot};
 
 /// A pending request awaiting a response from the remote agent.
 enum PendingRequest {
-    Classify(oneshot::Sender<CommandClassification>),
     Complete(oneshot::Sender<(Vec<CompletionItem>, usize)>),
     SearchHistory(oneshot::Sender<Vec<HistoryEntry>>),
-    Nest(Transport),
+    Nest,
     PtySpawn(BlockId),
 }
 
@@ -35,7 +33,6 @@ enum PendingRequest {
 #[derive(Debug, Clone)]
 pub(crate) struct BackendEntry {
     pub env: EnvInfo,
-    pub transport: Transport,
 }
 
 /// Side effect from processing a response — the caller must act on these.
@@ -50,7 +47,6 @@ pub(crate) enum ResponseEffect {
 /// Connection state for the remote backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionState {
-    Connecting,
     Connected,
     Reconnecting,
     Disconnected,
@@ -64,8 +60,6 @@ pub(crate) struct RemoteBackend {
     request_tx: mpsc::UnboundedSender<RequestEnvelope>,
     /// Remote environment info from the last HelloOk.
     pub env: EnvInfo,
-    /// Session token from HelloOk (for resume).
-    pub session_token: [u8; 16],
     /// Last seen sequence number (for resume), shared with event bridge.
     pub(crate) last_seen_seq: Arc<AtomicU64>,
     /// Next request ID.
@@ -82,8 +76,8 @@ pub(crate) struct RemoteBackend {
     pub rtt_ms: Arc<AtomicU64>,
     /// Receiver for non-event responses from the event bridge.
     pub(crate) response_rx: mpsc::UnboundedReceiver<Response>,
-    /// Bytes received since last credit grant (for flow control replenishment).
-    bytes_since_grant: u64,
+    /// The SSH/docker/kubectl child process (owned for lifecycle management).
+    child: Option<tokio::process::Child>,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -104,27 +98,24 @@ pub(crate) struct QueuedCommand {
     pub block_id: BlockId,
 }
 
-/// Envelope wrapping a request with optional response channel.
+/// Envelope wrapping a request for the transport task.
 pub(crate) struct RequestEnvelope {
     pub request: Request,
-    /// For fire-and-forget requests (Execute, PtyInput), this is None.
-    pub response_tx: Option<oneshot::Sender<Response>>,
 }
 
 impl RemoteBackend {
     /// Create a new remote backend from an established transport.
     pub fn new(
         env: EnvInfo,
-        session_token: [u8; 16],
         request_tx: mpsc::UnboundedSender<RequestEnvelope>,
         rtt_ms: Arc<AtomicU64>,
         last_seen_seq: Arc<AtomicU64>,
         response_rx: mpsc::UnboundedReceiver<Response>,
+        child: Option<tokio::process::Child>,
     ) -> Self {
         Self {
             request_tx,
             env,
-            session_token,
             last_seen_seq,
             next_id: 1,
             pending: HashMap::new(),
@@ -133,18 +124,13 @@ impl RemoteBackend {
             pending_queue: Vec::new(),
             rtt_ms,
             response_rx,
-            bytes_since_grant: 0,
+            child,
         }
     }
 
     /// Read the current RTT in milliseconds (0 = not yet measured).
     pub fn current_rtt_ms(&self) -> u64 {
         self.rtt_ms.load(Ordering::Relaxed)
-    }
-
-    /// Read the last seen event sequence number.
-    pub fn last_seen_seq(&self) -> u64 {
-        self.last_seen_seq.load(Ordering::Relaxed)
     }
 
     /// Poll and process any pending non-event responses from the event bridge.
@@ -185,10 +171,7 @@ impl RemoteBackend {
     ///
     /// If the transport channel is closed, transitions to `Disconnected`.
     pub fn send(&mut self, request: Request) {
-        if self.request_tx.send(RequestEnvelope {
-            request,
-            response_tx: None,
-        }).is_err() {
+        if self.request_tx.send(RequestEnvelope { request }).is_err() {
             self.state = ConnectionState::Disconnected;
         }
     }
@@ -206,18 +189,6 @@ impl RemoteBackend {
             command,
             block_id,
         });
-    }
-
-    /// Classify a command on the remote agent (async).
-    pub fn classify(&mut self, command: &str) -> oneshot::Receiver<CommandClassification> {
-        let (tx, rx) = oneshot::channel();
-        let id = self.next_id();
-        self.pending.insert(id, PendingRequest::Classify(tx));
-        self.send(Request::Classify {
-            id,
-            command: command.to_string(),
-        });
-        rx
     }
 
     /// Request tab completions from the remote agent (async).
@@ -257,11 +228,6 @@ impl RemoteBackend {
     /// Send a terminal resize to the remote agent.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.send(Request::TerminalResize { cols, rows });
-    }
-
-    /// Send a ping to the remote agent.
-    pub fn ping(&mut self, seq: u64) {
-        self.send(Request::Ping { seq });
     }
 
     /// Request graceful shutdown.
@@ -313,12 +279,6 @@ impl RemoteBackend {
     /// Returns a `ResponseEffect` that the caller may need to act on.
     pub fn handle_response(&mut self, response: Response) -> ResponseEffect {
         match response {
-            Response::ClassifyResult { id, classification } => {
-                if let Some(PendingRequest::Classify(tx)) = self.pending.remove(&id) {
-                    let _ = tx.send(classification);
-                }
-                ResponseEffect::None
-            }
             Response::CompleteResult {
                 id,
                 completions,
@@ -336,10 +296,9 @@ impl RemoteBackend {
                 ResponseEffect::None
             }
             Response::NestOk { id, env } => {
-                if let Some(PendingRequest::Nest(transport)) = self.pending.remove(&id) {
+                if let Some(PendingRequest::Nest) = self.pending.remove(&id) {
                     self.backend_stack.push(BackendEntry {
                         env: self.env.clone(),
-                        transport,
                     });
                     self.env = env;
                 }
@@ -386,7 +345,7 @@ impl RemoteBackend {
     /// Nest into a deeper level.
     pub fn nest(&mut self, transport: Transport) {
         let id = self.next_id();
-        self.pending.insert(id, PendingRequest::Nest(transport.clone()));
+        self.pending.insert(id, PendingRequest::Nest);
         self.send(Request::Nest {
             id,
             transport,
@@ -403,5 +362,21 @@ impl RemoteBackend {
     /// Swap the request channel to a new transport (after reconnection).
     pub fn swap_request_tx(&mut self, new_tx: mpsc::UnboundedSender<RequestEnvelope>) {
         self.request_tx = new_tx;
+    }
+
+    /// Kill the SSH/docker/kubectl child process (sync — sends SIGKILL without awaiting).
+    pub fn kill_child_sync(&mut self) {
+        if let Some(ref mut child) = self.child {
+            let _ = child.start_kill();
+        }
+        self.child = None;
+    }
+
+    /// Check if the child process is still alive.
+    /// Returns `true` if alive (or if there's no child to check).
+    pub fn check_child_alive(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .map_or(true, |c| c.try_wait().ok().flatten().is_none())
     }
 }
