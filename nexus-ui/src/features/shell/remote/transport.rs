@@ -26,7 +26,7 @@ pub(crate) struct TransportHandle {
     /// Last seen event sequence number from the agent.
     pub last_seen_seq: Arc<AtomicU64>,
     /// Receiver for non-event responses (ClassifyResult, CompleteResult, etc.)
-    pub response_rx: mpsc::Receiver<Response>,
+    pub response_rx: mpsc::UnboundedReceiver<Response>,
 }
 
 impl TransportHandle {
@@ -218,7 +218,7 @@ impl TransportHandle {
         mpsc::UnboundedSender<super::RequestEnvelope>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
-        mpsc::Receiver<Response>,
+        mpsc::UnboundedReceiver<Response>,
     )>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -280,8 +280,14 @@ impl TransportHandle {
             }
         });
 
-        // Non-event response channel (bounded for backpressure)
-        let (response_tx, response_rx) = mpsc::channel::<Response>(64);
+        // Non-event response channel (unbounded).
+        // Must be unbounded to prevent a deadlock with flow control:
+        // if this channel fills up, the event bridge blocks on send(),
+        // can't read more agent data, can't trigger credit replenishment,
+        // and the agent blocks on credits.acquire_many() — both sides stuck.
+        // These are small, infrequent control messages (ClassifyResult,
+        // CompleteResult, NestOk, etc.), so unbounded is safe.
+        let (response_tx, response_rx) = mpsc::unbounded_channel::<Response>();
 
         // Spawn response reader task (event bridge)
         let bridge_rtt = rtt_ms.clone();

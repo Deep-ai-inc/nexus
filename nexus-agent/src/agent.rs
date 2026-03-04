@@ -47,7 +47,7 @@ impl Agent {
             kernel: Arc::new(Mutex::new(kernel)),
             kernel_rx,
             idle_timeout_secs,
-            next_seq: 0,
+            next_seq: 1,
             ring_buffer: RingBuffer::new(1024 * 1024), // 1 MB default
             next_id: 0,
             viewport_cols: 80,

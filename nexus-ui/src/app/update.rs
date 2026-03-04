@@ -64,6 +64,63 @@ impl NexusState {
                 } else {
                     self.scroll.snap_to_bottom();
                 }
+
+                // Remote tab completion: intercept and send async request
+                if matches!(m, super::message::InputMsg::TabComplete) && self.remote.is_some() {
+                    let remote = self.remote.as_mut().unwrap();
+                    let input = self.input.text_input.text.clone();
+                    let cursor = self.input.text_input.cursor;
+                    self.input.completion_generation += 1;
+                    let generation = self.input.completion_generation;
+                    let rx = remote.complete(&input, cursor);
+                    return Command::perform(async move {
+                        match rx.await {
+                            Ok((items, start)) => {
+                                let completions = items.into_iter().map(|item| {
+                                    nexus_kernel::Completion {
+                                        text: item.text,
+                                        display: item.display,
+                                        kind: convert_completion_kind(item.kind),
+                                        score: item.score,
+                                    }
+                                }).collect();
+                                NexusMessage::Input(super::message::InputMsg::RemoteCompletionResult {
+                                    completions, anchor: start, generation,
+                                })
+                            }
+                            Err(_) => NexusMessage::Input(super::message::InputMsg::CompletionDismiss),
+                        }
+                    });
+                }
+
+                // Remote history search: intercept and send async request
+                if let super::message::InputMsg::HistorySearchKey(ref event) = m {
+                    if self.remote.is_some() {
+                        // Update the query text locally
+                        self.input.history_search.handle_key_local(event);
+                        let query = self.input.history_search.query.clone();
+                        if query.is_empty() {
+                            self.input.history_search.results.clear();
+                            return Command::none();
+                        }
+                        let remote = self.remote.as_mut().unwrap();
+                        self.input.history_generation += 1;
+                        let generation = self.input.history_generation;
+                        let rx = remote.search_history(&query, 50);
+                        return Command::perform(async move {
+                            match rx.await {
+                                Ok(entries) => {
+                                    let results = entries.into_iter().map(|e| e.command).collect();
+                                    NexusMessage::Input(super::message::InputMsg::RemoteHistoryResult {
+                                        results, generation,
+                                    })
+                                }
+                                Err(_) => NexusMessage::Input(super::message::InputMsg::HistorySearchDismiss),
+                            }
+                        });
+                    }
+                }
+
                 let submit = self.input.update(m);
                 if let Some(req) = submit {
                     self.handle_submit(req)
@@ -81,6 +138,30 @@ impl NexusState {
                 if let ShellMsg::KillBlock(id) | ShellMsg::SendInterrupt(id) = &m {
                     if let Some(cancel) = self.connecting_tasks.remove(id) {
                         cancel.cancel();
+                    }
+                    // Forward cancel to remote agent
+                    if let Some(ref mut remote) = self.remote {
+                        remote.cancel_block(*id);
+                    }
+                }
+
+                // Remote PTY input: intercept and forward to agent
+                if let ShellMsg::PtyInput(block_id, ref event) = m {
+                    if let Some(ref mut remote) = self.remote {
+                        // If this block has no local PTY handle, it's a remote PTY
+                        if !self.shell.pty.has_handle(block_id) {
+                            let block = self.shell.blocks.get(block_id);
+                            let flags = block
+                                .map(|b| crate::features::shell::pty_backend::TermKeyFlags {
+                                    app_cursor: b.parser.app_cursor(),
+                                    ..Default::default()
+                                })
+                                .unwrap_or_default();
+                            if let Some(bytes) = crate::features::shell::pty_backend::strata_key_to_bytes(&event, flags) {
+                                remote.pty_input(block_id, bytes);
+                            }
+                            return Command::none();
+                        }
                     }
                 }
                 // Remote connection results are handled at the root level
@@ -271,11 +352,16 @@ impl NexusState {
 
         // Handle "exit" when in remote mode — pop the backend stack.
         if !is_agent && text.trim() == "exit" && self.remote.is_some() {
-            if let Some(mut remote) = self.remote.take() {
+            let remote = self.remote.as_mut().unwrap();
+            if remote.backend_stack.is_empty() {
+                // Outermost remote level — shutdown and disconnect
+                let mut remote = self.remote.take().unwrap();
                 remote.shutdown();
-                // Restore local CWD
                 let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
                 self.cwd = cwd;
+            } else {
+                // Nested level — unnest one hop, stay connected
+                remote.unnest();
             }
             return Command::none();
         }
@@ -331,7 +417,15 @@ impl NexusState {
             sync_focus_flags(&self.focus, &mut self.input, &mut self.agent);
 
             if let Some(ssh_command) = remote_transport {
-                // Remote transport command — spawn async connection task.
+                // Already connected — nest via the existing connection
+                if let Some(ref mut remote) = self.remote {
+                    if let Some(transport) = parse_remote_command(&ssh_command) {
+                        remote.nest(transport);
+                    }
+                    return cmds;
+                }
+
+                // Not connected — first connection, spawn async task
                 let kernel_tx = self.kernel_tx.clone();
                 let cancel = tokio_util::sync::CancellationToken::new();
                 self.connecting_tasks.insert(block_id, cancel.clone());
@@ -1287,6 +1381,22 @@ fn parse_kubectl_transport<'a>(
         namespace,
         container,
     })
+}
+
+/// Convert protocol CompletionKind to kernel CompletionKind.
+fn convert_completion_kind(kind: nexus_protocol::messages::CompletionKind) -> nexus_kernel::CompletionKind {
+    match kind {
+        nexus_protocol::messages::CompletionKind::File => nexus_kernel::CompletionKind::File,
+        nexus_protocol::messages::CompletionKind::Directory => nexus_kernel::CompletionKind::Directory,
+        nexus_protocol::messages::CompletionKind::Executable => nexus_kernel::CompletionKind::Executable,
+        nexus_protocol::messages::CompletionKind::Builtin => nexus_kernel::CompletionKind::Builtin,
+        nexus_protocol::messages::CompletionKind::NativeCommand => nexus_kernel::CompletionKind::NativeCommand,
+        nexus_protocol::messages::CompletionKind::Function => nexus_kernel::CompletionKind::Function,
+        nexus_protocol::messages::CompletionKind::Alias => nexus_kernel::CompletionKind::Alias,
+        nexus_protocol::messages::CompletionKind::Variable => nexus_kernel::CompletionKind::Variable,
+        nexus_protocol::messages::CompletionKind::GitBranch => nexus_kernel::CompletionKind::GitBranch,
+        nexus_protocol::messages::CompletionKind::Flag => nexus_kernel::CompletionKind::Flag,
+    }
 }
 
 /// Collect environment variables to forward to the remote agent.

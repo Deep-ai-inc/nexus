@@ -614,21 +614,32 @@ impl ShellWidget {
 
         // If we're in remote mode, route through the remote backend
         if let Some(remote) = remote {
-            // Even in remote mode, check if this is a transport command
-            // that should trigger nesting (ssh inside ssh)
             let classification = kernel.blocking_lock().classify_command(&trimmed);
-            if classification == CommandClassification::RemoteTransport {
-                // Return for the orchestrator to handle as Nest
-                return Some(trimmed);
+            match classification {
+                CommandClassification::RemoteTransport => {
+                    // Return for the orchestrator to handle as Nest
+                    return Some(trimmed);
+                }
+                CommandClassification::Pty => {
+                    // Remote PTY: spawn on the agent, create local block with parser
+                    let (cols, rows) = self.pty.terminal_size.get();
+                    remote.pty_spawn(&trimmed, block_id, cols, rows);
+                    let mut block = Block::new(block_id, command);
+                    block.parser = self.pty.new_parser();
+                    self.blocks.push(block);
+                    uctx.set_focus(Focus::Block(block_id));
+                    uctx.snap_to_bottom();
+                    return None;
+                }
+                CommandClassification::Kernel => {
+                    remote.execute(trimmed, block_id);
+                    let mut block = Block::new(block_id, command);
+                    block.parser = self.pty.new_parser();
+                    self.blocks.push(block);
+                    uctx.snap_to_bottom();
+                    return None;
+                }
             }
-
-            remote.execute(trimmed, block_id);
-            // Create a local block to track the remote command
-            let mut block = Block::new(block_id, command);
-            block.parser = self.pty.new_parser();
-            self.blocks.push(block);
-            uctx.snap_to_bottom();
-            return None;
         }
 
         let classification = kernel.blocking_lock().classify_command(&trimmed);

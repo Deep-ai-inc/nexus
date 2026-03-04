@@ -51,7 +51,22 @@ impl NexusState {
 
         // Poll remote responses (ClassifyResult, CompleteResult, etc.)
         if let Some(ref mut remote) = self.remote {
-            remote.poll_responses();
+            for effect in remote.poll_responses() {
+                match effect {
+                    crate::features::shell::remote::ResponseEffect::PtySpawnFailed { block_id, message } => {
+                        let _ = self.kernel_tx.send(nexus_api::ShellEvent::StderrChunk {
+                            block_id,
+                            data: format!("Remote PTY failed: {}\n", message).into_bytes(),
+                        });
+                        let _ = self.kernel_tx.send(nexus_api::ShellEvent::CommandFinished {
+                            block_id,
+                            exit_code: 1,
+                            duration_ms: 0,
+                        });
+                    }
+                    crate::features::shell::remote::ResponseEffect::None => {}
+                }
+            }
         }
 
         // Auto-scroll during active drag/selection
@@ -204,6 +219,47 @@ impl NexusState {
                 width,
                 height,
             });
+        }
+    }
+
+    // --- Remote terminal resize ---
+
+    /// Check if the terminal size changed and needs to be sent to the remote agent.
+    /// Returns true if a debounce timer should be scheduled.
+    pub(super) fn sync_remote_terminal_size(&mut self) -> bool {
+        if self.remote.is_none() {
+            return false;
+        }
+        let current = self.shell.pty.terminal_size.get();
+        if current == self.last_remote_size {
+            self.remote_size_changed_at = None;
+            return false;
+        }
+
+        match self.remote_size_changed_at {
+            Some(t) if t.elapsed() >= std::time::Duration::from_millis(50) => {
+                // Stable for long enough — commit
+                self.last_remote_size = current;
+                self.remote_size_changed_at = None;
+                let remote = self.remote.as_mut().unwrap();
+                remote.resize(current.0, current.1);
+                // Also resize individual remote PTYs
+                for block in &self.shell.blocks.blocks {
+                    if block.is_running() && !self.shell.pty.has_handle(block.id) {
+                        remote.pty_resize(block.id, current.0, current.1);
+                    }
+                }
+                false
+            }
+            Some(_) => {
+                // Timer exists but hasn't expired — keep polling
+                true
+            }
+            None => {
+                // First detection of size change — start the timer
+                self.remote_size_changed_at = Some(Instant::now());
+                true
+            }
         }
     }
 

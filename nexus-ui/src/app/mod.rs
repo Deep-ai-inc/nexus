@@ -103,6 +103,12 @@ pub struct NexusState {
     pub(crate) remote: Option<crate::features::shell::remote::RemoteBackend>,
     /// Cancellation tokens for in-flight remote connection tasks, keyed by block_id.
     pub(crate) connecting_tasks: std::collections::HashMap<nexus_api::BlockId, tokio_util::sync::CancellationToken>,
+    /// Last terminal size sent to the remote agent (avoids redundant messages).
+    pub(crate) last_remote_size: (u16, u16),
+    /// When the remote terminal size last changed — for debounce timing.
+    pub(crate) remote_size_changed_at: Option<Instant>,
+    /// CancellationToken for the in-flight resize debounce sleep task.
+    pub(crate) resize_debounce_cancel: Option<tokio_util::sync::CancellationToken>,
 
     // --- Layout ---
     pub zoom_level: f32,
@@ -144,6 +150,33 @@ impl Component for NexusState {
         let cmd = self.dispatch_update(msg, ctx);
 
         self.shell.sync_terminal_size();
+
+        // Debounced remote terminal size sync
+        let resize_started = self.sync_remote_terminal_size();
+        let cmd = if resize_started {
+            // Cancel previous debounce task — at most 1 sleep in flight
+            if let Some(token) = self.resize_debounce_cancel.take() {
+                token.cancel();
+            }
+            let token = tokio_util::sync::CancellationToken::new();
+            self.resize_debounce_cancel = Some(token.clone());
+            Command::batch(vec![
+                cmd,
+                Command::perform(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(60)) => {
+                            NexusMessage::Tick
+                        }
+                        _ = token.cancelled() => {
+                            NexusMessage::Tick
+                        }
+                    }
+                }),
+            ])
+        } else {
+            cmd
+        };
+
         (cmd, ())
     }
 
@@ -527,6 +560,9 @@ impl RootComponent for NexusState {
 
             remote: None,
             connecting_tasks: std::collections::HashMap::new(),
+            last_remote_size: (120, 24),
+            remote_size_changed_at: None,
+            resize_debounce_cancel: None,
 
             zoom_level: 0.85,
 

@@ -51,6 +51,10 @@ pub(crate) struct InputWidget {
     pub history_search: HistorySearchWidget,
     // Shared reference for completion/search
     kernel: Arc<Mutex<Kernel>>,
+    /// Monotonic generation counter for remote tab completion — prevents stale responses.
+    pub(crate) completion_generation: u64,
+    /// Monotonic generation counter for remote history search — prevents stale responses.
+    pub(crate) history_generation: u64,
 }
 
 impl InputWidget {
@@ -70,6 +74,8 @@ impl InputWidget {
             completion: CompletionWidget::new(),
             history_search: HistorySearchWidget::new(),
             kernel,
+            completion_generation: 0,
+            history_generation: 0,
         }
     }
 
@@ -106,6 +112,25 @@ impl InputWidget {
             InputMsg::HistorySearchSelect(index) => { self.history_search_select(index); None }
             InputMsg::HistorySearchAcceptIndex(index) => { self.history_search_accept_index(index); None }
             InputMsg::HistorySearchScroll(action) => { self.history_search.apply_scroll(action); None }
+
+            InputMsg::RemoteCompletionResult { completions, anchor, generation } => {
+                // Discard superseded responses
+                if generation != self.completion_generation {
+                    return None;
+                }
+                let output = self.completion.apply_remote_result(completions, anchor, &self.text_input.text, self.text_input.cursor);
+                self.apply_completion_output(output);
+                None
+            }
+            InputMsg::RemoteHistoryResult { results, generation } => {
+                // Discard superseded responses
+                if generation != self.history_generation {
+                    return None;
+                }
+                self.history_search.results = results;
+                self.history_search.index = 0;
+                None
+            }
         }
     }
 

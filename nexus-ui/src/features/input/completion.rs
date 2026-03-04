@@ -130,6 +130,36 @@ impl CompletionWidget {
         output
     }
 
+    /// Apply pre-fetched results from remote tab completion.
+    pub fn apply_remote_result(
+        &mut self,
+        completions: Vec<Completion>,
+        anchor: usize,
+        input_text: &str,
+        input_cursor: usize,
+    ) -> CompletionOutput {
+        if completions.len() == 1 {
+            let comp = &completions[0];
+            let mut t = input_text.to_string();
+            let end = input_cursor.min(t.len());
+            t.replace_range(anchor..end, &comp.text);
+            let cursor = anchor + comp.text.len();
+            self.completions.clear();
+            self.index = None;
+            CompletionOutput::Applied { text: t, cursor }
+        } else if !completions.is_empty() {
+            self.completions = completions;
+            self.index = Some(0);
+            self.anchor = anchor;
+            self.scroll.offset = 0.0;
+            CompletionOutput::None
+        } else {
+            self.completions.clear();
+            self.index = None;
+            CompletionOutput::None
+        }
+    }
+
     /// Handle scroll action on the completion popup.
     pub fn apply_scroll(&mut self, action: ScrollAction) {
         self.scroll.apply(action);

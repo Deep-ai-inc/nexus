@@ -26,6 +26,8 @@ enum PendingRequest {
     Classify(oneshot::Sender<CommandClassification>),
     Complete(oneshot::Sender<(Vec<CompletionItem>, usize)>),
     SearchHistory(oneshot::Sender<Vec<HistoryEntry>>),
+    Nest(Transport),
+    PtySpawn(BlockId),
 }
 
 /// An entry in the backend connection stack.
@@ -34,6 +36,15 @@ enum PendingRequest {
 pub(crate) struct BackendEntry {
     pub env: EnvInfo,
     pub transport: Transport,
+}
+
+/// Side effect from processing a response — the caller must act on these.
+#[derive(Debug)]
+pub(crate) enum ResponseEffect {
+    /// No side effect.
+    None,
+    /// A remote PTY spawn failed — the caller should emit synthetic error + finish events.
+    PtySpawnFailed { block_id: BlockId, message: String },
 }
 
 /// Connection state for the remote backend.
@@ -70,7 +81,7 @@ pub(crate) struct RemoteBackend {
     /// Current RTT in milliseconds (shared with event bridge).
     pub rtt_ms: Arc<AtomicU64>,
     /// Receiver for non-event responses from the event bridge.
-    pub(crate) response_rx: mpsc::Receiver<Response>,
+    pub(crate) response_rx: mpsc::UnboundedReceiver<Response>,
     /// Bytes received since last credit grant (for flow control replenishment).
     bytes_since_grant: u64,
 }
@@ -108,7 +119,7 @@ impl RemoteBackend {
         request_tx: mpsc::UnboundedSender<RequestEnvelope>,
         rtt_ms: Arc<AtomicU64>,
         last_seen_seq: Arc<AtomicU64>,
-        response_rx: mpsc::Receiver<Response>,
+        response_rx: mpsc::UnboundedReceiver<Response>,
     ) -> Self {
         Self {
             request_tx,
@@ -139,11 +150,16 @@ impl RemoteBackend {
     /// Poll and process any pending non-event responses from the event bridge.
     /// Should be called during UI update cycles to deliver ClassifyResult,
     /// CompleteResult, HistoryResult, etc. to pending request handlers.
-    pub fn poll_responses(&mut self) {
+    /// Returns any side effects that the caller must act on.
+    pub fn poll_responses(&mut self) -> Vec<ResponseEffect> {
+        let mut effects = Vec::new();
         loop {
             match self.response_rx.try_recv() {
                 Ok(response) => {
-                    self.handle_response(response);
+                    let effect = self.handle_response(response);
+                    if !matches!(effect, ResponseEffect::None) {
+                        effects.push(effect);
+                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -155,6 +171,7 @@ impl RemoteBackend {
                 }
             }
         }
+        effects
     }
 
     /// Allocate the next request ID.
@@ -263,6 +280,7 @@ impl RemoteBackend {
         rows: u16,
     ) {
         let id = self.next_id();
+        self.pending.insert(id, PendingRequest::PtySpawn(block_id));
         self.send(Request::PtySpawn {
             id,
             command: command.to_string(),
@@ -288,14 +306,14 @@ impl RemoteBackend {
     }
 
     /// Handle a response from the remote agent.
-    /// Returns true if the response was handled (matched a pending request).
-    pub fn handle_response(&mut self, response: Response) -> bool {
+    /// Returns a `ResponseEffect` that the caller may need to act on.
+    pub fn handle_response(&mut self, response: Response) -> ResponseEffect {
         match response {
             Response::ClassifyResult { id, classification } => {
                 if let Some(PendingRequest::Classify(tx)) = self.pending.remove(&id) {
                     let _ = tx.send(classification);
-                    return true;
                 }
+                ResponseEffect::None
             }
             Response::CompleteResult {
                 id,
@@ -304,28 +322,53 @@ impl RemoteBackend {
             } => {
                 if let Some(PendingRequest::Complete(tx)) = self.pending.remove(&id) {
                     let _ = tx.send((completions, start));
-                    return true;
                 }
+                ResponseEffect::None
             }
             Response::HistoryResult { id, entries } => {
                 if let Some(PendingRequest::SearchHistory(tx)) = self.pending.remove(&id) {
                     let _ = tx.send(entries);
-                    return true;
                 }
+                ResponseEffect::None
+            }
+            Response::NestOk { id, env } => {
+                if let Some(PendingRequest::Nest(transport)) = self.pending.remove(&id) {
+                    self.backend_stack.push(BackendEntry {
+                        env: self.env.clone(),
+                        transport,
+                    });
+                    self.env = env;
+                }
+                ResponseEffect::None
+            }
+            Response::UnnestOk { id, env } => {
+                self.pending.remove(&id);
+                self.backend_stack.pop();
+                self.env = env;
+                ResponseEffect::None
+            }
+            Response::ChildLost { reason } => {
+                tracing::warn!("remote child lost: {reason}");
+                if let Some(previous) = self.backend_stack.pop() {
+                    self.env = previous.env;
+                }
+                ResponseEffect::None
             }
             Response::Pong { seq: _ } => {
                 // RTT tracking handled by event bridge
-                return true;
+                ResponseEffect::None
             }
             Response::Error { id, message } => {
                 tracing::error!("remote error (id={id}): {message}");
-                // Clean up pending request if any
-                self.pending.remove(&id);
-                return true;
+                match self.pending.remove(&id) {
+                    Some(PendingRequest::PtySpawn(block_id)) => {
+                        ResponseEffect::PtySpawnFailed { block_id, message }
+                    }
+                    _ => ResponseEffect::None,
+                }
             }
-            _ => {}
+            _ => ResponseEffect::None,
         }
-        false
     }
 
     /// Flush the offline command queue after reconnection.
@@ -339,6 +382,7 @@ impl RemoteBackend {
     /// Nest into a deeper level.
     pub fn nest(&mut self, transport: Transport) {
         let id = self.next_id();
+        self.pending.insert(id, PendingRequest::Nest(transport.clone()));
         self.send(Request::Nest {
             id,
             transport,

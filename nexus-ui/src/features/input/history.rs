@@ -63,6 +63,18 @@ impl HistorySearchWidget {
         HistorySearchOutput::None
     }
 
+    /// Handle a key event locally — update the query text only (no kernel search).
+    /// Used for remote mode where the search is async.
+    pub fn handle_key_local(&mut self, key_event: &KeyEvent) {
+        if let KeyEvent::Pressed { key, .. } = key_event {
+            match key {
+                Key::Character(c) => self.query.push_str(c),
+                Key::Named(NamedKey::Backspace) => { self.query.pop(); }
+                _ => {}
+            }
+        }
+    }
+
     /// Handle a key event while history search is active.
     pub fn handle_key(&mut self, key_event: KeyEvent, kernel: &Arc<Mutex<Kernel>>) -> HistorySearchOutput {
         if let KeyEvent::Pressed { key, .. } = key_event {

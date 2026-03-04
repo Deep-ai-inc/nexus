@@ -35,7 +35,7 @@ const GRANT_SIZE: u64 = 256 * 1024;
 pub(crate) async fn run<R: AsyncRead + Unpin>(
     mut reader: FrameReader<R>,
     kernel_tx: broadcast::Sender<ShellEvent>,
-    response_tx: mpsc::Sender<Response>,
+    response_tx: mpsc::UnboundedSender<Response>,
     request_tx: mpsc::UnboundedSender<RequestEnvelope>,
     ping_timestamps: Arc<Mutex<HashMap<u64, Instant>>>,
     rtt_ms: Arc<AtomicU64>,
@@ -92,12 +92,12 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
             Response::ChildLost { reason } => {
                 tracing::warn!("remote child lost: {reason}");
                 // Forward to response handler for UI notification
-                let _ = response_tx.send(Response::ChildLost { reason }).await;
+                let _ = response_tx.send(Response::ChildLost { reason });
             }
             other => {
                 // Non-event responses (ClassifyResult, CompleteResult, etc.)
                 // Forward to RemoteBackend's response handler.
-                if response_tx.send(other).await.is_err() {
+                if response_tx.send(other).is_err() {
                     tracing::debug!("response channel closed, stopping event bridge");
                     break;
                 }

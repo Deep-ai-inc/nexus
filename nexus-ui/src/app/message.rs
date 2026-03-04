@@ -50,7 +50,7 @@ pub enum NexusMessage {
         request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
         rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        response_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<nexus_protocol::messages::Response>>>>,
+        response_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<nexus_protocol::messages::Response>>>>,
         env: nexus_protocol::messages::EnvInfo,
     },
     FileDrop(FileDropMsg),
@@ -148,6 +148,21 @@ pub enum InputMsg {
     HistorySearchSelect(usize),
     HistorySearchAcceptIndex(usize),
     HistorySearchScroll(ScrollAction),
+
+    // Remote async results
+    /// Async tab completion result from remote agent.
+    RemoteCompletionResult {
+        completions: Vec<nexus_kernel::Completion>,
+        anchor: usize,
+        /// Monotonic generation — discard if != current completion_generation.
+        generation: u64,
+    },
+    /// Async history search result from remote agent.
+    RemoteHistoryResult {
+        results: Vec<String>,
+        /// Monotonic generation — discard if != current history_generation.
+        generation: u64,
+    },
 }
 
 // =========================================================================

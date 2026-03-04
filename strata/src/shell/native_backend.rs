@@ -1226,6 +1226,15 @@ fn handle_key_event<A: StrataApp>(view: &AnyObject, key_event: KeyEvent) {
     let Some(state_cell) = (unsafe { get_state::<A>(view) }) else { return };
     {
         let mut state = state_cell.borrow_mut();
+
+        // Drain pending async results before processing the key event.
+        // Without this, Command::perform results (e.g. RemoteConnected)
+        // sitting in command_rx would not be applied until the next timer
+        // tick, causing the key handler to act on stale state.
+        while let Ok(msg) = state.command_rx.try_recv() {
+            process_message::<A>(&mut state, msg);
+        }
+
         if let Some(msg) = A::on_key(&state.app, key_event) {
             process_message::<A>(&mut state, msg);
         }
