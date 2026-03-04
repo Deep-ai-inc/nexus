@@ -1,5 +1,7 @@
 //! Message dispatch and domain handlers for NexusState.
 
+use std::time::Instant;
+
 use strata::Command;
 
 use crate::data::Focus;
@@ -56,6 +58,19 @@ impl NexusState {
     ) -> Command<NexusMessage> {
         // Apply deferred scroll offset from view() (scroll-to-block)
         self.scroll.apply_pending();
+
+        // Any interaction outside the breadcrumb cancels the disconnect prompt
+        if self.disconnect_confirm.is_some() {
+            let keep = matches!(
+                msg,
+                NexusMessage::UnnestToLevel(0)
+                    | NexusMessage::DisconnectConfirmExpired
+                    | NexusMessage::Tick
+            );
+            if !keep {
+                self.disconnect_confirm = None;
+            }
+        }
 
         match msg {
             NexusMessage::Input(m) => {
@@ -212,7 +227,31 @@ impl NexusState {
             NexusMessage::Scroll(action) => { self.scroll.apply_user_scroll(action); Command::none() }
             NexusMessage::ScrollToJob(_) => { self.scroll.snap_to_bottom(); Command::none() }
             NexusMessage::UnnestToLevel(level) => {
+                if level == 0 {
+                    // Disconnect — requires confirmation (double-click within 3s)
+                    if self.disconnect_confirm.is_some() {
+                        // Second click — confirmed, disconnect
+                        self.disconnect_confirm = None;
+                        self.handle_unnest_to_level(0);
+                        return Command::none();
+                    }
+                    // First click — enter confirmation state
+                    self.disconnect_confirm = Some(Instant::now());
+                    return Command::perform(async {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        NexusMessage::DisconnectConfirmExpired
+                    });
+                }
                 self.handle_unnest_to_level(level);
+                Command::none()
+            }
+            NexusMessage::DisconnectConfirmExpired => {
+                // Clear stale confirmation (only if still pending)
+                if let Some(started) = self.disconnect_confirm {
+                    if started.elapsed() >= std::time::Duration::from_secs(3) {
+                        self.disconnect_confirm = None;
+                    }
+                }
                 Command::none()
             }
             NexusMessage::RemoteStateChanged(state) => {
@@ -598,6 +637,7 @@ impl NexusState {
     fn handle_unnest_to_level(&mut self, level: usize) {
         if level == 0 {
             // Disconnect entirely
+            self.disconnect_confirm = None;
             if let Some(mut remote) = self.remote.take() {
                 remote.shutdown();
                 let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());

@@ -12,6 +12,7 @@ use strata::primitives::Color;
 
 use crate::features::shell::remote::{BackendEntry, ConnectionState};
 use crate::utils::ids as source_ids;
+use nexus_protocol::messages::EnvInfo;
 
 /// Data needed to render the breadcrumb bar.
 pub(crate) struct BreadcrumbBar<'a> {
@@ -19,12 +20,16 @@ pub(crate) struct BreadcrumbBar<'a> {
     pub local_host: &'a str,
     /// The remote connection stack.
     pub stack: &'a [BackendEntry],
+    /// The current (active) remote environment, shown as the final segment.
+    pub current_env: Option<&'a EnvInfo>,
     /// Current connection state.
     pub state: ConnectionState,
     /// Current round-trip time in milliseconds (if available).
     pub rtt_ms: Option<u64>,
     /// If set, segments beyond this depth are greyed out (unnesting in progress).
     pub unnesting_to: Option<usize>,
+    /// Whether the disconnect confirmation is active (first click happened).
+    pub confirm_active: bool,
 }
 
 impl<'a> Widget<'a> for BreadcrumbBar<'a> {
@@ -46,17 +51,22 @@ impl<'a> Widget<'a> for BreadcrumbBar<'a> {
 
         // "local" segment — clickable (depth 0 = disconnect entirely)
         let local_alpha = self.segment_alpha(0);
+        let (local_label, local_color) = if self.confirm_active {
+            ("disconnect?".to_string(), Color::rgba(0.9, 0.5, 0.2, 0.9))
+        } else {
+            (self.local_host.to_string(), Color::rgba(0.7, 0.8, 1.0, local_alpha))
+        };
         row = row.push(
             Row::new()
                 .id(source_ids::breadcrumb_segment(0))
                 .push(
-                    TextElement::new(self.local_host.to_string())
-                        .color(Color::rgba(0.7, 0.8, 1.0, local_alpha))
+                    TextElement::new(local_label)
+                        .color(local_color)
                         .size(12.0),
                 ),
         );
 
-        // Remote segments
+        // Remote segments (from backend_stack — previously visited hops)
         for (i, entry) in self.stack.iter().enumerate() {
             let depth = i + 1;
             let alpha = self.segment_alpha(depth);
@@ -76,6 +86,30 @@ impl<'a> Widget<'a> for BreadcrumbBar<'a> {
                     .push(
                         TextElement::new(label)
                             .color(Color::rgba(0.7, 0.8, 1.0, alpha))
+                            .size(12.0),
+                    ),
+            );
+        }
+
+        // Current (active) remote environment — final segment
+        if let Some(env) = self.current_env {
+            let depth = self.stack.len() + 1;
+
+            // Separator
+            row = row.push(
+                TextElement::new("\u{203A}".to_string()) // ›
+                    .color(Color::rgba(0.5, 0.5, 0.5, 0.8))
+                    .size(12.0),
+            );
+
+            // Active segment — full brightness
+            let label = format!("{}@{}", env.user, env.hostname);
+            row = row.push(
+                Row::new()
+                    .id(source_ids::breadcrumb_segment(depth))
+                    .push(
+                        TextElement::new(label)
+                            .color(Color::rgba(0.7, 0.8, 1.0, 1.0))
                             .size(12.0),
                     ),
             );

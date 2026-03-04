@@ -107,6 +107,9 @@ pub struct NexusState {
     pub(crate) last_remote_size: (u16, u16),
     /// When the remote terminal size last changed — for debounce timing.
     pub(crate) remote_size_changed_at: Option<Instant>,
+    /// Disconnect confirmation state — set on first click of "local" breadcrumb,
+    /// cleared after 3s timeout. Second click within window triggers disconnect.
+    pub(crate) disconnect_confirm: Option<Instant>,
     /// CancellationToken for the in-flight resize debounce sleep task.
     pub(crate) resize_debounce_cancel: Option<tokio_util::sync::CancellationToken>,
 
@@ -562,6 +565,7 @@ impl RootComponent for NexusState {
             connecting_tasks: std::collections::HashMap::new(),
             last_remote_size: (120, 24),
             remote_size_changed_at: None,
+            disconnect_confirm: None,
             resize_debounce_cancel: None,
 
             zoom_level: 0.85,

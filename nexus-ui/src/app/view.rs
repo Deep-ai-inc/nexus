@@ -35,9 +35,11 @@ impl NexusState {
             col = col.push(crate::ui::widgets::BreadcrumbBar {
                 local_host: "local",
                 stack: &remote.backend_stack,
+                current_env: Some(&remote.env),
                 state: remote.state,
                 rtt_ms: if rtt > 0 { Some(rtt) } else { None },
                 unnesting_to: None,
+                confirm_active: self.disconnect_confirm.is_some(),
             });
         }
 

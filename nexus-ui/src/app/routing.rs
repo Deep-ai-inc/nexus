@@ -446,11 +446,16 @@ fn route_widget_click(
 
     // Breadcrumb segments — unnest to clicked level
     if state.remote.is_some() {
-        let stack_len = state.remote.as_ref().map_or(0, |r| r.backend_stack.len()) + 1;
-        for depth in 0..stack_len {
+        let stack_len = state.remote.as_ref().map_or(0, |r| r.backend_stack.len());
+        // depth 0 = local, 1..stack_len = stack entries
+        for depth in 0..=stack_len {
             if id == source_ids::breadcrumb_segment(depth) {
                 return Some(MouseResponse::message(NexusMessage::UnnestToLevel(depth)));
             }
+        }
+        // Current env segment (stack_len + 1) — no-op, already there
+        if id == source_ids::breadcrumb_segment(stack_len + 1) {
+            return Some(MouseResponse::none());
         }
     }
 

@@ -42,6 +42,8 @@ pub enum NexusMessage {
     ScrollToJob(u32),
     /// Unnest remote connection to the specified depth (0 = disconnect entirely).
     UnnestToLevel(usize),
+    /// Disconnect confirmation timeout expired (3s elapsed without second click).
+    DisconnectConfirmExpired,
     /// Remote connection state changed (from reconnect task).
     RemoteStateChanged(crate::features::shell::remote::ConnectionState),
     /// Reconnection succeeded — swap transport.
