@@ -66,12 +66,15 @@ pub struct Attachment {
 pub struct NexusShared {
     /// Global block ID counter — ensures unique IDs across all windows.
     pub next_block_id: Arc<AtomicU64>,
+    /// Hues assigned to existing windows, for max-distance tint selection.
+    pub window_hues: Arc<std::sync::Mutex<Vec<f32>>>,
 }
 
 impl Default for NexusShared {
     fn default() -> Self {
         Self {
             next_block_id: Arc::new(AtomicU64::new(1)),
+            window_hues: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -132,9 +135,26 @@ pub struct NexusState {
     last_cursor_blink: bool,
     pub context: NexusContext,
 
+    /// Per-window background tint color (subtle hue to distinguish windows).
+    pub window_tint: strata::primitives::Color,
+    /// This window's hue value (for removal on drop).
+    window_hue: f32,
+    /// Shared hue list (for removal on drop).
+    window_hues: Arc<std::sync::Mutex<Vec<f32>>>,
+
     /// Debug mode for layout visualization (toggle with Cmd+Shift+D).
     #[cfg(debug_assertions)]
     pub debug_layout: bool,
+}
+
+impl Drop for NexusState {
+    fn drop(&mut self) {
+        if let Ok(mut hues) = self.window_hues.lock() {
+            if let Some(pos) = hues.iter().position(|&h| h == self.window_hue) {
+                hues.swap_remove(pos);
+            }
+        }
+    }
 }
 
 // =========================================================================
@@ -536,6 +556,14 @@ impl RootComponent for NexusState {
 
         let context = NexusContext::new(home.clone());
 
+        // Pick a hue maximally distant from all existing windows.
+        let (window_hue, window_tint) = {
+            let mut hues = shared.window_hues.lock().unwrap();
+            let hue = crate::ui::theme::next_hue(&hues);
+            hues.push(hue);
+            (hue, crate::ui::theme::tinted_bg(hue))
+        };
+
         // Sync the kernel's internal CWD to match this window's starting dir.
         kernel.state_mut().set_cwd(home).ok();
 
@@ -578,6 +606,9 @@ impl RootComponent for NexusState {
             last_frame: Cell::new(Instant::now()),
             fps_smooth: Cell::new(0.0),
             last_cursor_blink: true,
+            window_tint,
+            window_hue,
+            window_hues: shared.window_hues.clone(),
             context,
             #[cfg(debug_assertions)]
             debug_layout: false,
@@ -603,7 +634,7 @@ impl RootComponent for NexusState {
     }
 
     fn background_color(&self) -> strata::primitives::Color {
-        crate::ui::theme::BG_APP
+        self.window_tint
     }
 
     fn should_exit(&self) -> bool {

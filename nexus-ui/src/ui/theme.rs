@@ -4,7 +4,7 @@ use strata::primitives::Color;
 
 // Backgrounds (darker charcoal matching Claude Code)
 pub const BG_APP: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
-pub const BG_BLOCK: Color = Color { r: 0.09, g: 0.09, b: 0.1, a: 1.0 };
+pub const BG_BLOCK: Color = Color { r: 0.09, g: 0.09, b: 0.1, a: 0.6 };
 pub const BG_INPUT: Color = Color { r: 0.08, g: 0.08, b: 0.09, a: 1.0 };
 
 // Status (softer tones matching Claude Code)
@@ -54,3 +54,53 @@ pub const WELCOME_TITLE: Color = Color { r: 0.6, g: 0.8, b: 0.6, a: 1.0 };
 pub const WELCOME_HEADING: Color = Color { r: 0.8, g: 0.7, b: 0.5, a: 1.0 };
 pub const CARD_BG: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.03 };
 pub const CARD_BORDER: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 0.06 };
+
+/// Pick a hue maximally distant from existing hues on the color wheel.
+/// Returns a hue in 0.0–360.0. If `existing` is empty, returns 210° (cool blue).
+pub fn next_hue(existing: &[f32]) -> f32 {
+    if existing.is_empty() {
+        return 210.0;
+    }
+    let mut sorted: Vec<f32> = existing.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Find the largest angular gap (including wrap-around)
+    let mut best_gap = 0.0_f32;
+    let mut best_mid = sorted[0] / 2.0; // default: gap from 0 to first
+    for i in 0..sorted.len() {
+        let next = if i + 1 < sorted.len() {
+            sorted[i + 1]
+        } else {
+            sorted[0] + 360.0
+        };
+        let gap = next - sorted[i];
+        if gap > best_gap {
+            best_gap = gap;
+            best_mid = sorted[i] + gap / 2.0;
+        }
+    }
+    best_mid % 360.0
+}
+
+/// Produce a subtle tint of `BG_APP` at the given hue (0–360).
+/// The tint is barely perceptible but distinguishable between adjacent windows.
+pub fn tinted_bg(hue: f32) -> Color {
+    let strength = 0.08_f32;
+    // Convert hue to an RGB unit vector
+    let h = (hue % 360.0) / 60.0;
+    let sector = h as u32;
+    let frac = h - sector as f32;
+    let (dr, dg, db) = match sector {
+        0 => (1.0, frac, 0.0),
+        1 => (1.0 - frac, 1.0, 0.0),
+        2 => (0.0, 1.0, frac),
+        3 => (0.0, 1.0 - frac, 1.0),
+        4 => (frac, 0.0, 1.0),
+        _ => (1.0, 0.0, 1.0 - frac),
+    };
+    Color {
+        r: BG_APP.r + dr * strength,
+        g: BG_APP.g + dg * strength,
+        b: BG_APP.b + db * strength,
+        a: 1.0,
+    }
+}
