@@ -89,7 +89,7 @@ The difference is invisible until you need it:
              │                           │
 ┌────────────▼──────────────┐ ┌──────────▼────────────────────────┐
 │  SHELL INTERPRETER        │ │  AGENT SYSTEM                     │
-│  nexus-kernel             │ │  nexus-agent                      │
+│  nexus-kernel             │ │  nexus-agent (AI)                 │
 │    ├─ Parser (tree-sitter)│ │    ├─ Agentic loop & tool system  │
 │    ├─ Evaluator (AST)     │ │    ├─ Session management          │
 │    ├─ 110+ native commands│ │    └─ ACP protocol integration    │
@@ -99,7 +99,7 @@ The difference is invisible until you need it:
 │  Execution paths:         │ │      (Anthropic, OpenAI, Ollama,  │
 │    Kernel → Value output  │ │       Vertex, Groq, Mistral,      │
 │    PTY    → raw terminal  │ │       Cerebras, OpenRouter, ...)   │
-│                           │ │    nexus-executor  Cmd execution  │
+│    Remote → nexus-agent   │ │    nexus-executor  Cmd execution  │
 │                           │ │    nexus-fs        File ops       │
 │                           │ │    nexus-web       Web & search   │
 │                           │ │    nexus-sandbox   Policy enforce │
@@ -112,6 +112,9 @@ The difference is invisible until you need it:
 │            | List | Table | Record | FileEntry | Process       │
 │            | GitStatus | GitCommit | Media | ...               │
 │                                                                 │
+│  nexus-protocol    Binary wire protocol (client ↔ remote agent)│
+│    Framed msgpack, flow control, session resume, priority lanes │
+│                                                                 │
 │  nexus-term        Headless terminal emulation                 │
 │    ANSI parsing via alacritty_terminal, virtual grid for TUIs  │
 │                                                                 │
@@ -121,13 +124,15 @@ The difference is invisible until you need it:
 Data flow:
   Input → Parser → CommandClassification
     ├─ Kernel path → Evaluator → Native cmd → Value → ShellEvent
-    └─ PTY path    → Subprocess → nexus-term (ANSI) → Grid → ShellEvent
+    ├─ PTY path    → Subprocess → nexus-term (ANSI) → Grid → ShellEvent
+    └─ Remote path → SSH/Docker/kubectl → nexus-agent → nexus-protocol → ShellEvent
   All ShellEvents → tokio broadcast → UI subscription → GPU render
 ```
 
 **Native commands** (ls, git, ps, etc.) return structured `Value` types.
 **Legacy commands** (vim, htop, etc.) run in a PTY with full terminal emulation.
-**The UI** renders both seamlessly through Strata, a custom GPU rendering engine with its own Metal pipeline, glyph atlas, and text shaping via cosmic-text.
+**Remote commands** run on a deployed agent via `nexus-protocol`, returning the same structured types over SSH/Docker/kubectl.
+**The UI** renders all three seamlessly through Strata, a custom GPU rendering engine with its own Metal pipeline, glyph atlas, and text shaping via cosmic-text.
 
 ## Status
 
@@ -141,10 +146,50 @@ Data flow:
 - Terminal emulation for TUI apps (vim, htop)
 - Output persistence and `|` continuation
 - AI agent with 13 LLM providers, tool use, and ACP protocol
-
-**In Progress:**
+- Remote shells via SSH, Docker, kubectl with auto-deployed agent
+- Connection progress overlay with real-time upload tracking
 - Interactive table rendering (click to sort/filter)
 - Semantic actions (right-click context menus)
+
+## Remote Shells — `ssh`, `docker exec`, `kubectl exec`
+
+Nexus extends its structured shell to remote machines. Type `ssh user@host` and Nexus automatically deploys a lightweight agent binary, establishing a full structured session on the remote — not a dumb PTY pipe.
+
+```bash
+ssh root@gpu-server          # deploys agent, connects with progress overlay
+docker exec -it my-container # same structured shell inside Docker
+kubectl exec my-pod          # and Kubernetes pods
+```
+
+**What happens under the hood:**
+
+1. **Agent deployment** — Nexus detects the remote architecture (`uname -m`), finds the matching agent binary, and uploads it over SSH stdin in 64KB chunks with a real-time progress bar. Version-keyed by protocol hash so multiple Nexus versions coexist.
+2. **Structured protocol** — The agent runs the same kernel as the local shell. Commands return typed `Value` objects (tables, file entries, git status) over a binary protocol — not escape codes. Native commands work identically on the remote.
+3. **Connection progress** — A native GUI overlay shows each stage: checking agent → detecting architecture → uploading (with progress bar) → connecting → connected. Ctrl+C cancels at any point.
+4. **Nesting** — Run `ssh` inside an SSH session. Each level gets its own agent. Breadcrumb bar shows the full chain. `exit` pops one level.
+5. **Reconnection** — If the connection drops, Nexus detects it and can re-establish the session. The agent persists on the remote with a 7-day idle timeout.
+
+```
+┌─────────────────────────────────────────────┐
+│ ● $ ssh root@gpu-server                     │
+│                                             │
+│   ⠹ Uploading agent...                     │
+│     12.5 MB                                 │
+│   ████████████░░░░░░░░  62%                │
+└─────────────────────────────────────────────┘
+```
+
+**Agent binary locations:**
+- Local: `~/.nexus/agents/nexus-agent-{target}` (e.g. `nexus-agent-x86_64-unknown-linux-musl`)
+- Remote: `~/.nexus/agent-{protocol_version}`
+
+Cross-compile the agent:
+```bash
+docker run --rm -v "$(pwd)":/src -w /src messense/rust-musl-cross:x86_64-musl \
+  cargo build --release -p nexus-agent --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/nexus-agent \
+  ~/.nexus/agents/nexus-agent-x86_64-unknown-linux-musl
+```
 
 ## Reactive Streaming Pipelines — `watch`
 
