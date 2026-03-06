@@ -2,7 +2,7 @@
 //!
 //! Frame format:
 //! ```text
-//! [len: u32 LE] [priority: u8] [payload: rmp-serde encoded Request/Response]
+//! [len: u32 LE] [priority: u8] [flags: u8] [payload: rmp-serde encoded Request/Response]
 //! ```
 //!
 //! The codec maintains a priority queue for outbound frames, draining
@@ -19,8 +19,12 @@ use crate::MAX_FRAME_PAYLOAD;
 /// Maximum total frame size (header + payload). 32 MB safety limit.
 const MAX_FRAME_SIZE: u32 = 32 * 1024 * 1024;
 
-/// Frame header size: 4 bytes length + 1 byte priority.
-const HEADER_SIZE: usize = 5;
+/// Frame header size: 4 bytes length + 1 byte priority + 1 byte flags.
+const HEADER_SIZE: usize = 6;
+
+/// Flag indicating the frame contains a `Response::Event`.
+/// Used by relay readers to skip msgpack decode for non-event frames.
+pub const FLAG_EVENT: u8 = 1;
 
 #[derive(Debug, Error)]
 pub enum CodecError {
@@ -79,6 +83,7 @@ where
 
         let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let _priority = header[4];
+        let _flags = header[5];
 
         if len > MAX_FRAME_SIZE {
             return Err(CodecError::FrameTooLarge { size: len });
@@ -102,7 +107,7 @@ where
     ///
     /// For priority-aware sending, use [`enqueue`] + [`flush_queues`] instead.
     pub async fn write<T: Serialize>(&mut self, msg: &T, priority: u8) -> Result<(), CodecError> {
-        let frame = encode_frame(msg, priority)?;
+        let frame = encode_frame(msg, priority, 0)?;
         self.writer.write_all(&frame).await?;
         self.writer.flush().await?;
         Ok(())
@@ -110,7 +115,7 @@ where
 
     /// Enqueue a message for priority-aware sending.
     pub fn enqueue<T: Serialize>(&mut self, msg: &T, priority: u8) -> Result<(), CodecError> {
-        let frame = encode_frame(msg, priority)?;
+        let frame = encode_frame(msg, priority, 0)?;
         let idx = (priority as usize).min(2);
         self.write_queues[idx].push_back(frame);
         Ok(())
@@ -165,6 +170,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
         let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let _priority = header[4];
+        let _flags = header[5];
 
         if len > MAX_FRAME_SIZE {
             return Err(CodecError::FrameTooLarge { size: len });
@@ -181,6 +187,41 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
         rmp_serde::from_slice(&payload).map_err(|e| CodecError::Deserialize(e.to_string()))
     }
+
+    /// Read the next raw frame without deserializing.
+    ///
+    /// Writes the payload into `buf` (clearing it first) and returns `(priority, flags)`.
+    /// Used by relay readers to avoid decoding non-event frames.
+    pub async fn read_raw(&mut self, buf: &mut Vec<u8>) -> Result<(u8, u8), CodecError> {
+        let mut header = [0u8; HEADER_SIZE];
+        match self.reader.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(CodecError::ConnectionClosed);
+            }
+            Err(e) => return Err(CodecError::Io(e)),
+        }
+
+        let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let priority = header[4];
+        let flags = header[5];
+
+        if len > MAX_FRAME_SIZE {
+            return Err(CodecError::FrameTooLarge { size: len });
+        }
+
+        buf.clear();
+        buf.resize(len as usize, 0);
+        self.reader
+            .read_exact(buf)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => CodecError::ConnectionClosed,
+                _ => CodecError::Io(e),
+            })?;
+
+        Ok((priority, flags))
+    }
 }
 
 /// Write half of a frame codec.
@@ -192,7 +233,7 @@ pub struct FrameWriter<W> {
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     /// Serialize and write a message immediately.
     pub async fn write<T: Serialize>(&mut self, msg: &T, priority: u8) -> Result<(), CodecError> {
-        let frame = encode_frame(msg, priority)?;
+        let frame = encode_frame(msg, priority, 0)?;
         self.writer.write_all(&frame).await?;
         self.writer.flush().await?;
         Ok(())
@@ -201,7 +242,20 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     /// Write a pre-serialized payload (from `encode_payload`) with framing header.
     ///
     /// Used for replaying ring buffer contents without re-serialization.
+    /// Flags are set to 0.
     pub async fn write_raw(&mut self, payload: &[u8], priority: u8) -> Result<(), CodecError> {
+        self.write_raw_flagged(payload, priority, 0).await
+    }
+
+    /// Write a pre-serialized payload with explicit flags.
+    ///
+    /// Used by event writers to set `FLAG_EVENT` for relay optimization.
+    pub async fn write_raw_flagged(
+        &mut self,
+        payload: &[u8],
+        priority: u8,
+        flags: u8,
+    ) -> Result<(), CodecError> {
         let len = payload.len() as u32;
         if len > MAX_FRAME_SIZE {
             return Err(CodecError::FrameTooLarge { size: len });
@@ -209,6 +263,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
         frame.extend_from_slice(&len.to_le_bytes());
         frame.push(priority);
+        frame.push(flags);
         frame.extend_from_slice(payload);
         self.writer.write_all(&frame).await?;
         self.writer.flush().await?;
@@ -217,7 +272,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
 
     /// Enqueue a message for priority-aware sending.
     pub fn enqueue<T: Serialize>(&mut self, msg: &T, priority: u8) -> Result<(), CodecError> {
-        let frame = encode_frame(msg, priority)?;
+        let frame = encode_frame(msg, priority, 0)?;
         let idx = (priority as usize).min(2);
         self.write_queues[idx].push_back(frame);
         Ok(())
@@ -240,8 +295,8 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     }
 }
 
-/// Encode a message into a complete frame: [len: u32 LE][priority: u8][payload].
-fn encode_frame<T: Serialize>(msg: &T, priority: u8) -> Result<Vec<u8>, CodecError> {
+/// Encode a message into a complete frame: [len: u32 LE][priority: u8][flags: u8][payload].
+fn encode_frame<T: Serialize>(msg: &T, priority: u8, flags: u8) -> Result<Vec<u8>, CodecError> {
     let payload = rmp_serde::to_vec(msg).map_err(|e| CodecError::Serialize(e.to_string()))?;
     let len = payload.len() as u32;
 
@@ -252,6 +307,7 @@ fn encode_frame<T: Serialize>(msg: &T, priority: u8) -> Result<Vec<u8>, CodecErr
     let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
     frame.extend_from_slice(&len.to_le_bytes());
     frame.push(priority);
+    frame.push(flags);
     frame.extend_from_slice(&payload);
     Ok(frame)
 }
@@ -315,6 +371,7 @@ mod tests {
     #[tokio::test]
     async fn round_trip_response() {
         let env = EnvInfo {
+            instance_id: String::new(),
             user: "alice".into(),
             hostname: "devbox".into(),
             cwd: PathBuf::from("/home/alice"),
@@ -591,6 +648,7 @@ mod tests {
                 session_token: [0u8; 16],
                 last_seen_seq: 42,
             },
+            Request::CancelFileRead { id: 42 },
             Request::Shutdown,
         ];
 
@@ -606,6 +664,7 @@ mod tests {
     #[tokio::test]
     async fn all_response_variants() {
         let env = EnvInfo {
+            instance_id: String::new(),
             user: "test".into(),
             hostname: "host".into(),
             cwd: PathBuf::from("/home/test"),
@@ -668,6 +727,7 @@ mod tests {
             },
             Response::ChildLost {
                 reason: "connection reset".into(),
+                surviving_env: env.clone(),
             },
             Response::GrantCredits { bytes: 65536 },
             Response::Pong { seq: 1 },

@@ -266,9 +266,59 @@ impl NexusState {
                 last_seen_seq,
                 response_rx,
                 env,
+                child,
+                session_token,
             } => {
+                // Orphan cleanup: terminate running blocks that have no local PTY handle.
+                // The fresh agent has no running blocks, so these would spin forever.
+                if self.remote.is_some() {
+                    let orphan_ids: Vec<nexus_api::BlockId> = self
+                        .shell
+                        .blocks
+                        .blocks
+                        .iter()
+                        .filter(|b| b.is_running() && !self.shell.pty.has_handle(b.id))
+                        .map(|b| b.id)
+                        .collect();
+                    for id in orphan_ids {
+                        let _ = self.kernel_tx.send(nexus_api::ShellEvent::StderrChunk {
+                            block_id: id,
+                            data: b"Connection lost \xe2\x80\x94 remote agent restarted\n".to_vec(),
+                        });
+                        let _ = self.kernel_tx.send(nexus_api::ShellEvent::CommandFinished {
+                            block_id: id,
+                            exit_code: -1,
+                            duration_ms: 0,
+                        });
+                    }
+                }
+
                 if let Some(ref mut remote) = self.remote {
                     if let Some(rx) = response_rx.lock().unwrap().take() {
+                        // Take child from Arc<Mutex<Option<>>>
+                        remote.set_child(child.lock().unwrap().take());
+                        remote.session_token = session_token;
+                        // Clear backend_stack — reconnection goes to a fresh agent, nested hops are lost.
+                        // Notify the user if they had nested sessions.
+                        if !remote.backend_stack.is_empty() {
+                            let depth = remote.backend_stack.len();
+                            let msg = format!(
+                                "Connection restored to outermost host. \
+                                 {} nested session{} lost during disconnect.\n",
+                                depth,
+                                if depth == 1 { " was" } else { "s were" },
+                            );
+                            // Emit into the most recent running block, or just log
+                            if let Some(last_block) = self.shell.blocks.blocks.last() {
+                                let _ = self.kernel_tx.send(nexus_api::ShellEvent::StderrChunk {
+                                    block_id: last_block.id,
+                                    data: msg.into_bytes(),
+                                });
+                            } else {
+                                tracing::warn!("{}", msg.trim());
+                            }
+                            remote.backend_stack.clear();
+                        }
                         remote.swap_request_tx(request_tx);
                         remote.rtt_ms = rtt_ms;
                         remote.last_seen_seq = last_seen_seq;
@@ -276,6 +326,43 @@ impl NexusState {
                         remote.env = env;
                         remote.state = crate::features::shell::remote::ConnectionState::Connected;
                         remote.flush_queue();
+                    }
+                }
+
+                self.reconnect_cancel = None;
+                Command::none()
+            }
+            NexusMessage::RemoteResumed {
+                request_tx,
+                rtt_ms,
+                last_seen_seq,
+                response_rx,
+                env,
+                child,
+            } => {
+                // Seamless resume — the agent is the same process, all blocks are
+                // still running. Do NOT kill orphans or clear the backend stack.
+                if let Some(ref mut remote) = self.remote {
+                    if let Some(rx) = response_rx.lock().unwrap().take() {
+                        remote.set_child(child.lock().unwrap().take());
+                        remote.swap_request_tx(request_tx);
+                        remote.rtt_ms = rtt_ms;
+                        remote.last_seen_seq = last_seen_seq;
+                        remote.response_rx = rx;
+                        remote.env = env;
+                        remote.state = crate::features::shell::remote::ConnectionState::Connected;
+                        remote.flush_queue();
+                    }
+                }
+
+                self.reconnect_cancel = None;
+                Command::none()
+            }
+            NexusMessage::ReconnectFailed => {
+                self.reconnect_cancel = None;
+                if let Some(ref mut remote) = self.remote {
+                    if remote.state == crate::features::shell::remote::ConnectionState::Reconnecting {
+                        remote.state = crate::features::shell::remote::ConnectionState::Disconnected;
                     }
                 }
                 Command::none()
@@ -293,8 +380,9 @@ impl NexusState {
                 Command::none()
             }
             NexusMessage::Tick => {
-                self.on_output_arrived();
-                self.check_reconnect()
+                // on_output_arrived + check_reconnect are now called from on_tick()
+                // (runs every frame). This handler exists only for resize debounce.
+                Command::none()
             }
             NexusMessage::FileDrop(m) => self.dispatch_file_drop(m),
             NexusMessage::Drag(m) => { self.dispatch_drag(m, ctx); Command::none() }
@@ -393,6 +481,10 @@ impl NexusState {
         if !is_agent && text.trim() == "exit" && self.remote.is_some() {
             let remote = self.remote.as_mut().unwrap();
             if remote.backend_stack.is_empty() {
+                // Cancel any in-flight reconnection
+                if let Some(cancel) = self.reconnect_cancel.take() {
+                    cancel.cancel();
+                }
                 // Outermost remote level — shutdown and disconnect
                 let mut remote = self.remote.take().unwrap();
                 remote.shutdown();
@@ -460,7 +552,7 @@ impl NexusState {
                 // Already connected — nest via the existing connection
                 if let Some(ref mut remote) = self.remote {
                     if let Some(transport) = parse_remote_command(&ssh_command) {
-                        remote.nest(transport);
+                        remote.nest(transport, block_id);
                     }
                     return cmds;
                 }
@@ -550,7 +642,7 @@ impl NexusState {
 
         progress.emit("Connecting...", None, None);
         let forwarded_env = collect_forwarded_env();
-        let (handle, env, _session_token, request_tx) =
+        let (handle, env, session_token, request_tx) =
             crate::features::shell::remote::transport::TransportHandle::connect(
                 &transport,
                 &agent_path,
@@ -575,6 +667,9 @@ impl NexusState {
             handle.last_seen_seq,
             handle.response_rx,
             Some(handle.child),
+            transport.clone(),
+            agent_path.clone(),
+            session_token,
         );
 
         Ok((remote, env))
@@ -604,8 +699,8 @@ impl NexusState {
     }
 
     /// Check if we need to start a reconnection attempt.
-    /// Called on each Tick. Only triggers once (state transition Disconnected → Reconnecting).
-    fn check_reconnect(&mut self) -> Command<NexusMessage> {
+    /// Called on each tick. Only triggers once (state transition Disconnected → Reconnecting).
+    pub(super) fn check_reconnect(&mut self) -> Command<NexusMessage> {
         use crate::features::shell::remote::ConnectionState;
 
         // Detect SSH child death → mark as Disconnected
@@ -625,26 +720,47 @@ impl NexusState {
             return Command::none();
         }
 
+        // Guard: don't spawn a second reconnect task
+        if self.reconnect_cancel.is_some() {
+            return Command::none();
+        }
+
         // Transition to Reconnecting so we don't spawn multiple tasks
         if let Some(ref mut remote) = self.remote {
             remote.state = ConnectionState::Reconnecting;
         }
 
-        // We need the SSH command to reconnect. For now, we don't store the original
-        // SSH command, so reconnection would need the environment info.
-        // Since the transport handle doesn't persist the destination, we can't
-        // reconnect without it. This is a limitation — for a full implementation,
-        // we'd store the SSH destination in RemoteBackend.
-        //
-        // For now, just set the state and let the user reconnect manually or
-        // use UnnestToLevel(0) to disconnect.
-        tracing::info!("remote connection lost, state set to Reconnecting");
-        Command::none()
+        let remote = self.remote.as_ref().unwrap();
+        let transport = remote.transport.clone();
+        let agent_path = remote.agent_path.clone();
+        let instance_id = remote.env.instance_id.clone();
+        let session_token = remote.session_token;
+        let last_seen_seq = remote.last_seen_seq.load(std::sync::atomic::Ordering::Relaxed);
+        let kernel_tx = self.kernel_tx.clone();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.reconnect_cancel = Some(cancel.clone());
+
+        tracing::info!("remote connection lost, starting reconnect loop");
+
+        Command::perform(reconnect_loop(
+            transport,
+            agent_path,
+            instance_id,
+            session_token,
+            last_seen_seq,
+            kernel_tx,
+            cancel,
+        ))
     }
 
     /// Handle breadcrumb click: unnest to the specified depth.
     fn handle_unnest_to_level(&mut self, level: usize) {
         if level == 0 {
+            // Cancel any in-flight reconnection first
+            if let Some(cancel) = self.reconnect_cancel.take() {
+                cancel.cancel();
+            }
             // Disconnect entirely
             self.disconnect_confirm = None;
             if let Some(mut remote) = self.remote.take() {
@@ -1446,6 +1562,120 @@ fn convert_completion_kind(kind: nexus_protocol::messages::CompletionKind) -> ne
         nexus_protocol::messages::CompletionKind::GitBranch => nexus_kernel::CompletionKind::GitBranch,
         nexus_protocol::messages::CompletionKind::Flag => nexus_kernel::CompletionKind::Flag,
     }
+}
+
+/// Async reconnection loop with exponential backoff.
+///
+/// Two-phase approach per attempt:
+///   1. Try `Resume` with the stored session token — if the agent is still alive
+///      (e.g. running as a daemon or the UDS is intact), we seamlessly continue
+///      without killing orphan blocks or clearing the nesting stack.
+///   2. If Resume fails (agent restarted, token invalid, server rebooted), fall
+///      back to a fresh `Hello` handshake — this triggers orphan cleanup and
+///      stack clearing on the UI side.
+///
+/// Tries up to 10 times with delays [1, 2, 4, 8, 16, 30, 30, 30, 30, 30] seconds.
+async fn reconnect_loop(
+    transport: nexus_protocol::messages::Transport,
+    agent_path: String,
+    instance_id: String,
+    session_token: [u8; 16],
+    last_seen_seq: u64,
+    kernel_tx: tokio::sync::broadcast::Sender<nexus_api::ShellEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> NexusMessage {
+    let delays = [1, 2, 4, 8, 16, 30, 30, 30, 30, 30];
+
+    for (attempt, &delay_secs) in delays.iter().enumerate() {
+        // Wait before attempt (cancellable)
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+            _ = cancel.cancelled() => {
+                tracing::info!("reconnect cancelled");
+                return NexusMessage::ReconnectFailed;
+            }
+        }
+
+        tracing::info!("reconnect attempt {}/{}", attempt + 1, delays.len());
+
+        // Phase 1: Try Resume (session token still valid → seamless reconnect)
+        let attach_id = if instance_id.is_empty() { None } else { Some(instance_id.as_str()) };
+        let resume_future = crate::features::shell::remote::transport::TransportHandle::resume(
+            &transport,
+            &agent_path,
+            attach_id,
+            session_token,
+            last_seen_seq,
+            kernel_tx.clone(),
+        );
+
+        let resume_result = tokio::select! {
+            res = resume_future => res,
+            _ = cancel.cancelled() => {
+                tracing::info!("reconnect cancelled during resume attempt");
+                return NexusMessage::ReconnectFailed;
+            }
+        };
+
+        match resume_result {
+            Ok((handle, env, request_tx)) => {
+                let child = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.child)));
+                let response_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
+                tracing::info!("resumed session on {}@{}", env.user, env.hostname);
+                return NexusMessage::RemoteResumed {
+                    request_tx,
+                    rtt_ms: handle.rtt_ms,
+                    last_seen_seq: handle.last_seen_seq,
+                    response_rx,
+                    env,
+                    child,
+                };
+            }
+            Err(e) => {
+                tracing::info!("resume failed (expected if agent restarted): {e}");
+            }
+        }
+
+        // Phase 2: Fall back to fresh Hello (agent restarted → orphan cleanup on UI side)
+        let forwarded_env = collect_forwarded_env();
+        let connect_future = crate::features::shell::remote::transport::TransportHandle::connect(
+            &transport,
+            &agent_path,
+            forwarded_env,
+            kernel_tx.clone(),
+        );
+
+        let connect_result = tokio::select! {
+            res = connect_future => res,
+            _ = cancel.cancelled() => {
+                tracing::info!("reconnect cancelled during fresh connect attempt");
+                return NexusMessage::ReconnectFailed;
+            }
+        };
+
+        match connect_result {
+            Ok((handle, env, new_session_token, request_tx)) => {
+                let child = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.child)));
+                let response_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
+                tracing::info!("reconnected (fresh) to {}@{}", env.user, env.hostname);
+                return NexusMessage::RemoteReconnected {
+                    request_tx,
+                    rtt_ms: handle.rtt_ms,
+                    last_seen_seq: handle.last_seen_seq,
+                    response_rx,
+                    env,
+                    child,
+                    session_token: new_session_token,
+                };
+            }
+            Err(e) => {
+                tracing::warn!("reconnect attempt {} failed: {}", attempt + 1, e);
+            }
+        }
+    }
+
+    tracing::error!("reconnect failed after {} attempts", delays.len());
+    NexusMessage::ReconnectFailed
 }
 
 /// Collect environment variables to forward to the remote agent.

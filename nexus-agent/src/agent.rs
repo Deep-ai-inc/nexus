@@ -2,22 +2,36 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
 use nexus_api::{BlockId, ShellEvent};
 use nexus_kernel::Kernel;
-use nexus_protocol::codec::{decode_payload, FrameCodec, FrameWriter};
+use nexus_protocol::codec::{decode_payload, encode_payload, FrameCodec, FrameReader, FrameWriter, FLAG_EVENT};
 use nexus_protocol::messages::*;
 use nexus_protocol::priority;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, Semaphore};
 
 use crate::pty::PtyManager;
+use crate::relay::{self, ActiveRelay};
 use crate::session::RingBuffer;
+
+/// Exit reason from the relay loop.
+enum RelayExit {
+    /// Child agent died or its pipe closed.
+    ChildLost(String),
+    /// Parent disconnected (reader returned ConnectionClosed).
+    ParentDisconnected,
+    /// Client sent Shutdown (clean exit).
+    Shutdown,
+}
 
 /// The remote agent. Wraps a `Kernel` and speaks the Nexus wire protocol.
 pub struct Agent {
+    /// Unique identifier for this agent session (UUID v4).
+    instance_id: String,
     kernel: Arc<Mutex<Kernel>>,
     kernel_rx: broadcast::Receiver<ShellEvent>,
     idle_timeout_secs: u64,
@@ -25,8 +39,6 @@ pub struct Agent {
     next_seq: u64,
     /// Ring buffer for session resume.
     ring_buffer: RingBuffer,
-    /// Next request ID tracker (for generating unique IDs internally).
-    next_id: u32,
     /// Terminal viewport dimensions (for native commands like `ls`).
     viewport_cols: u16,
     viewport_rows: u16,
@@ -37,6 +49,13 @@ pub struct Agent {
     /// Credit-based flow control semaphore.
     /// Permits represent bytes the client has granted for sending.
     credits: Arc<Semaphore>,
+    /// IDs of file reads that have been cancelled by the client.
+    /// Checked by spawned file-read tasks on each chunk iteration.
+    cancelled_reads: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    /// Active relay to a nested child agent (persists across disconnects).
+    active_relay: Option<ActiveRelay>,
+    /// Environment variables forwarded from the client (for nesting).
+    forwarded_env: HashMap<String, String>,
 }
 
 impl Agent {
@@ -44,18 +63,32 @@ impl Agent {
         let (kernel, kernel_rx) = Kernel::new()?;
 
         Ok(Self {
+            instance_id: uuid::Uuid::new_v4().to_string(),
             kernel: Arc::new(Mutex::new(kernel)),
             kernel_rx,
             idle_timeout_secs,
             next_seq: 1,
             ring_buffer: RingBuffer::new(1024 * 1024), // 1 MB default
-            next_id: 0,
             viewport_cols: 80,
             viewport_rows: 24,
             pty_manager: PtyManager::new(),
             session_token: None,
             credits: Arc::new(Semaphore::new(0)),
+            cancelled_reads: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            active_relay: None,
+            forwarded_env: HashMap::new(),
         })
+    }
+
+    /// Returns the unique instance ID for this agent session.
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Returns true if the agent should persist after a parent disconnect
+    /// (has active relay or running PTY sessions).
+    pub fn should_persist(&self) -> bool {
+        self.active_relay.is_some() || self.pty_manager.has_active_sessions()
     }
 
     /// Main loop: read requests from `input`, write responses to `output`.
@@ -64,57 +97,41 @@ impl Agent {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        // Drain stale credits from a previous connection
+        let stale = self.credits.available_permits();
+        if stale > 0 {
+            let _ = self.credits.acquire_many(stale as u32).await;
+            // permits are dropped immediately, resetting to 0
+        }
+
         let codec = FrameCodec::new(input, output);
         let (mut reader, writer) = codec.into_parts();
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
-        // Spawn kernel event forwarder
-        let event_writer = writer.clone();
-        let kernel_tx = self.kernel.lock().await.event_sender().clone();
-        let mut event_rx = kernel_tx.subscribe();
+        // Move ring buffer into Arc<Mutex<>> for sharing with tasks
         let ring_buffer = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
             &mut self.ring_buffer,
             RingBuffer::new(0),
         )));
 
-        let next_seq = Arc::new(std::sync::atomic::AtomicU64::new(self.next_seq));
-        let next_seq_clone = next_seq.clone();
-        let ring_clone = ring_buffer.clone();
-        let ring_sender = ring_buffer.clone();
+        let next_seq = Arc::new(AtomicU64::new(self.next_seq));
         let credits = self.credits.clone();
+        let kernel_tx = self.kernel.lock().await.event_sender().clone();
 
-        // Two-stage event pipeline using RingBuffer as the queue:
-        //
-        // Stage 1 (collector): reads kernel events, assigns seq numbers,
-        //   pushes to ring buffer, and notifies the sender. Never blocks
-        //   on flow control — the ring buffer is always populated.
-        //
-        // Stage 2 (sender): wakes on Notify, drains unsent frames from
-        //   the ring buffer, acquires flow control credits, writes raw
-        //   frames to the wire. May block on credits without causing
-        //   event loss — the ring buffer retains everything.
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let notify_clone = notify.clone();
+        // =====================================================================
+        // Event pipeline: collector → event_queue → sender (assigns seq inside
+        // writer lock to guarantee wire order = seq order)
+        // =====================================================================
 
+        let (event_queue_tx, mut event_queue_rx) = mpsc::unbounded_channel::<ShellEvent>();
+
+        // Collector: reads kernel events, pushes to unbounded channel
+        let mut event_rx = kernel_tx.subscribe();
         let collector_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
-                        let seq =
-                            next_seq_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let resp = Response::Event {
-                            seq,
-                            event: event.clone(),
-                        };
-
-                        // Always buffer for resume — never gated by flow control
-                        {
-                            let mut rb = ring_clone.lock().await;
-                            rb.push(&resp);
-                        }
-
-                        // Wake the sender (non-blocking, never fails)
-                        notify_clone.notify_one();
+                        let _ = event_queue_tx.send(event);
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!("event forwarder lagged by {n} events");
@@ -124,39 +141,94 @@ impl Agent {
             }
         });
 
+        // Sender: pops events, acquires credits, assigns seq inside writer lock
+        let event_writer = writer.clone();
+        let sender_next_seq = next_seq.clone();
+        let sender_ring = ring_buffer.clone();
+        let sender_credits = credits.clone();
+
         let sender_task = tokio::spawn(async move {
-            let mut last_sent_seq: u64 = 0;
-
-            loop {
-                notify.notified().await;
-
-                // Drain all unsent frames from the ring buffer
-                let pending = {
-                    let rb = ring_sender.lock().await;
-                    rb.drain_since(last_sent_seq)
+            while let Some(event) = event_queue_rx.recv().await {
+                // Encode with placeholder seq to estimate size for credit acquisition.
+                // The real seq is assigned inside the writer lock below.
+                let size_est = {
+                    let placeholder = Response::Event {
+                        seq: 0,
+                        event: event.clone(),
+                    };
+                    match encode_payload(&placeholder) {
+                        Ok(bytes) => bytes.len(),
+                        Err(_) => continue,
+                    }
                 };
 
-                for (seq, payload) in pending {
-                    // Acquire flow control credits
-                    let frame_size = payload.len();
-                    let _ = credits.acquire_many(frame_size as u32).await;
+                // Acquire credits outside lock (avoids holding lock while blocked)
+                match sender_credits.acquire_many(size_est.max(1) as u32).await {
+                    Ok(permit) => permit.forget(),
+                    Err(_) => return, // semaphore closed
+                }
 
-                    // Write raw frame (no re-serialization)
-                    let mut w = event_writer.lock().await;
-                    if w.write_raw(&payload, nexus_protocol::priority::INTERACTIVE)
-                        .await
-                        .is_err()
-                    {
-                        return; // Connection lost
+                // Lock writer → assign seq → encode → push to ring buffer → write
+                let mut w = event_writer.lock().await;
+                let seq = sender_next_seq.fetch_add(1, Ordering::Relaxed);
+                let resp = Response::Event { seq, event };
+                let payload = match encode_payload(&resp) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!("failed to encode event: {e}");
+                        continue;
                     }
-
-                    last_sent_seq = seq;
+                };
+                {
+                    sender_ring.lock().await.push_raw(seq, payload.clone());
+                }
+                if w.write_raw_flagged(&payload, priority::INTERACTIVE, FLAG_EVENT)
+                    .await
+                    .is_err()
+                {
+                    return; // Connection lost
                 }
             }
         });
 
+        // =====================================================================
         // Main request loop
+        // =====================================================================
         loop {
+            // If we have an active relay, enter relay mode
+            if let Some(mut active_relay) = self.active_relay.take() {
+                let exit = Self::relay_loop(
+                    &mut reader,
+                    &mut active_relay.child_writer,
+                    &mut active_relay.child_lost_rx,
+                    &writer,
+                    &self.credits,
+                    &mut self.viewport_cols,
+                    &mut self.viewport_rows,
+                    &self.kernel,
+                    &self.instance_id,
+                )
+                .await;
+
+                match exit {
+                    RelayExit::ChildLost(reason) => {
+                        tracing::info!("child lost: {reason}");
+                        active_relay.cleanup().await;
+                        // Fall through to normal dispatch
+                    }
+                    RelayExit::ParentDisconnected => {
+                        // Relay stays alive for reconnection
+                        self.active_relay = Some(active_relay);
+                        break;
+                    }
+                    RelayExit::Shutdown => {
+                        active_relay.cleanup().await;
+                        break;
+                    }
+                }
+                continue;
+            }
+
             let request: Request = match reader.read().await {
                 Ok(req) => req,
                 Err(nexus_protocol::codec::CodecError::ConnectionClosed) => {
@@ -200,9 +272,7 @@ impl Agent {
                 }
 
                 Request::CancelBlock { id: _, block_id } => {
-                    // Cancel via kernel's cancel mechanism
                     nexus_kernel::commands::cancel_block(block_id);
-                    // Also kill PTY process group if it's a PTY session
                     let _ = self.pty_manager.kill(block_id, libc::SIGINT);
                 }
 
@@ -259,7 +329,6 @@ impl Agent {
                 Request::TerminalResize { cols, rows } => {
                     self.viewport_cols = cols;
                     self.viewport_rows = rows;
-                    // Update COLUMNS/LINES env vars so native commands can query them
                     let mut kernel = self.kernel.lock().await;
                     kernel
                         .state_mut()
@@ -269,14 +338,27 @@ impl Agent {
                         .set_env("LINES".to_string(), rows.to_string());
                 }
 
+                Request::CancelFileRead { id } => {
+                    self.cancelled_reads.lock().unwrap().insert(id);
+                }
+
                 Request::FileRead {
                     id,
                     path,
                     offset,
                     len,
                 } => {
-                    self.handle_file_read(id, &path, offset, len, &writer)
-                        .await?;
+                    let writer = writer.clone();
+                    let cancelled = self.cancelled_reads.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            Self::handle_file_read_task(id, &path, offset, len, &writer, &cancelled)
+                                .await
+                        {
+                            tracing::error!("file read error (id={id}): {e}");
+                        }
+                        cancelled.lock().unwrap().remove(&id);
+                    });
                 }
 
                 Request::FileWrite {
@@ -291,26 +373,45 @@ impl Agent {
 
                 Request::Nest {
                     id,
-                    transport: _,
+                    transport,
                     force_redeploy: _,
                 } => {
-                    // TODO: Implement nesting
-                    let resp = Response::Error {
-                        id,
-                        message: "Nesting not yet implemented".into(),
-                    };
-                    let mut w = writer.lock().await;
-                    w.write(&resp, resp.priority()).await?;
+                    match relay::spawn_and_handshake(&transport, self.forwarded_env.clone()).await {
+                        Ok((child_reader, child_writer, child, env)) => {
+                            let (reader_task, child_lost_rx) = relay::start_relay_reader(
+                                child_reader,
+                                writer.clone(),
+                                credits.clone(),
+                                next_seq.clone(),
+                                ring_buffer.clone(),
+                            );
+                            self.active_relay = Some(ActiveRelay {
+                                child,
+                                child_writer,
+                                reader_task,
+                                child_lost_rx,
+                            });
+                            let resp = Response::NestOk { id, env };
+                            let mut w = writer.lock().await;
+                            w.write(&resp, resp.priority()).await?;
+                            // Next iteration enters relay mode
+                        }
+                        Err(e) => {
+                            let resp = Response::Error {
+                                id,
+                                message: format!("Nest failed: {e}"),
+                            };
+                            let mut w = writer.lock().await;
+                            w.write(&resp, resp.priority()).await?;
+                        }
+                    }
                 }
 
-                Request::Unnest { id } => {
-                    // TODO: Implement unnesting
-                    let resp = Response::Error {
-                        id,
-                        message: "Not in nested mode".into(),
-                    };
-                    let mut w = writer.lock().await;
-                    w.write(&resp, resp.priority()).await?;
+                Request::Unnest { id: _ } => {
+                    // Leaf node: shut down cleanly.
+                    // Parent detects child pipe EOF → sends ChildLost to its parent.
+                    self.pty_manager.shutdown_all();
+                    break;
                 }
 
                 Request::GrantCredits { bytes } => {
@@ -341,8 +442,113 @@ impl Agent {
 
         collector_task.abort();
         sender_task.abort();
-        self.pty_manager.shutdown_all();
+
+        // Save ring buffer and seq counter for next run() call
+        self.ring_buffer = ring_buffer.lock().await.take();
+        self.next_seq = next_seq.load(Ordering::Relaxed);
+
         Ok(())
+    }
+
+    /// Relay loop: forward requests between parent and child.
+    ///
+    /// Intercepts GrantCredits, Ping, TerminalResize locally.
+    /// Forwards everything else as raw bytes to child.
+    async fn relay_loop<R, W>(
+        reader: &mut FrameReader<R>,
+        child_writer: &mut FrameWriter<tokio::process::ChildStdin>,
+        child_lost_rx: &mut tokio::sync::oneshot::Receiver<String>,
+        parent_writer: &Arc<Mutex<FrameWriter<W>>>,
+        credits: &Arc<Semaphore>,
+        viewport_cols: &mut u16,
+        viewport_rows: &mut u16,
+        kernel: &Arc<Mutex<Kernel>>,
+        instance_id: &str,
+    ) -> RelayExit
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin + Send,
+    {
+        let mut buf = Vec::new();
+
+        loop {
+            tokio::select! {
+                result = reader.read_raw(&mut buf) => {
+                    let (req_priority, _flags) = match result {
+                        Ok(pf) => pf,
+                        Err(nexus_protocol::codec::CodecError::ConnectionClosed) => {
+                            tracing::info!("parent disconnected during relay");
+                            return RelayExit::ParentDisconnected;
+                        }
+                        Err(e) => {
+                            tracing::error!("relay read error: {e}");
+                            return RelayExit::ParentDisconnected;
+                        }
+                    };
+
+                    // Decode to decide routing
+                    let request: Request = match decode_payload(&buf) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("relay: failed to decode request: {e}");
+                            continue;
+                        }
+                    };
+
+                    match request {
+                        Request::GrantCredits { bytes } => {
+                            credits.add_permits(bytes as usize);
+                        }
+                        Request::Ping { seq } => {
+                            let resp = Response::Pong { seq };
+                            let mut w = parent_writer.lock().await;
+                            let _ = w.write(&resp, priority::CONTROL).await;
+                        }
+                        Request::TerminalResize { cols, rows } => {
+                            // Apply locally (correct dimensions when child disconnects)
+                            *viewport_cols = cols;
+                            *viewport_rows = rows;
+                            {
+                                let mut k = kernel.lock().await;
+                                k.state_mut().set_env("COLUMNS".to_string(), cols.to_string());
+                                k.state_mut().set_env("LINES".to_string(), rows.to_string());
+                            }
+                            // Forward to child
+                            if child_writer.write_raw(&buf, req_priority).await.is_err() {
+                                // Child write failed — will be caught by child_lost_rx
+                                continue;
+                            }
+                        }
+                        Request::Shutdown => {
+                            // Forward to child, then exit
+                            let _ = child_writer.write_raw(&buf, req_priority).await;
+                            return RelayExit::Shutdown;
+                        }
+                        _ => {
+                            // Forward raw to child (Execute, PtyInput, Unnest, CancelBlock, etc.)
+                            if child_writer.write_raw(&buf, req_priority).await.is_err() {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                reason = &mut *child_lost_rx => {
+                    let reason = reason.unwrap_or_else(|_| "child_lost channel dropped".to_string());
+
+                    // Send ChildLost with our own identity to parent
+                    let surviving_env = Self::collect_env_info_static(instance_id).await;
+                    let resp = Response::ChildLost {
+                        reason: reason.clone(),
+                        surviving_env,
+                    };
+                    let mut w = parent_writer.lock().await;
+                    let _ = w.write(&resp, resp.priority()).await;
+
+                    return RelayExit::ChildLost(reason);
+                }
+            }
+        }
     }
 
     async fn handle_hello<W: AsyncWrite + Unpin + Send>(
@@ -350,6 +556,9 @@ impl Agent {
         forwarded_env: HashMap<String, String>,
         writer: &Arc<tokio::sync::Mutex<FrameWriter<W>>>,
     ) -> Result<()> {
+        // Store forwarded env for nesting
+        self.forwarded_env = forwarded_env.clone();
+
         // Merge forwarded environment variables into kernel state
         {
             let mut kernel = self.kernel.lock().await;
@@ -368,7 +577,7 @@ impl Agent {
             capabilities: nexus_protocol::AgentCaps {
                 flow_control: true,
                 resume: true,
-                nesting: false,
+                nesting: true,
                 file_transfer: true,
                 pty: true,
             },
@@ -398,21 +607,17 @@ impl Agent {
             return Ok(());
         }
 
-        // Replay buffered events since last_seen_seq
+        // Replay buffered events since last_seen_seq using raw writes
         {
             let rb = ring_buffer.lock().await;
             let frames = rb.replay_since(last_seen_seq);
             let mut w = writer.lock().await;
             for payload in frames {
-                if let Ok(resp) = decode_payload::<Response>(payload) {
-                    let _ = w.write(&resp, resp.priority()).await;
-                }
+                let _ = w
+                    .write_raw_flagged(payload, priority::INTERACTIVE, FLAG_EVENT)
+                    .await;
             }
         }
-
-        // Reset flow control credits (stale credits from pre-disconnect)
-        // The client will send a fresh GrantCredits after resume.
-        self.credits = Arc::new(Semaphore::new(0));
 
         // Send session state
         let env = self.collect_env_info().await;
@@ -436,12 +641,8 @@ impl Agent {
     ) {
         let kernel = self.kernel.clone();
 
-        // Execute on the blocking thread pool — reuses the existing tokio
-        // runtime instead of spawning a new OS thread + reactor per command.
         tokio::task::spawn_blocking(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Use Handle::block_on to access the async kernel lock from
-                // the blocking thread, without creating a new runtime.
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(async {
                     let mut kernel = kernel.lock().await;
@@ -552,13 +753,14 @@ impl Agent {
         Ok(())
     }
 
-    async fn handle_file_read<W: AsyncWrite + Unpin + Send>(
-        &self,
+    /// Spawnable file-read task that checks `cancelled_reads` on each chunk.
+    async fn handle_file_read_task<W: AsyncWrite + Unpin + Send + 'static>(
         id: u32,
         path: &str,
         offset: u64,
         len: Option<u64>,
         writer: &Arc<tokio::sync::Mutex<FrameWriter<W>>>,
+        cancelled: &Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     ) -> Result<()> {
         use tokio::io::AsyncReadExt;
 
@@ -572,6 +774,17 @@ impl Agent {
                 let chunk_size = nexus_protocol::MAX_FRAME_PAYLOAD;
                 let mut remaining = len;
                 loop {
+                    if cancelled.lock().unwrap().contains(&id) {
+                        let resp = Response::FileData {
+                            id,
+                            data: Vec::new(),
+                            eof: true,
+                        };
+                        let mut w = writer.lock().await;
+                        let _ = w.write(&resp, nexus_protocol::priority::BULK).await;
+                        break;
+                    }
+
                     let read_size = match remaining {
                         Some(r) => chunk_size.min(r as usize),
                         None => chunk_size,
@@ -652,6 +865,11 @@ impl Agent {
     }
 
     async fn collect_env_info(&self) -> EnvInfo {
+        Self::collect_env_info_static(&self.instance_id).await
+    }
+
+    /// Collect environment info without needing `&self` (for use in relay loop).
+    async fn collect_env_info_static(instance_id: &str) -> EnvInfo {
         let user = std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| "unknown".into());
@@ -666,6 +884,7 @@ impl Agent {
         let arch = std::env::consts::ARCH.to_string();
 
         EnvInfo {
+            instance_id: instance_id.to_string(),
             user,
             hostname,
             cwd,

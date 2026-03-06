@@ -370,4 +370,9 @@ impl PtyManager {
     pub fn active_block_ids(&self) -> Vec<BlockId> {
         self.sessions.keys().copied().collect()
     }
+
+    /// Returns true if there are any active PTY sessions.
+    pub fn has_active_sessions(&self) -> bool {
+        !self.sessions.is_empty()
+    }
 }

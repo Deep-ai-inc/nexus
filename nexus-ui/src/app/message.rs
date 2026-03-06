@@ -48,14 +48,28 @@ pub enum NexusMessage {
     /// Remote connection state changed (from reconnect task).
     RemoteStateChanged(crate::features::shell::remote::ConnectionState),
     /// Reconnection succeeded — swap transport.
-    /// Uses Arc<Mutex<Option<...>>> pattern because Receiver isn't Clone.
+    /// Uses Arc<Mutex<Option<...>>> pattern because Receiver/Child aren't Clone.
     RemoteReconnected {
         request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
         rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
         response_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<nexus_protocol::messages::Response>>>>,
         env: nexus_protocol::messages::EnvInfo,
+        child: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+        session_token: [u8; 16],
     },
+    /// Session resumed successfully — swap transport without orphan cleanup.
+    /// Uses Arc<Mutex<Option<...>>> pattern because Receiver/Child aren't Clone.
+    RemoteResumed {
+        request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
+        rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        response_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<nexus_protocol::messages::Response>>>>,
+        env: nexus_protocol::messages::EnvInfo,
+        child: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+    },
+    /// Reconnection failed after all retries.
+    ReconnectFailed,
     FileDrop(FileDropMsg),
     Drag(DragMsg),
 

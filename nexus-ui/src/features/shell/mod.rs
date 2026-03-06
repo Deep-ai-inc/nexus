@@ -617,6 +617,11 @@ impl ShellWidget {
             let classification = kernel.blocking_lock().classify_command(&trimmed);
             match classification {
                 CommandClassification::RemoteTransport => {
+                    // Create a block so the user sees the command while nesting
+                    let mut block = Block::new(block_id, trimmed.clone());
+                    block.parser = self.pty.new_parser();
+                    self.blocks.push(block);
+                    uctx.snap_to_bottom();
                     // Return for the orchestrator to handle as Nest
                     return Some(trimmed);
                 }

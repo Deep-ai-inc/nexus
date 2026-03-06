@@ -104,6 +104,11 @@ pub enum Request {
         offset: u64,
         data: Vec<u8>,
     },
+    /// Cancel an in-progress file read. The agent should stop sending FileData
+    /// chunks for this request ID.
+    CancelFileRead {
+        id: u32,
+    },
 
     // -- Nesting --
     /// Deploy a child agent via the given transport and enter relay mode.
@@ -202,8 +207,10 @@ pub enum Response {
         env: EnvInfo,
     },
     /// The child agent/connection in a relay died unexpectedly.
+    /// `surviving_env` identifies the agent that is still alive (the parent).
     ChildLost {
         reason: String,
+        surviving_env: EnvInfo,
     },
 
     // -- Flow control --
@@ -237,6 +244,10 @@ pub enum Response {
 /// Remote environment information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvInfo {
+    /// Unique identifier for this agent session (UUID v4).
+    /// Prevents identity collisions (docker containers, bastion hosts, `ssh localhost`).
+    #[serde(default)]
+    pub instance_id: String,
     pub user: String,
     pub hostname: String,
     pub cwd: PathBuf,
@@ -315,6 +326,7 @@ impl Request {
         match self {
             // Control plane — always first
             Request::CancelBlock { .. }
+            | Request::CancelFileRead { .. }
             | Request::PtyInput { .. }
             | Request::Ping { .. }
             | Request::Shutdown => crate::priority::CONTROL,

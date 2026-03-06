@@ -87,6 +87,35 @@ impl RingBuffer {
             .collect()
     }
 
+    /// Push a pre-encoded payload into the ring buffer.
+    ///
+    /// Avoids double-encoding: the caller encodes once, then uses this
+    /// to store the raw bytes alongside `write_raw_flagged`.
+    pub fn push_raw(&mut self, seq: u64, payload: Vec<u8>) {
+        let frame_size = payload.len();
+
+        // If a single frame exceeds the entire buffer, skip it
+        if frame_size > self.max_bytes {
+            tracing::warn!(
+                "skipping frame of {frame_size} bytes (exceeds ring buffer max {})",
+                self.max_bytes
+            );
+            return;
+        }
+
+        // Drop oldest frames until there's room
+        while self.current_bytes + frame_size > self.max_bytes {
+            if let Some((_, old)) = self.frames.pop_front() {
+                self.current_bytes -= old.len();
+            } else {
+                break;
+            }
+        }
+
+        self.current_bytes += frame_size;
+        self.frames.push_back((seq, payload));
+    }
+
     /// Get the highest sequence number in the buffer.
     pub fn latest_seq(&self) -> u64 {
         self.frames.back().map(|(seq, _)| *seq).unwrap_or(0)
@@ -104,6 +133,16 @@ impl RingBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
+    }
+
+    /// Take the contents of this ring buffer, leaving an empty buffer
+    /// with the same capacity.
+    pub fn take(&mut self) -> Self {
+        Self {
+            frames: std::mem::take(&mut self.frames),
+            current_bytes: std::mem::replace(&mut self.current_bytes, 0),
+            max_bytes: self.max_bytes,
+        }
     }
 }
 

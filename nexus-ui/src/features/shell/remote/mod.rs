@@ -24,8 +24,25 @@ use tokio::sync::{mpsc, oneshot};
 enum PendingRequest {
     Complete(oneshot::Sender<(Vec<CompletionItem>, usize)>),
     SearchHistory(oneshot::Sender<Vec<HistoryEntry>>),
-    Nest,
+    Nest(BlockId),
     PtySpawn(BlockId),
+    FileRead {
+        tx: oneshot::Sender<Vec<u8>>,
+        buffer: Vec<u8>,
+    },
+    /// One entry per chunk — all share the same accumulator.
+    /// The last chunk to complete fires the oneshot.
+    FileWriteChunk(Arc<std::sync::Mutex<FileWriteAccum>>),
+}
+
+/// Shared accumulator for multi-chunk file writes.
+///
+/// Each `FileWriteOk` response adds to `total_written` and decrements
+/// `chunks_remaining`. When it reaches zero, the oneshot fires.
+struct FileWriteAccum {
+    total_written: u64,
+    chunks_remaining: usize,
+    tx: Option<oneshot::Sender<u64>>,
 }
 
 /// An entry in the backend connection stack.
@@ -42,6 +59,10 @@ pub(crate) enum ResponseEffect {
     None,
     /// A remote PTY spawn failed — the caller should emit synthetic error + finish events.
     PtySpawnFailed { block_id: BlockId, message: String },
+    /// CWD changed (from NestOk, UnnestOk, or ChildLost).
+    CwdChanged { cwd: std::path::PathBuf },
+    /// Nest request failed — the caller should emit error + finish on the block.
+    NestFailed { block_id: BlockId, message: String },
 }
 
 /// Connection state for the remote backend.
@@ -78,6 +99,15 @@ pub(crate) struct RemoteBackend {
     pub(crate) response_rx: mpsc::UnboundedReceiver<Response>,
     /// The SSH/docker/kubectl child process (owned for lifecycle management).
     child: Option<tokio::process::Child>,
+    /// Transport used to establish this connection (for reconnection).
+    pub(crate) transport: Transport,
+    /// Path to the agent binary on the remote host.
+    pub(crate) agent_path: String,
+    /// Session token from the last HelloOk (stored for future resume support).
+    pub(crate) session_token: [u8; 16],
+    /// Tracks the expected surviving agent's instance_id during an intentional Unnest.
+    /// When ChildLost arrives and matches this, no error toast is shown.
+    pending_unnest_target: Option<String>,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -112,6 +142,9 @@ impl RemoteBackend {
         last_seen_seq: Arc<AtomicU64>,
         response_rx: mpsc::UnboundedReceiver<Response>,
         child: Option<tokio::process::Child>,
+        transport: Transport,
+        agent_path: String,
+        session_token: [u8; 16],
     ) -> Self {
         Self {
             request_tx,
@@ -125,6 +158,10 @@ impl RemoteBackend {
             rtt_ms,
             response_rx,
             child,
+            transport,
+            agent_path,
+            session_token,
+            pending_unnest_target: None,
         }
     }
 
@@ -275,6 +312,138 @@ impl RemoteBackend {
         });
     }
 
+    /// Send a signal to a remote PTY (e.g. SIGKILL for force-kill).
+    ///
+    /// API surface for future "Force Kill" UI (e.g. double-Ctrl+C).
+    /// The normal KillBlock path uses cancel_block() → SIGINT which is correct
+    /// for graceful interrupt. This method is for escalation.
+    #[allow(dead_code)]
+    pub fn pty_kill(&mut self, block_id: BlockId, signal: i32) {
+        self.send(Request::PtyKill { block_id, signal });
+    }
+
+    /// Close a remote PTY (hangup the master fd).
+    ///
+    /// API surface for future use — closes the PTY without signaling the process.
+    #[allow(dead_code)]
+    pub fn pty_close(&mut self, block_id: BlockId) {
+        self.send(Request::PtyClose { block_id });
+    }
+
+    /// Read a file from the remote agent.
+    ///
+    /// Returns a oneshot receiver that resolves with the full file contents.
+    /// Accumulates chunked `FileData` responses internally. Capped at 50 MB
+    /// to prevent OOM — larger files will error on the receiver side.
+    #[allow(dead_code)]
+    pub fn file_read(&mut self, path: &str) -> oneshot::Receiver<Vec<u8>> {
+        let (tx, rx) = oneshot::channel();
+        let id = self.next_id();
+        self.pending.insert(
+            id,
+            PendingRequest::FileRead {
+                tx,
+                buffer: Vec::new(),
+            },
+        );
+        self.send(Request::FileRead {
+            id,
+            path: path.to_string(),
+            offset: 0,
+            len: None,
+        });
+        rx
+    }
+
+    /// Cancel an in-progress file read on the remote agent.
+    ///
+    /// Sends `CancelFileRead` so the agent stops sending chunks for this ID.
+    #[allow(dead_code)]
+    fn cancel_file_read(&mut self, id: u32) {
+        self.send(Request::CancelFileRead { id });
+    }
+
+    /// Write a file to the remote agent.
+    ///
+    /// Splits data into 16 KB chunks (MAX_FRAME_PAYLOAD) and sends them via a
+    /// background tokio task that yields between chunks to avoid blocking the
+    /// UI thread or bloating the unbounded channel with megabytes at once.
+    ///
+    /// Every chunk's ID is tracked in `pending` with a shared `FileWriteAccum`.
+    /// The agent replies `FileWriteOk` per chunk; the accumulator aggregates
+    /// `bytes_written` and fires the oneshot when all chunks are acknowledged.
+    ///
+    // TODO: Large uploads spike local memory because `request_tx` is unbounded
+    // and `yield_now()` doesn't provide real backpressure — the runtime may
+    // poll the spawned task to completion before the transport drains the
+    // channel. A bounded channel or explicit semaphore would be needed to
+    // cap in-flight data.
+    #[allow(dead_code)]
+    pub fn file_write(&mut self, path: &str, data: &[u8]) -> oneshot::Receiver<u64> {
+        let (tx, rx) = oneshot::channel();
+
+        if data.is_empty() {
+            let _ = tx.send(0);
+            return rx;
+        }
+
+        const CHUNK_SIZE: usize = 16 * 1024; // MAX_FRAME_PAYLOAD
+        let num_chunks = (data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        let accum = Arc::new(std::sync::Mutex::new(FileWriteAccum {
+            total_written: 0,
+            chunks_remaining: num_chunks,
+            tx: Some(tx),
+        }));
+
+        // Pre-allocate all chunk IDs and build envelopes synchronously so IDs
+        // are sequential and registered in `pending` before any response arrives.
+        let mut envelopes = Vec::with_capacity(num_chunks);
+        for (i, chunk) in data.chunks(CHUNK_SIZE).enumerate() {
+            let id = self.next_id();
+            self.pending
+                .insert(id, PendingRequest::FileWriteChunk(accum.clone()));
+            envelopes.push(RequestEnvelope {
+                request: Request::FileWrite {
+                    id,
+                    path: path.to_string(),
+                    offset: (i * CHUNK_SIZE) as u64,
+                    data: chunk.to_vec(),
+                },
+            });
+        }
+
+        // Send the first chunk immediately so small writes don't wait a tick.
+        if let Some(first) = envelopes.first() {
+            if self
+                .request_tx
+                .send(RequestEnvelope {
+                    request: first.request.clone(),
+                })
+                .is_err()
+            {
+                self.state = ConnectionState::Disconnected;
+                return rx;
+            }
+        }
+
+        // Remaining chunks are sent from a background task with yielding.
+        if envelopes.len() > 1 {
+            let sender = self.request_tx.clone();
+            let remaining: Vec<RequestEnvelope> = envelopes.into_iter().skip(1).collect();
+            tokio::spawn(async move {
+                for envelope in remaining {
+                    if sender.send(envelope).is_err() {
+                        break; // Transport gone
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+
+        rx
+    }
+
     /// Handle a response from the remote agent.
     /// Returns a `ResponseEffect` that the caller may need to act on.
     pub fn handle_response(&mut self, response: Response) -> ResponseEffect {
@@ -296,29 +465,84 @@ impl RemoteBackend {
                 ResponseEffect::None
             }
             Response::NestOk { id, env } => {
-                if let Some(PendingRequest::Nest) = self.pending.remove(&id) {
+                if let Some(PendingRequest::Nest(_)) = self.pending.remove(&id) {
                     self.backend_stack.push(BackendEntry {
                         env: self.env.clone(),
                     });
+                    let cwd = env.cwd.clone();
                     self.env = env;
+                    return ResponseEffect::CwdChanged { cwd };
                 }
                 ResponseEffect::None
             }
             Response::UnnestOk { id, env } => {
                 self.pending.remove(&id);
                 self.backend_stack.pop();
+                let cwd = env.cwd.clone();
                 self.env = env;
-                ResponseEffect::None
+                ResponseEffect::CwdChanged { cwd }
             }
-            Response::ChildLost { reason } => {
-                tracing::warn!("remote child lost: {reason}");
-                if let Some(previous) = self.backend_stack.pop() {
-                    self.env = previous.env;
+            Response::ChildLost {
+                reason,
+                surviving_env,
+            } => {
+                // Pop entries ABOVE the surviving agent
+                while let Some(top) = self.backend_stack.pop() {
+                    if top.env.instance_id == surviving_env.instance_id {
+                        break;
+                    }
                 }
-                ResponseEffect::None
+                let cwd = surviving_env.cwd.clone();
+                self.env = surviving_env;
+
+                // Only show warning if this wasn't an intentional Unnest
+                let is_clean = self
+                    .pending_unnest_target
+                    .take()
+                    .map_or(false, |target| target == self.env.instance_id);
+                if !is_clean {
+                    tracing::warn!("nested connection lost: {reason}");
+                }
+                ResponseEffect::CwdChanged { cwd }
             }
             Response::Pong { seq: _ } => {
                 // RTT tracking handled by event bridge
+                ResponseEffect::None
+            }
+            Response::FileData { id, data, eof } => {
+                // Accumulate chunks; only complete on eof.
+                if let Some(pending) = self.pending.get_mut(&id) {
+                    if let PendingRequest::FileRead { buffer, .. } = pending {
+                        buffer.extend_from_slice(&data);
+                        // OOM guard: cap at 50 MB — tell the agent to stop sending
+                        if buffer.len() > 50 * 1024 * 1024 {
+                            tracing::warn!("file read exceeded 50 MB cap, cancelling");
+                            self.pending.remove(&id);
+                            self.cancel_file_read(id);
+                            return ResponseEffect::None;
+                        }
+                        if eof {
+                            if let Some(PendingRequest::FileRead { tx, buffer }) =
+                                self.pending.remove(&id)
+                            {
+                                let _ = tx.send(buffer);
+                            }
+                        }
+                    }
+                }
+                ResponseEffect::None
+            }
+            Response::FileWriteOk { id, bytes_written } => {
+                if let Some(PendingRequest::FileWriteChunk(accum)) = self.pending.remove(&id) {
+                    let mut state = accum.lock().unwrap();
+                    state.total_written += bytes_written;
+                    state.chunks_remaining -= 1;
+                    if state.chunks_remaining == 0 {
+                        if let Some(tx) = state.tx.take() {
+                            let _ = tx.send(state.total_written);
+                        }
+                    }
+                }
                 ResponseEffect::None
             }
             Response::Error { id, message } => {
@@ -326,6 +550,9 @@ impl RemoteBackend {
                 match self.pending.remove(&id) {
                     Some(PendingRequest::PtySpawn(block_id)) => {
                         ResponseEffect::PtySpawnFailed { block_id, message }
+                    }
+                    Some(PendingRequest::Nest(block_id)) => {
+                        ResponseEffect::NestFailed { block_id, message }
                     }
                     _ => ResponseEffect::None,
                 }
@@ -343,9 +570,9 @@ impl RemoteBackend {
     }
 
     /// Nest into a deeper level.
-    pub fn nest(&mut self, transport: Transport) {
+    pub fn nest(&mut self, transport: Transport, block_id: BlockId) {
         let id = self.next_id();
-        self.pending.insert(id, PendingRequest::Nest);
+        self.pending.insert(id, PendingRequest::Nest(block_id));
         self.send(Request::Nest {
             id,
             transport,
@@ -355,6 +582,11 @@ impl RemoteBackend {
 
     /// Unnest from the current level.
     pub fn unnest(&mut self) {
+        // Track the expected surviving agent for ChildLost disambiguation
+        self.pending_unnest_target = self
+            .backend_stack
+            .last()
+            .map(|entry| entry.env.instance_id.clone());
         let id = self.next_id();
         self.send(Request::Unnest { id });
     }
@@ -362,6 +594,11 @@ impl RemoteBackend {
     /// Swap the request channel to a new transport (after reconnection).
     pub fn swap_request_tx(&mut self, new_tx: mpsc::UnboundedSender<RequestEnvelope>) {
         self.request_tx = new_tx;
+    }
+
+    /// Replace the child process (after reconnection).
+    pub fn set_child(&mut self, child: Option<tokio::process::Child>) {
+        self.child = child;
     }
 
     /// Kill the SSH/docker/kubectl child process (sync — sends SIGKILL without awaiting).

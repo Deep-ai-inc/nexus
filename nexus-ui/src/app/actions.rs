@@ -64,6 +64,20 @@ impl NexusState {
                             duration_ms: 0,
                         });
                     }
+                    crate::features::shell::remote::ResponseEffect::NestFailed { block_id, message } => {
+                        let _ = self.kernel_tx.send(nexus_api::ShellEvent::StderrChunk {
+                            block_id,
+                            data: format!("Nest failed: {}\n", message).into_bytes(),
+                        });
+                        let _ = self.kernel_tx.send(nexus_api::ShellEvent::CommandFinished {
+                            block_id,
+                            exit_code: 1,
+                            duration_ms: 0,
+                        });
+                    }
+                    crate::features::shell::remote::ResponseEffect::CwdChanged { cwd } => {
+                        self.cwd = cwd.to_string_lossy().to_string();
+                    }
                     crate::features::shell::remote::ResponseEffect::None => {}
                 }
             }

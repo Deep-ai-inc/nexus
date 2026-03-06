@@ -3,156 +3,311 @@
 //! When the agent receives a `Nest` request, it:
 //! 1. Deploys a child agent via the specified transport
 //! 2. Enters relay mode (transparent byte forwarding parent ↔ child)
-//! 3. Intercepts only `Unnest` to tear down the child
+//! 3. Intercepts only control messages (GrantCredits, Ping, TerminalResize)
 //!
 //! On child pipe EOF (container killed, SSH dropped):
 //! - Exits relay mode
-//! - Sends `Response::ChildLost { reason }` to parent
+//! - Sends `Response::ChildLost { reason, surviving_env }` to parent
 //! - Agent becomes active again at this level
 
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
-use nexus_protocol::codec::{FrameCodec, FrameReader, FrameWriter};
+use nexus_protocol::codec::{
+    decode_payload, encode_payload, FrameCodec, FrameReader, FrameWriter, FLAG_EVENT,
+};
 use nexus_protocol::messages::{EnvInfo, Request, Response, Transport};
-use nexus_protocol::{AgentCaps, ClientCaps, PROTOCOL_VERSION};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use nexus_protocol::{priority, ClientCaps, PROTOCOL_VERSION};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{oneshot, Mutex, Semaphore};
+use tokio::task::JoinHandle;
 
-/// State of the relay when active.
-pub(crate) struct RelayState {
+use crate::session::RingBuffer;
+
+/// Active relay state. Stored in Agent struct, survives parent disconnects.
+pub(crate) struct ActiveRelay {
     /// The child transport process (SSH, docker, etc.)
-    child: Child,
-    /// Child environment info.
-    pub env: EnvInfo,
+    pub child: Child,
+    /// Writer to the child's stdin (for forwarding requests).
+    pub child_writer: FrameWriter<ChildStdin>,
+    /// Background task reading child stdout and forwarding to parent.
+    pub reader_task: JoinHandle<()>,
+    /// Fires when the child dies or its pipe closes.
+    pub child_lost_rx: oneshot::Receiver<String>,
 }
 
-impl RelayState {
-    /// Spawn a child agent via the given transport and perform handshake.
-    pub async fn spawn(
-        transport: &Transport,
-        forwarded_env: std::collections::HashMap<String, String>,
-    ) -> Result<Self> {
-        let mut child = match transport {
-            Transport::Ssh {
+impl ActiveRelay {
+    /// Clean up the relay: kill the child and abort the reader task.
+    pub async fn cleanup(mut self) {
+        self.reader_task.abort();
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+}
+
+/// Spawn a child agent via the given transport and perform handshake.
+///
+/// Returns the codec halves, child process, and child's EnvInfo.
+/// The caller uses these to set up `ActiveRelay` and `start_relay_reader()`.
+pub(crate) async fn spawn_and_handshake(
+    transport: &Transport,
+    forwarded_env: HashMap<String, String>,
+) -> Result<(FrameReader<ChildStdout>, FrameWriter<ChildStdin>, Child, EnvInfo)> {
+    let mut child = spawn_child(transport).await?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no child stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no child stdout"))?;
+
+    let codec = FrameCodec::new(stdout, stdin);
+    let (mut reader, mut writer) = codec.into_parts();
+
+    // Hello handshake with child
+    let hello = Request::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        capabilities: ClientCaps {
+            flow_control: true,
+            resume: false,
+            nesting: true,
+            file_transfer: true,
+        },
+        forwarded_env,
+    };
+    writer
+        .write(&hello, hello.priority())
+        .await
+        .map_err(|e| anyhow::anyhow!("child handshake failed: {e}"))?;
+
+    let response: Response = reader
+        .read()
+        .await
+        .map_err(|e| anyhow::anyhow!("child handshake failed: {e}"))?;
+
+    let env = match response {
+        Response::HelloOk { env, .. } => env,
+        Response::Error { message, .. } => {
+            anyhow::bail!("child agent rejected Hello: {message}");
+        }
+        other => {
+            anyhow::bail!("unexpected child response: {other:?}");
+        }
+    };
+
+    // Grant huge credits to child so it never blocks on our side
+    let grant = Request::GrantCredits {
+        bytes: 1_000_000_000,
+    };
+    writer
+        .write(&grant, grant.priority())
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to send initial credits to child: {e}"))?;
+
+    Ok((reader, writer, child, env))
+}
+
+/// Spawn the relay reader task.
+///
+/// Reads frames from the child, rewrites Event seq numbers inside the writer lock,
+/// and forwards everything to the parent. Non-event frames are forwarded as raw bytes
+/// without deserialization.
+///
+/// Returns a join handle and a oneshot receiver that fires when the child dies.
+pub(crate) fn start_relay_reader<W>(
+    mut child_reader: FrameReader<ChildStdout>,
+    parent_writer: Arc<Mutex<FrameWriter<W>>>,
+    credits: Arc<Semaphore>,
+    next_seq: Arc<AtomicU64>,
+    ring_buffer: Arc<tokio::sync::Mutex<RingBuffer>>,
+) -> (JoinHandle<()>, oneshot::Receiver<String>)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (child_lost_tx, child_lost_rx) = oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let reason = loop {
+            match child_reader.read_raw(&mut buf).await {
+                Ok((child_priority, flags)) => {
+                    // Credit-gate non-control frames
+                    if child_priority > priority::CONTROL {
+                        // acquire_many panics on 0, and we want to block on credits
+                        let size = buf.len().max(1) as u32;
+                        match credits.acquire_many(size).await {
+                            Ok(permit) => permit.forget(), // consumed
+                            Err(_) => break "credit semaphore closed".to_string(),
+                        }
+                    }
+
+                    if flags & FLAG_EVENT != 0 {
+                        // Decode child event, rewrite seq, re-encode, push to ring buffer
+                        let child_resp: Response = match decode_payload(&buf) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("relay: failed to decode event: {e}");
+                                continue;
+                            }
+                        };
+
+                        let event = match child_resp {
+                            Response::Event { event, .. } => event,
+                            _ => {
+                                // FLAG_EVENT set but not an Event? Forward as-is.
+                                let mut w = parent_writer.lock().await;
+                                if w.write_raw(&buf, child_priority).await.is_err() {
+                                    break "parent write failed".to_string();
+                                }
+                                continue;
+                            }
+                        };
+
+                        // Assign seq INSIDE writer lock — guarantees wire order = seq order
+                        let mut w = parent_writer.lock().await;
+                        let new_seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                        let rewritten = Response::Event {
+                            seq: new_seq,
+                            event,
+                        };
+                        let encoded = match encode_payload(&rewritten) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!("relay: failed to encode event: {e}");
+                                continue;
+                            }
+                        };
+
+                        // Push to ring buffer for resume replay
+                        {
+                            ring_buffer
+                                .lock()
+                                .await
+                                .push_raw(new_seq, encoded.clone());
+                        }
+
+                        if w.write_raw_flagged(&encoded, priority::INTERACTIVE, FLAG_EVENT)
+                            .await
+                            .is_err()
+                        {
+                            break "parent write failed".to_string();
+                        }
+                    } else {
+                        // Non-event: forward raw without decode
+                        let mut w = parent_writer.lock().await;
+                        if w.write_raw(&buf, child_priority).await.is_err() {
+                            break "parent write failed".to_string();
+                        }
+                    }
+                }
+                Err(nexus_protocol::codec::CodecError::ConnectionClosed) => {
+                    break "child connection closed".to_string();
+                }
+                Err(e) => {
+                    break format!("child read error: {e}");
+                }
+            }
+        };
+
+        let _ = child_lost_tx.send(reason);
+    });
+
+    (task, child_lost_rx)
+}
+
+// =========================================================================
+// Transport spawning & deployment helpers
+// =========================================================================
+
+/// Spawn the transport child process (SSH/Docker/kubectl/Command).
+async fn spawn_child(transport: &Transport) -> Result<Child> {
+    let child = match transport {
+        Transport::Ssh {
+            destination,
+            port,
+            identity,
+            extra_args,
+        } => {
+            let agent_path = detect_and_deploy_agent_ssh(
                 destination,
-                port,
-                identity,
+                port.as_ref(),
+                identity.as_deref(),
                 extra_args,
-            } => {
-                let agent_path = detect_and_deploy_agent_ssh(destination, port.as_ref(), identity.as_deref()).await?;
-                let mut cmd = Command::new("ssh");
-                cmd.arg("-o").arg("BatchMode=yes");
-                if let Some(port) = port {
-                    cmd.arg("-p").arg(port.to_string());
-                }
-                if let Some(identity) = identity {
-                    cmd.arg("-i").arg(identity);
-                }
-                for arg in extra_args {
-                    cmd.arg(arg);
-                }
-                cmd.arg(destination);
-                cmd.arg(&agent_path);
-                cmd.stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                cmd.spawn()?
+            )
+            .await?;
+            let mut cmd = Command::new("ssh");
+            cmd.arg("-o").arg("BatchMode=yes");
+            cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+            if let Some(port) = port {
+                cmd.arg("-p").arg(port.to_string());
             }
-            Transport::Docker { container, user } => {
-                let mut cmd = Command::new("docker");
-                cmd.arg("exec").arg("-i");
-                if let Some(user) = user {
-                    cmd.arg("-u").arg(user);
-                }
-                cmd.arg(container);
-                // Self-replicate: copy agent binary into container first
-                // For now, assume agent is already deployed
-                cmd.arg("/tmp/nexus-agent");
-                cmd.stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                cmd.spawn()?
+            if let Some(identity) = identity {
+                cmd.arg("-i").arg(identity);
             }
-            Transport::Kubectl {
-                pod,
-                namespace,
-                container,
-            } => {
-                let mut cmd = Command::new("kubectl");
-                cmd.arg("exec").arg("-i");
-                if let Some(ns) = namespace {
-                    cmd.arg("-n").arg(ns);
-                }
-                if let Some(ctr) = container {
-                    cmd.arg("-c").arg(ctr);
-                }
-                cmd.arg(pod).arg("--").arg("/tmp/nexus-agent");
-                cmd.stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                cmd.spawn()?
+            for arg in extra_args {
+                cmd.arg(arg);
             }
-            Transport::Command { argv } => {
-                if argv.is_empty() {
-                    anyhow::bail!("empty command argv for transport");
-                }
-                let mut cmd = Command::new(&argv[0]);
-                for arg in &argv[1..] {
-                    cmd.arg(arg);
-                }
-                cmd.stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                cmd.spawn()?
+            cmd.arg(destination);
+            cmd.arg(&agent_path);
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.spawn()?
+        }
+        Transport::Docker { container, user } => {
+            let mut cmd = Command::new("docker");
+            cmd.arg("exec").arg("-i");
+            if let Some(user) = user {
+                cmd.arg("-u").arg(user);
             }
-        };
-
-        // Get stdin/stdout for the child
-        let stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
-
-        // Handshake with child agent
-        let codec = FrameCodec::new(stdout, stdin);
-        let (mut reader, mut writer) = codec.into_parts();
-
-        let hello = Request::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            capabilities: ClientCaps {
-                flow_control: false,
-                resume: false,
-                nesting: true,
-                file_transfer: true,
-            },
-            forwarded_env,
-        };
-        writer.write(&hello, hello.priority()).await?;
-
-        let response: Response = reader.read().await
-            .map_err(|e| anyhow::anyhow!("child handshake failed: {e}"))?;
-
-        let env = match response {
-            Response::HelloOk { env, .. } => env,
-            Response::Error { message, .. } => {
-                anyhow::bail!("child agent rejected Hello: {message}");
+            cmd.arg(container);
+            cmd.arg("/tmp/nexus-agent");
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.spawn()?
+        }
+        Transport::Kubectl {
+            pod,
+            namespace,
+            container,
+        } => {
+            let mut cmd = Command::new("kubectl");
+            cmd.arg("exec").arg("-i");
+            if let Some(ns) = namespace {
+                cmd.arg("-n").arg(ns);
             }
-            other => {
-                anyhow::bail!("unexpected child response: {other:?}");
+            if let Some(ctr) = container {
+                cmd.arg("-c").arg(ctr);
             }
-        };
-
-        // Put stdin/stdout back into the child process
-        // (We consumed them for handshake — in production we'd keep the reader/writer
-        // and relay bytes. For now, store the child handle for cleanup.)
-
-        Ok(Self { child, env })
-    }
-
-    /// Kill the child process.
-    pub async fn kill(&mut self) -> Result<()> {
-        self.child.kill().await?;
-        Ok(())
-    }
+            cmd.arg(pod).arg("--").arg("/tmp/nexus-agent");
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.spawn()?
+        }
+        Transport::Command { argv } => {
+            if argv.is_empty() {
+                anyhow::bail!("empty command argv for transport");
+            }
+            let mut cmd = Command::new(&argv[0]);
+            for arg in &argv[1..] {
+                cmd.arg(arg);
+            }
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.spawn()?
+        }
+    };
+    Ok(child)
 }
 
 /// Map `uname -m` output to the Rust target architecture string.
@@ -171,32 +326,52 @@ async fn detect_and_deploy_agent_ssh(
     destination: &str,
     port: Option<&u16>,
     identity: Option<&str>,
+    extra_args: &[String],
 ) -> Result<String> {
     // Detect arch
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     if let Some(port) = port {
         cmd.arg("-p").arg(port.to_string());
     }
     if let Some(identity) = identity {
         cmd.arg("-i").arg(identity);
     }
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
     cmd.arg(destination).arg("uname -m");
     let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("failed to detect remote architecture: {stderr}");
+    }
     let remote_uname = String::from_utf8(output.stdout)?.trim().to_string();
+    if remote_uname.is_empty() {
+        anyhow::bail!("failed to detect remote architecture: uname returned empty output");
+    }
 
     // Check if agent already deployed
     let agent_path = format!("~/.nexus/agent-{}", PROTOCOL_VERSION);
     let mut check_cmd = Command::new("ssh");
     check_cmd.arg("-o").arg("BatchMode=yes");
+    check_cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     if let Some(port) = port {
         check_cmd.arg("-p").arg(port.to_string());
     }
     if let Some(identity) = identity {
         check_cmd.arg("-i").arg(identity);
     }
-    check_cmd.arg(destination)
-        .arg(format!("{} --protocol-version 2>/dev/null", agent_path));
+    for arg in extra_args {
+        check_cmd.arg(arg);
+    }
+    check_cmd
+        .arg(destination)
+        .arg(format!(
+            "{} --protocol-version 2>/dev/null",
+            agent_path
+        ));
     let output = check_cmd.output().await?;
     if output.status.success() {
         let remote_version: u32 = String::from_utf8(output.stdout)?
@@ -208,11 +383,9 @@ async fn detect_and_deploy_agent_ssh(
         }
     }
 
-    // Verify architecture compatibility before self-replicating.
-    // If the remote arch doesn't match our compile target, we can't
-    // just copy /proc/self/exe — it would be the wrong binary format.
+    // Verify architecture compatibility
     let remote_arch = uname_to_target_arch(&remote_uname);
-    let my_arch = std::env::consts::ARCH; // e.g. "x86_64", "aarch64"
+    let my_arch = std::env::consts::ARCH;
     if remote_arch != my_arch {
         anyhow::bail!(
             "architecture mismatch: this agent is {my_arch} but remote is \
@@ -226,7 +399,7 @@ async fn detect_and_deploy_agent_ssh(
     #[cfg(target_os = "linux")]
     {
         let self_exe = tokio::fs::read("/proc/self/exe").await?;
-        upload_binary_ssh(destination, port, identity, &self_exe, &agent_path).await?;
+        upload_binary_ssh(destination, port, identity, extra_args, &self_exe, &agent_path).await?;
         return Ok(agent_path);
     }
 
@@ -234,7 +407,7 @@ async fn detect_and_deploy_agent_ssh(
     {
         let exe_path = std::env::current_exe()?;
         let self_exe = tokio::fs::read(&exe_path).await?;
-        upload_binary_ssh(destination, port, identity, &self_exe, &agent_path).await?;
+        upload_binary_ssh(destination, port, identity, extra_args, &self_exe, &agent_path).await?;
         Ok(agent_path)
     }
 }
@@ -244,16 +417,21 @@ async fn upload_binary_ssh(
     destination: &str,
     port: Option<&u16>,
     identity: Option<&str>,
+    extra_args: &[String],
     binary: &[u8],
     remote_path: &str,
 ) -> Result<()> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     if let Some(port) = port {
         cmd.arg("-p").arg(port.to_string());
     }
     if let Some(identity) = identity {
         cmd.arg("-i").arg(identity);
+    }
+    for arg in extra_args {
+        cmd.arg(arg);
     }
     cmd.arg(destination);
     cmd.arg(format!(

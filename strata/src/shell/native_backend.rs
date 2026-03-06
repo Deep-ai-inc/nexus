@@ -2478,7 +2478,9 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             let at_tick = state.last_tick_time.elapsed().as_millis() >= state.tick_interval_ms as u128;
             if at_tick {
                 state.last_tick_time = Instant::now();
-                if A::on_tick(&mut state.app) {
+                let (dirty, cmd) = A::on_tick(&mut state.app);
+                spawn_commands(&state.tokio_rt, cmd, state.command_tx.clone());
+                if dirty {
                     state.needs_render = true;
                 }
             }

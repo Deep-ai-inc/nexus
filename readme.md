@@ -191,6 +191,24 @@ cp target/x86_64-unknown-linux-musl/release/nexus-agent \
   ~/.nexus/agents/nexus-agent-x86_64-unknown-linux-musl
 ```
 
+Supported targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`. Use the matching `messense/rust-musl-cross:{arch}-musl` Docker image.
+
+**After modifying agent or protocol code**, you must cross-compile, install, and rebuild the client:
+```bash
+# 1. If the wire format changed (header, message schema), bump PROTOCOL_VERSION
+#    in nexus-protocol/src/lib.rs — otherwise the deploy skips upload
+# 2. Cross-compile
+docker run --rm -v "$(pwd)":/src -w /src messense/rust-musl-cross:x86_64-musl \
+  cargo build --release -p nexus-agent --target x86_64-unknown-linux-musl
+# 3. Install to deploy location
+cp target/x86_64-unknown-linux-musl/release/nexus-agent \
+  ~/.nexus/agents/nexus-agent-x86_64-unknown-linux-musl
+# 4. Rebuild client
+cargo build -p nexus-ui
+```
+
+The deploy system checks the remote agent's protocol version via `--protocol-version`. If it matches the client's `PROTOCOL_VERSION`, the upload is skipped. Forgetting to bump the version after a breaking wire change causes "failed to read HelloOk: connection closed" — the old agent can't parse the new frame format.
+
 ## Reactive Streaming Pipelines — `watch`
 
 `watch` is a shell keyword that re-executes a typed pipeline on an interval, streaming live updates to the UI.

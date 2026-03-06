@@ -115,6 +115,8 @@ pub struct NexusState {
     pub(crate) disconnect_confirm: Option<Instant>,
     /// CancellationToken for the in-flight resize debounce sleep task.
     pub(crate) resize_debounce_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// CancellationToken for the in-flight reconnection task (at most one).
+    pub(crate) reconnect_cancel: Option<tokio_util::sync::CancellationToken>,
 
     // --- Layout ---
     pub zoom_level: f32,
@@ -420,7 +422,7 @@ impl Component for NexusState {
         Subscription::batch(subs)
     }
 
-    fn on_tick(&mut self) -> bool {
+    fn on_tick(&mut self) -> (bool, strata::app::Command<NexusMessage>) {
         let output_dirty = self.shell.needs_redraw() || self.agent.needs_redraw();
         let connecting = self.shell.blocks.blocks.iter().any(|b| b.connect_progress.is_some());
         let auto_scrolling = self.drag.auto_scroll.get().is_some();
@@ -432,7 +434,9 @@ impl Component for NexusState {
         let cursor_changed = cursor_now != self.last_cursor_blink;
         self.last_cursor_blink = cursor_now;
 
-        output_dirty || spring_animating || auto_scrolling || cursor_changed || connecting
+        let cmd = self.check_reconnect();
+        let dirty = output_dirty || spring_animating || auto_scrolling || cursor_changed || connecting;
+        (dirty, cmd)
     }
 
     fn selection(&self) -> Option<&strata::Selection> {
@@ -595,6 +599,7 @@ impl RootComponent for NexusState {
             remote_size_changed_at: None,
             disconnect_confirm: None,
             resize_debounce_cancel: None,
+            reconnect_cancel: None,
 
             zoom_level: 0.85,
 

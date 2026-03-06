@@ -74,10 +74,12 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
 
         match response {
             Response::Event { seq, event } => {
-                // Track last seen sequence number for resume
+                // Seq dedup: skip events already seen (safety net for resume replay)
+                let prev = last_seen_seq.load(Ordering::Relaxed);
+                if prev > 0 && seq <= prev {
+                    continue;
+                }
                 last_seen_seq.store(seq, Ordering::Relaxed);
-                // Inject directly into the local broadcast channel.
-                // The BlockManager, rendering, etc. will handle it identically.
                 let _ = kernel_tx.send(event);
             }
             Response::Pong { seq } => {
@@ -88,10 +90,16 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
                     rtt_ms.store(elapsed, Ordering::Relaxed);
                 }
             }
-            Response::ChildLost { reason } => {
+            Response::ChildLost {
+                reason,
+                surviving_env,
+            } => {
                 tracing::warn!("remote child lost: {reason}");
                 // Forward to response handler for UI notification
-                let _ = response_tx.send(Response::ChildLost { reason });
+                let _ = response_tx.send(Response::ChildLost {
+                    reason,
+                    surviving_env,
+                });
             }
             other => {
                 // Non-event responses (ClassifyResult, CompleteResult, etc.)

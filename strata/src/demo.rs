@@ -873,10 +873,10 @@ impl StrataApp for DemoApp {
         None
     }
 
-    fn on_tick(state: &mut Self::State) -> bool {
+    fn on_tick(state: &mut Self::State) -> (bool, Command<Self::Message>) {
         let left = state.left_scroll.tick_spring_back();
         let right = state.right_scroll.tick_spring_back();
-        left || right
+        (left || right, Command::none())
     }
 
     fn subscription(_state: &Self::State) -> Subscription<Self::Message> {
