@@ -209,6 +209,9 @@ mod apple_events {
             add_method(cls, sel!(uniqueID), tab_unique_id as *const _, c"@@:");
             add_method(cls, sel!(tabIndex), tab_index as *const _, c"@@:");
             add_method(cls, sel!(sessions), tab_sessions as *const _, c"@@:");
+            add_method(cls, sel!(countOfSessions), tab_count_of_sessions as *const _, c"q@:");
+            add_method(cls, sel!(objectInSessionsAtIndex:), tab_object_in_sessions_at_index as *const _, c"@@:q");
+            add_method(cls, sel!(valueInSessionsWithUniqueID:), tab_value_in_sessions_with_unique_id as *const _, c"@@:@");
 
             objc2::ffi::objc_registerClassPair(cls);
         }
@@ -232,6 +235,9 @@ mod apple_events {
             add_method(cls, sel!(orderedIndex), window_ordered_index as *const _, c"@@:");
             add_method(cls, sel!(setOrderedIndex:), window_set_ordered_index as *const _, c"v@:@");
             add_method(cls, sel!(tabs), window_tabs as *const _, c"@@:");
+            add_method(cls, sel!(countOfTabs), window_count_of_tabs as *const _, c"q@:");
+            add_method(cls, sel!(objectInTabsAtIndex:), window_object_in_tabs_at_index as *const _, c"@@:q");
+            add_method(cls, sel!(valueInTabsWithUniqueID:), window_value_in_tabs_with_unique_id as *const _, c"@@:@");
 
             objc2::ffi::objc_registerClassPair(cls);
         }
@@ -508,6 +514,32 @@ mod apple_events {
         }
     }
 
+    extern "C" fn window_value_in_tabs_with_unique_id(this: &AnyObject, _sel: Sel, _uid: *mut AnyObject) -> *mut AnyObject {
+        // Only one tab per window — always return it.
+        let wid = unsafe { get_ivar_u64(this as *const _, c"_windowID") };
+        let cls = AnyClass::get("NexusScriptTab").unwrap();
+        unsafe {
+            let obj: *mut AnyObject = msg_send![cls, new];
+            set_ivar_u64(obj, c"_windowID", wid);
+            obj
+        }
+    }
+
+    extern "C" fn window_count_of_tabs(_this: &AnyObject, _sel: Sel) -> usize {
+        1 // Always one tab per window
+    }
+
+    extern "C" fn window_object_in_tabs_at_index(this: &AnyObject, _sel: Sel, index: usize) -> *mut AnyObject {
+        if index != 0 { return std::ptr::null_mut(); }
+        let wid = unsafe { get_ivar_u64(this as *const _, c"_windowID") };
+        let cls = AnyClass::get("NexusScriptTab").unwrap();
+        unsafe {
+            let obj: *mut AnyObject = msg_send![cls, new];
+            set_ivar_u64(obj, c"_windowID", wid);
+            obj
+        }
+    }
+
     // ========================================================================
     // NexusScriptTab
     // ========================================================================
@@ -532,15 +564,16 @@ mod apple_events {
                 uniqueID: nsnumber_i64(wid as i64)
             ];
 
-            // Tab specifier (unique ID = "tab-{windowID}")
+            // Tab specifier (always index 0)
             let win_desc = script_class_desc("NexusScriptWindow");
             let tab_key = NSString::from_str("tabs");
-            let alloc2: *mut AnyObject = msg_send![spec_cls, alloc];
+            let idx_cls = AnyClass::get("NSIndexSpecifier").unwrap();
+            let alloc2: *mut AnyObject = msg_send![idx_cls, alloc];
             msg_send![alloc2,
                 initWithContainerClassDescription: win_desc,
                 containerSpecifier: win_spec,
                 key: &*tab_key,
-                uniqueID: nsstring(&format!("tab-{wid}"))
+                index: 0i64
             ]
         }
     }
@@ -572,6 +605,48 @@ mod apple_events {
         }
     }
 
+    extern "C" fn tab_value_in_sessions_with_unique_id(this: &AnyObject, _sel: Sel, uid: *mut AnyObject) -> *mut AnyObject {
+        let wid = unsafe { get_ivar_u64(this as *const _, c"_windowID") };
+        let Some(registry) = global_registry() else { return std::ptr::null_mut(); };
+        let snap = registry.snapshot();
+        let Some(win) = snap.iter().find(|w| w.id == wid) else { return std::ptr::null_mut(); };
+        unsafe {
+            let s: *const i8 = msg_send![uid, UTF8String];
+            if s.is_null() { return std::ptr::null_mut(); }
+            let uid_str = std::ffi::CStr::from_ptr(s).to_string_lossy();
+            let Some(idx) = win.sessions.iter().position(|sess| sess.unique_id == uid_str.as_ref()) else {
+                return std::ptr::null_mut();
+            };
+            let cls = AnyClass::get("NexusScriptSession").unwrap();
+            let obj: *mut AnyObject = msg_send![cls, new];
+            set_ivar_u64(obj, c"_windowID", wid);
+            set_ivar_usize(obj, c"_sessionIndex", idx);
+            obj
+        }
+    }
+
+    extern "C" fn tab_count_of_sessions(this: &AnyObject, _sel: Sel) -> usize {
+        let wid = unsafe { get_ivar_u64(this as *const _, c"_windowID") };
+        let Some(registry) = global_registry() else { return 0; };
+        let snap = registry.snapshot();
+        snap.iter().find(|w| w.id == wid).map(|w| w.sessions.len()).unwrap_or(0)
+    }
+
+    extern "C" fn tab_object_in_sessions_at_index(this: &AnyObject, _sel: Sel, index: usize) -> *mut AnyObject {
+        let wid = unsafe { get_ivar_u64(this as *const _, c"_windowID") };
+        let Some(registry) = global_registry() else { return std::ptr::null_mut(); };
+        let snap = registry.snapshot();
+        let Some(win) = snap.iter().find(|w| w.id == wid) else { return std::ptr::null_mut(); };
+        if index >= win.sessions.len() { return std::ptr::null_mut(); }
+        let cls = AnyClass::get("NexusScriptSession").unwrap();
+        unsafe {
+            let obj: *mut AnyObject = msg_send![cls, new];
+            set_ivar_u64(obj, c"_windowID", wid);
+            set_ivar_usize(obj, c"_sessionIndex", index);
+            obj
+        }
+    }
+
     // ========================================================================
     // NexusScriptSession
     // ========================================================================
@@ -579,18 +654,17 @@ mod apple_events {
     extern "C" fn session_object_specifier(this: &AnyObject, _sel: Sel) -> *mut AnyObject {
         unsafe {
             let wid = get_ivar_u64(this as *const _, c"_windowID");
-            let uid_str = get_session(this as *const _)
-                .map(|s| s.unique_id).unwrap_or_default();
+            let idx = get_ivar_usize(this as *const _, c"_sessionIndex");
 
             let app: *mut AnyObject =
                 msg_send![AnyClass::get("NSApplication").unwrap(), sharedApplication];
             let app_desc = script_class_desc("NSApplication");
             let app_spec: *mut AnyObject = msg_send![app, objectSpecifier];
-            let spec_cls = AnyClass::get("NSUniqueIDSpecifier").unwrap();
 
-            // Window specifier
+            // Window specifier (by unique ID)
+            let uid_cls = AnyClass::get("NSUniqueIDSpecifier").unwrap();
             let win_key = NSString::from_str("orderedScriptingWindows");
-            let alloc1: *mut AnyObject = msg_send![spec_cls, alloc];
+            let alloc1: *mut AnyObject = msg_send![uid_cls, alloc];
             let win_spec: *mut AnyObject = msg_send![alloc1,
                 initWithContainerClassDescription: app_desc,
                 containerSpecifier: app_spec,
@@ -598,26 +672,27 @@ mod apple_events {
                 uniqueID: nsnumber_i64(wid as i64)
             ];
 
-            // Tab specifier (unique ID = "tab-{windowID}")
+            // Tab specifier (always index 0)
+            let idx_cls = AnyClass::get("NSIndexSpecifier").unwrap();
             let win_desc = script_class_desc("NexusScriptWindow");
             let tab_key = NSString::from_str("tabs");
-            let alloc_tab: *mut AnyObject = msg_send![spec_cls, alloc];
+            let alloc_tab: *mut AnyObject = msg_send![idx_cls, alloc];
             let tab_spec: *mut AnyObject = msg_send![alloc_tab,
                 initWithContainerClassDescription: win_desc,
                 containerSpecifier: win_spec,
                 key: &*tab_key,
-                uniqueID: nsstring(&format!("tab-{wid}"))
+                index: 0i64
             ];
 
-            // Session specifier
+            // Session specifier (by index)
             let tab_desc = script_class_desc("NexusScriptTab");
             let sess_key = NSString::from_str("sessions");
-            let alloc2: *mut AnyObject = msg_send![spec_cls, alloc];
+            let alloc2: *mut AnyObject = msg_send![idx_cls, alloc];
             msg_send![alloc2,
                 initWithContainerClassDescription: tab_desc,
                 containerSpecifier: tab_spec,
                 key: &*sess_key,
-                uniqueID: nsstring(&uid_str)
+                index: idx as i64
             ]
         }
     }

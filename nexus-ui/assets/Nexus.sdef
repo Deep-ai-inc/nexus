@@ -57,7 +57,7 @@
         <class name="tab" code="NxTb" description="A tab within a Nexus window (currently one per window)."
                plural="tabs">
             <cocoa class="NexusScriptTab"/>
-            <property name="unique id" code="TbID" type="text" access="r"
+            <property name="id" code="ID  " type="text" access="r"
                       description="Stable tab identifier.">
                 <cocoa key="uniqueID"/>
             </property>
@@ -73,7 +73,7 @@
         <class name="session" code="Sess" description="A shell session within a tab."
                plural="sessions">
             <cocoa class="NexusScriptSession"/>
-            <property name="unique id" code="SsID" type="text" access="r"
+            <property name="id" code="ID  " type="text" access="r"
                       description="Stable session identifier.">
                 <cocoa key="uniqueID"/>
             </property>

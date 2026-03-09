@@ -540,42 +540,27 @@ impl NexusState {
 
         let (cols, rows) = self.shell.pty.terminal_size.get();
 
-        let sessions: Vec<SessionSnapshot> = self
-            .shell
-            .blocks
-            .blocks
-            .iter()
-            .map(|block| {
-                let is_busy = block.is_running();
-                let tty = self
-                    .shell
-                    .pty
-                    .handles
-                    .iter()
-                    .find(|h| h.block_id == block.id)
-                    .and_then(|h| h.tty_path.clone())
-                    .unwrap_or_default();
+        // Always report at least one session (the active shell), matching iTerm2
+        // where each tab always has a session even before any command is run.
+        let active_tty = self.shell.pty.handles.last()
+            .and_then(|h| h.tty_path.clone())
+            .unwrap_or_default();
+        let has_busy_block = self.shell.blocks.blocks.iter().any(|b| b.is_running());
 
-                SessionSnapshot {
-                    unique_id: format!("block-{}", block.id.0),
-                    tty,
-                    name: block
-                        .osc_title
-                        .clone()
-                        .unwrap_or_else(|| block.command.clone()),
-                    cwd: self.cwd.clone(),
-                    columns: cols,
-                    rows,
-                    running_command: if is_busy {
-                        block.command.clone()
-                    } else {
-                        String::new()
-                    },
-                    is_busy,
-                    profile_name: String::new(),
-                }
-            })
-            .collect();
+        let sessions = vec![SessionSnapshot {
+            unique_id: format!("window-{}", self.window_id),
+            tty: active_tty,
+            name: self.compute_title(),
+            cwd: self.cwd.clone(),
+            columns: cols,
+            rows,
+            running_command: self.shell.blocks.blocks.iter().rev()
+                .find(|b| b.is_running())
+                .map(|b| b.command.clone())
+                .unwrap_or_default(),
+            is_busy: has_busy_block,
+            profile_name: String::new(),
+        }];
 
         self.session_registry.update_window(WindowSnapshot {
             id: self.window_id,
