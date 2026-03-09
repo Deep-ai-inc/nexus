@@ -97,7 +97,7 @@
                       description="Terminal row count.">
                 <cocoa key="rows"/>
             </property>
-            <property name="running command" code="rcmd" type="text" access="r"
+            <property name="command" code="rcmd" type="text" access="r"
                       description="Currently executing command, or empty.">
                 <cocoa key="runningCommand"/>
             </property>

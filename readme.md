@@ -255,7 +255,7 @@ tell application "Nexus"
     get cwd of session 1 of tab 1 of window 1         -- "/Users/kevin/projects"
     get columns of session 1 of tab 1 of window 1     -- 120
     get rows of session 1 of tab 1 of window 1        -- 36
-    get running command of session 1 of tab 1 of window 1  -- "cargo build" or ""
+    get command of session 1 of tab 1 of window 1           -- "cargo build" or ""
     get is busy of session 1 of tab 1 of window 1     -- true/false
 end tell
 ```
@@ -276,13 +276,13 @@ Bounds use iTerm2's `{x1, y1, x2, y2}` convention (origin + opposite corner), no
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `unique id` | text | Stable session identifier (e.g. `"block-42"`) |
+| `id` | text | Stable session identifier (e.g. `"window-1"`) |
 | `tty` | text | PTY device path (e.g. `/dev/ttys003`), empty for builtins |
 | `name` | text | Session display name (OSC title or command) |
 | `cwd` | text | Current working directory |
 | `columns` | integer | Terminal column count |
 | `rows` | integer | Terminal row count |
-| `running command` | text | Currently executing command, or empty |
+| `command` | text | Currently executing command, or empty |
 | `is busy` | boolean | Whether a command is actively running |
 | `profile name` | text | Reserved for future use |
 
