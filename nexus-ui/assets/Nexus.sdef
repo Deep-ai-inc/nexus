@@ -45,7 +45,7 @@
                 <cocoa key="name"/>
             </property>
             <property name="bounds" code="pbnd" access="rw"
-                      description="Window bounding rectangle: {x, y, width, height}.">
+                      description="Window bounding rectangle: {x1, y1, x2, y2}.">
                 <cocoa key="boundsAsRect"/>
                 <type type="integer" list="yes"/>
             </property>
@@ -53,8 +53,8 @@
                       description="Window z-order index (1 = frontmost).">
                 <cocoa key="orderedIndex"/>
             </property>
-            <element type="session" access="r">
-                <cocoa key="sessions"/>
+            <element type="tab" access="r">
+                <cocoa key="tabs"/>
             </element>
         </class>
 
@@ -66,7 +66,23 @@
 
     <suite name="Nexus Suite" code="Nxus" description="Nexus terminal session scripting.">
 
-        <class name="session" code="Sess" description="A shell session within a Nexus window."
+        <class name="tab" code="NxTb" description="A tab within a Nexus window (currently one per window)."
+               plural="tabs">
+            <cocoa class="NexusScriptTab"/>
+            <property name="unique id" code="TbID" type="text" access="r"
+                      description="Stable tab identifier.">
+                <cocoa key="uniqueID"/>
+            </property>
+            <property name="index" code="pidx" type="integer" access="r"
+                      description="Tab index within the window (always 1 for now).">
+                <cocoa key="tabIndex"/>
+            </property>
+            <element type="session" access="r">
+                <cocoa key="sessions"/>
+            </element>
+        </class>
+
+        <class name="session" code="Sess" description="A shell session within a tab."
                plural="sessions">
             <cocoa class="NexusScriptSession"/>
             <property name="unique id" code="SsID" type="text" access="r"

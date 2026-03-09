@@ -237,25 +237,26 @@ Nexus exposes its window and session state via Cocoa Scripting, so external tool
 open target/Nexus.app
 ```
 
+The hierarchy matches iTerm2: **window → tab → session**. Nexus currently has one tab per window, so the tab layer is always `tab 1`.
+
 ### Reading state
 
 ```applescript
 tell application "Nexus"
-    get every window                          -- {window id 1, window id 2, ...}
-    get id of window 1                        -- 1
-    get name of window 1                      -- "Nexus — ~/projects"
-    get bounds of window 1                    -- {x, y, width, height}
-    get index of window 1                     -- 1 (frontmost)
+    get every window                                  -- {window id 1, ...}
+    get id of window 1                                -- 1
+    get name of window 1                              -- "Nexus — ~/projects"
+    get bounds of window 1                            -- {x1, y1, x2, y2}
+    get index of window 1                             -- 1 (frontmost)
 
-    get every session of window 1             -- sessions (one per shell block)
-    get unique id of session 1 of window 1    -- "block-42"
-    get tty of session 1 of window 1          -- "/dev/ttys003"
-    get cwd of session 1 of window 1          -- "/Users/kevin/projects"
-    get columns of session 1 of window 1      -- 120
-    get rows of session 1 of window 1         -- 36
-    get running command of session 1 of window 1  -- "cargo build" or ""
-    get is busy of session 1 of window 1      -- true/false
-    get name of session 1 of window 1         -- session display name
+    get every tab of window 1                         -- {tab 1}
+    get every session of tab 1 of window 1            -- sessions
+    get tty of session 1 of tab 1 of window 1         -- "/dev/ttys003"
+    get cwd of session 1 of tab 1 of window 1         -- "/Users/kevin/projects"
+    get columns of session 1 of tab 1 of window 1     -- 120
+    get rows of session 1 of tab 1 of window 1        -- 36
+    get running command of session 1 of tab 1 of window 1  -- "cargo build" or ""
+    get is busy of session 1 of tab 1 of window 1     -- true/false
 end tell
 ```
 
@@ -263,11 +264,13 @@ end tell
 
 ```applescript
 tell application "Nexus"
-    set bounds of window 1 to {100, 100, 1200, 800}  -- move/resize
+    set bounds of window 1 to {100, 100, 900, 700}   -- {x1, y1, x2, y2}
     set index of window 1 to 1                        -- raise to front
     activate                                          -- bring app to foreground
 end tell
 ```
+
+Bounds use iTerm2's `{x1, y1, x2, y2}` convention (origin + opposite corner), not `{x, y, width, height}`.
 
 ### Session properties
 
