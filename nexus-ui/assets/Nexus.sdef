@@ -2,11 +2,7 @@
 <!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
 <dictionary title="Nexus Terminology">
 
-    <!-- ================================================================== -->
-    <!-- Standard Suite                                                     -->
-    <!-- ================================================================== -->
-
-    <suite name="Standard Suite" code="????" description="Common classes and commands for all applications.">
+    <suite name="Nexus Suite" code="Nxus" description="Nexus terminal scripting.">
 
         <command name="count" code="corecnte" description="Return the number of elements of a particular class within an object.">
             <cocoa class="NSCountCommand"/>
@@ -58,14 +54,6 @@
             </element>
         </class>
 
-    </suite>
-
-    <!-- ================================================================== -->
-    <!-- Nexus Suite                                                        -->
-    <!-- ================================================================== -->
-
-    <suite name="Nexus Suite" code="Nxus" description="Nexus terminal session scripting.">
-
         <class name="tab" code="NxTb" description="A tab within a Nexus window (currently one per window)."
                plural="tabs">
             <cocoa class="NexusScriptTab"/>
@@ -73,7 +61,7 @@
                       description="Stable tab identifier.">
                 <cocoa key="uniqueID"/>
             </property>
-            <property name="index" code="pidx" type="integer" access="r"
+            <property name="index" code="NxTi" type="integer" access="r"
                       description="Tab index within the window (always 1 for now).">
                 <cocoa key="tabIndex"/>
             </property>
