@@ -32,3 +32,8 @@ unicode-width = { workspace = true }
 rmp-serde = { workspace = true }
 base64 = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }  # Markdown parsing
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWindow", "NSRunningApplication"] }
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSString", "NSGeometry", "NSObject", "NSDictionary", "NSValue"] }

@@ -20,6 +20,8 @@ pub struct PtyHandle {
     /// Child process for signal handling.
     #[allow(dead_code)]
     child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>,
+    /// Slave PTY device path (e.g. `/dev/ttys001`), if available.
+    pub tty_path: Option<String>,
 }
 
 impl PtyHandle {
@@ -60,6 +62,12 @@ impl PtyHandle {
 
         // Spawn the child process
         let child = pair.slave.spawn_command(cmd)?;
+
+        // Capture the slave TTY device path (e.g. /dev/ttys001) from the child PID.
+        let tty_path = child
+            .process_id()
+            .and_then(crate::infra::scripting::tty_for_pid);
+
         let child: Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>> =
             Arc::new(Mutex::new(Some(child)));
 
@@ -110,6 +118,7 @@ impl PtyHandle {
             writer,
             master,
             child,
+            tty_path,
         })
     }
 

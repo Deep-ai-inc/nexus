@@ -447,6 +447,17 @@ pub trait StrataApp: Sized + 'static {
         1.0
     }
 
+    /// Optional integer tag for the window (used for external scripting).
+    /// Returns 0 (no tag) by default.
+    fn window_tag(_state: &Self::State) -> isize {
+        0
+    }
+
+    /// Called after the NSWindow is created, with the raw window pointer.
+    /// Used by external scripting to map window IDs to NSWindow instances.
+    fn on_window_ready(_state: &Self::State, _nswindow_ptr: usize) {}
+
+
     /// Called when the user selects an item from a deferred native context menu.
     /// The app should map the index back to the original menu items and return
     /// the appropriate message to dispatch.

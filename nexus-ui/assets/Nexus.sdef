@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<dictionary title="Nexus Terminology">
+
+    <!-- ================================================================== -->
+    <!-- Standard Suite                                                     -->
+    <!-- ================================================================== -->
+
+    <suite name="Standard Suite" code="????" description="Common classes and commands for all applications.">
+
+        <command name="count" code="corecnte" description="Return the number of elements of a particular class within an object.">
+            <cocoa class="NSCountCommand"/>
+            <access-group identifier="*"/>
+            <direct-parameter type="specifier" description="The objects to be counted."/>
+            <parameter name="each" code="kocl" type="type" optional="yes"
+                       description="The class of objects to be counted.">
+                <cocoa key="ObjectClass"/>
+            </parameter>
+            <result type="integer" description="The count."/>
+        </command>
+
+        <command name="exists" code="coredoex" description="Verify that an object exists.">
+            <cocoa class="NSExistsCommand"/>
+            <access-group identifier="*"/>
+            <direct-parameter type="any" description="The object(s) to check."/>
+            <result type="boolean" description="Did the object(s) exist?"/>
+        </command>
+
+        <class name="application" code="capp" description="The Nexus application."
+               plural="applications">
+            <cocoa class="NSApplication"/>
+            <element type="window" access="r">
+                <cocoa key="orderedScriptingWindows"/>
+            </element>
+        </class>
+
+        <class name="window" code="cwin" description="A Nexus window." plural="windows">
+            <cocoa class="NexusScriptWindow"/>
+            <property name="id" code="ID  " type="integer" access="r"
+                      description="Unique window identifier.">
+                <cocoa key="uniqueID"/>
+            </property>
+            <property name="name" code="pnam" type="text" access="r"
+                      description="Window title.">
+                <cocoa key="name"/>
+            </property>
+            <property name="bounds" code="pbnd" access="rw"
+                      description="Window bounding rectangle: {x, y, width, height}.">
+                <cocoa key="boundsAsRect"/>
+                <type type="integer" list="yes"/>
+            </property>
+            <property name="index" code="pidx" type="integer" access="rw"
+                      description="Window z-order index (1 = frontmost).">
+                <cocoa key="orderedIndex"/>
+            </property>
+            <element type="session" access="r">
+                <cocoa key="sessions"/>
+            </element>
+        </class>
+
+    </suite>
+
+    <!-- ================================================================== -->
+    <!-- Nexus Suite                                                        -->
+    <!-- ================================================================== -->
+
+    <suite name="Nexus Suite" code="Nxus" description="Nexus terminal session scripting.">
+
+        <class name="session" code="Sess" description="A shell session within a Nexus window."
+               plural="sessions">
+            <cocoa class="NexusScriptSession"/>
+            <property name="unique id" code="SsID" type="text" access="r"
+                      description="Stable session identifier.">
+                <cocoa key="uniqueID"/>
+            </property>
+            <property name="tty" code="ttyp" type="text" access="r"
+                      description="PTY device path (e.g. /dev/ttys001), or empty for builtins.">
+                <cocoa key="tty"/>
+            </property>
+            <property name="name" code="pnam" type="text" access="r"
+                      description="Session display name.">
+                <cocoa key="name"/>
+            </property>
+            <property name="cwd" code="cwdp" type="text" access="r"
+                      description="Current working directory.">
+                <cocoa key="cwd"/>
+            </property>
+            <property name="columns" code="cols" type="integer" access="r"
+                      description="Terminal column count.">
+                <cocoa key="columns"/>
+            </property>
+            <property name="rows" code="rows" type="integer" access="r"
+                      description="Terminal row count.">
+                <cocoa key="rows"/>
+            </property>
+            <property name="running command" code="rcmd" type="text" access="r"
+                      description="Currently executing command, or empty.">
+                <cocoa key="runningCommand"/>
+            </property>
+            <property name="is busy" code="busy" type="boolean" access="r"
+                      description="Whether a command is actively running.">
+                <cocoa key="isBusy"/>
+            </property>
+            <property name="profile name" code="prof" type="text" access="r"
+                      description="Session profile name (reserved for future use).">
+                <cocoa key="profileName"/>
+            </property>
+        </class>
+
+    </suite>
+
+</dictionary>

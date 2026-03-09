@@ -55,6 +55,14 @@ pub trait RootComponent: Component + Sized {
         false
     }
 
+    /// Optional integer tag for the window (used for external scripting).
+    fn window_tag(&self) -> isize {
+        0
+    }
+
+    /// Called after the NSWindow is created, with the raw window pointer.
+    fn on_window_ready(&self, _nswindow_ptr: usize) {}
+
     /// The root `IdSpace` for the component tree.
     fn root_ids() -> IdSpace {
         IdSpace::new(0)
@@ -162,6 +170,14 @@ where
 
     fn on_tick(state: &mut C) -> (bool, crate::app::Command<C::Message>) {
         state.on_tick()
+    }
+
+    fn window_tag(state: &C) -> isize {
+        state.window_tag()
+    }
+
+    fn on_window_ready(state: &C, nswindow_ptr: usize) {
+        state.on_window_ready(nswindow_ptr);
     }
 
     fn on_native_menu_result(state: &mut C, index: usize) -> Option<C::Message> {

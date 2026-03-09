@@ -68,6 +68,10 @@ pub struct NexusShared {
     pub next_block_id: Arc<AtomicU64>,
     /// Hues assigned to existing windows, for max-distance tint selection.
     pub window_hues: Arc<std::sync::Mutex<Vec<f32>>>,
+    /// Global window ID counter.
+    pub next_window_id: Arc<AtomicU64>,
+    /// Session registry — external tools query this via the UDS server.
+    pub session_registry: crate::infra::scripting::SessionRegistry,
 }
 
 impl Default for NexusShared {
@@ -75,6 +79,8 @@ impl Default for NexusShared {
         Self {
             next_block_id: Arc::new(AtomicU64::new(1)),
             window_hues: Arc::new(std::sync::Mutex::new(Vec::new())),
+            next_window_id: Arc::new(AtomicU64::new(1)),
+            session_registry: crate::infra::scripting::SessionRegistry::new(),
         }
     }
 }
@@ -144,6 +150,11 @@ pub struct NexusState {
     /// Shared hue list (for removal on drop).
     window_hues: Arc<std::sync::Mutex<Vec<f32>>>,
 
+    /// Unique window ID (for scripting / external tool identification).
+    pub window_id: u64,
+    /// Session registry ref (for cleanup on drop).
+    session_registry: crate::infra::scripting::SessionRegistry,
+
     /// Debug mode for layout visualization (toggle with Cmd+Shift+D).
     #[cfg(debug_assertions)]
     pub debug_layout: bool,
@@ -156,6 +167,7 @@ impl Drop for NexusState {
                 hues.swap_remove(pos);
             }
         }
+        self.session_registry.remove_window(self.window_id);
     }
 }
 
@@ -435,6 +447,10 @@ impl Component for NexusState {
         self.last_cursor_blink = cursor_now;
 
         let cmd = self.check_reconnect();
+
+        // Push session state to the scripting registry (cheap — just mutex + clone).
+        self.update_session_registry();
+
         let dirty = output_dirty || spring_animating || auto_scrolling || cursor_changed || connecting;
         (dirty, cmd)
     }
@@ -518,6 +534,56 @@ impl NexusState {
         }
     }
 
+    /// Push a session snapshot to the registry for external tool queries.
+    pub(crate) fn update_session_registry(&self) {
+        use crate::infra::scripting::{SessionSnapshot, WindowSnapshot};
+
+        let (cols, rows) = self.shell.pty.terminal_size.get();
+
+        let sessions: Vec<SessionSnapshot> = self
+            .shell
+            .blocks
+            .blocks
+            .iter()
+            .map(|block| {
+                let is_busy = block.is_running();
+                let tty = self
+                    .shell
+                    .pty
+                    .handles
+                    .iter()
+                    .find(|h| h.block_id == block.id)
+                    .and_then(|h| h.tty_path.clone())
+                    .unwrap_or_default();
+
+                SessionSnapshot {
+                    unique_id: format!("block-{}", block.id.0),
+                    tty,
+                    name: block
+                        .osc_title
+                        .clone()
+                        .unwrap_or_else(|| block.command.clone()),
+                    cwd: self.cwd.clone(),
+                    columns: cols,
+                    rows,
+                    running_command: if is_busy {
+                        block.command.clone()
+                    } else {
+                        String::new()
+                    },
+                    is_busy,
+                    profile_name: String::new(),
+                }
+            })
+            .collect();
+
+        self.session_registry.update_window(WindowSnapshot {
+            id: self.window_id,
+            name: self.compute_title(),
+            sessions,
+        });
+    }
+
     /// Get the command string of the most recent running block (kernel or PTY).
     fn last_running_command(&self) -> Option<String> {
         self.shell.blocks.blocks.iter().rev()
@@ -559,6 +625,10 @@ impl RootComponent for NexusState {
         let cwd = home.display().to_string();
 
         let context = NexusContext::new(home.clone());
+
+        // Assign a unique window ID and start the scripting server (first window only).
+        let window_id = shared.next_window_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::infra::scripting::init(shared.session_registry.clone());
 
         // Pick a hue maximally distant from all existing windows.
         let (window_hue, window_tint) = {
@@ -614,6 +684,8 @@ impl RootComponent for NexusState {
             window_tint,
             window_hue,
             window_hues: shared.window_hues.clone(),
+            window_id,
+            session_registry: shared.session_registry.clone(),
             context,
             #[cfg(debug_assertions)]
             debug_layout: false,
@@ -640,6 +712,14 @@ impl RootComponent for NexusState {
 
     fn background_color(&self) -> strata::primitives::Color {
         self.window_tint
+    }
+
+    fn window_tag(&self) -> isize {
+        self.window_id as isize
+    }
+
+    fn on_window_ready(&self, nswindow_ptr: usize) {
+        self.session_registry.set_nswindow_ptr(self.window_id, nswindow_ptr);
     }
 
     fn should_exit(&self) -> bool {

@@ -88,21 +88,18 @@ The difference is invisible until you need it:
 └────────────┬───────────────────────────┬────────────────────────┘
              │                           │
 ┌────────────▼──────────────┐ ┌──────────▼────────────────────────┐
-│  SHELL INTERPRETER        │ │  AGENT SYSTEM                     │
-│  nexus-kernel             │ │  nexus-agent (AI)                 │
-│    ├─ Parser (tree-sitter)│ │    ├─ Agentic loop & tool system  │
-│    ├─ Evaluator (AST)     │ │    ├─ Session management          │
-│    ├─ 110+ native commands│ │    └─ ACP protocol integration    │
-│    ├─ Job control         │ │                                   │
-│    └─ SQLite history      │ │  Composed of:                     │
-│                           │ │    nexus-llm       Multi-provider │
-│  Execution paths:         │ │      (Anthropic, OpenAI, Ollama,  │
-│    Kernel → Value output  │ │       Vertex, Groq, Mistral,      │
-│    PTY    → raw terminal  │ │       Cerebras, OpenRouter, ...)   │
-│    Remote → nexus-agent   │ │    nexus-executor  Cmd execution  │
-│                           │ │    nexus-fs        File ops       │
-│                           │ │    nexus-web       Web & search   │
-│                           │ │    nexus-sandbox   Policy enforce │
+│  SHELL INTERPRETER        │ │  AI & REMOTE                      │
+│  nexus-kernel             │ │                                   │
+│    ├─ Parser (tree-sitter)│ │  AI agent (Claude Code CLI)       │
+│    ├─ Evaluator (AST)     │ │    ├─ NDJSON event streaming      │
+│    ├─ 100+ native commands│ │    ├─ Permission prompt routing   │
+│    ├─ Job control         │ │    └─ Tool result rendering       │
+│    └─ SQLite history      │ │                                   │
+│                           │ │  nexus-agent       Remote shell   │
+│  Execution paths:         │ │    ├─ Auto-deployed via SSH       │
+│    Kernel → Value output  │ │    ├─ Runs nexus-kernel remotely  │
+│    PTY    → raw terminal  │ │    └─ Binary protocol (msgpack)   │
+│    Remote → nexus-agent   │ │                                   │
 └────────────┬──────────────┘ └──────────┬────────────────────────┘
              │                           │
 ┌────────────▼───────────────────────────▼────────────────────────┐
@@ -117,8 +114,6 @@ The difference is invisible until you need it:
 │                                                                 │
 │  nexus-term        Headless terminal emulation                 │
 │    ANSI parsing via alacritty_terminal, virtual grid for TUIs  │
-│                                                                 │
-│  nexus-sandbox     macOS Seatbelt, read-only/workspace policies │
 └─────────────────────────────────────────────────────────────────┘
 
 Data flow:
@@ -129,7 +124,7 @@ Data flow:
   All ShellEvents → tokio broadcast → UI subscription → GPU render
 ```
 
-**Native commands** (ls, git, ps, etc.) return structured `Value` types.
+**Native commands** (ls, ps, etc.) return structured `Value` types.
 **Legacy commands** (vim, htop, etc.) run in a PTY with full terminal emulation.
 **Remote commands** run on a deployed agent via `nexus-protocol`, returning the same structured types over SSH/Docker/kubectl.
 **The UI** renders all three seamlessly through Strata, a custom GPU rendering engine with its own Metal pipeline, glyph atlas, and text shaping via cosmic-text.
@@ -138,14 +133,13 @@ Data flow:
 
 **Working:**
 - Bash-compatible parsing (pipes, loops, redirects, subshells)
-- 110+ native commands with structured output
-- Native git commands (status, log, branch, diff, add, commit, remote, stash)
+- 100+ native commands with structured output
 - Session persistence (SQLite — history with full-text search, blocks)
 - Tilde expansion, glob expansion
 - PTY for external commands
 - Terminal emulation for TUI apps (vim, htop)
 - Output persistence and `|` continuation
-- AI agent with 13 LLM providers, tool use, and ACP protocol
+- AI agent via Claude Code CLI with tool use and permissions
 - Remote shells via SSH, Docker, kubectl with auto-deployed agent
 - Connection progress overlay with real-time upload tracking
 - Interactive table rendering (click to sort/filter)
@@ -229,6 +223,65 @@ This is not Unix `watch`. Unix `watch` reruns a string and repaints characters. 
 - **Pipeline-aware** — The kernel knows the semantics of each stage. External commands (`watch docker ps`) fall back to stdout capture with ANSI preservation.
 
 Interval syntax: bare number = seconds (`-n 1`), suffix = explicit (`-n 500ms`, `-n 2s`). Default is 2 seconds. Cancel with Ctrl+C.
+
+## AppleScript / Automation
+
+Nexus exposes its window and session state via Cocoa Scripting, so external tools (dashboards, window managers, scripts) can query and control it — the same way iTerm2 does.
+
+**Requirements:** Nexus must be running as a `.app` bundle (not a bare binary) for macOS to load the scripting dictionary.
+
+```bash
+# Build and package
+./scripts/package-app.sh          # debug build
+./scripts/package-app.sh --release  # release build
+open target/Nexus.app
+```
+
+### Reading state
+
+```applescript
+tell application "Nexus"
+    get every window                          -- {window id 1, window id 2, ...}
+    get id of window 1                        -- 1
+    get name of window 1                      -- "Nexus — ~/projects"
+    get bounds of window 1                    -- {x, y, width, height}
+    get index of window 1                     -- 1 (frontmost)
+
+    get every session of window 1             -- sessions (one per shell block)
+    get unique id of session 1 of window 1    -- "block-42"
+    get tty of session 1 of window 1          -- "/dev/ttys003"
+    get cwd of session 1 of window 1          -- "/Users/kevin/projects"
+    get columns of session 1 of window 1      -- 120
+    get rows of session 1 of window 1         -- 36
+    get running command of session 1 of window 1  -- "cargo build" or ""
+    get is busy of session 1 of window 1      -- true/false
+    get name of session 1 of window 1         -- session display name
+end tell
+```
+
+### Writing state
+
+```applescript
+tell application "Nexus"
+    set bounds of window 1 to {100, 100, 1200, 800}  -- move/resize
+    set index of window 1 to 1                        -- raise to front
+    activate                                          -- bring app to foreground
+end tell
+```
+
+### Session properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `unique id` | text | Stable session identifier (e.g. `"block-42"`) |
+| `tty` | text | PTY device path (e.g. `/dev/ttys003`), empty for builtins |
+| `name` | text | Session display name (OSC title or command) |
+| `cwd` | text | Current working directory |
+| `columns` | integer | Terminal column count |
+| `rows` | integer | Terminal row count |
+| `running command` | text | Currently executing command, or empty |
+| `is busy` | boolean | Whether a command is actively running |
+| `profile name` | text | Reserved for future use |
 
 ## Quick Start
 

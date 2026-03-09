@@ -300,7 +300,7 @@ fn encode_named(
 /// translates GUI events into VT byte sequences, and debounces resize
 /// signals.  The shell widget delegates all PTY operations here.
 pub(crate) struct PtyBackend {
-    pub(super) handles: Vec<PtyHandle>,
+    pub(crate) handles: Vec<PtyHandle>,
     pub(super) tx: mpsc::UnboundedSender<(BlockId, PtyEvent)>,
     pub(crate) rx: Arc<Mutex<mpsc::UnboundedReceiver<(BlockId, PtyEvent)>>>,
 

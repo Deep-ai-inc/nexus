@@ -471,6 +471,13 @@ fn open_new_window_with_state<A: StrataApp>(
     window.setTitle(&NSString::from_str(&title));
     win_state.current_title = title;
 
+    // Store window pointer for external scripting identification.
+    let tag = A::window_tag(&win_state.app);
+    if tag != 0 {
+        let win_ptr = &*window as *const NSWindow as usize;
+        A::on_window_ready(&win_state.app, win_ptr);
+    }
+
     // Store state pointer in the view's ivar.
     let win_state_ptr = Box::into_raw(Box::new(RefCell::new(win_state)));
     unsafe {

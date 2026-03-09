@@ -2,3 +2,4 @@
 
 pub mod systems;
 pub mod pty_driver;
+pub mod scripting;
