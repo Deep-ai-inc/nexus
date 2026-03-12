@@ -114,7 +114,8 @@ struct WindowState<A: StrataApp> {
     tick_interval_ms: u64,   // Display refresh interval (e.g. 8 for 120Hz, 16 for 60Hz)
     pending_window_resize: Option<(f32, f32)>, // Deferred setContentSize (avoid reentrant borrow)
     poll_timer: *mut c_void, // CFRunLoopTimerRef for main-thread polling (invalidated on close)
-    transactional_present: bool, // When true, render_if_needed uses presentsWithTransaction
+    transactional_present: bool,
+    titlebar_height: f32, // When true, render_if_needed uses presentsWithTransaction
 }
 
 // ============================================================================
@@ -349,7 +350,8 @@ fn open_new_window_with_state<A: StrataApp>(
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::Resizable
-        | NSWindowStyleMask::Miniaturizable;
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::FullSizeContentView;
 
     // Size and position the window using gravitational best-fit:
     // - Size: 50% of screen in each dimension (quarter of screen area)
@@ -379,6 +381,7 @@ fn open_new_window_with_state<A: StrataApp>(
         )
     };
     window.setBackgroundColor(Some(&bg_color));
+    unsafe { let _: () = msg_send![&*window, setTitlebarAppearsTransparent: Bool::YES]; }
     window.setMinSize(NSSize::new(400.0, 300.0));
 
     let dpi_scale = window.backingScaleFactor() as f32;
@@ -456,6 +459,17 @@ fn open_new_window_with_state<A: StrataApp>(
         pending_window_resize: None,
         poll_timer: std::ptr::null_mut(),
         transactional_present: false,
+        titlebar_height: {
+            // With FullSizeContentView the content rect == frame, so compute
+            // the titlebar height using the style mask WITHOUT FullSizeContentView.
+            let frame = window.frame();
+            let style_without_fscv = NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Resizable
+                | NSWindowStyleMask::Miniaturizable;
+            let content_without = unsafe { NSWindow::contentRectForFrameRect_styleMask(frame, style_without_fscv, mtm) };
+            (frame.size.height - content_without.size.height) as f32
+        },
     };
 
     // Render first frame synchronously before showing window.
@@ -1354,7 +1368,12 @@ fn handle_resize_end<A: StrataApp>(view: &AnyObject) {
 
 fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
     if A::is_exit_request(&msg) {
-        std::process::exit(0);
+        unsafe {
+            let mtm = MainThreadMarker::new_unchecked();
+            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            app.terminate(None);
+        }
+        return;
     }
     if A::is_new_window_request(&msg) {
         if let Some(f) = unsafe { CREATE_WINDOW_FN } { f(); }
@@ -1389,7 +1408,8 @@ fn process_message<A: StrataApp>(state: &mut WindowState<A>, msg: A::Message) {
 fn build_scene<A: StrataApp>(state: &WindowState<A>) -> Scene {
     let zoom = A::zoom_level(&state.app);
     let mut snapshot = LayoutSnapshot::new();
-    snapshot.set_viewport(Rect::new(0.0, 0.0, state.base_size.0, state.base_size.1));
+    let tb = state.titlebar_height / zoom;
+    snapshot.set_viewport(Rect::new(0.0, tb, state.base_size.0, state.base_size.1));
     snapshot.set_zoom_level(zoom);
     A::view(&state.app, &mut snapshot);
 
@@ -1959,6 +1979,29 @@ fn populate_pipeline(
         clip.map(|c| [c.x * scale, c.y * scale, c.width * scale, c.height * scale])
     }
     #[inline]
+    fn scale_gradient(gradient: &crate::primitives::Gradient, scale: f32) -> crate::primitives::Gradient {
+        use crate::primitives::Gradient;
+        match gradient {
+            Gradient::Linear { start, end, stops, spread } => Gradient::Linear {
+                start: Point::new(start.x * scale, start.y * scale),
+                end: Point::new(end.x * scale, end.y * scale),
+                stops: stops.clone(),
+                spread: *spread,
+            },
+            Gradient::Radial { center, radius, stops, spread } => Gradient::Radial {
+                center: Point::new(center.x * scale, center.y * scale),
+                radius: radius * scale,
+                stops: stops.clone(),
+                spread: *spread,
+            },
+            Gradient::Conic { center, angle, stops, spread } => Gradient::Conic {
+                center: Point::new(center.x * scale, center.y * scale),
+                angle: *angle,
+                stops: stops.clone(),
+                spread: *spread,
+            },
+        }
+    }
     fn maybe_clip(pipeline: &mut StrataPipeline, start: usize, clip: &Option<Rect>, scale: f32) {
         if let Some(gpu_clip) = clip_to_gpu(clip, scale) {
             pipeline.apply_clip_since(start, gpu_clip);
@@ -2031,6 +2074,17 @@ fn populate_pipeline(
     for prim in &primitives.images {
         let start = pipeline.instance_count();
         pipeline.add_image(prim.rect.x * scale, prim.rect.y * scale, prim.rect.width * scale, prim.rect.height * scale, prim.handle, prim.corner_radius * scale, prim.tint);
+        maybe_clip(pipeline, start, &prim.clip_rect, scale);
+    }
+    for prim in &primitives.gradient_rects {
+        let start = pipeline.instance_count();
+        // Scale gradient parameters to match the scaled rect
+        let scaled_gradient = scale_gradient(&prim.gradient, scale);
+        pipeline.add_gradient_rect(
+            prim.rect.x * scale, prim.rect.y * scale,
+            prim.rect.width * scale, prim.rect.height * scale,
+            &scaled_gradient, prim.corner_radius * scale,
+        );
         maybe_clip(pipeline, start, &prim.clip_rect, scale);
     }
 
@@ -2211,6 +2265,16 @@ fn populate_pipeline(
     for prim in &overlays.images {
         let start = pipeline.instance_count();
         pipeline.add_image(prim.rect.x * scale, prim.rect.y * scale, prim.rect.width * scale, prim.rect.height * scale, prim.handle, prim.corner_radius * scale, prim.tint);
+        maybe_clip(pipeline, start, &prim.clip_rect, scale);
+    }
+    for prim in &overlays.gradient_rects {
+        let start = pipeline.instance_count();
+        let scaled_gradient = scale_gradient(&prim.gradient, scale);
+        pipeline.add_gradient_rect(
+            prim.rect.x * scale, prim.rect.y * scale,
+            prim.rect.width * scale, prim.rect.height * scale,
+            &scaled_gradient, prim.corner_radius * scale,
+        );
         maybe_clip(pipeline, start, &prim.clip_rect, scale);
     }
     for prim in &overlays.text_runs {

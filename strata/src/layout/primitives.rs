@@ -4,7 +4,7 @@
 //! with zero abstraction overhead. Use for backgrounds, decorations, canvas drawing.
 
 use crate::gpu::ImageHandle;
-use crate::primitives::{Color, Point, Rect};
+use crate::primitives::{Color, Gradient, Point, Rect};
 
 /// A batch of primitives ready for GPU rendering.
 ///
@@ -38,6 +38,9 @@ pub struct PrimitiveBatch {
 
     /// Images (rendered via image atlas, Mode 4).
     pub(crate) images: Vec<ImagePrimitive>,
+
+    /// Gradient-filled rectangles (rendered via Mode 6).
+    pub(crate) gradient_rects: Vec<GradientRect>,
 
     /// Clip stack for nested container clipping.
     /// Each entry is a clip rect; the effective clip is the intersection of all.
@@ -146,6 +149,15 @@ pub struct ImagePrimitive {
     pub clip_rect: Option<Rect>,
 }
 
+/// A gradient-filled rectangle primitive.
+#[derive(Debug, Clone)]
+pub struct GradientRect {
+    pub rect: Rect,
+    pub gradient: Gradient,
+    pub corner_radius: f32,
+    pub clip_rect: Option<Rect>,
+}
+
 impl PrimitiveBatch {
     /// Create an empty primitive batch.
     pub fn new() -> Self {
@@ -163,6 +175,7 @@ impl PrimitiveBatch {
         self.borders.clear();
         self.shadows.clear();
         self.images.clear();
+        self.gradient_rects.clear();
         self.clip_stack.clear();
     }
 
@@ -446,6 +459,24 @@ impl PrimitiveBatch {
         self
     }
 
+    /// Add a gradient-filled rectangle.
+    #[inline]
+    pub fn add_gradient_rect(
+        &mut self,
+        rect: Rect,
+        gradient: Gradient,
+        corner_radius: f32,
+    ) -> &mut Self {
+        let clip_rect = self.current_clip();
+        self.gradient_rects.push(GradientRect {
+            rect,
+            gradient,
+            corner_radius,
+            clip_rect,
+        });
+        self
+    }
+
     /// Check if the batch is empty.
     pub fn is_empty(&self) -> bool {
         self.solid_rects.is_empty()
@@ -457,6 +488,7 @@ impl PrimitiveBatch {
             && self.borders.is_empty()
             && self.shadows.is_empty()
             && self.images.is_empty()
+            && self.gradient_rects.is_empty()
     }
 
     /// Total number of primitives.
@@ -470,6 +502,7 @@ impl PrimitiveBatch {
             + self.borders.len()
             + self.shadows.len()
             + self.images.len()
+            + self.gradient_rects.len()
     }
 }
 

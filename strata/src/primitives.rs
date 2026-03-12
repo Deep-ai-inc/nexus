@@ -394,6 +394,148 @@ impl Color {
     pub const fn with_alpha(self, a: f32) -> Self {
         Self { a, ..self }
     }
+
+    /// Convert from sRGB to Oklab color space.
+    pub fn to_oklab(self) -> [f32; 4] {
+        // sRGB → linear
+        let r = srgb_to_linear(self.r);
+        let g = srgb_to_linear(self.g);
+        let b = srgb_to_linear(self.b);
+
+        // Linear RGB → LMS (via Oklab matrix)
+        let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
+        let m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;
+        let s = 0.0883024619 * r + 0.2220049874 * g + 0.6896925507 * b;
+
+        // Cube root
+        let l_ = l.cbrt();
+        let m_ = m.cbrt();
+        let s_ = s.cbrt();
+
+        // LMS → Oklab
+        let ok_l = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+        let ok_a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+        let ok_b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+
+        [ok_l, ok_a, ok_b, self.a]
+    }
+}
+
+/// sRGB component to linear.
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// A color stop in a gradient.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColorStop {
+    /// The color at this stop (sRGB).
+    pub color: Color,
+    /// Position along the gradient (0.0 = start, 1.0 = end).
+    pub offset: f32,
+}
+
+/// Spread mode for gradient edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Spread {
+    /// Clamp to the nearest stop color.
+    #[default]
+    Pad = 0,
+    /// Repeat the gradient pattern.
+    Repeat = 1,
+    /// Mirror the gradient pattern.
+    Reflect = 2,
+}
+
+/// A gradient fill.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Gradient {
+    /// Linear gradient between two points.
+    Linear {
+        start: Point,
+        end: Point,
+        stops: Vec<ColorStop>,
+        spread: Spread,
+    },
+    /// Radial gradient from center outward.
+    Radial {
+        center: Point,
+        radius: f32,
+        stops: Vec<ColorStop>,
+        spread: Spread,
+    },
+    /// Conic (angular) gradient around a center point.
+    Conic {
+        center: Point,
+        /// Starting angle in radians (0 = right, increasing clockwise).
+        angle: f32,
+        stops: Vec<ColorStop>,
+        spread: Spread,
+    },
+}
+
+impl Gradient {
+    /// Create a simple two-stop linear gradient.
+    pub fn linear(start: Point, end: Point, from: Color, to: Color) -> Self {
+        Self::Linear {
+            start,
+            end,
+            stops: vec![
+                ColorStop { color: from, offset: 0.0 },
+                ColorStop { color: to, offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        }
+    }
+
+    /// Create a simple two-stop radial gradient.
+    pub fn radial(center: Point, radius: f32, from: Color, to: Color) -> Self {
+        Self::Radial {
+            center,
+            radius,
+            stops: vec![
+                ColorStop { color: from, offset: 0.0 },
+                ColorStop { color: to, offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        }
+    }
+
+    /// Create a simple two-stop conic gradient.
+    pub fn conic(center: Point, angle: f32, from: Color, to: Color) -> Self {
+        Self::Conic {
+            center,
+            angle,
+            stops: vec![
+                ColorStop { color: from, offset: 0.0 },
+                ColorStop { color: to, offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        }
+    }
+
+    pub fn stops(&self) -> &[ColorStop] {
+        match self {
+            Self::Linear { stops, .. } | Self::Radial { stops, .. } | Self::Conic { stops, .. } => stops,
+        }
+    }
+
+    pub fn spread(&self) -> Spread {
+        match self {
+            Self::Linear { spread, .. } | Self::Radial { spread, .. } | Self::Conic { spread, .. } => *spread,
+        }
+    }
+}
+
+/// A fill style — either a solid color or a gradient.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fill {
+    Solid(Color),
+    Gradient(Gradient),
 }
 
 #[cfg(test)]

@@ -54,7 +54,7 @@ pub use text_input::TextInputElement;
 pub use table::{TableElement, TableColumn, TableCell, VirtualTableElement, VirtualCell, CellContent};
 pub use canvas::Canvas;
 pub use list_view::ListView;
-pub use primitives::{LineStyle, PrimitiveBatch};
+pub use primitives::{GradientRect, LineStyle, PrimitiveBatch};
 
 // =========================================================================
 // Integration Tests (Phase 4 Verification)

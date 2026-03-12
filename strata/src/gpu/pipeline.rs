@@ -38,7 +38,7 @@ use lru::LruCache;
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 use super::glyph_atlas::GlyphAtlas;
-use crate::primitives::{Color, Rect};
+use crate::primitives::{Color, Gradient, Rect, Spread};
 
 /// Opaque handle to a loaded image in the pipeline's image atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -219,6 +219,42 @@ impl LineStyle {
     }
 }
 
+/// GPU gradient header (32 bytes, 16-byte aligned).
+///
+/// Stored in a storage buffer, indexed by gradient instances.
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct GpuGradient {
+    /// Gradient kind: 0=linear, 1=radial, 2=conic.
+    kind: u32,
+    /// Index of first stop in the stops buffer.
+    stop_offset: u32,
+    /// Number of color stops.
+    stop_count: u32,
+    /// Spread mode: 0=pad, 1=repeat, 2=reflect.
+    spread: u32,
+    /// Gradient parameters (interpretation depends on kind):
+    /// Linear: start.x, start.y, end.x, end.y
+    /// Radial: center.x, center.y, radius, 0
+    /// Conic:  center.x, center.y, angle, 0
+    params: [f32; 4],
+}
+
+/// GPU gradient color stop (32 bytes, 16-byte aligned).
+///
+/// Colors are stored in Oklab space for perceptually uniform interpolation.
+/// The shader interpolates in Oklab then converts to linear sRGB at the end.
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct GpuGradientStop {
+    /// Color in Oklab: [L, a, b, alpha].
+    color: [f32; 4],
+    /// Position along gradient (0.0–1.0).
+    offset: f32,
+    /// Padding for 16-byte alignment.
+    _padding: [f32; 3],
+}
+
 /// Uniform data for the shader.
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
@@ -339,6 +375,18 @@ pub struct StrataPipeline {
     /// Identity of the grid being cached (hash of cols + rows + x-origin).
     /// If grid identity changes, the entire row cache is invalidated.
     grid_cache_id: u64,
+    /// Gradient headers for the current frame.
+    gradients: Vec<GpuGradient>,
+    /// Gradient color stops for the current frame (Oklab colors).
+    gradient_stops: Vec<GpuGradientStop>,
+    /// Triple-buffered gradient header buffer.
+    gradient_buffers: Vec<metal::Buffer>,
+    /// Triple-buffered gradient stop buffer.
+    gradient_stop_buffers: Vec<metal::Buffer>,
+    /// Current gradient buffer capacity (number of headers).
+    gradient_capacity: usize,
+    /// Current gradient stop buffer capacity (number of stops).
+    gradient_stop_capacity: usize,
 }
 
 /// Fast per-character glyph lookup for terminal grid text.
@@ -545,6 +593,12 @@ impl StrataPipeline {
             grid_line_y: None,
             grid_row_cache: Vec::new(),
             grid_cache_id: 0,
+            gradients: Vec::new(),
+            gradient_stops: Vec::new(),
+            gradient_buffers: Vec::new(),
+            gradient_stop_buffers: Vec::new(),
+            gradient_capacity: 0,
+            gradient_stop_capacity: 0,
         }
     }
 
@@ -573,6 +627,8 @@ impl StrataPipeline {
     /// Clear instances for new frame.
     pub fn clear(&mut self) {
         self.instances.clear();
+        self.gradients.clear();
+        self.gradient_stops.clear();
         self.cache_hits = 0;
         self.cache_misses = 0;
         self.shaping_time = std::time::Duration::ZERO;
@@ -798,6 +854,74 @@ impl StrataPipeline {
             radius,
             color,
         );
+    }
+
+    // =========================================================================
+    // Mode 6: Gradient
+    // =========================================================================
+
+    /// Add a gradient-filled rectangle.
+    ///
+    /// Gradient points are in the rect's local coordinate space (relative to
+    /// the rect's top-left corner). The shader computes `t` per-fragment.
+    pub fn add_gradient_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        gradient: &Gradient,
+        corner_radius: f32,
+    ) {
+        let (kind, params) = match gradient {
+            Gradient::Linear { start, end, .. } => (0u32, [start.x, start.y, end.x, end.y]),
+            Gradient::Radial { center, radius, .. } => (1u32, [center.x, center.y, *radius, 0.0]),
+            Gradient::Conic { center, angle, .. } => (2u32, [center.x, center.y, *angle, 0.0]),
+        };
+
+        let stop_offset = self.gradient_stops.len() as u32;
+        let stops = gradient.stops();
+        for stop in stops {
+            let oklab = stop.color.to_oklab();
+            self.gradient_stops.push(GpuGradientStop {
+                color: oklab,
+                offset: stop.offset,
+                _padding: [0.0; 3],
+            });
+        }
+
+        let gradient_index = self.gradients.len() as u32;
+        self.gradients.push(GpuGradient {
+            kind,
+            stop_offset,
+            stop_count: stops.len() as u32,
+            spread: gradient.spread() as u32,
+            params,
+        });
+
+        let (uv_tl, uv_br) = self.white_pixel_uv_f32();
+        self.instances.push(GpuInstance {
+            pos: [x, y],
+            size: [width, height],
+            uv_tl,
+            uv_br,
+            // Pack gradient index as bits into the color field
+            color: gradient_index,
+            mode: 6,
+            corner_radius,
+            texture_layer: 0,
+            clip_rect: NO_CLIP,
+        });
+    }
+
+    /// Add a gradient-filled rounded rectangle from a Rect.
+    pub fn add_gradient_rect_from(
+        &mut self,
+        rect: &Rect,
+        gradient: &Gradient,
+        corner_radius: f32,
+    ) {
+        self.add_gradient_rect(rect.x, rect.y, rect.width, rect.height, gradient, corner_radius);
     }
 
     // =========================================================================
@@ -1793,6 +1917,38 @@ impl StrataPipeline {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
             }
         }
+
+        // Upload gradient buffers (only when gradients are used this frame)
+        if !self.gradients.is_empty() {
+            // Resize gradient header buffers if needed
+            if self.gradients.len() > self.gradient_capacity {
+                self.gradient_capacity = self.gradients.len().next_power_of_two().max(64);
+                let buf_size = (self.gradient_capacity * std::mem::size_of::<GpuGradient>()) as u64;
+                self.gradient_buffers = (0..MAX_FRAMES_IN_FLIGHT)
+                    .map(|_| device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared))
+                    .collect();
+            }
+            // Resize gradient stop buffers if needed
+            if self.gradient_stops.len() > self.gradient_stop_capacity {
+                self.gradient_stop_capacity = self.gradient_stops.len().next_power_of_two().max(256);
+                let buf_size = (self.gradient_stop_capacity * std::mem::size_of::<GpuGradientStop>()) as u64;
+                self.gradient_stop_buffers = (0..MAX_FRAMES_IN_FLIGHT)
+                    .map(|_| device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared))
+                    .collect();
+            }
+
+            let src = bytemuck::cast_slice::<GpuGradient, u8>(&self.gradients);
+            unsafe {
+                let dst = self.gradient_buffers[slot].contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+            }
+
+            let src = bytemuck::cast_slice::<GpuGradientStop, u8>(&self.gradient_stops);
+            unsafe {
+                let dst = self.gradient_stop_buffers[slot].contents() as *mut u8;
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+            }
+        }
     }
 
     /// Render all instances in a single draw call.
@@ -1845,6 +2001,11 @@ impl StrataPipeline {
             encoder.set_fragment_sampler_state(0, Some(&self.atlas_sampler));
             encoder.set_fragment_texture(1, Some(&self.image_atlas.texture));
             encoder.set_fragment_sampler_state(1, Some(&self.image_sampler));
+            // Bind gradient buffers (fragment buffer indices 1 and 2)
+            if !self.gradient_buffers.is_empty() {
+                encoder.set_fragment_buffer(1, Some(&self.gradient_buffers[slot]), 0);
+                encoder.set_fragment_buffer(2, Some(&self.gradient_stop_buffers[slot]), 0);
+            }
             encoder.draw_primitives_instanced(
                 metal::MTLPrimitiveType::Triangle,
                 0,

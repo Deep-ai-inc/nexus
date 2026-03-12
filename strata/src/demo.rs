@@ -19,7 +19,7 @@ use crate::event_context::{
     CaptureState, Key, KeyEvent, MouseButton, MouseEvent, NamedKey,
 };
 use crate::layout_snapshot::HitResult;
-use crate::primitives::{Color, Point, Rect};
+use crate::primitives::{Color, ColorStop, Gradient, Point, Rect, Spread};
 use crate::layout::{LayoutConstraints, LayoutContext};
 use crate::{
     AppConfig, ButtonElement, Canvas, Column, Command, CrossAxisAlignment, ImageElement, ImageHandle,
@@ -723,6 +723,12 @@ impl StrataApp for DemoApp {
                             .width(Length::Fill)
                             .height(Length::Fixed(180.0)),
                     )
+                    // Gradient showcase
+                    .push(
+                        Canvas::new(draw_gradients)
+                            .width(Length::Fill)
+                            .height(Length::Fixed(320.0)),
+                    )
                     // Table
                     .push(Card::new("Table").push(table)),
             );
@@ -1039,6 +1045,185 @@ fn draw_line_styles(bounds: Rect, p: &mut PrimitiveBatch, time: f32) {
         })
         .collect();
     p.add_polyline_styled(wave, 1.0, colors::SUCCESS, LineStyle::Dashed);
+}
+
+fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
+    let x = bounds.x;
+    let y = bounds.y;
+    let width = bounds.width;
+
+    p.add_rounded_rect(Rect::new(x, y, width, 320.0), 6.0, colors::BG_BLOCK);
+    p.add_text("Gradients", Point::new(x + 10.0, y + 6.0), colors::TEXT_SECONDARY, 14.0);
+
+    let lx = x + 14.0;
+    let lw = width - 28.0;
+    let rect_h = 50.0;
+    let rect_w = (lw - 20.0) / 3.0; // three rects per row
+
+    // --- Row 1: Basic gradient types ---
+    let ry = y + 30.0;
+    p.add_text("Linear", Point::new(lx, ry), colors::TEXT_MUTED, 12.0);
+    p.add_text("Radial", Point::new(lx + rect_w + 10.0, ry), colors::TEXT_MUTED, 12.0);
+    p.add_text("Conic", Point::new(lx + (rect_w + 10.0) * 2.0, ry), colors::TEXT_MUTED, 12.0);
+
+    let ry = ry + 16.0;
+
+    // Linear: horizontal blue→purple
+    p.add_gradient_rect(
+        Rect::new(lx, ry, rect_w, rect_h),
+        Gradient::Linear {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(rect_w, 0.0),
+            stops: vec![
+                ColorStop { color: Color::rgb(0.2, 0.4, 1.0), offset: 0.0 },
+                ColorStop { color: Color::rgb(0.8, 0.2, 0.9), offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        },
+        6.0,
+    );
+
+    // Radial: warm center fade
+    let rx = lx + rect_w + 10.0;
+    p.add_gradient_rect(
+        Rect::new(rx, ry, rect_w, rect_h),
+        Gradient::Radial {
+            center: Point::new(rect_w / 2.0, rect_h / 2.0),
+            radius: rect_w / 2.0,
+            stops: vec![
+                ColorStop { color: Color::rgb(1.0, 0.8, 0.2), offset: 0.0 },
+                ColorStop { color: Color::rgb(0.8, 0.2, 0.1), offset: 0.6 },
+                ColorStop { color: Color::rgb(0.1, 0.05, 0.15), offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        },
+        6.0,
+    );
+
+    // Conic: color wheel
+    let cx = lx + (rect_w + 10.0) * 2.0;
+    p.add_gradient_rect(
+        Rect::new(cx, ry, rect_w, rect_h),
+        Gradient::Conic {
+            center: Point::new(rect_w / 2.0, rect_h / 2.0),
+            angle: 0.0,
+            stops: vec![
+                ColorStop { color: Color::rgb(1.0, 0.0, 0.0), offset: 0.0 },
+                ColorStop { color: Color::rgb(1.0, 1.0, 0.0), offset: 0.167 },
+                ColorStop { color: Color::rgb(0.0, 1.0, 0.0), offset: 0.333 },
+                ColorStop { color: Color::rgb(0.0, 1.0, 1.0), offset: 0.5 },
+                ColorStop { color: Color::rgb(0.0, 0.0, 1.0), offset: 0.667 },
+                ColorStop { color: Color::rgb(1.0, 0.0, 1.0), offset: 0.833 },
+                ColorStop { color: Color::rgb(1.0, 0.0, 0.0), offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        },
+        6.0,
+    );
+
+    // --- Row 2: Spread modes ---
+    let ry = ry + rect_h + 20.0;
+    p.add_text("Pad", Point::new(lx, ry), colors::TEXT_MUTED, 12.0);
+    p.add_text("Repeat", Point::new(lx + rect_w + 10.0, ry), colors::TEXT_MUTED, 12.0);
+    p.add_text("Reflect", Point::new(lx + (rect_w + 10.0) * 2.0, ry), colors::TEXT_MUTED, 12.0);
+
+    let ry = ry + 16.0;
+    let spread_stops = vec![
+        ColorStop { color: Color::rgb(0.1, 0.8, 0.5), offset: 0.2 },
+        ColorStop { color: Color::rgb(0.1, 0.2, 0.8), offset: 0.8 },
+    ];
+
+    // Pad (default — clamps at edges)
+    p.add_gradient_rect(
+        Rect::new(lx, ry, rect_w, rect_h),
+        Gradient::Linear {
+            start: Point::new(rect_w * 0.3, 0.0),
+            end: Point::new(rect_w * 0.7, 0.0),
+            stops: spread_stops.clone(),
+            spread: Spread::Pad,
+        },
+        6.0,
+    );
+
+    // Repeat
+    p.add_gradient_rect(
+        Rect::new(rx, ry, rect_w, rect_h),
+        Gradient::Linear {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(rect_w * 0.25, 0.0),
+            stops: spread_stops.clone(),
+            spread: Spread::Repeat,
+        },
+        6.0,
+    );
+
+    // Reflect
+    p.add_gradient_rect(
+        Rect::new(cx, ry, rect_w, rect_h),
+        Gradient::Linear {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(rect_w * 0.25, 0.0),
+            stops: spread_stops,
+            spread: Spread::Reflect,
+        },
+        6.0,
+    );
+
+    // --- Row 3: Multi-stop and diagonal ---
+    let ry = ry + rect_h + 20.0;
+    p.add_text("Diagonal", Point::new(lx, ry), colors::TEXT_MUTED, 12.0);
+    p.add_text("Multi-stop", Point::new(lx + rect_w + 10.0, ry), colors::TEXT_MUTED, 12.0);
+    p.add_text("Subtle UI", Point::new(lx + (rect_w + 10.0) * 2.0, ry), colors::TEXT_MUTED, 12.0);
+
+    let ry = ry + 16.0;
+
+    // Diagonal gradient
+    p.add_gradient_rect(
+        Rect::new(lx, ry, rect_w, rect_h),
+        Gradient::Linear {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(rect_w, rect_h),
+            stops: vec![
+                ColorStop { color: Color::rgb(0.95, 0.3, 0.4), offset: 0.0 },
+                ColorStop { color: Color::rgb(0.3, 0.2, 0.8), offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        },
+        6.0,
+    );
+
+    // Multi-stop rainbow bar
+    p.add_gradient_rect(
+        Rect::new(rx, ry, rect_w, rect_h),
+        Gradient::Linear {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(rect_w, 0.0),
+            stops: vec![
+                ColorStop { color: Color::rgb(0.9, 0.2, 0.3), offset: 0.0 },
+                ColorStop { color: Color::rgb(0.9, 0.6, 0.1), offset: 0.25 },
+                ColorStop { color: Color::rgb(0.2, 0.8, 0.4), offset: 0.5 },
+                ColorStop { color: Color::rgb(0.2, 0.5, 0.9), offset: 0.75 },
+                ColorStop { color: Color::rgb(0.7, 0.3, 0.9), offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        },
+        6.0,
+    );
+
+    // Subtle dark UI gradient (practical use case)
+    p.add_gradient_rect(
+        Rect::new(cx, ry, rect_w, rect_h),
+        Gradient::Linear {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(0.0, rect_h),
+            stops: vec![
+                ColorStop { color: Color::rgb(0.15, 0.15, 0.22), offset: 0.0 },
+                ColorStop { color: Color::rgb(0.08, 0.08, 0.12), offset: 1.0 },
+            ],
+            spread: Spread::Pad,
+        },
+        6.0,
+    );
 }
 
 /// Run the demo application.
