@@ -1979,29 +1979,6 @@ fn populate_pipeline(
         clip.map(|c| [c.x * scale, c.y * scale, c.width * scale, c.height * scale])
     }
     #[inline]
-    fn scale_gradient(gradient: &crate::primitives::Gradient, scale: f32) -> crate::primitives::Gradient {
-        use crate::primitives::Gradient;
-        match gradient {
-            Gradient::Linear { start, end, stops, spread } => Gradient::Linear {
-                start: Point::new(start.x * scale, start.y * scale),
-                end: Point::new(end.x * scale, end.y * scale),
-                stops: stops.clone(),
-                spread: *spread,
-            },
-            Gradient::Radial { center, radius, stops, spread } => Gradient::Radial {
-                center: Point::new(center.x * scale, center.y * scale),
-                radius: radius * scale,
-                stops: stops.clone(),
-                spread: *spread,
-            },
-            Gradient::Conic { center, angle, stops, spread } => Gradient::Conic {
-                center: Point::new(center.x * scale, center.y * scale),
-                angle: *angle,
-                stops: stops.clone(),
-                spread: *spread,
-            },
-        }
-    }
     fn maybe_clip(pipeline: &mut StrataPipeline, start: usize, clip: &Option<Rect>, scale: f32) {
         if let Some(gpu_clip) = clip_to_gpu(clip, scale) {
             pipeline.apply_clip_since(start, gpu_clip);
@@ -2079,11 +2056,10 @@ fn populate_pipeline(
     for prim in &primitives.gradient_rects {
         let start = pipeline.instance_count();
         // Scale gradient parameters to match the scaled rect
-        let scaled_gradient = scale_gradient(&prim.gradient, scale);
         pipeline.add_gradient_rect(
             prim.rect.x * scale, prim.rect.y * scale,
             prim.rect.width * scale, prim.rect.height * scale,
-            &scaled_gradient, prim.corner_radius * scale,
+            &prim.gradient, prim.corner_radius * scale,
         );
         maybe_clip(pipeline, start, &prim.clip_rect, scale);
     }
@@ -2269,11 +2245,10 @@ fn populate_pipeline(
     }
     for prim in &overlays.gradient_rects {
         let start = pipeline.instance_count();
-        let scaled_gradient = scale_gradient(&prim.gradient, scale);
         pipeline.add_gradient_rect(
             prim.rect.x * scale, prim.rect.y * scale,
             prim.rect.width * scale, prim.rect.height * scale,
-            &scaled_gradient, prim.corner_radius * scale,
+            &prim.gradient, prim.corner_radius * scale,
         );
         maybe_clip(pipeline, start, &prim.clip_rect, scale);
     }

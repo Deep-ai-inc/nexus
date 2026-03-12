@@ -1073,7 +1073,7 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
         Rect::new(lx, ry, rect_w, rect_h),
         Gradient::Linear {
             start: Point::new(0.0, 0.0),
-            end: Point::new(rect_w, 0.0),
+            end: Point::new(1.0, 0.0),
             stops: vec![
                 ColorStop { color: Color::rgb(0.2, 0.4, 1.0), offset: 0.0 },
                 ColorStop { color: Color::rgb(0.8, 0.2, 0.9), offset: 1.0 },
@@ -1088,8 +1088,8 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
     p.add_gradient_rect(
         Rect::new(rx, ry, rect_w, rect_h),
         Gradient::Radial {
-            center: Point::new(rect_w / 2.0, rect_h / 2.0),
-            radius: rect_w / 2.0,
+            center: Point::new(0.5, 0.5),
+            radius: 0.5,
             stops: vec![
                 ColorStop { color: Color::rgb(1.0, 0.8, 0.2), offset: 0.0 },
                 ColorStop { color: Color::rgb(0.8, 0.2, 0.1), offset: 0.6 },
@@ -1105,7 +1105,7 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
     p.add_gradient_rect(
         Rect::new(cx, ry, rect_w, rect_h),
         Gradient::Conic {
-            center: Point::new(rect_w / 2.0, rect_h / 2.0),
+            center: Point::new(0.5, 0.5),
             angle: 0.0,
             stops: vec![
                 ColorStop { color: Color::rgb(1.0, 0.0, 0.0), offset: 0.0 },
@@ -1137,8 +1137,8 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
     p.add_gradient_rect(
         Rect::new(lx, ry, rect_w, rect_h),
         Gradient::Linear {
-            start: Point::new(rect_w * 0.3, 0.0),
-            end: Point::new(rect_w * 0.7, 0.0),
+            start: Point::new(0.3, 0.0),
+            end: Point::new(0.7, 0.0),
             stops: spread_stops.clone(),
             spread: Spread::Pad,
         },
@@ -1150,7 +1150,7 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
         Rect::new(rx, ry, rect_w, rect_h),
         Gradient::Linear {
             start: Point::new(0.0, 0.0),
-            end: Point::new(rect_w * 0.25, 0.0),
+            end: Point::new(0.25, 0.0),
             stops: spread_stops.clone(),
             spread: Spread::Repeat,
         },
@@ -1162,7 +1162,7 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
         Rect::new(cx, ry, rect_w, rect_h),
         Gradient::Linear {
             start: Point::new(0.0, 0.0),
-            end: Point::new(rect_w * 0.25, 0.0),
+            end: Point::new(0.25, 0.0),
             stops: spread_stops,
             spread: Spread::Reflect,
         },
@@ -1182,7 +1182,7 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
         Rect::new(lx, ry, rect_w, rect_h),
         Gradient::Linear {
             start: Point::new(0.0, 0.0),
-            end: Point::new(rect_w, rect_h),
+            end: Point::new(1.0, 1.0),
             stops: vec![
                 ColorStop { color: Color::rgb(0.95, 0.3, 0.4), offset: 0.0 },
                 ColorStop { color: Color::rgb(0.3, 0.2, 0.8), offset: 1.0 },
@@ -1197,7 +1197,7 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
         Rect::new(rx, ry, rect_w, rect_h),
         Gradient::Linear {
             start: Point::new(0.0, 0.0),
-            end: Point::new(rect_w, 0.0),
+            end: Point::new(1.0, 0.0),
             stops: vec![
                 ColorStop { color: Color::rgb(0.9, 0.2, 0.3), offset: 0.0 },
                 ColorStop { color: Color::rgb(0.9, 0.6, 0.1), offset: 0.25 },
@@ -1215,7 +1215,7 @@ fn draw_gradients(bounds: Rect, p: &mut PrimitiveBatch) {
         Rect::new(cx, ry, rect_w, rect_h),
         Gradient::Linear {
             start: Point::new(0.0, 0.0),
-            end: Point::new(0.0, rect_h),
+            end: Point::new(0.0, 1.0),
             stops: vec![
                 ColorStop { color: Color::rgb(0.15, 0.15, 0.22), offset: 0.0 },
                 ColorStop { color: Color::rgb(0.08, 0.08, 0.12), offset: 1.0 },

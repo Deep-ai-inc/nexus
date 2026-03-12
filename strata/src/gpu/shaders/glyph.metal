@@ -220,11 +220,11 @@ static float4 sample_gradient(
         return stops[last].color;
     }
 
-    // Find the two surrounding stops
+    // Find the two surrounding stops (stops are ordered, so only check upper bound)
     for (uint i = stop_offset; i < last; i++) {
-        float off0 = stops[i].offset;
         float off1 = stops[i + 1u].offset;
-        if (t >= off0 && t <= off1) {
+        if (t <= off1) {
+            float off0 = stops[i].offset;
             float range = off1 - off0;
             float frac = (range > 0.0001) ? (t - off0) / range : 0.0;
             return mix(stops[i].color, stops[i + 1u].color, frac);
@@ -303,23 +303,22 @@ fragment float4 fs_main(
         float t = 0.0;
 
         if (grad.kind == 0u) {
-            // Linear: project onto start→end vector
-            float2 start = grad.params.xy;
-            float2 end = grad.params.zw;
+            // Linear: un-normalize params from unit space to local pixels
+            float2 start = grad.params.xy * in.quad_size;
+            float2 end = grad.params.zw * in.quad_size;
             float2 delta = end - start;
             float len_sq = dot(delta, delta);
             t = (len_sq > 0.0001) ? dot(pos - start, delta) / len_sq : 0.0;
         } else if (grad.kind == 1u) {
-            // Radial: distance from center / radius
-            float2 center = grad.params.xy;
-            float radius = grad.params.z;
+            // Radial: center in unit space, radius relative to width
+            float2 center = grad.params.xy * in.quad_size;
+            float radius = grad.params.z * in.quad_size.x;
             t = (radius > 0.0001) ? length(pos - center) / radius : 0.0;
         } else {
-            // Conic: angle from center, normalized to 0–1
-            float2 center = grad.params.xy;
+            // Conic: center in unit space, angle in radians
+            float2 center = grad.params.xy * in.quad_size;
             float start_angle = grad.params.z;
             float angle = atan2(pos.y - center.y, pos.x - center.x) - start_angle;
-            // Normalize to 0–1 (atan2 returns -π to π)
             t = fract(angle / (2.0 * M_PI_F));
         }
 

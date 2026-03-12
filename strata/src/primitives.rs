@@ -454,21 +454,23 @@ pub enum Spread {
 /// A gradient fill.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gradient {
-    /// Linear gradient between two points.
+    /// Linear gradient between two points (normalized 0–1 coordinates).
+    /// (0,0) is top-left, (1,1) is bottom-right of the rect.
     Linear {
         start: Point,
         end: Point,
         stops: Vec<ColorStop>,
         spread: Spread,
     },
-    /// Radial gradient from center outward.
+    /// Radial gradient from center outward (normalized coordinates).
+    /// Center is in 0–1 space; radius is relative to rect width.
     Radial {
         center: Point,
         radius: f32,
         stops: Vec<ColorStop>,
         spread: Spread,
     },
-    /// Conic (angular) gradient around a center point.
+    /// Conic (angular) gradient around a center point (normalized coordinates).
     Conic {
         center: Point,
         /// Starting angle in radians (0 = right, increasing clockwise).
