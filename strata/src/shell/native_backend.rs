@@ -664,7 +664,7 @@ fn create_view_and_layers(
     // Add NSTrackingArea for mouseMoved/mouseEntered/mouseExited.
     // NSTrackingInVisibleRect auto-adjusts to view bounds on resize.
     unsafe {
-        let flags: usize = 0x01 | 0x02 | 0x80 | 0x200; // enteredAndExited | mouseMoved | activeAlways | inVisibleRect
+        let flags: usize = 0x01 | 0x02 | 0x20 | 0x200; // enteredAndExited | mouseMoved | activeInKeyWindow | inVisibleRect
         let tracking_class = AnyClass::get("NSTrackingArea").unwrap();
         let tracking_area: *mut AnyObject = msg_send![tracking_class, alloc];
         let tracking_area: *mut AnyObject = msg_send![tracking_area,
@@ -1262,6 +1262,9 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
             MouseEvent::WheelScrolled { position, .. } => {
                 state.cursor_position = Some(*position);
             }
+            MouseEvent::CursorLeft => {
+                state.cursor_position = None;
+            }
             _ => {}
         }
 
@@ -1345,11 +1348,11 @@ fn handle_mouse_event<A: StrataApp>(view: &AnyObject, strata_event: MouseEvent) 
         }
 
         // Update system cursor based on hover target.
-        // Always call set_cursor — AppKit resets the cursor via cursor-rect
-        // evaluation (on frame changes, focus changes, etc.) which can silently
-        // undo our [NSCursor set] between events. Without re-asserting every
-        // move, the dedup would see "same icon" and skip, leaving the arrow.
-        if let Some(snapshot) = &state.cached_snapshot {
+        // Only set cursor when mouse is inside the view — CursorLeft clears
+        // cursor_position to None, so we skip to avoid fighting other apps.
+        // Always call set_cursor here (no dedup) because AppKit may have
+        // reset the cursor via cursor-rect evaluation between events.
+        if let (Some(_), Some(snapshot)) = (state.cursor_position, &state.cached_snapshot) {
             let icon = if let Some(source) = state.capture.captured_by() {
                 snapshot.cursor_for_capture(source)
             } else {
@@ -2716,7 +2719,7 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
             }
 
             // Update cursor after render (widgets may have shifted under cursor).
-            // Always re-assert — AppKit can reset cursor between timer ticks.
+            // Only update if the icon actually changed — avoids fighting AppKit.
             if let (Some(pos), Some(snapshot)) = (state.cursor_position, state.cached_snapshot.as_ref()) {
                 let zoom = state.current_zoom;
                 let adjusted = Point::new(pos.x / zoom, pos.y / zoom);
@@ -2725,8 +2728,10 @@ fn install_main_thread_timer<A: StrataApp>(state_ptr: *mut RefCell<WindowState<A
                 } else {
                     snapshot.cursor_at(adjusted)
                 };
-                state.current_cursor = icon;
-                crate::platform::set_cursor(icon);
+                if icon != state.current_cursor {
+                    state.current_cursor = icon;
+                    crate::platform::set_cursor(icon);
+                }
             }
         });
     }
