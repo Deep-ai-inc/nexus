@@ -4,6 +4,7 @@ use strata::content_address::SourceId;
 use strata::layout_snapshot::HitResult;
 
 use crate::app::message::DropZone;
+use crate::data::blocks::Focus;
 use crate::utils::ids as source_ids;
 use crate::app::NexusState;
 
@@ -19,7 +20,9 @@ pub fn resolve_drop_zone(state: &NexusState, hit: &Option<HitResult>) -> DropZon
             } else if state.agent.block_for_source(*id).is_some() {
                 DropZone::AgentPanel
             } else {
-                DropZone::Empty
+                // Unrecognized widget (scroll container, background, etc.)
+                // — use the focused shell block if there is one.
+                focused_shell_block(state)
             }
         }
         // Hit content — check which block it belongs to
@@ -29,10 +32,18 @@ pub fn resolve_drop_zone(state: &NexusState, hit: &Option<HitResult>) -> DropZon
             } else if state.agent.block_for_source(addr.source_id).is_some() {
                 DropZone::AgentPanel
             } else {
-                DropZone::Empty
+                focused_shell_block(state)
             }
         }
-        None => DropZone::Empty,
+        None => focused_shell_block(state),
+    }
+}
+
+/// If a shell block is focused, return it as the drop zone; otherwise Empty.
+fn focused_shell_block(state: &NexusState) -> DropZone {
+    match state.focus {
+        Focus::Block(id) if state.shell.block_by_id(id).is_some() => DropZone::ShellBlock(id),
+        _ => DropZone::Empty,
     }
 }
 

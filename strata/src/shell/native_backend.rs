@@ -27,7 +27,7 @@ use objc2_foundation::{
 use crate::app::{AppConfig, CaptureRequest, Command, StrataApp};
 use crate::content_address::Selection;
 use crate::event_context::{
-    CaptureState, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey,
+    CaptureState, FileDropEvent, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, NamedKey,
     ScrollDelta,
 };
 use crate::gpu::{ImageHandle, ImageStore, PendingImage, StrataPipeline};
@@ -554,6 +554,19 @@ fn create_view_and_layers(
         let _: () = msg_send![&*view, setLayerContentsRedrawPolicy: 3i64];
     }
 
+    // Register as file drop destination.
+    unsafe {
+        let file_type: &AnyObject = msg_send![
+            AnyClass::get("NSString").unwrap(),
+            stringWithUTF8String: c"public.file-url".as_ptr()
+        ];
+        let types: *mut AnyObject = msg_send![
+            AnyClass::get("NSArray").unwrap(),
+            arrayWithObject: file_type
+        ];
+        let _: () = msg_send![&*view, registerForDraggedTypes: types];
+    }
+
     // Get root layer.
     let root_layer: *mut AnyObject = unsafe { msg_send![&*view, layer] };
     if root_layer.is_null() {
@@ -760,6 +773,17 @@ fn register_strata_view_class() -> &'static AnyClass {
             // NSWindowDelegate method — view acts as its window's delegate.
             add_method_raw(cls_ptr, sel!(windowWillClose:),
                 Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(window_will_close)), c"v@:@");
+
+            // NSDraggingDestination protocol — file drop support.
+            // Return value is NSDragOperation (unsigned long = Q on 64-bit).
+            add_method_raw(cls_ptr, sel!(draggingEntered:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject) -> u64, unsafe extern "C" fn()>(dragging_entered)), c"Q@:@");
+            add_method_raw(cls_ptr, sel!(draggingUpdated:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject) -> u64, unsafe extern "C" fn()>(dragging_updated)), c"Q@:@");
+            add_method_raw(cls_ptr, sel!(draggingExited:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject), unsafe extern "C" fn()>(dragging_exited)), c"v@:@");
+            add_method_raw(cls_ptr, sel!(performDragOperation:),
+                Some(std::mem::transmute::<extern "C" fn(&AnyObject, Sel, *mut AnyObject) -> Bool, unsafe extern "C" fn()>(perform_drag_operation)), c"B@:@");
         }
 
         cls
@@ -784,6 +808,7 @@ static mut RESIZE_HANDLER: Option<fn(&AnyObject, f32, f32)> = None;
 static mut RESIZE_START_HANDLER: Option<fn(&AnyObject)> = None;
 static mut RESIZE_END_HANDLER: Option<fn(&AnyObject)> = None;
 static mut WINDOW_CLOSE_HANDLER: Option<fn(&AnyObject)> = None;
+static mut FILE_DROP_HANDLER: Option<fn(&AnyObject, FileDropEvent, Point)> = None;
 
 fn install_event_handlers<A: StrataApp>() {
     unsafe {
@@ -794,6 +819,7 @@ fn install_event_handlers<A: StrataApp>() {
         RESIZE_END_HANDLER = Some(handle_resize_end::<A>);
         RESIZE_IDLE_HANDLER = Some(handle_resize_idle::<A>);
         WINDOW_CLOSE_HANDLER = Some(handle_window_close::<A>);
+        FILE_DROP_HANDLER = Some(handle_file_drop_event::<A>);
     }
 }
 
@@ -825,6 +851,14 @@ fn dispatch_window_close(view: &AnyObject) {
     unsafe {
         if let Some(handler) = WINDOW_CLOSE_HANDLER {
             handler(view);
+        }
+    }
+}
+
+fn dispatch_file_drop(view: &AnyObject, event: FileDropEvent, position: Point) {
+    unsafe {
+        if let Some(handler) = FILE_DROP_HANDLER {
+            handler(view, event, position);
         }
     }
 }
@@ -1062,6 +1096,105 @@ extern "C" fn view_did_end_live_resize(this: &AnyObject, _sel: Sel) {
 
 extern "C" fn window_will_close(this: &AnyObject, _sel: Sel, _notification: *mut AnyObject) {
     dispatch_window_close(this);
+}
+
+// ============================================================================
+// NSDraggingDestination — File Drop
+// ============================================================================
+
+/// NSDragOperation constants.
+const NS_DRAG_OPERATION_NONE: u64 = 0;
+const NS_DRAG_OPERATION_COPY: u64 = 1;
+
+/// Extract the first file URL path from a dragging pasteboard.
+unsafe fn first_file_path_from_drag(sender: *mut AnyObject) -> Option<std::path::PathBuf> {
+    if sender.is_null() { return None; }
+    let pasteboard: *mut AnyObject = msg_send![sender, draggingPasteboard];
+    if pasteboard.is_null() { return None; }
+
+    // Read file URLs from pasteboard: [NSURL readObjectsForClasses:options:]
+    let nsurl_class = AnyClass::get("NSURL")?;
+    let class_array: *mut AnyObject = msg_send![
+        AnyClass::get("NSArray").unwrap(),
+        arrayWithObject: nsurl_class as *const _ as *mut AnyObject
+    ];
+    let options: *mut AnyObject = msg_send![AnyClass::get("NSDictionary").unwrap(), dictionary];
+    let urls: *mut AnyObject = msg_send![pasteboard, readObjectsForClasses: class_array options: options];
+    if urls.is_null() { return None; }
+
+    let count: usize = msg_send![urls, count];
+    if count == 0 { return None; }
+
+    let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
+    let is_file: Bool = msg_send![url, isFileURL];
+    if !is_file.as_bool() { return None; }
+
+    let path_str: *mut AnyObject = msg_send![url, path];
+    if path_str.is_null() { return None; }
+
+    let cstr: *const std::ffi::c_char = msg_send![path_str, UTF8String];
+    if cstr.is_null() { return None; }
+
+    let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy();
+    Some(std::path::PathBuf::from(s.as_ref()))
+}
+
+/// Convert drag sender location to physical (scaled) view coordinates.
+unsafe fn drag_position(view: &AnyObject, sender: *mut AnyObject) -> Point {
+    let point: NSPoint = msg_send![sender, draggingLocation];
+    let local: NSPoint = msg_send![view, convertPoint: point fromView: std::ptr::null::<AnyObject>()];
+    let scale = get_dpi_scale(view);
+    Point::new(local.x as f32 * scale, local.y as f32 * scale)
+}
+
+extern "C" fn dragging_entered(this: &AnyObject, _sel: Sel, sender: *mut AnyObject) -> u64 {
+    unsafe {
+        let pos = drag_position(this, sender);
+        if let Some(path) = first_file_path_from_drag(sender) {
+            dispatch_file_drop(this, FileDropEvent::Hovered(path), pos);
+            NS_DRAG_OPERATION_COPY
+        } else {
+            NS_DRAG_OPERATION_NONE
+        }
+    }
+}
+
+extern "C" fn dragging_updated(this: &AnyObject, _sel: Sel, sender: *mut AnyObject) -> u64 {
+    unsafe {
+        let pos = drag_position(this, sender);
+        if let Some(path) = first_file_path_from_drag(sender) {
+            dispatch_file_drop(this, FileDropEvent::Hovered(path), pos);
+            NS_DRAG_OPERATION_COPY
+        } else {
+            NS_DRAG_OPERATION_NONE
+        }
+    }
+}
+
+extern "C" fn dragging_exited(this: &AnyObject, _sel: Sel, _sender: *mut AnyObject) {
+    dispatch_file_drop(this, FileDropEvent::HoverLeft, Point::ORIGIN);
+}
+
+extern "C" fn perform_drag_operation(this: &AnyObject, _sel: Sel, sender: *mut AnyObject) -> Bool {
+    unsafe {
+        let pos = drag_position(this, sender);
+        if let Some(path) = first_file_path_from_drag(sender) {
+            dispatch_file_drop(this, FileDropEvent::Dropped(path), pos);
+            Bool::YES
+        } else {
+            Bool::NO
+        }
+    }
+}
+
+/// Get DPI scale from the view's backing scale factor.
+unsafe fn get_dpi_scale(view: &AnyObject) -> f32 {
+    let window: *mut AnyObject = msg_send![view, window];
+    if window.is_null() {
+        return 2.0; // sensible default
+    }
+    let scale: CGFloat = msg_send![window, backingScaleFactor];
+    scale as f32
 }
 
 // ============================================================================
@@ -2463,6 +2596,30 @@ fn handle_window_close<A: StrataApp>(view: &AnyObject) {
             let _: *mut AnyObject = msg_send![window_ptr, autorelease];
         }
     }
+}
+
+fn handle_file_drop_event<A: StrataApp>(view: &AnyObject, event: FileDropEvent, physical_pos: Point) {
+    let Some(state_cell) = (unsafe { get_state::<A>(view) }) else { return };
+    {
+        let mut state = state_cell.borrow_mut();
+
+        // Update cursor position so subsequent renders show the right state.
+        state.cursor_position = Some(physical_pos);
+
+        let zoom = state.current_zoom;
+        let logical_pos = Point::new(physical_pos.x / zoom, physical_pos.y / zoom);
+        let hit = state.cached_snapshot.as_ref().and_then(|snapshot| {
+            snapshot.hit_test(logical_pos)
+        });
+
+        if let Some(msg) = A::on_file_drop(&state.app, event, hit) {
+            process_message::<A>(&mut state, msg);
+        }
+        if state.pending_window_resize.is_none() {
+            render_if_needed::<A>(&mut state);
+        }
+    }
+    flush_pending_resize::<A>(state_cell);
 }
 
 // ============================================================================

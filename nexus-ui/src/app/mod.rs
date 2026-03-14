@@ -257,12 +257,13 @@ impl Component for NexusState {
         // Only the scroll content gets side/top insets; the input bar is
         // edge-to-edge with only bottom padding below it.
         let z = self.zoom_level;
+        let titlebar_inset = vp.y;
         let safe = Padding::new(2.0 / z, 4.0 / z, 0.0, 4.0 / z);
 
         let mut main_col = Column::new()
             .width(Length::Fixed(vw))
             .height(Length::Fixed(vh))
-            .padding_custom(Padding::new(0.0, 0.0, 4.0 / z, 0.0));
+            .padding_custom(Padding::new(titlebar_inset, 0.0, 4.0 / z, 0.0));
 
         main_col = main_col.push(
             Column::new()

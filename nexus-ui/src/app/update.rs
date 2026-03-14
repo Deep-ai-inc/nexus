@@ -1044,9 +1044,13 @@ impl NexusState {
                             }
                         })
                     }
-                    DropZone::ShellBlock(_) => {
+                    DropZone::ShellBlock(block_id) => {
                         let quoted = file_drop::shell_quote(&path);
-                        self.insert_text_at_cursor(&quoted);
+                        // Write directly to PTY if the block has one, otherwise
+                        // fall back to the input bar.
+                        if !self.shell.paste_to_pty(block_id, &quoted) {
+                            self.insert_text_at_cursor(&quoted);
+                        }
                         Command::none()
                     }
                 }
