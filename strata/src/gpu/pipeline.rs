@@ -38,7 +38,7 @@ use lru::LruCache;
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 use super::glyph_atlas::GlyphAtlas;
-use crate::primitives::{Color, Gradient, Rect, Spread};
+use crate::primitives::{Color, Gradient, Rect};
 
 /// Opaque handle to a loaded image in the pipeline's image atlas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

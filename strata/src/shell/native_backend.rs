@@ -1135,7 +1135,7 @@ unsafe fn first_file_path_from_drag(sender: *mut AnyObject) -> Option<std::path:
     let cstr: *const std::ffi::c_char = msg_send![path_str, UTF8String];
     if cstr.is_null() { return None; }
 
-    let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy();
+    let s = unsafe { std::ffi::CStr::from_ptr(cstr) }.to_string_lossy();
     Some(std::path::PathBuf::from(s.as_ref()))
 }
 
@@ -1143,7 +1143,7 @@ unsafe fn first_file_path_from_drag(sender: *mut AnyObject) -> Option<std::path:
 unsafe fn drag_position(view: &AnyObject, sender: *mut AnyObject) -> Point {
     let point: NSPoint = msg_send![sender, draggingLocation];
     let local: NSPoint = msg_send![view, convertPoint: point fromView: std::ptr::null::<AnyObject>()];
-    let scale = get_dpi_scale(view);
+    let scale = unsafe { get_dpi_scale(view) };
     Point::new(local.x as f32 * scale, local.y as f32 * scale)
 }
 
