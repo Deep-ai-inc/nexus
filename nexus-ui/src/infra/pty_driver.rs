@@ -59,6 +59,8 @@ impl PtyHandle {
         cmd.arg("-c");
         cmd.arg(command);
         cmd.cwd(cwd);
+        // Advertise ourselves so child programs can detect Nexus.
+        cmd.env("TERM_PROGRAM", "Nexus");
 
         // Spawn the child process
         let child = pair.slave.spawn_command(cmd)?;

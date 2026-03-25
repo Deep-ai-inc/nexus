@@ -209,6 +209,15 @@ pub enum ShellMsg {
     ToggleTreeExpand(BlockId, PathBuf),
     /// Load tree children for an expanded directory.
     TreeChildrenLoaded(BlockId, PathBuf, Vec<nexus_api::FileEntry>),
+    /// A PTY process emitted the NexusSSH OSC requesting a native SSH connection.
+    /// The PTY should be killed and replaced with a remote transport.
+    OscSshConnect {
+        block_id: BlockId,
+        destination: String,
+        port: Option<u16>,
+        identity: Option<String>,
+        extra_ssh_args: Vec<String>,
+    },
     /// Remote agent connected successfully.
     /// Uses `Arc<Mutex<Option<...>>>` because RemoteBackend isn't Clone.
     /// The handler `.take()`s the value on first use.

@@ -189,13 +189,23 @@ impl NexusState {
                         self.handle_remote_connect_failed(block_id, error);
                         return Command::none();
                     }
+                    ShellMsg::OscSshConnect { block_id, destination, port, identity, extra_ssh_args } => {
+                        return self.handle_osc_ssh_connect(block_id, destination, port, identity, extra_ssh_args);
+                    }
                     other => other,
                 };
                 let (shell, mut uctx) = self.shell_ctx();
                 shell.update(m, &mut uctx, ctx.images);
                 let cmds = uctx.into_commands();
                 sync_focus_flags(&self.focus, &mut self.input, &mut self.agent);
-                cmds
+                // Check if a NexusSSH OSC was detected during PTY output processing.
+                // Must happen after uctx is consumed to avoid double-borrow of self.
+                if let Some((block_id, dest, port, key, ssh_opts)) = self.shell.pending_osc_ssh.take() {
+                    let osc_cmd = self.handle_osc_ssh_connect(block_id, dest, port, key, ssh_opts);
+                    Command::batch(vec![cmds, osc_cmd])
+                } else {
+                    cmds
+                }
             }
             NexusMessage::Agent(m) => {
                 if matches!(m, super::message::AgentMsg::QuestionInputMouse(_)) {
@@ -581,6 +591,54 @@ impl NexusState {
         }
 
         Command::none()
+    }
+
+    /// Handle a NexusSSH OSC from a PTY process: kill the PTY and initiate
+    /// a native Nexus remote transport connection.
+    fn handle_osc_ssh_connect(
+        &mut self,
+        block_id: nexus_api::BlockId,
+        destination: String,
+        port: Option<u16>,
+        identity: Option<String>,
+        extra_ssh_args: Vec<String>,
+    ) -> Command<NexusMessage> {
+        // Kill the PTY process that emitted the OSC
+        self.shell.pty.kill(block_id);
+        self.shell.pty.remove_handle(block_id);
+
+        // Build an equivalent ssh command string for connect_remote
+        let mut ssh_command = format!("ssh");
+        if let Some(p) = port {
+            ssh_command.push_str(&format!(" -p {p}"));
+        }
+        if let Some(ref key) = identity {
+            ssh_command.push_str(&format!(" -i {key}"));
+        }
+        for arg in &extra_ssh_args {
+            ssh_command.push(' ');
+            ssh_command.push_str(arg);
+        }
+        ssh_command.push(' ');
+        ssh_command.push_str(&destination);
+
+        // Reuse the same connect flow as typing `ssh ...` directly
+        let kernel_tx = self.kernel_tx.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.connecting_tasks.insert(block_id, cancel.clone());
+        Command::perform(async move {
+            match Self::connect_remote(ssh_command, kernel_tx, block_id, cancel).await {
+                Ok((remote, env)) => NexusMessage::Shell(ShellMsg::RemoteConnected {
+                    block_id,
+                    remote: std::sync::Arc::new(std::sync::Mutex::new(Some(remote))),
+                    env: Box::new(env),
+                }),
+                Err(e) => NexusMessage::Shell(ShellMsg::RemoteConnectFailed {
+                    block_id,
+                    error: e.to_string(),
+                }),
+            }
+        })
     }
 
     /// Async task to establish a remote connection.

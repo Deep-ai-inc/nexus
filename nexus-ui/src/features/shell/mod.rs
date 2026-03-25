@@ -91,6 +91,10 @@ pub(crate) struct ShellWidget {
 
     // --- Subscription channel (kernel events) ---
     kernel_rx: Arc<Mutex<broadcast::Receiver<ShellEvent>>>,
+
+    /// Pending SSH connection request from a NexusSSH OSC escape sequence.
+    /// Set by PTY output handlers, consumed by the orchestrator.
+    pub(crate) pending_osc_ssh: Option<(BlockId, String, Option<u16>, Option<String>, Vec<String>)>,
 }
 
 impl ShellWidget {
@@ -106,6 +110,7 @@ impl ShellWidget {
             click_registry: RefCell::new(HashMap::new()),
             table_layout_cache: RefCell::new(HashMap::new()),
             kernel_rx,
+            pending_osc_ssh: None,
         }
     }
 
@@ -589,8 +594,8 @@ impl ShellWidget {
             ShellMsg::TreeChildrenLoaded(block_id, path, entries) => {
                 self.set_tree_children(block_id, path, entries);
             }
-            // Remote connection results are handled at the root level (update.rs)
-            ShellMsg::RemoteConnected { .. } | ShellMsg::RemoteConnectFailed { .. } => {}
+            // Remote connection results and OSC SSH are handled at the root level (update.rs)
+            ShellMsg::RemoteConnected { .. } | ShellMsg::RemoteConnectFailed { .. } | ShellMsg::OscSshConnect { .. } => {}
         }
     }
 
@@ -670,6 +675,61 @@ impl ShellWidget {
         }
     }
 
+    /// Scan raw PTY output for the NexusSSH OSC escape sequence.
+    ///
+    /// Format: `\x1b]1337;NexusSSH;host=...;user=...;key=...;port=...\x07`
+    /// (or `\x1b\\` as terminator). All params except `host` are optional.
+    /// When detected, the PTY process should be killed and replaced with a
+    /// native Nexus remote transport connection.
+    fn scan_nexus_ssh_osc(data: &[u8]) -> Option<(String, Option<u16>, Option<String>, Vec<String>)> {
+        // Look for the OSC prefix
+        const PREFIX: &[u8] = b"\x1b]1337;NexusSSH;";
+        let start = data.windows(PREFIX.len()).position(|w| w == PREFIX)?;
+        let payload_start = start + PREFIX.len();
+
+        // Find the terminator: BEL (\x07) or ST (\x1b\\)
+        let payload_end = data[payload_start..].iter().position(|&b| b == 0x07)
+            .map(|i| payload_start + i)
+            .or_else(|| {
+                data[payload_start..].windows(2)
+                    .position(|w| w == b"\x1b\\")
+                    .map(|i| payload_start + i)
+            })?;
+
+        let payload = std::str::from_utf8(&data[payload_start..payload_end]).ok()?;
+
+        let mut host = None;
+        let mut user = None;
+        let mut key = None;
+        let mut port = None;
+        let mut ssh_options: Vec<String> = Vec::new();
+
+        for param in payload.split(';') {
+            if let Some((k, v)) = param.split_once('=') {
+                match k {
+                    "host" => host = Some(v.to_string()),
+                    "user" => user = Some(v.to_string()),
+                    "key" => key = Some(v.to_string()),
+                    "port" => port = v.parse().ok(),
+                    // ssh_opt=StrictHostKeyChecking=no → -o StrictHostKeyChecking=no
+                    "ssh_opt" => {
+                        ssh_options.push("-o".to_string());
+                        ssh_options.push(v.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let host = host?;
+        let destination = match user {
+            Some(u) => format!("{u}@{host}"),
+            None => host,
+        };
+
+        Some((destination, port, key, ssh_options))
+    }
+
     /// Handle a batch of PTY events. Coalesces consecutive Output events
     /// for the same block into a single `feed()` call, preserving ordering
     /// relative to Exited events.
@@ -682,9 +742,16 @@ impl ShellWidget {
 
         let flush = |acc_id: &mut Option<BlockId>,
                      acc_data: &mut Vec<u8>,
-                     bm: &mut BlockManager| {
+                     bm: &mut BlockManager,
+                     pending_osc: &mut Option<(BlockId, String, Option<u16>, Option<String>, Vec<String>)>| {
             if let Some(id) = acc_id.take() {
                 if !acc_data.is_empty() {
+                    // Check for NexusSSH OSC before feeding to parser
+                    if pending_osc.is_none() {
+                        if let Some((dest, port, key, ssh_opts)) = Self::scan_nexus_ssh_osc(acc_data) {
+                            *pending_osc = Some((id, dest, port, key, ssh_opts));
+                        }
+                    }
                     if let Some(block) = bm.get_mut(id) {
                         block.parser.feed(acc_data);
                         if let Some(title) = block.parser.take_title() {
@@ -709,6 +776,7 @@ impl ShellWidget {
                             &mut acc_id,
                             &mut acc_data,
                             &mut self.blocks,
+                            &mut self.pending_osc_ssh,
                         );
                         acc_id = Some(id);
                         acc_data = data;
@@ -720,6 +788,7 @@ impl ShellWidget {
                         &mut acc_id,
                         &mut acc_data,
                         &mut self.blocks,
+                        &mut self.pending_osc_ssh,
                     );
                     self.handle_pty_exited(id, code, uctx);
                     had_exit = true;
@@ -728,7 +797,7 @@ impl ShellWidget {
         }
 
         // Flush remaining accumulated output.
-        flush(&mut acc_id, &mut acc_data, &mut self.blocks);
+        flush(&mut acc_id, &mut acc_data, &mut self.blocks, &mut self.pending_osc_ssh);
 
         // Don't set terminal_dirty here — the batch message itself triggers
         // a render (every App message bumps frame).
@@ -745,6 +814,12 @@ impl ShellWidget {
 
     /// Handle a single PTY output event (unbatched fallback).
     pub fn handle_pty_output(&mut self, id: BlockId, data: Vec<u8>, uctx: &mut UpdateContext) {
+        // Check for NexusSSH OSC before feeding to parser
+        if self.pending_osc_ssh.is_none() {
+            if let Some((dest, port, key, ssh_opts)) = Self::scan_nexus_ssh_osc(&data) {
+                self.pending_osc_ssh = Some((id, dest, port, key, ssh_opts));
+            }
+        }
         if let Some(block) = self.blocks.get_mut(id) {
             block.parser.feed(&data);
             if let Some(title) = block.parser.take_title() {
@@ -1210,5 +1285,154 @@ pub(crate) fn value_to_anchor_action(value: &Value) -> AnchorAction {
         Value::Process(info) => AnchorAction::CopyToClipboard(info.pid.to_string()),
         Value::GitCommit(info) => AnchorAction::CopyToClipboard(info.short_hash.clone()),
         _ => AnchorAction::CopyToClipboard(value.to_text()),
+    }
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::ShellWidget;
+
+    #[test]
+    fn scan_osc_basic() {
+        let data = b"\x1b]1337;NexusSSH;host=10.0.0.1;user=ubuntu;key=/home/k/.ssh/id_ed25519\x07";
+        let (dest, port, key, ssh_opts) = ShellWidget::scan_nexus_ssh_osc(data).unwrap();
+        assert_eq!(dest, "ubuntu@10.0.0.1");
+        assert_eq!(port, None);
+        assert_eq!(key.as_deref(), Some("/home/k/.ssh/id_ed25519"));
+        assert!(ssh_opts.is_empty());
+    }
+
+    #[test]
+    fn scan_osc_with_port() {
+        let data = b"\x1b]1337;NexusSSH;host=example.com;user=root;port=2222\x07";
+        let (dest, port, key, _) = ShellWidget::scan_nexus_ssh_osc(data).unwrap();
+        assert_eq!(dest, "root@example.com");
+        assert_eq!(port, Some(2222));
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn scan_osc_host_only() {
+        let data = b"\x1b]1337;NexusSSH;host=192.168.1.100\x07";
+        let (dest, port, key, _) = ShellWidget::scan_nexus_ssh_osc(data).unwrap();
+        assert_eq!(dest, "192.168.1.100");
+        assert_eq!(port, None);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn scan_osc_st_terminator() {
+        // ST = ESC backslash (\x1b\\) as alternative to BEL (\x07)
+        let data = b"\x1b]1337;NexusSSH;host=myhost;user=admin\x1b\\";
+        let (dest, port, _, _) = ShellWidget::scan_nexus_ssh_osc(data).unwrap();
+        assert_eq!(dest, "admin@myhost");
+        assert_eq!(port, None);
+    }
+
+    #[test]
+    fn scan_osc_surrounded_by_other_output() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"some random output\r\n");
+        data.extend_from_slice(b"\x1b]1337;NexusSSH;host=10.0.0.5;user=ubuntu\x07");
+        data.extend_from_slice(b"more output after\r\n");
+        let (dest, _, _, _) = ShellWidget::scan_nexus_ssh_osc(&data).unwrap();
+        assert_eq!(dest, "ubuntu@10.0.0.5");
+    }
+
+    #[test]
+    fn scan_osc_no_host_returns_none() {
+        let data = b"\x1b]1337;NexusSSH;user=ubuntu;key=/tmp/k\x07";
+        assert!(ShellWidget::scan_nexus_ssh_osc(data).is_none());
+    }
+
+    #[test]
+    fn scan_osc_missing_prefix_returns_none() {
+        let data = b"ssh ubuntu@host";
+        assert!(ShellWidget::scan_nexus_ssh_osc(data).is_none());
+    }
+
+    #[test]
+    fn scan_osc_unterminated_returns_none() {
+        // No BEL or ST terminator
+        let data = b"\x1b]1337;NexusSSH;host=10.0.0.1;user=ubuntu";
+        assert!(ShellWidget::scan_nexus_ssh_osc(data).is_none());
+    }
+
+    #[test]
+    fn scan_osc_unknown_params_ignored() {
+        let data = b"\x1b]1337;NexusSSH;host=h;user=u;foo=bar;baz=42\x07";
+        let (dest, port, key, _) = ShellWidget::scan_nexus_ssh_osc(data).unwrap();
+        assert_eq!(dest, "u@h");
+        assert_eq!(port, None);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn scan_osc_all_params() {
+        let data = b"\x1b]1337;NexusSSH;host=gpu.internal;user=kevin;key=/Users/kevin/.ssh/id_ed25519;port=22\x07";
+        let (dest, port, key, _) = ShellWidget::scan_nexus_ssh_osc(data).unwrap();
+        assert_eq!(dest, "kevin@gpu.internal");
+        assert_eq!(port, Some(22));
+        assert_eq!(key.as_deref(), Some("/Users/kevin/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn scan_osc_ssh_options() {
+        let data = b"\x1b]1337;NexusSSH;host=10.0.0.1;user=ubuntu;ssh_opt=StrictHostKeyChecking=no;ssh_opt=UserKnownHostsFile=/dev/null\x07";
+        let (dest, _, _, ssh_opts) = ShellWidget::scan_nexus_ssh_osc(data).unwrap();
+        assert_eq!(dest, "ubuntu@10.0.0.1");
+        assert_eq!(ssh_opts, vec!["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"]);
+    }
+
+    /// Component test: simulate PTY output batch containing the OSC,
+    /// feed through handle_pty_batch, verify pending_osc_ssh is set.
+    #[test]
+    fn pty_batch_sets_pending_osc_ssh() {
+        use crate::data::PtyEvent;
+        use nexus_api::BlockId;
+
+        let osc = b"\x1b]1337;NexusSSH;host=10.0.0.99;user=ubuntu;key=/tmp/test_key;port=2222\x07";
+
+        let (_kernel_tx, kernel_rx) = tokio::sync::broadcast::channel(16);
+        let kernel_rx = std::sync::Arc::new(tokio::sync::Mutex::new(kernel_rx));
+        let mut shell = ShellWidget::new(kernel_rx);
+
+        let block_id = BlockId(1);
+        let mut block = crate::data::Block::new(block_id, "test".to_string());
+        block.parser = shell.pty.new_parser();
+        shell.blocks.push(block);
+
+        let batch = vec![(block_id, PtyEvent::Output(osc.to_vec()))];
+
+        let mut scroll = crate::ui::scroll::ScrollModel::new();
+        let mut focus = crate::data::Focus::Input;
+        let mut cwd = String::from("/tmp");
+        let mut context = crate::data::context::NexusContext {
+            cwd: std::path::PathBuf::from("/tmp"),
+            git: None,
+            project: None,
+            last_interaction: None,
+            env_vars: std::collections::HashMap::new(),
+            nexus_md: None,
+        };
+        let mut uctx = crate::app::update_context::UpdateContext::new(
+            &mut scroll,
+            &mut focus,
+            &mut cwd,
+            &mut context,
+        );
+
+        shell.handle_pty_batch(batch, &mut uctx);
+
+        let (bid, dest, port, key, ssh_opts) = shell.pending_osc_ssh.expect("pending_osc_ssh should be set");
+        assert_eq!(bid, block_id);
+        assert_eq!(dest, "ubuntu@10.0.0.99");
+        assert_eq!(port, Some(2222));
+        assert_eq!(key.as_deref(), Some("/tmp/test_key"));
+        assert!(ssh_opts.is_empty());
     }
 }
