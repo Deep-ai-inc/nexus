@@ -283,10 +283,11 @@ impl Agent {
                     cols,
                     rows,
                     term,
+                    cwd,
                 } => {
                     if let Err(e) = self
                         .pty_manager
-                        .spawn(&command, block_id, cols, rows, &term, &kernel_tx)
+                        .spawn(&command, block_id, cols, rows, &term, &cwd, &kernel_tx)
                         .await
                     {
                         let resp = Response::Error {

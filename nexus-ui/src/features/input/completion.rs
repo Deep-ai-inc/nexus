@@ -20,6 +20,16 @@ pub(crate) enum CompletionOutput {
     Dismissed,
 }
 
+/// Snap a byte offset to the nearest valid char boundary (rounding down).
+fn snap_to_char_boundary(s: &str, n: usize) -> usize {
+    let n = n.min(s.len());
+    let mut i = n;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// Completion popup state and logic.
 pub(crate) struct CompletionWidget {
     pub completions: Vec<Completion>,
@@ -56,16 +66,17 @@ impl CompletionWidget {
             // Single completion: apply immediately
             let comp = &completions[0];
             let mut t = input_text.to_string();
-            let end = input_cursor.min(t.len());
-            t.replace_range(anchor..end, &comp.text);
-            let cursor = anchor + comp.text.len();
+            let a = snap_to_char_boundary(&t, anchor);
+            let end = snap_to_char_boundary(&t, input_cursor);
+            t.replace_range(a..end, &comp.text);
+            let cursor = a + comp.text.len();
             self.completions.clear();
             self.index = None;
             CompletionOutput::Applied { text: t, cursor }
         } else if !completions.is_empty() {
             self.completions = completions;
             self.index = Some(0);
-            self.anchor = anchor;
+            self.anchor = snap_to_char_boundary(input_text, anchor);
             self.scroll.offset = 0.0;
             CompletionOutput::None
         } else {
@@ -92,9 +103,10 @@ impl CompletionWidget {
         let output = if let Some(idx) = self.index {
             if let Some(comp) = self.completions.get(idx) {
                 let mut t = input_text.to_string();
-                let end = input_cursor.min(t.len());
-                t.replace_range(self.anchor..end, &comp.text);
-                let cursor = self.anchor + comp.text.len();
+                let a = snap_to_char_boundary(&t, self.anchor);
+                let end = snap_to_char_boundary(&t, input_cursor);
+                t.replace_range(a..end, &comp.text);
+                let cursor = a + comp.text.len();
                 CompletionOutput::Accepted { text: t, cursor }
             } else {
                 CompletionOutput::Dismissed
@@ -118,9 +130,10 @@ impl CompletionWidget {
     pub fn select(&mut self, index: usize, input_text: &str, input_cursor: usize) -> CompletionOutput {
         let output = if let Some(comp) = self.completions.get(index) {
             let mut t = input_text.to_string();
-            let end = input_cursor.min(t.len());
-            t.replace_range(self.anchor..end, &comp.text);
-            let cursor = self.anchor + comp.text.len();
+            let a = snap_to_char_boundary(&t, self.anchor);
+            let end = snap_to_char_boundary(&t, input_cursor);
+            t.replace_range(a..end, &comp.text);
+            let cursor = a + comp.text.len();
             CompletionOutput::Accepted { text: t, cursor }
         } else {
             CompletionOutput::Dismissed
@@ -141,16 +154,17 @@ impl CompletionWidget {
         if completions.len() == 1 {
             let comp = &completions[0];
             let mut t = input_text.to_string();
-            let end = input_cursor.min(t.len());
-            t.replace_range(anchor..end, &comp.text);
-            let cursor = anchor + comp.text.len();
+            let a = snap_to_char_boundary(&t, anchor);
+            let end = snap_to_char_boundary(&t, input_cursor);
+            t.replace_range(a..end, &comp.text);
+            let cursor = a + comp.text.len();
             self.completions.clear();
             self.index = None;
             CompletionOutput::Applied { text: t, cursor }
         } else if !completions.is_empty() {
             self.completions = completions;
             self.index = Some(0);
-            self.anchor = anchor;
+            self.anchor = snap_to_char_boundary(input_text, anchor);
             self.scroll.offset = 0.0;
             CompletionOutput::None
         } else {

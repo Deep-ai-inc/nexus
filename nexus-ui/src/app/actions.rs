@@ -142,7 +142,16 @@ impl NexusState {
     }
 
     pub(super) fn block_has_active_pty(&self, id: nexus_api::BlockId) -> bool {
-        self.shell.pty.has_handle(id)
+        if self.shell.pty.has_handle(id) {
+            return true;
+        }
+        // Remote PTY: block is running and we have an active remote connection.
+        if self.remote.is_some() {
+            if let Some(block) = self.shell.block_by_id(id) {
+                return block.is_running();
+            }
+        }
+        false
     }
 
     // --- Cursor ---

@@ -633,7 +633,7 @@ impl ShellWidget {
                 CommandClassification::Pty => {
                     // Remote PTY: spawn on the agent, create local block with parser
                     let (cols, rows) = self.pty.terminal_size.get();
-                    remote.pty_spawn(&trimmed, block_id, cols, rows);
+                    remote.pty_spawn(&trimmed, block_id, cols, rows, cwd);
                     let mut block = Block::new(block_id, command);
                     block.parser = self.pty.new_parser();
                     self.blocks.push(block);

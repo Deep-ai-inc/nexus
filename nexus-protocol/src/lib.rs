@@ -13,7 +13,7 @@ pub use types::{AgentCaps, ClientCaps};
 
 /// Protocol version. Increment on breaking changes.
 /// Used to version-key deployed agent binaries.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum payload size per frame (16 KB) to prevent head-of-line blocking.
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024;

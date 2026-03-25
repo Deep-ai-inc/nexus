@@ -60,6 +60,7 @@ pub enum Request {
         cols: u16,
         rows: u16,
         term: String,
+        cwd: String,
     },
     /// Send input data to a PTY.
     PtyInput {

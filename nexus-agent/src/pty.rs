@@ -158,6 +158,7 @@ impl PtyManager {
         cols: u16,
         rows: u16,
         term: &str,
+        cwd: &str,
         kernel_tx: &broadcast::Sender<ShellEvent>,
     ) -> Result<()> {
         // 1. Allocate PTY pair
@@ -187,6 +188,9 @@ impl PtyManager {
         cmd.env("TERM", &term);
         cmd.env("COLUMNS", cols.to_string());
         cmd.env("LINES", rows.to_string());
+        if !cwd.is_empty() {
+            cmd.current_dir(cwd);
+        }
 
         // Use the slave fd for child stdio
         unsafe {

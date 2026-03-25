@@ -285,6 +285,7 @@ impl RemoteBackend {
         block_id: BlockId,
         cols: u16,
         rows: u16,
+        cwd: &str,
     ) {
         let id = self.next_id();
         self.pending.insert(id, PendingRequest::PtySpawn(block_id));
@@ -295,6 +296,7 @@ impl RemoteBackend {
             cols,
             rows,
             term: "xterm-256color".to_string(),
+            cwd: cwd.to_string(),
         });
     }
 

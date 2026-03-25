@@ -44,7 +44,6 @@ similar = "2.6"
 sha2 = "0.10"
 md-5 = "0.10"
 uuid = { version = "1.0", features = ["v4"] }
-git2 = "0.19"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -71,3 +70,8 @@ nexus-kernel = { path = "nexus-kernel" }
 nexus-protocol = { path = "nexus-protocol" }
 nexus-term = { path = "nexus-term" }
 strata = { path = "strata" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
