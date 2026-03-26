@@ -497,8 +497,10 @@ impl NexusState {
                 }
                 // Outermost remote level — shutdown and disconnect
                 let mut remote = self.remote.take().unwrap();
+                let label = format!("{}@{}", remote.env.user, remote.env.hostname);
                 remote.shutdown();
                 remote.kill_child_sync();
+                self.insert_ssh_banner(&format!("Disconnected from {label}"));
                 self.cwd = self.pre_remote_cwd.take()
                     .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
             } else {
@@ -748,15 +750,13 @@ impl NexusState {
             if self.pre_remote_cwd.is_none() {
                 self.pre_remote_cwd = Some(self.cwd.clone());
             }
+            // Insert a connect banner into the scrollback
+            let label = format!("{}@{}", env.user, env.hostname);
+            self.insert_ssh_banner(&format!("Connected to {label}"));
             // Update CWD to remote CWD
             self.cwd = env.cwd.display().to_string();
             self.remote = Some(remote);
-            tracing::info!(
-                "connected to remote: {}@{} ({})",
-                env.user,
-                env.hostname,
-                env.cwd.display()
-            );
+            tracing::info!("connected to remote: {label} ({})", env.cwd.display());
         }
     }
 
@@ -826,8 +826,10 @@ impl NexusState {
             // Disconnect entirely
             self.disconnect_confirm = None;
             if let Some(mut remote) = self.remote.take() {
+                let label = format!("{}@{}", remote.env.user, remote.env.hostname);
                 remote.shutdown();
                 remote.kill_child_sync();
+                self.insert_ssh_banner(&format!("Disconnected from {label}"));
                 self.cwd = self.pre_remote_cwd.take()
                     .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
             }

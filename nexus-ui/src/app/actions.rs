@@ -154,6 +154,18 @@ impl NexusState {
         false
     }
 
+    /// Insert a non-interactive SSH banner block into the scrollback.
+    pub(super) fn insert_ssh_banner(&mut self, text: &str) {
+        use crate::data::Block;
+        use nexus_api::BlockState;
+
+        let id = self.next_id();
+        let mut block = Block::new(id, format!("── {text} ──"));
+        block.state = BlockState::Success;
+        block.duration_ms = Some(0);
+        self.shell.blocks.push(block);
+    }
+
     // --- Cursor ---
 
     pub(super) fn cursor_visible(&self) -> bool {
