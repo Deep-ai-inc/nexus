@@ -110,6 +110,8 @@ pub struct NexusState {
     // --- Remote ---
     /// Active remote connection (if any).
     pub(crate) remote: Option<crate::features::shell::remote::RemoteBackend>,
+    /// Local CWD saved before the first remote connection, restored on full disconnect.
+    pub(crate) pre_remote_cwd: Option<String>,
     /// Cancellation tokens for in-flight remote connection tasks, keyed by block_id.
     pub(crate) connecting_tasks: std::collections::HashMap<nexus_api::BlockId, tokio_util::sync::CancellationToken>,
     /// Last terminal size sent to the remote agent (avoids redundant messages).
@@ -650,6 +652,7 @@ impl RootComponent for NexusState {
             kernel_tx,
 
             remote: None,
+            pre_remote_cwd: None,
             connecting_tasks: std::collections::HashMap::new(),
             last_remote_size: (120, 24),
             remote_size_changed_at: None,

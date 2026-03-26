@@ -499,8 +499,8 @@ impl NexusState {
                 let mut remote = self.remote.take().unwrap();
                 remote.shutdown();
                 remote.kill_child_sync();
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-                self.cwd = cwd;
+                self.cwd = self.pre_remote_cwd.take()
+                    .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
             } else {
                 // Nested level — unnest one hop, stay connected
                 remote.unnest();
@@ -744,6 +744,10 @@ impl NexusState {
         // Take the remote backend out of the Arc<Mutex<Option<...>>>
         let remote = remote.lock().unwrap().take();
         if let Some(remote) = remote {
+            // Save local CWD before first remote connection
+            if self.pre_remote_cwd.is_none() {
+                self.pre_remote_cwd = Some(self.cwd.clone());
+            }
             // Update CWD to remote CWD
             self.cwd = env.cwd.display().to_string();
             self.remote = Some(remote);
@@ -824,8 +828,8 @@ impl NexusState {
             if let Some(mut remote) = self.remote.take() {
                 remote.shutdown();
                 remote.kill_child_sync();
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-                self.cwd = cwd;
+                self.cwd = self.pre_remote_cwd.take()
+                    .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
             }
         } else if let Some(ref mut remote) = self.remote {
             // Pop back to the target level by sending Unnest for each extra level
