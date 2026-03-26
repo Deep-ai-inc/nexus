@@ -157,11 +157,16 @@ kubectl exec my-pod          # and Kubernetes pods
 
 **What happens under the hood:**
 
-1. **Agent deployment** — Nexus detects the remote architecture (`uname -m`), finds the matching agent binary, and uploads it over SSH stdin in 64KB chunks with a real-time progress bar. Version-keyed by protocol hash so multiple Nexus versions coexist.
+1. **Agent deployment** — Nexus detects the remote architecture (`uname -m`), finds the matching agent binary, and uploads it over SSH stdin in 64KB chunks with a real-time progress bar. Version-keyed by protocol hash so multiple Nexus versions coexist. The agent is built with LTO + strip + UPX compression (~2.3 MB).
 2. **Structured protocol** — The agent runs the same kernel as the local shell. Commands return typed `Value` objects (tables, file entries, git status) over a binary protocol — not escape codes. Native commands work identically on the remote.
-3. **Connection progress** — A native GUI overlay shows each stage: checking agent → detecting architecture → uploading (with progress bar) → connecting → connected. Ctrl+C cancels at any point.
-4. **Nesting** — Run `ssh` inside an SSH session. Each level gets its own agent. Breadcrumb bar shows the full chain. `exit` pops one level.
-5. **Reconnection** — If the connection drops, Nexus detects it and can re-establish the session. The agent persists on the remote with a 7-day idle timeout.
+3. **Interactive PTYs** — Remote PTY commands (vim, htop, etc.) are fully interactive with keyboard input, correct CWD, and terminal mode tracking. PTYs spawn in the current working directory, not the home folder.
+4. **Connection progress** — A native GUI overlay shows each stage: checking agent → detecting architecture → uploading (with progress bar) → connecting → connected. Ctrl+C cancels at any point.
+5. **Scrollback markers** — Connect and disconnect events insert banner blocks in the scrollback, so you can see which commands ran on which host.
+6. **CWD preservation** — Your local working directory is saved before connecting and restored on disconnect, including through nested sessions.
+7. **Nesting** — Run `ssh` inside an SSH session. Each level gets its own agent. Breadcrumb bar shows the full chain. `exit` pops one level.
+8. **Reconnection** — If the connection drops, Nexus detects it and can re-establish the session. The agent persists on the remote with a 7-day idle timeout.
+9. **NexusSSH OSC** — Shell wrapper scripts can emit `\x1b]1337;NexusSSH;host=...;user=...\x07` to trigger native SSH handoff, bypassing the PTY and connecting directly via the agent protocol.
+10. **File drag-and-drop** — Drag files from Finder onto a shell block to insert the shell-quoted path directly into the PTY.
 
 ```
 ┌─────────────────────────────────────────────┐
