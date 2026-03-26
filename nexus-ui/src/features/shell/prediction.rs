@@ -18,6 +18,7 @@ use nexus_term::TerminalGrid;
 #[derive(Debug, Clone)]
 struct Prediction {
     /// The echo epoch this prediction belongs to.
+    /// This is the agent-write-acknowledged epoch, not necessarily child-consumed.
     epoch: u64,
     /// Grid column where the character should appear.
     col: u16,
@@ -138,25 +139,42 @@ impl PredictionEngine {
     }
 
     /// Look up a predicted character at the given grid position.
+    /// Searches both pending and grace_pending so predictions remain
+    /// visible during the grace period.
     pub fn get(&self, col: u16, row: u16) -> Option<PredictedCell> {
         for pred in &self.pending {
             if pred.col == col && pred.row == row {
                 return Some(PredictedCell { ch: pred.ch });
             }
         }
+        for entry in &self.grace_pending {
+            if entry.col == col && entry.row == row {
+                return Some(PredictedCell { ch: entry.ch });
+            }
+        }
         None
     }
 
-    /// Get the predicted cursor position, if predictions are pending.
+    /// Get the predicted cursor position, if predictions are pending
+    /// or grace entries are still active.
     pub fn predicted_cursor(&self) -> Option<(u16, u16)> {
-        if self.pending.is_empty() {
-            return None;
-        }
-        let col = self.anchor_col + self.cursor_col_offset;
-        if col >= self.cols {
-            Some((col - self.cols, self.anchor_row + 1))
+        if !self.pending.is_empty() {
+            let col = self.anchor_col + self.cursor_col_offset;
+            if col >= self.cols {
+                Some((col - self.cols, self.anchor_row + 1))
+            } else {
+                Some((col, self.anchor_row))
+            }
+        } else if let Some(last) = self.grace_pending.back() {
+            // Position cursor after the last grace entry.
+            let col = last.col + 1;
+            if col >= self.cols {
+                Some((col - self.cols, last.row + 1))
+            } else {
+                Some((col, last.row))
+            }
         } else {
-            Some((col, self.anchor_row))
+            None
         }
     }
 
@@ -173,7 +191,8 @@ impl PredictionEngine {
     /// Returns `true` if a rollback occurred.
     pub fn reconcile(&mut self, confirmed_epoch: u64, grid: &TerminalGrid, rtt_ms: u64) -> bool {
         let now = Instant::now();
-        let grace_ms = Self::grace_period_ms(rtt_ms);
+        let scale_factor = (self.pending.len().max(1) as u64).min(5);
+        let grace_ms = Self::grace_period_ms(rtt_ms).saturating_mul(scale_factor).min(3000);
 
         // Re-check grace entries
         self.grace_pending.retain(|entry| {
@@ -236,9 +255,10 @@ impl PredictionEngine {
         self.pre_feed_snapshot.clear();
     }
 
-    /// Number of pending predictions (for diagnostics).
+    /// Number of active predictions (pending + grace) for diagnostics
+    /// and UI visibility checks.
     pub fn pending_count(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.grace_pending.len()
     }
 }
 

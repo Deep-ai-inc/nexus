@@ -28,6 +28,10 @@ pub struct TerminalParser {
     cached_scrollback: RefCell<Option<Rc<TerminalGrid>>>,
     /// Shared storage for the latest OSC title set by the child process.
     title_slot: Arc<Mutex<Option<String>>>,
+    /// Leftover bytes from a previous feed that could be a partial DECTCEM match.
+    dectcem_window: Vec<u8>,
+    /// Reusable buffer for viewport diff snapshots.
+    diff_buffer: Vec<char>,
 }
 
 impl std::fmt::Debug for TerminalParser {
@@ -80,6 +84,8 @@ impl TerminalParser {
             cached_viewport: RefCell::new(None),
             cached_scrollback: RefCell::new(None),
             title_slot,
+            dectcem_window: Vec::new(),
+            diff_buffer: Vec::new(),
         }
     }
 
@@ -161,14 +167,14 @@ impl TerminalParser {
         let cols = self.term.columns() as u16;
         let rows = self.term.screen_lines() as u16;
 
-        // Snapshot current viewport cell characters
+        // Snapshot current viewport cell characters (reuse diff_buffer)
+        self.diff_buffer.clear();
         let grid = self.term.grid();
-        let mut snapshot: Vec<char> = Vec::with_capacity((cols as usize) * (rows as usize));
         for row in 0..rows as i32 {
             let term_line = Line(row);
             let grid_row = &grid[term_line];
             for col in 0..cols as usize {
-                snapshot.push(grid_row[Column(col)].c);
+                self.diff_buffer.push(grid_row[Column(col)].c);
             }
         }
 
@@ -183,7 +189,7 @@ impl TerminalParser {
             let grid_row = &grid[term_line];
             for col in (0..cols).rev() {
                 let new_ch = grid_row[Column(col as usize)].c;
-                let old_ch = snapshot[(row as usize) * (cols as usize) + (col as usize)];
+                let old_ch = self.diff_buffer[(row as usize) * (cols as usize) + (col as usize)];
                 if new_ch != old_ch && new_ch != ' ' && new_ch != '\0' {
                     last_write = Some((col, row));
                     break 'outer;
@@ -195,15 +201,38 @@ impl TerminalParser {
     }
 
     /// Internal: feed with DECTCEM tracking, no cache invalidation.
+    ///
+    /// Handles split-chunk boundaries: if a previous call ended with bytes
+    /// that could be a partial `ESC[?25h`, they are prepended here so the
+    /// match isn't missed.
     fn feed_tracking_cursor_inner(&mut self, bytes: &[u8]) -> Option<(u16, u16)> {
         const SHOW_CURSOR_SEQ: &[u8] = b"\x1b[?25h";
+        let max_leftover = SHOW_CURSOR_SEQ.len() - 1;
+
+        // Prepend any leftover bytes from a previous call.
+        let combined: Vec<u8>;
+        let input: &[u8] = if self.dectcem_window.is_empty() {
+            bytes
+        } else {
+            combined = [self.dectcem_window.as_slice(), bytes].concat();
+            &combined
+        };
+        // Track how many bytes came from the leftover so we skip them in advance().
+        let leftover_len = self.dectcem_window.len();
+        self.dectcem_window.clear();
+
         let mut last_visible_pos: Option<(u16, u16)> = None;
         let mut start = 0;
 
-        while start < bytes.len() {
-            if let Some(offset) = find_subsequence(&bytes[start..], SHOW_CURSOR_SEQ) {
+        while start < input.len() {
+            if let Some(offset) = find_subsequence(&input[start..], SHOW_CURSOR_SEQ) {
                 let end = start + offset + SHOW_CURSOR_SEQ.len();
-                self.processor.advance(&mut self.term, &bytes[start..end]);
+                // Only advance bytes that belong to `bytes` (skip leftover prefix).
+                let feed_start = start.max(leftover_len) - leftover_len;
+                let feed_end = end.saturating_sub(leftover_len).min(bytes.len());
+                if feed_end > feed_start {
+                    self.processor.advance(&mut self.term, &bytes[feed_start..feed_end]);
+                }
                 let cursor = &self.term.grid().cursor;
                 last_visible_pos = Some((
                     cursor.point.column.0 as u16,
@@ -211,8 +240,25 @@ impl TerminalParser {
                 ));
                 start = end;
             } else {
-                self.processor.advance(&mut self.term, &bytes[start..]);
+                // No more matches — feed remaining original bytes and break.
+                let feed_start = start.max(leftover_len) - leftover_len;
+                if feed_start < bytes.len() {
+                    self.processor.advance(&mut self.term, &bytes[feed_start..]);
+                }
                 break;
+            }
+        }
+
+        // Save trailing bytes that could be a partial match for next call.
+        if input.len() >= max_leftover {
+            let tail = &input[input.len() - max_leftover..];
+            // Only save if the tail starts with ESC (potential partial sequence).
+            if let Some(esc_pos) = tail.iter().position(|&b| b == 0x1b) {
+                self.dectcem_window.extend_from_slice(&tail[esc_pos..]);
+            }
+        } else if !input.is_empty() {
+            if let Some(esc_pos) = input.iter().position(|&b| b == 0x1b) {
+                self.dectcem_window.extend_from_slice(&input[esc_pos..]);
             }
         }
 

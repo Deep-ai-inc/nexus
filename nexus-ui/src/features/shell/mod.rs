@@ -886,13 +886,14 @@ impl ShellWidget {
                         block.last_visible_cursor = Some(visible_pos);
                     }
                     if let Some(write_pos) = last_write {
-                        // Only accept write positions near the established row
-                        // to avoid jumps when TUI apps redraw UI chrome elsewhere.
-                        let dominated = if let Some((_, prev_row)) = block.last_write_cursor {
-                            let row_diff = (write_pos.1 as i32 - prev_row as i32).abs();
-                            // Reject if the write jumped >2 rows from the established input line,
-                            // UNLESS the write is further right on the same-ish row (advancing input).
-                            row_diff > 2
+                        // Only filter write positions when predictions are active.
+                        // When idle, always accept so the anchor tracks the real input line.
+                        // When active, reject jumps >2 rows to avoid status bar hijack.
+                        let dominated = if block.prediction.pending_count() > 0 {
+                            block.last_write_cursor
+                                .map_or(false, |(_, prev_row)| {
+                                    (write_pos.1 as i32 - prev_row as i32).abs() > 2
+                                })
                         } else {
                             false
                         };
@@ -909,8 +910,9 @@ impl ShellWidget {
                         let learned = block.prediction.learned_offset();
                         let rollback = block.prediction.reconcile(last_echo_epoch, &grid, self.rtt_ms);
                         if rollback {
-                            // Reset write cursor so next keystroke picks up fresh position
+                            // Reset cursor hints so next keystroke picks up fresh position
                             block.last_write_cursor = None;
+                            block.last_visible_cursor = None;
                         }
                         tracing::debug!(
                             "[RECONCILE] epoch={last_echo_epoch} rtt={}ms before={pending_before} after={} rollback={rollback} grid_cursor=({gc},{gr}) learned=({},{}) grid_rows={} last_vis_cursor={:?}",
@@ -966,12 +968,38 @@ impl ShellWidget {
             ShellEvent::TerminalSnapshot {
                 block_id,
                 grid,
-                alt_screen: _,
-                app_cursor: _,
-                bracketed_paste: _,
+                alt_screen,
+                app_cursor,
+                bracketed_paste,
             } => {
                 if let Some(block) = self.blocks.get_mut(block_id) {
+                    // Seed last_write_cursor from snapshot: scan bottom-right
+                    // to top-left for the last non-empty cell. This gives
+                    // predictions a usable anchor immediately after reconnect
+                    // (before any new stdout chunks arrive).
+                    let snap_cols = grid.cols();
+                    let mut write_hint = None;
+                    'scan: for r in (0..grid.rows()).rev() {
+                        for c in (0..snap_cols).rev() {
+                            if let Some(cell) = grid.get(c, r) {
+                                if cell.c != ' ' && cell.c != '\0' {
+                                    write_hint = Some((c, r));
+                                    break 'scan;
+                                }
+                            }
+                        }
+                    }
                     block.parser.set_viewport_snapshot(grid);
+                    block.terminal_modes = Some(nexus_api::TerminalModes {
+                        alt_screen,
+                        app_cursor,
+                        bracketed_paste,
+                        echo: true,   // default; snapshot doesn't carry termios
+                        icanon: false, // default; snapshot doesn't carry termios
+                    });
+                    block.last_visible_cursor = None;
+                    block.last_write_cursor = write_hint;
+                    block.prediction.reset();
                     block.version += 1;
                 }
                 self.terminal_dirty = true;
