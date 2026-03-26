@@ -7,6 +7,8 @@ use std::time::Instant;
 use nexus_api::{BlockId, BlockState, OutputFormat, Value};
 use nexus_term::TerminalParser;
 
+use crate::features::shell::prediction::PredictionEngine;
+
 use crate::data::agent_block::AgentBlock;
 use super::enums::ProcSort;
 use super::view::{ViewState, FileTreeState, TableFilter, TableSort};
@@ -104,6 +106,18 @@ pub struct Block {
     /// High-water mark for content_rows, used to debounce shrink flicker
     /// on running blocks that do clear+reprint cycles (e.g. Claude Code).
     pub peak_content_rows: AtomicU16,
+    /// Current terminal mode flags from the agent's shadow parser.
+    /// Used for intelligent local echo decisions.
+    pub terminal_modes: Option<nexus_api::TerminalModes>,
+    /// Local echo prediction engine for low-latency keystroke feedback.
+    pub prediction: PredictionEngine,
+    /// Last cursor position observed when DECTCEM was on (cursor visible).
+    /// For TUI apps that toggle cursor visibility, this captures the true
+    /// input cursor position between redraw cycles.
+    pub last_visible_cursor: Option<(u16, u16)>,
+    /// Last grid position where a character was actually written during feed.
+    /// For TUI apps with hidden cursors, this reveals the true input area.
+    pub last_write_cursor: Option<(u16, u16)>,
 }
 
 impl Block {
@@ -132,6 +146,10 @@ impl Block {
             osc_title: None,
             connect_progress: None,
             peak_content_rows: AtomicU16::new(0),
+            terminal_modes: None,
+            prediction: PredictionEngine::new(),
+            last_visible_cursor: None,
+            last_write_cursor: None,
         }
     }
 

@@ -187,6 +187,7 @@ pub fn wait_with_events(
                         let _ = events.send(ShellEvent::StdoutChunk {
                             block_id,
                             data: buffer[..n].to_vec(),
+                            last_echo_epoch: 0,
                         });
                     }
 
@@ -236,6 +237,7 @@ pub fn wait_with_events(
                             let _ = events.send(ShellEvent::StdoutChunk {
                                 block_id,
                                 data: buffer[..n].to_vec(),
+                                last_echo_epoch: 0,
                             });
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -543,6 +545,7 @@ pub fn spawn_with_stdin(
                         let _ = events_clone.send(ShellEvent::StdoutChunk {
                             block_id: block_id_clone,
                             data: buffer[..n].to_vec(),
+                            last_echo_epoch: 0,
                         });
                     }
                     Err(_) => break,

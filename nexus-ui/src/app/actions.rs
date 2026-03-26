@@ -49,6 +49,11 @@ impl NexusState {
             }
         }
 
+        // Sync RTT from remote backend for prediction grace period scaling
+        if let Some(ref remote) = self.remote {
+            self.shell.rtt_ms = remote.current_rtt_ms();
+        }
+
         // Poll remote responses (ClassifyResult, CompleteResult, etc.)
         if let Some(ref mut remote) = self.remote {
             for effect in remote.poll_responses() {

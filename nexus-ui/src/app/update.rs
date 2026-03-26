@@ -173,7 +173,57 @@ impl NexusState {
                                 })
                                 .unwrap_or_default();
                             if let Some(bytes) = crate::features::shell::pty_backend::strata_key_to_bytes(&event, flags) {
-                                remote.pty_input(block_id, bytes);
+                                // Log cursor positions before sending input
+                                if let Some(block) = self.shell.blocks.get(block_id) {
+                                    let vis = block.parser.grid();
+                                    let (vc, vr) = vis.cursor();
+                                    let vis_shape = vis.cursor_shape();
+                                    let vis_visible = vis.cursor_visible();
+                                    let (rc, rr) = block.parser.raw_cursor();
+                                    let sb = block.parser.grid_with_scrollback();
+                                    let (sc, sr) = sb.cursor();
+                                    tracing::debug!(
+                                        "[KEY-PRE] vis_cursor=({vc},{vr}) raw_cursor=({rc},{rr}) sb_cursor=({sc},{sr}) vis_shape={vis_shape:?} vis_visible={vis_visible} sb_rows={} vis_rows={} scrollback_lines={}",
+                                        sb.rows(), vis.rows(), block.parser.scrollback_lines()
+                                    );
+                                }
+                                let epoch = remote.pty_input(block_id, bytes);
+
+                                // Local echo prediction: predict printable chars
+                                // Only for unmodified or shifted keys (no ctrl/alt)
+                                if let Some(ch) = predictable_char(event) {
+                                    if let Some(block) = self.shell.blocks.get_mut(block_id) {
+                                        if block.prediction.is_enabled() {
+                                            let grid = block.parser.grid();
+                                            let cursor_hidden = !block.parser.cursor_visible_mode();
+                                            // When cursor is visible, trust the grid cursor directly.
+                                            // When hidden (TUI apps like CC), use last write position + 1
+                                            // (the next column after the last drawn character).
+                                            // DECTCEM visible cursor overrides both (TUI apps that flash cursor).
+                                            let (cursor_col, cursor_row) = if let Some(pos) = block.last_visible_cursor {
+                                                pos
+                                            } else if cursor_hidden {
+                                                block.last_write_cursor
+                                                    .map(|(c, r)| (c + 1, r))
+                                                    .unwrap_or_else(|| grid.cursor())
+                                            } else {
+                                                grid.cursor()
+                                            };
+                                            block.prediction.set_cols(grid.cols());
+                                            block.prediction.predict(epoch, ch, cursor_col, cursor_row);
+                                            block.version += 1;
+                                            tracing::debug!(
+                                                "[PREDICT] epoch={epoch} ch={ch:?} cursor=({cursor_col},{cursor_row}) last_vis={:?} last_write={:?} grid_rows={} pending={}",
+                                                block.last_visible_cursor, block.last_write_cursor, grid.rows(),
+                                                block.prediction.pending_count()
+                                            );
+                                        } else {
+                                            tracing::debug!("[PREDICT] disabled for block {:?}", block_id);
+                                        }
+                                    }
+                                } else {
+                                    tracing::trace!("[PREDICT] not predictable: {event:?}");
+                                }
                             }
                             return Command::none();
                         }
@@ -1773,4 +1823,47 @@ fn collect_forwarded_env() -> std::collections::HashMap<String, String> {
     }
 
     env
+}
+
+/// Extract a single printable character from a key event for local echo prediction.
+///
+/// Returns `Some(ch)` only for plain character keys (no ctrl/alt/meta).
+/// Shift is allowed (uppercase, symbols). Control sequences, arrow keys,
+/// backspace, enter, etc. are NOT predictable — they may trigger arbitrary
+/// terminal behavior (tab completion, history search, line editing).
+fn predictable_char(event: &strata::event_context::KeyEvent) -> Option<char> {
+    use strata::event_context::{Key, KeyEvent};
+    match event {
+        KeyEvent::Pressed { key, modifiers, text } => {
+            // No prediction for ctrl/alt/meta combos
+            if modifiers.ctrl || modifiers.alt || modifiers.meta {
+                return None;
+            }
+            // Try OS-composed text first (handles shift, dead keys, compose)
+            if let Some(text) = text {
+                let mut chars = text.chars();
+                if let Some(ch) = chars.next() {
+                    if chars.next().is_none() && !ch.is_control() {
+                        return Some(ch);
+                    }
+                }
+            }
+            // Fall back to Key::Character (text may be None on some platforms)
+            if let Key::Character(c) = key {
+                let mut chars = c.chars();
+                if let Some(ch) = chars.next() {
+                    if chars.next().is_none() && !ch.is_control() {
+                        // Apply shift for letters
+                        return if modifiers.shift && ch.is_ascii_lowercase() {
+                            Some(ch.to_ascii_uppercase())
+                        } else {
+                            Some(ch)
+                        };
+                    }
+                }
+            }
+            None
+        }
+        KeyEvent::Released { .. } => None,
+    }
 }

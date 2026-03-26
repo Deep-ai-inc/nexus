@@ -13,7 +13,10 @@ impl NexusState {
             // Use shared ordered block list (same order as navigation helpers)
             for id in self.all_block_ids_ordered() {
                 if let Some(block) = self.shell.block_by_id(id) {
-                    scroll = self.shell.push_block(scroll, block, &self.focus);
+                    let dimmed = self.remote.as_ref().map_or(false, |r| {
+                        r.state != crate::features::shell::remote::ConnectionState::Connected
+                    });
+                    scroll = self.shell.push_block(scroll, block, &self.focus, dimmed);
                 } else if let Some(&idx) = self.agent.block_index.get(&id) {
                     if let Some(block) = self.agent.blocks.get(idx) {
                         scroll = self.agent.push_block(scroll, block);

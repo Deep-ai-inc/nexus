@@ -2,25 +2,52 @@
 //!
 //! Maps `PtySpawn`, `PtyInput`, `PtyResize`, `PtyKill`, `PtyClose` requests
 //! to actual PTY operations on the remote machine.
+//!
+//! Each PTY session runs a shadow terminal emulator (`ShadowParser`) inside
+//! its reader task. The shadow parser is owned exclusively by the reader —
+//! no shared mutex on the hot path. Snapshot requests are served via a
+//! oneshot channel: the caller sends a oneshot::Sender, the reader task
+//! extracts the grid and responds.
 
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use anyhow::Result;
-use nexus_api::{BlockId, ShellEvent};
+use nexus_api::{BlockId, ShellEvent, TerminalModes};
+use nexus_term::ShadowParser;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, WriteHalf};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Manages active PTY sessions on the agent.
 pub(crate) struct PtyManager {
     /// Active PTY sessions indexed by block ID.
     sessions: HashMap<BlockId, PtySession>,
+}
+
+/// Request types the reader task services between reads.
+enum ReaderRequest {
+    /// Extract a full snapshot (viewport + scrollback + modes).
+    Snapshot(oneshot::Sender<SnapshotResponse>),
+    /// Resize the shadow parser (sent alongside the ioctl resize).
+    Resize { cols: u16, rows: u16 },
+}
+
+/// Response from a snapshot request.
+pub(crate) struct SnapshotResponse {
+    pub grid: nexus_term::TerminalGrid,
+    pub scrollback: Vec<nexus_term::Cell>,
+    pub scrollback_cols: u16,
+    pub alt_screen: bool,
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
 }
 
 /// A single PTY session.
@@ -40,6 +67,13 @@ struct PtySession {
     /// Raw fd for ioctl operations (resize). Kept alive via the AsyncFd
     /// inside the split halves, but we need the numeric fd for ioctl.
     master_raw_fd: i32,
+    /// Channel to send requests to the reader task (snapshot, resize).
+    /// Lock-free: the reader task owns the ShadowParser exclusively.
+    reader_tx: mpsc::UnboundedSender<ReaderRequest>,
+    /// Highest echo epoch written to the PTY master.
+    /// Written by the input path (after write_all), read by the reader task
+    /// to stamp StdoutChunk events. Lock-free coordination.
+    last_written_epoch: Arc<AtomicU64>,
 }
 
 /// Newtype for AsyncRead + AsyncWrite over a PTY master fd.
@@ -232,34 +266,29 @@ impl PtyManager {
         let raw_fd = pty_master.as_raw_fd();
         let (read_half, write_half) = tokio::io::split(pty_master);
 
-        // 6. Spawn reader task: read output and send StdoutChunk events
+        // 6. Create channel for reader requests (snapshot, resize)
+        let (reader_tx, reader_rx) = mpsc::unbounded_channel::<ReaderRequest>();
+
+        // 7. Shared epoch counter: input path writes, reader task reads
+        let last_written_epoch = Arc::new(AtomicU64::new(0));
+
+        // 8. Spawn reader task: owns ShadowParser exclusively (no shared mutex)
         let tx = kernel_tx.clone();
         let reader_block_id = block_id;
-        let reader_handle = tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut reader = read_half;
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break, // EOF — slave closed
-                    Ok(n) => {
-                        let _ = tx.send(ShellEvent::StdoutChunk {
-                            block_id: reader_block_id,
-                            data: buf[..n].to_vec(),
-                        });
-                    }
-                    Err(e) => {
-                        // EIO is normal when the slave side closes
-                        if e.raw_os_error() != Some(libc::EIO) {
-                            tracing::debug!("pty read error: {e}");
-                        }
-                        break;
-                    }
-                }
-            }
-        });
+        let reader_raw_fd = raw_fd;
+        let reader_epoch = last_written_epoch.clone();
+        let reader_handle = tokio::spawn(reader_task(
+            read_half,
+            reader_rx,
+            tx,
+            reader_block_id,
+            reader_raw_fd,
+            cols,
+            rows,
+            reader_epoch,
+        ));
 
-        // 7. Spawn waiter task: wait for child exit and send CommandFinished
+        // 9. Spawn waiter task: wait for child exit and send CommandFinished
         let tx = kernel_tx.clone();
         let waiter_block_id = block_id;
         let waiter_handle = tokio::spawn(async move {
@@ -282,7 +311,7 @@ impl PtyManager {
             });
         });
 
-        // 8. Store session
+        // 10. Store session
         self.sessions.insert(
             block_id,
             PtySession {
@@ -293,17 +322,27 @@ impl PtyManager {
                 reader_handle,
                 waiter_handle,
                 master_raw_fd: raw_fd,
+                reader_tx,
+                last_written_epoch,
             },
         );
 
         Ok(())
     }
 
-    /// Write input to a PTY session.
-    pub async fn input(&mut self, block_id: BlockId, data: &[u8]) -> Result<()> {
+    /// Write input to a PTY session and update the echo epoch.
+    ///
+    /// The epoch is stored AFTER the write completes, ensuring the reader
+    /// task only sees the epoch once the bytes are in the PTY master's
+    /// kernel buffer. This guarantees: any StdoutChunk stamped with
+    /// epoch N reflects output produced after the input for epoch N
+    /// was written.
+    pub async fn input(&mut self, block_id: BlockId, data: &[u8], echo_epoch: u64) -> Result<()> {
         use tokio::io::AsyncWriteExt;
         if let Some(session) = self.sessions.get_mut(&block_id) {
             session.write_half.write_all(data).await?;
+            // Store epoch AFTER write — reader task will see it on next read
+            session.last_written_epoch.store(echo_epoch, Ordering::Release);
         }
         Ok(())
     }
@@ -321,6 +360,8 @@ impl PtyManager {
             if ret == -1 {
                 return Err(io::Error::last_os_error().into());
             }
+            // Tell reader task to resize its shadow parser (lock-free)
+            let _ = session.reader_tx.send(ReaderRequest::Resize { cols, rows });
         }
         Ok(())
     }
@@ -379,4 +420,116 @@ impl PtyManager {
     pub fn has_active_sessions(&self) -> bool {
         !self.sessions.is_empty()
     }
+
+    /// Request a terminal snapshot from the reader task (lock-free).
+    /// Returns None if the session doesn't exist or the reader task has exited.
+    pub async fn snapshot(&self, block_id: BlockId) -> Option<SnapshotResponse> {
+        let session = self.sessions.get(&block_id)?;
+        let (tx, rx) = oneshot::channel();
+        session.reader_tx.send(ReaderRequest::Snapshot(tx)).ok()?;
+        rx.await.ok()
+    }
+}
+
+/// The reader task: owns a ShadowParser exclusively. Reads PTY output,
+/// feeds the shadow parser, emits events, and services snapshot requests.
+/// No shared mutexes — all communication is via channels.
+async fn reader_task(
+    read_half: tokio::io::ReadHalf<PtyMaster>,
+    mut request_rx: mpsc::UnboundedReceiver<ReaderRequest>,
+    tx: broadcast::Sender<ShellEvent>,
+    block_id: BlockId,
+    master_raw_fd: i32,
+    cols: u16,
+    rows: u16,
+    last_written_epoch: Arc<AtomicU64>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut reader = read_half;
+    let mut shadow = ShadowParser::new(cols, rows);
+    let mut last_modes: Option<TerminalModes> = None;
+    let mut buf = [0u8; 4096];
+
+    loop {
+        tokio::select! {
+            // Hot path: read PTY output
+            result = reader.read(&mut buf) => {
+                match result {
+                    Ok(0) => break, // EOF — slave closed
+                    Ok(n) => {
+                        let data = &buf[..n];
+
+                        // Feed shadow parser (owned, no lock)
+                        shadow.feed(data);
+
+                        // Check terminal mode changes
+                        let (echo, icanon) = read_termios_flags(master_raw_fd);
+                        let current_modes = TerminalModes {
+                            echo,
+                            icanon,
+                            alt_screen: shadow.is_alternate_screen(),
+                            app_cursor: shadow.app_cursor(),
+                            bracketed_paste: shadow.bracketed_paste(),
+                        };
+
+                        if last_modes.as_ref() != Some(&current_modes) {
+                            let _ = tx.send(ShellEvent::TerminalModeChanged {
+                                block_id,
+                                modes: current_modes.clone(),
+                            });
+                            last_modes = Some(current_modes);
+                        }
+
+                        let epoch = last_written_epoch.load(Ordering::Acquire);
+                        let _ = tx.send(ShellEvent::StdoutChunk {
+                            block_id,
+                            data: data.to_vec(),
+                            last_echo_epoch: epoch,
+                        });
+                    }
+                    Err(e) => {
+                        if e.raw_os_error() != Some(libc::EIO) {
+                            tracing::debug!("pty read error: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Service requests between reads (snapshot, resize)
+            Some(req) = request_rx.recv() => {
+                match req {
+                    ReaderRequest::Snapshot(reply_tx) => {
+                        let grid = shadow.extract_grid();
+                        let (scrollback, scrollback_cols) = shadow.extract_scrollback();
+                        let resp = SnapshotResponse {
+                            grid,
+                            scrollback,
+                            scrollback_cols,
+                            alt_screen: shadow.is_alternate_screen(),
+                            app_cursor: shadow.app_cursor(),
+                            bracketed_paste: shadow.bracketed_paste(),
+                        };
+                        let _ = reply_tx.send(resp);
+                    }
+                    ReaderRequest::Resize { cols, rows } => {
+                        shadow.resize(cols, rows);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read ECHO and ICANON flags from the PTY slave's termios (via the master fd).
+fn read_termios_flags(master_fd: i32) -> (bool, bool) {
+    let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+    let ret = unsafe { libc::tcgetattr(master_fd, termios.as_mut_ptr()) };
+    if ret == -1 {
+        return (true, true); // Default: assume echo + canonical
+    }
+    let termios = unsafe { termios.assume_init() };
+    let echo = (termios.c_lflag & libc::ECHO) != 0;
+    let icanon = (termios.c_lflag & libc::ICANON) != 0;
+    (echo, icanon)
 }

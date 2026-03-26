@@ -1,6 +1,7 @@
 //! Shell widget — owns terminal blocks, PTY handles, jobs, and image handles.
 
 pub(crate) mod block_manager;
+pub(crate) mod prediction;
 pub(crate) mod pty_backend;
 pub(crate) mod remote;
 pub(crate) mod shell_context;
@@ -80,6 +81,9 @@ pub(crate) struct ShellWidget {
     pub(crate) pty: PtyBackend,
     pub terminal_dirty: bool,
     pub last_exit_code: Option<i32>,
+    /// Current RTT to the remote agent (ms). Used by prediction reconciliation
+    /// to scale the grace period. 0 = local (no prediction needed).
+    pub rtt_ms: u64,
 
     /// Unified click registry — populated during view(), read during click/drag handling.
     /// Keyed by SourceId, provides O(1) lookup for anchors and tree toggles.
@@ -111,6 +115,7 @@ impl ShellWidget {
             table_layout_cache: RefCell::new(HashMap::new()),
             kernel_rx,
             pending_osc_ssh: None,
+            rtt_ms: 0,
         }
     }
 
@@ -134,6 +139,7 @@ impl ShellWidget {
         scroll: strata::ScrollColumn<'a>,
         block: &'a Block,
         focus: &Focus,
+        connection_dimmed: bool,
     ) -> strata::ScrollColumn<'a> {
         let is_focused = matches!(focus, Focus::Block(id) if *id == block.id);
         scroll.push(ShellBlockWidget {
@@ -144,6 +150,7 @@ impl ShellWidget {
             click_registry: &self.click_registry,
             table_layout_cache: &self.table_layout_cache,
             table_cell_images: &self.blocks.table_cell_images,
+            connection_dimmed,
         })
     }
 
@@ -865,8 +872,58 @@ impl ShellWidget {
                     self.blocks.push(block);
                 }
             }
-            ShellEvent::StdoutChunk { block_id, data }
-            | ShellEvent::StderrChunk { block_id, data } => {
+            ShellEvent::StdoutChunk { block_id, data, last_echo_epoch } => {
+                if let Some(block) = self.blocks.get_mut(block_id) {
+                    // Snapshot predicted positions BEFORE feed for false-positive detection
+                    if last_echo_epoch > 0 && block.prediction.pending_count() > 0 {
+                        let grid = block.parser.grid();
+                        block.prediction.snapshot_before_feed(&grid);
+                    }
+                    // Feed with write tracking — detect both DECTCEM transitions
+                    // and the last grid position where content was written.
+                    let (last_write, dectcem_pos) = block.parser.feed_tracking_writes(&data);
+                    if let Some(visible_pos) = dectcem_pos {
+                        block.last_visible_cursor = Some(visible_pos);
+                    }
+                    if let Some(write_pos) = last_write {
+                        // Only accept write positions near the established row
+                        // to avoid jumps when TUI apps redraw UI chrome elsewhere.
+                        let dominated = if let Some((_, prev_row)) = block.last_write_cursor {
+                            let row_diff = (write_pos.1 as i32 - prev_row as i32).abs();
+                            // Reject if the write jumped >2 rows from the established input line,
+                            // UNLESS the write is further right on the same-ish row (advancing input).
+                            row_diff > 2
+                        } else {
+                            false
+                        };
+                        if !dominated {
+                            block.last_write_cursor = Some(write_pos);
+                        }
+                    }
+                    block.version += 1;
+                    // Reconcile predictions against the now-updated visible grid
+                    if last_echo_epoch > 0 && block.prediction.pending_count() > 0 {
+                        let pending_before = block.prediction.pending_count();
+                        let grid = block.parser.grid();
+                        let (gc, gr) = grid.cursor();
+                        let learned = block.prediction.learned_offset();
+                        let rollback = block.prediction.reconcile(last_echo_epoch, &grid, self.rtt_ms);
+                        if rollback {
+                            // Reset write cursor so next keystroke picks up fresh position
+                            block.last_write_cursor = None;
+                        }
+                        tracing::debug!(
+                            "[RECONCILE] epoch={last_echo_epoch} rtt={}ms before={pending_before} after={} rollback={rollback} grid_cursor=({gc},{gr}) learned=({},{}) grid_rows={} last_vis_cursor={:?}",
+                            self.rtt_ms,
+                            block.prediction.pending_count(),
+                            learned.0, learned.1, grid.rows(),
+                            block.last_visible_cursor
+                        );
+                    }
+                }
+                self.terminal_dirty = true;
+            }
+            ShellEvent::StderrChunk { block_id, data } => {
                 if let Some(block) = self.blocks.get_mut(block_id) {
                     block.parser.feed(&data);
                     block.version += 1;
@@ -905,6 +962,43 @@ impl ShellWidget {
             }
             ShellEvent::CwdChanged { new, .. } => {
                 uctx.set_cwd(new);
+            }
+            ShellEvent::TerminalSnapshot {
+                block_id,
+                grid,
+                alt_screen: _,
+                app_cursor: _,
+                bracketed_paste: _,
+            } => {
+                if let Some(block) = self.blocks.get_mut(block_id) {
+                    block.parser.set_viewport_snapshot(grid);
+                    block.version += 1;
+                }
+                self.terminal_dirty = true;
+            }
+            ShellEvent::TerminalModeChanged { block_id, modes } => {
+                if let Some(block) = self.blocks.get_mut(block_id) {
+                    // Don't gate predictions on termios echo flag — many programs
+                    // (bash/readline, zsh) disable kernel echo and handle it themselves.
+                    // The prediction engine's reconciliation handles mismatches.
+                    // Predictions are always enabled; rollback is the safety net.
+                    block.terminal_modes = Some(modes);
+                }
+            }
+            ShellEvent::ScrollbackHistory {
+                block_id,
+                cells,
+                cols,
+            } => {
+                // TODO: Feed structured scrollback into the parser's history buffer.
+                // For now, log receipt so we know the pipeline works end-to-end.
+                if let Some(_block) = self.blocks.get_mut(block_id) {
+                    let rows = if cols > 0 { cells.len() / cols as usize } else { 0 };
+                    tracing::debug!(
+                        "received scrollback for block {:?}: {rows} rows x {cols} cols",
+                        block_id
+                    );
+                }
             }
             _ => {}
         }

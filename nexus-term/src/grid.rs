@@ -1,11 +1,12 @@
 //! Terminal grid - a 2D array of cells.
 
-use std::cell::Cell as StdCell;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::cell::Cell;
+use serde::{Deserialize, Serialize};
 
 /// Terminal cursor shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CursorShape {
     Block,
     HollowBlock,
@@ -15,7 +16,7 @@ pub enum CursorShape {
 }
 
 /// A terminal grid containing rows of cells.
-#[derive(Debug, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalGrid {
     /// The cells, stored row-major.
     cells: Vec<Cell>,
@@ -32,8 +33,31 @@ pub struct TerminalGrid {
     /// Cursor shape.
     cursor_shape: CursorShape,
     /// Cached content height (last non-empty row + 1).
-    /// Uses Cell for interior mutability since this is computed lazily.
-    content_rows_cache: StdCell<Option<u16>>,
+    /// Uses AtomicU16 for thread-safe interior mutability (u16::MAX = uncached).
+    #[serde(skip, default = "default_content_cache")]
+    content_rows_cache: AtomicU16,
+}
+
+/// Sentinel value meaning "cache not computed yet".
+const CONTENT_CACHE_NONE: u16 = u16::MAX;
+
+fn default_content_cache() -> AtomicU16 {
+    AtomicU16::new(CONTENT_CACHE_NONE)
+}
+
+impl Clone for TerminalGrid {
+    fn clone(&self) -> Self {
+        Self {
+            cells: self.cells.clone(),
+            cols: self.cols,
+            rows: self.rows,
+            cursor_col: self.cursor_col,
+            cursor_row: self.cursor_row,
+            cursor_visible: self.cursor_visible,
+            cursor_shape: self.cursor_shape,
+            content_rows_cache: AtomicU16::new(self.content_rows_cache.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl TerminalGrid {
@@ -48,7 +72,7 @@ impl TerminalGrid {
             cursor_row: 0,
             cursor_visible: true,
             cursor_shape: CursorShape::Block,
-            content_rows_cache: StdCell::new(None),
+            content_rows_cache: AtomicU16::new(CONTENT_CACHE_NONE),
         }
     }
 
@@ -99,18 +123,18 @@ impl TerminalGrid {
             // If we wrote visible content at or below cached bottom, bump cache upward.
             // If we might be clearing the last content row, drop cache to force rescan.
             if is_content {
-                if let Some(cached) = self.content_rows_cache.get() {
+                let cached = self.content_rows_cache.load(Ordering::Relaxed);
+                if cached != CONTENT_CACHE_NONE {
                     let needed = row + 1;
                     if needed > cached {
-                        self.content_rows_cache.set(Some(needed));
+                        self.content_rows_cache.store(needed, Ordering::Relaxed);
                     }
                 }
             } else {
                 // Clearing a cell - if it's on the cached last row, we must rescan
-                if let Some(cached) = self.content_rows_cache.get() {
-                    if row + 1 == cached {
-                        self.content_rows_cache.set(None);
-                    }
+                let cached = self.content_rows_cache.load(Ordering::Relaxed);
+                if cached != CONTENT_CACHE_NONE && row + 1 == cached {
+                    self.content_rows_cache.store(CONTENT_CACHE_NONE, Ordering::Relaxed);
                 }
             }
         }
@@ -118,18 +142,19 @@ impl TerminalGrid {
 
     /// Invalidate the content rows cache (call after bulk modifications).
     pub fn invalidate_content_cache(&mut self) {
-        self.content_rows_cache.set(None);
+        self.content_rows_cache.store(CONTENT_CACHE_NONE, Ordering::Relaxed);
     }
 
     /// Set the content rows cache directly (for use after extraction).
     pub fn set_content_rows_cache(&self, rows: u16) {
-        self.content_rows_cache.set(Some(rows));
+        self.content_rows_cache.store(rows, Ordering::Relaxed);
     }
 
     /// Get the number of rows with actual content (cached).
     /// Scans from bottom-up for O(1) best case (full screens).
     pub fn content_rows(&self) -> u16 {
-        if let Some(cached) = self.content_rows_cache.get() {
+        let cached = self.content_rows_cache.load(Ordering::Relaxed);
+        if cached != CONTENT_CACHE_NONE {
             return cached;
         }
 
@@ -166,7 +191,7 @@ impl TerminalGrid {
         if scan_time.as_micros() > 100 {
             eprintln!("[CONTENT_ROWS] cache MISS - {}us to scan {} rows", scan_time.as_micros(), self.rows);
         }
-        self.content_rows_cache.set(Some(result));
+        self.content_rows_cache.store(result, Ordering::Relaxed);
         result
     }
 
@@ -237,7 +262,7 @@ impl TerminalGrid {
         self.cursor_col = self.cursor_col.min(new_cols.saturating_sub(1));
         self.cursor_row = self.cursor_row.min(new_rows.saturating_sub(1));
         // Invalidate content rows cache
-        self.content_rows_cache.set(None);
+        self.content_rows_cache.store(CONTENT_CACHE_NONE, Ordering::Relaxed);
     }
 
     /// Iterate over rows.

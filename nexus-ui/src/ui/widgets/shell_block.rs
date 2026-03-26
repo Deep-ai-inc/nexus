@@ -44,6 +44,8 @@ pub struct ShellBlockWidget<'a> {
     pub(crate) table_layout_cache: &'a TableLayoutCache,
     /// Per-cell image handles for table cells with image media.
     pub(crate) table_cell_images: &'a HashMap<(nexus_api::BlockId, usize, usize), (ImageHandle, u32, u32)>,
+    /// Whether the remote connection is down (dims authoritative grid cells).
+    pub connection_dimmed: bool,
 }
 
 impl<'a> Widget<'a> for ShellBlockWidget<'a> {
@@ -52,12 +54,22 @@ impl<'a> Widget<'a> for ShellBlockWidget<'a> {
         let header_source = ids::shell_header(block.id);
 
         // Extract terminal content from parser.
-        let grid = if block.parser.is_alternate_screen() {
+        // When predictions are pending, use the full visible grid so the
+        // prediction overlay renders at the correct row (TUI apps like
+        // Claude Code may render input far below the content area).
+        let has_predictions = block.prediction.pending_count() > 0;
+        let grid = if block.parser.is_alternate_screen() || has_predictions {
             block.parser.grid()
         } else {
             block.parser.grid_with_scrollback()
         };
-        let content_rows = debounced_content_rows(block, &grid);
+        let mut content_rows = debounced_content_rows(block, &grid);
+        // Extend content_rows to include prediction area
+        if has_predictions {
+            if let Some((_, pred_row)) = block.prediction.predicted_cursor() {
+                content_rows = content_rows.max(pred_row + 1);
+            }
+        }
         let cols = grid.cols();
 
         let mut content = Column::new()
@@ -89,7 +101,7 @@ impl<'a> Widget<'a> for ShellBlockWidget<'a> {
             content = build_event_log(content, block, self.image_info, self.click_registry, self.table_layout_cache, self.table_cell_images);
 
             if block.structured_output.is_none() && block.live_value.is_none() && block.event_log.is_empty() && content_rows > 0 {
-                content = build_terminal_content(content, block, &grid, cols, content_rows);
+                content = build_terminal_content(content, block, &grid, cols, content_rows, self.connection_dimmed);
             }
         }
 
@@ -248,10 +260,15 @@ fn build_terminal_content<'a>(
     grid: &nexus_term::TerminalGrid,
     cols: u16,
     content_rows: u16,
+    connection_dimmed: bool,
 ) -> Column<'a> {
     let source_id = ids::shell_term(block.id);
+    let prediction = &block.prediction;
+
     let cursor_info = if block.is_running() && grid.cursor_shape() != nexus_term::CursorShape::Hidden {
-        let (c, r) = grid.cursor();
+        // Use predicted cursor position if predictions are pending
+        let (c, r) = prediction.predicted_cursor()
+            .unwrap_or_else(|| grid.cursor());
         if r < content_rows {
             let cell = grid.get(c, r);
             let (ch, fg, bg) = if let Some(cell) = cell {
@@ -287,6 +304,16 @@ fn build_terminal_content<'a>(
     let default_fg_packed = Color::rgb(0.9, 0.9, 0.9).pack();
     let default_bg_packed: u32 = 0;
 
+    // Style for predicted characters: dashed underline to mark as tentative.
+    // When connected, predictions are dimmed. When disconnected, predictions
+    // are BRIGHT (not dimmed) — they're the only "live" content on screen.
+    let prediction_style = RunStyle {
+        dim: !connection_dimmed,
+        underline: UnderlineStyle::Dashed,
+        ..RunStyle::default()
+    };
+
+    let mut row_idx: u16 = 0;
     for row in grid.rows_iter() {
         let mut runs: Vec<TextRun> = Vec::new();
         let mut run_text = String::new();
@@ -311,7 +338,13 @@ fn build_terminal_content<'a>(
 
             let cell_width: u16 = if cell.flags.wide_char { 2 } else { 1 };
 
-            let (fg_packed, bg_packed) = if cell.flags.inverse {
+            // Check for a prediction overlay at this position
+            let predicted = prediction.get(col, row_idx);
+
+            let (fg_packed, bg_packed, style, ch_override) = if let Some(pred) = predicted {
+                // Predicted cell: use default fg (dimmed) + dashed underline
+                (default_fg_packed, default_bg_packed, prediction_style, Some(pred.ch))
+            } else if cell.flags.inverse {
                 let resolved_fg = if matches!(cell.fg, nexus_term::Color::Default) {
                     Color::rgb(0.9, 0.9, 0.9)
                 } else {
@@ -322,7 +355,21 @@ fn build_terminal_content<'a>(
                 } else {
                     term_color_to_strata(cell.bg)
                 };
-                (resolved_bg.pack(), resolved_fg.pack())
+                let s = RunStyle {
+                    bold: cell.flags.bold,
+                    italic: cell.flags.italic,
+                    underline: match cell.flags.underline {
+                        nexus_term::UnderlineStyle::None => UnderlineStyle::None,
+                        nexus_term::UnderlineStyle::Single => UnderlineStyle::Single,
+                        nexus_term::UnderlineStyle::Double => UnderlineStyle::Double,
+                        nexus_term::UnderlineStyle::Curly => UnderlineStyle::Curly,
+                        nexus_term::UnderlineStyle::Dotted => UnderlineStyle::Dotted,
+                        nexus_term::UnderlineStyle::Dashed => UnderlineStyle::Dashed,
+                    },
+                    strikethrough: cell.flags.strikethrough,
+                    dim: cell.flags.dim || connection_dimmed,
+                };
+                (resolved_bg.pack(), resolved_fg.pack(), s, None)
             } else {
                 let fg = term_color_to_strata(cell.fg).pack();
                 let bg = if matches!(cell.bg, nexus_term::Color::Default) {
@@ -330,21 +377,21 @@ fn build_terminal_content<'a>(
                 } else {
                     term_color_to_strata(cell.bg).pack()
                 };
-                (fg, bg)
-            };
-            let style = RunStyle {
-                bold: cell.flags.bold,
-                italic: cell.flags.italic,
-                underline: match cell.flags.underline {
-                    nexus_term::UnderlineStyle::None => UnderlineStyle::None,
-                    nexus_term::UnderlineStyle::Single => UnderlineStyle::Single,
-                    nexus_term::UnderlineStyle::Double => UnderlineStyle::Double,
-                    nexus_term::UnderlineStyle::Curly => UnderlineStyle::Curly,
-                    nexus_term::UnderlineStyle::Dotted => UnderlineStyle::Dotted,
-                    nexus_term::UnderlineStyle::Dashed => UnderlineStyle::Dashed,
-                },
-                strikethrough: cell.flags.strikethrough,
-                dim: cell.flags.dim,
+                let s = RunStyle {
+                    bold: cell.flags.bold,
+                    italic: cell.flags.italic,
+                    underline: match cell.flags.underline {
+                        nexus_term::UnderlineStyle::None => UnderlineStyle::None,
+                        nexus_term::UnderlineStyle::Single => UnderlineStyle::Single,
+                        nexus_term::UnderlineStyle::Double => UnderlineStyle::Double,
+                        nexus_term::UnderlineStyle::Curly => UnderlineStyle::Curly,
+                        nexus_term::UnderlineStyle::Dotted => UnderlineStyle::Dotted,
+                        nexus_term::UnderlineStyle::Dashed => UnderlineStyle::Dashed,
+                    },
+                    strikethrough: cell.flags.strikethrough,
+                    dim: cell.flags.dim || connection_dimmed,
+                };
+                (fg, bg, s, None)
             };
 
             let same_attrs = fg_packed == run_fg && bg_packed == run_bg && style == run_style;
@@ -362,13 +409,18 @@ fn build_terminal_content<'a>(
                 run_style = style;
             }
 
-            cell.push_grapheme(&mut run_text);
+            if let Some(ch) = ch_override {
+                run_text.push(ch);
+            } else {
+                cell.push_grapheme(&mut run_text);
+            }
             run_cells += cell_width;
             col += cell_width;
         }
 
         flush_run(&mut runs, &mut run_text, run_fg, run_bg, run_col, &mut run_cells, run_style);
         term = term.row(runs);
+        row_idx += 1;
     }
 
     content.terminal(term)

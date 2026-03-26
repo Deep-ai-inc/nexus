@@ -157,6 +157,7 @@ mod tests {
             event: ShellEvent::StdoutChunk {
                 block_id: BlockId(1),
                 data: vec![b'x'; data_size],
+                last_echo_epoch: 0,
             },
         }
     }

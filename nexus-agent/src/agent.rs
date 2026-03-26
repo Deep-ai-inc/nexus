@@ -299,8 +299,8 @@ impl Agent {
                     }
                 }
 
-                Request::PtyInput { block_id, data } => {
-                    if let Err(e) = self.pty_manager.input(block_id, &data).await {
+                Request::PtyInput { block_id, data, echo_epoch } => {
+                    if let Err(e) = self.pty_manager.input(block_id, &data, echo_epoch).await {
                         tracing::warn!("pty input error for {:?}: {e}", block_id);
                     }
                 }
@@ -429,7 +429,7 @@ impl Agent {
                     session_token,
                     last_seen_seq,
                 } => {
-                    self.handle_resume(session_token, last_seen_seq, &writer, &ring_buffer)
+                    self.handle_resume(session_token, last_seen_seq, &writer, &ring_buffer, &next_seq)
                         .await?;
                 }
 
@@ -596,6 +596,7 @@ impl Agent {
         last_seen_seq: u64,
         writer: &Arc<tokio::sync::Mutex<FrameWriter<W>>>,
         ring_buffer: &Arc<tokio::sync::Mutex<RingBuffer>>,
+        next_seq: &Arc<AtomicU64>,
     ) -> Result<()> {
         // Validate session token
         if self.session_token != Some(session_token) {
@@ -620,9 +621,50 @@ impl Agent {
             }
         }
 
+        // Send terminal grid snapshots for all active PTY sessions.
+        // These arrive AFTER the ring buffer replay, so the UI can use them
+        // as the definitive screen state (correcting any gaps from evicted
+        // ring buffer frames).
+        let active_blocks = self.pty_manager.active_block_ids();
+        {
+            let mut w = writer.lock().await;
+            for &block_id in &active_blocks {
+                if let Some(snap) = self.pty_manager.snapshot(block_id).await {
+                    // Send viewport snapshot
+                    let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                    let snapshot_event = ShellEvent::TerminalSnapshot {
+                        block_id,
+                        grid: snap.grid,
+                        alt_screen: snap.alt_screen,
+                        app_cursor: snap.app_cursor,
+                        bracketed_paste: snap.bracketed_paste,
+                    };
+                    let resp = Response::Event {
+                        seq,
+                        event: snapshot_event,
+                    };
+                    let _ = w.write(&resp, priority::INTERACTIVE).await;
+
+                    // Send scrollback history if available
+                    if !snap.scrollback.is_empty() {
+                        let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                        let scrollback_event = ShellEvent::ScrollbackHistory {
+                            block_id,
+                            cells: snap.scrollback,
+                            cols: snap.scrollback_cols,
+                        };
+                        let resp = Response::Event {
+                            seq,
+                            event: scrollback_event,
+                        };
+                        let _ = w.write(&resp, priority::INTERACTIVE).await;
+                    }
+                }
+            }
+        }
+
         // Send session state
         let env = self.collect_env_info().await;
-        let active_blocks = self.pty_manager.active_block_ids();
         let resp = Response::SessionState {
             token: session_token,
             env,
@@ -866,7 +908,12 @@ impl Agent {
     }
 
     async fn collect_env_info(&self) -> EnvInfo {
-        Self::collect_env_info_static(&self.instance_id).await
+        let mut info = Self::collect_env_info_static(&self.instance_id).await;
+        // Use the kernel's tracked CWD (updated by `cd`) instead of the
+        // agent process's CWD (which never changes after launch).
+        let kernel = self.kernel.lock().await;
+        info.cwd = kernel.state().cwd.clone();
+        info
     }
 
     /// Collect environment info without needing `&self` (for use in relay loop).

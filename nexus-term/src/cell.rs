@@ -2,9 +2,10 @@
 
 use alacritty_terminal::term::cell::Flags as AlacrittyFlags;
 use alacritty_terminal::vte::ansi::Color as AnsiColor;
+use serde::{Deserialize, Serialize};
 
 /// A single cell in the terminal grid.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Cell {
     /// The character in this cell.
     pub c: char,
@@ -35,7 +36,7 @@ impl Cell {
 }
 
 /// Underline style.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnderlineStyle {
     #[default]
     None,
@@ -47,7 +48,7 @@ pub enum UnderlineStyle {
 }
 
 /// Cell attribute flags.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFlags {
     pub bold: bool,
     pub italic: bool,
@@ -92,7 +93,7 @@ impl From<AlacrittyFlags> for CellFlags {
 }
 
 /// Terminal color.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Color {
     /// Default foreground/background.
     Default,

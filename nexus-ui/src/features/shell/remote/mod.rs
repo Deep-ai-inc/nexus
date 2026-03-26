@@ -108,6 +108,11 @@ pub(crate) struct RemoteBackend {
     /// Tracks the expected surviving agent's instance_id during an intentional Unnest.
     /// When ChildLost arrives and matches this, no error toast is shown.
     pending_unnest_target: Option<String>,
+    /// Monotonically increasing echo epoch counter for local echo prediction.
+    /// Incremented on every PtyInput; the agent reflects it back on StdoutChunk.
+    echo_epoch: u64,
+    /// PTY inputs buffered while disconnected. Flushed in order on reconnect.
+    pending_inputs: Vec<QueuedInput>,
 }
 
 impl std::fmt::Debug for RemoteBackend {
@@ -126,6 +131,15 @@ impl std::fmt::Debug for RemoteBackend {
 pub(crate) struct QueuedCommand {
     pub command: String,
     pub block_id: BlockId,
+}
+
+/// A PTY input queued while disconnected. Carries the pre-assigned epoch
+/// so predictions stay consistent across reconnect.
+#[derive(Debug, Clone)]
+struct QueuedInput {
+    block_id: BlockId,
+    data: Vec<u8>,
+    echo_epoch: u64,
 }
 
 /// Envelope wrapping a request for the transport task.
@@ -162,6 +176,8 @@ impl RemoteBackend {
             agent_path,
             session_token,
             pending_unnest_target: None,
+            echo_epoch: 0,
+            pending_inputs: Vec::new(),
         }
     }
 
@@ -301,8 +317,31 @@ impl RemoteBackend {
     }
 
     /// Send input to a remote PTY.
-    pub fn pty_input(&mut self, block_id: BlockId, data: Vec<u8>) {
-        self.send(Request::PtyInput { block_id, data });
+    /// Increments the echo epoch so the agent can reflect it back
+    /// for local echo prediction confirmation. Returns the assigned epoch.
+    ///
+    /// When disconnected, the input is buffered locally and flushed on
+    /// reconnect. The epoch is still assigned so predictions remain valid.
+    pub fn pty_input(&mut self, block_id: BlockId, data: Vec<u8>) -> u64 {
+        self.echo_epoch += 1;
+        let epoch = self.echo_epoch;
+
+        if self.state == ConnectionState::Connected {
+            self.send(Request::PtyInput {
+                block_id,
+                data,
+                echo_epoch: epoch,
+            });
+        } else {
+            // Buffer for reconnect — predictions still render locally
+            self.pending_inputs.push(QueuedInput {
+                block_id,
+                data,
+                echo_epoch: epoch,
+            });
+        }
+
+        epoch
     }
 
     /// Resize a remote PTY.
@@ -568,6 +607,16 @@ impl RemoteBackend {
         let queue = std::mem::take(&mut self.pending_queue);
         for cmd in queue {
             self.execute(cmd.command, cmd.block_id);
+        }
+        // Flood buffered PTY inputs — predictions will reconcile
+        // against the server's echoed epochs.
+        let inputs = std::mem::take(&mut self.pending_inputs);
+        for input in inputs {
+            self.send(Request::PtyInput {
+                block_id: input.block_id,
+                data: input.data,
+                echo_epoch: input.echo_epoch,
+            });
         }
     }
 

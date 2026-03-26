@@ -66,6 +66,10 @@ pub enum Request {
     PtyInput {
         block_id: BlockId,
         data: Vec<u8>,
+        /// Monotonically increasing epoch for local echo prediction.
+        /// The agent reflects this back on StdoutChunk so the client
+        /// knows which predictions have been consumed by the PTY.
+        echo_epoch: u64,
     },
     /// Resize a PTY.
     PtyResize {

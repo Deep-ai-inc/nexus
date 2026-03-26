@@ -601,10 +601,12 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 term: "xterm-256color".into(),
+                cwd: "/home/user".into(),
             },
             Request::PtyInput {
                 block_id: BlockId(2),
                 data: b"hello".to_vec(),
+                echo_epoch: 42,
             },
             Request::PtyResize {
                 block_id: BlockId(2),

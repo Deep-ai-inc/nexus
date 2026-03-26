@@ -22,6 +22,10 @@ pub enum ShellEvent {
     StdoutChunk {
         block_id: BlockId,
         data: Vec<u8>,
+        /// The highest echo epoch the agent had written to the PTY master
+        /// at the time this chunk was read. The client uses this to confirm
+        /// or roll back local echo predictions.
+        last_echo_epoch: u64,
     },
 
     /// A chunk of stderr data is available.
@@ -81,6 +85,52 @@ pub enum ShellEvent {
         /// If false, appends to the stream log (e.g., ping replies).
         coalesce: bool,
     },
+
+    /// Snapshot of terminal grid state for a block (sent on reconnect).
+    /// Provides a complete viewport so the UI can render correctly even
+    /// if the ring buffer has evicted older escape sequences.
+    TerminalSnapshot {
+        block_id: BlockId,
+        grid: nexus_term::TerminalGrid,
+        alt_screen: bool,
+        app_cursor: bool,
+        bracketed_paste: bool,
+    },
+
+    /// Terminal mode flags changed for a PTY block.
+    /// Enables the UI to make intelligent decisions about local echo,
+    /// cursor key encoding, paste wrapping, etc.
+    TerminalModeChanged {
+        block_id: BlockId,
+        modes: TerminalModes,
+    },
+
+    /// Scrollback history sent on reconnect.
+    /// Contains structured Cell rows from the agent's shadow parser,
+    /// allowing the UI to populate the scrollback buffer with styled content
+    /// (not just raw bytes that need re-parsing).
+    ScrollbackHistory {
+        block_id: BlockId,
+        /// Flat row-major cell data: `rows * cols` cells, oldest row first.
+        cells: Vec<nexus_term::Cell>,
+        /// Number of columns per row.
+        cols: u16,
+    },
+}
+
+/// Terminal mode flags reported by the agent's shadow parser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalModes {
+    /// Slave PTY has ECHO enabled (characters are echoed by the kernel).
+    pub echo: bool,
+    /// Slave PTY is in canonical (line-buffered) mode.
+    pub icanon: bool,
+    /// Alternate screen buffer is active (full-screen TUI app).
+    pub alt_screen: bool,
+    /// Application Cursor Keys mode (DECCKM) — arrows emit SS3.
+    pub app_cursor: bool,
+    /// Bracketed paste mode is enabled.
+    pub bracketed_paste: bool,
 }
 
 /// State of a background job.

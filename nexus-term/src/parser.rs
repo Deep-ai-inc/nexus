@@ -91,6 +91,137 @@ impl TerminalParser {
         *self.cached_scrollback.borrow_mut() = None;
     }
 
+    /// Get the raw cursor position from alacritty's grid (not renderable_content).
+    pub fn raw_cursor(&self) -> (u16, u16) {
+        let cursor = &self.term.grid().cursor;
+        (cursor.point.column.0 as u16, cursor.point.line.0 as u16)
+    }
+
+    /// Whether DECTCEM (show cursor mode) is currently on.
+    pub fn cursor_visible_mode(&self) -> bool {
+        self.term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
+    }
+
+    /// Feed bytes and track DECTCEM transitions.
+    /// Returns `Some((col, row))` if the cursor became visible during this
+    /// feed (via `ESC[?25h`), giving the position where the app revealed
+    /// the cursor — typically the input position for TUI apps.
+    ///
+    /// Scans raw bytes for the DECTCEM-on sequence and splits processing
+    /// to capture the cursor position at that exact moment, even if the
+    /// cursor is hidden again later in the same chunk.
+    pub fn feed_tracking_cursor(&mut self, bytes: &[u8]) -> Option<(u16, u16)> {
+        // ESC[?25h = show cursor (DECTCEM on)
+        const SHOW_CURSOR_SEQ: &[u8] = b"\x1b[?25h";
+        let mut last_visible_pos: Option<(u16, u16)> = None;
+        let mut start = 0;
+
+        // Scan for all occurrences of ESC[?25h in the byte stream.
+        // Process up to and including each occurrence, then capture cursor.
+        while start < bytes.len() {
+            if let Some(offset) = find_subsequence(&bytes[start..], SHOW_CURSOR_SEQ) {
+                let end = start + offset + SHOW_CURSOR_SEQ.len();
+                // Process bytes up through the show-cursor sequence
+                self.processor.advance(&mut self.term, &bytes[start..end]);
+                // Capture cursor position at the moment it became visible
+                let cursor = &self.term.grid().cursor;
+                last_visible_pos = Some((
+                    cursor.point.column.0 as u16,
+                    cursor.point.line.0 as u16,
+                ));
+                start = end;
+            } else {
+                // No more show-cursor sequences — process the rest
+                self.processor.advance(&mut self.term, &bytes[start..]);
+                break;
+            }
+        }
+
+        // Invalidate caches
+        *self.cached_viewport.borrow_mut() = None;
+        *self.cached_scrollback.borrow_mut() = None;
+
+        last_visible_pos
+    }
+
+    /// Feed bytes and find the last grid position where a character was written.
+    ///
+    /// Snapshots the viewport before feeding, then scans bottom-right to
+    /// top-left for the last cell that changed. This reveals where TUI apps
+    /// (like Claude Code) actually drew their input text, even when the
+    /// terminal cursor is parked at a meaningless position with DECTCEM off.
+    ///
+    /// Also performs DECTCEM tracking. Returns:
+    /// - `last_write_pos`: last cell that changed (bottom-right-most)
+    /// - `dectcem_pos`: cursor position at DECTCEM-on transition (if any)
+    pub fn feed_tracking_writes(
+        &mut self,
+        bytes: &[u8],
+    ) -> (Option<(u16, u16)>, Option<(u16, u16)>) {
+        let cols = self.term.columns() as u16;
+        let rows = self.term.screen_lines() as u16;
+
+        // Snapshot current viewport cell characters
+        let grid = self.term.grid();
+        let mut snapshot: Vec<char> = Vec::with_capacity((cols as usize) * (rows as usize));
+        for row in 0..rows as i32 {
+            let term_line = Line(row);
+            let grid_row = &grid[term_line];
+            for col in 0..cols as usize {
+                snapshot.push(grid_row[Column(col)].c);
+            }
+        }
+
+        // Feed with DECTCEM tracking
+        let dectcem_pos = self.feed_tracking_cursor_inner(bytes);
+
+        // Scan for last changed cell (bottom-right to top-left)
+        let grid = self.term.grid();
+        let mut last_write: Option<(u16, u16)> = None;
+        'outer: for row in (0..rows).rev() {
+            let term_line = Line(row as i32);
+            let grid_row = &grid[term_line];
+            for col in (0..cols).rev() {
+                let new_ch = grid_row[Column(col as usize)].c;
+                let old_ch = snapshot[(row as usize) * (cols as usize) + (col as usize)];
+                if new_ch != old_ch && new_ch != ' ' && new_ch != '\0' {
+                    last_write = Some((col, row));
+                    break 'outer;
+                }
+            }
+        }
+
+        (last_write, dectcem_pos)
+    }
+
+    /// Internal: feed with DECTCEM tracking, no cache invalidation.
+    fn feed_tracking_cursor_inner(&mut self, bytes: &[u8]) -> Option<(u16, u16)> {
+        const SHOW_CURSOR_SEQ: &[u8] = b"\x1b[?25h";
+        let mut last_visible_pos: Option<(u16, u16)> = None;
+        let mut start = 0;
+
+        while start < bytes.len() {
+            if let Some(offset) = find_subsequence(&bytes[start..], SHOW_CURSOR_SEQ) {
+                let end = start + offset + SHOW_CURSOR_SEQ.len();
+                self.processor.advance(&mut self.term, &bytes[start..end]);
+                let cursor = &self.term.grid().cursor;
+                last_visible_pos = Some((
+                    cursor.point.column.0 as u16,
+                    cursor.point.line.0 as u16,
+                ));
+                start = end;
+            } else {
+                self.processor.advance(&mut self.term, &bytes[start..]);
+                break;
+            }
+        }
+
+        *self.cached_viewport.borrow_mut() = None;
+        *self.cached_scrollback.borrow_mut() = None;
+
+        last_visible_pos
+    }
+
     /// Take the latest OSC title set by the child process, if any.
     /// Returns `Some(title)` if the child set a title since the last call,
     /// or `None` if no title was set (or it was reset).
@@ -190,9 +321,12 @@ impl TerminalParser {
         let history_lines = grid.history_size();
         let total_lines = screen_lines + history_lines;
 
-        // Calculate actual content height to avoid huge empty grids
+        // Calculate actual content height to avoid huge empty grids.
+        // Always include the cursor row so predictions align with the cursor position.
         let content_rows = self.compute_content_height();
-        let total_to_render = content_rows.min(total_lines).max(1);
+        let cursor_point = grid.cursor.point;
+        let cursor_row_in_grid = (cursor_point.line.0 + history_lines as i32 + 1) as usize;
+        let total_to_render = content_rows.max(cursor_row_in_grid).min(total_lines).max(1);
 
         // Create a grid sized to actual content
         let mut result = TerminalGrid::new(cols as u16, total_to_render as u16);
@@ -320,6 +454,15 @@ impl TerminalParser {
         1 // At least 1 row
     }
 
+    /// Replace the cached viewport with an externally-provided grid snapshot.
+    ///
+    /// Used on reconnect: the agent sends a `TerminalSnapshot` with the
+    /// definitive screen state. The next `feed()` call will invalidate
+    /// this snapshot, so any subsequent PTY output overwrites it naturally.
+    pub fn set_viewport_snapshot(&mut self, grid: TerminalGrid) {
+        *self.cached_viewport.borrow_mut() = Some(Rc::new(grid));
+    }
+
     /// Clear the terminal.
     pub fn clear(&mut self) {
         // Send clear screen escape sequence
@@ -331,4 +474,9 @@ impl Default for TerminalParser {
     fn default() -> Self {
         Self::new(crate::DEFAULT_COLS, crate::DEFAULT_ROWS)
     }
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
