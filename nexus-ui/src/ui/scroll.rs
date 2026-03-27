@@ -17,6 +17,9 @@ pub enum ScrollTarget {
     Bottom,
     /// Focus a specific block: resolve position after layout.
     Block(BlockId),
+    /// Tail a specific block: align the block's bottom with the viewport bottom.
+    /// Used for active PTYs that have blocks below them.
+    BlockBottom(BlockId),
     /// Free scroll: user is reading history, don't auto-scroll.
     None,
 }
@@ -38,10 +41,10 @@ impl ScrollModel {
         }
     }
 
-    /// Passive hint: returns true if target is Bottom (viewport will follow
-    /// new output via f32::MAX in view), false if the user is scrolled away.
+    /// Passive hint: returns true if target is Bottom or BlockBottom (viewport
+    /// will follow new output), false if the user is scrolled away.
     pub fn hint_bottom(&mut self) -> bool {
-        self.target == ScrollTarget::Bottom
+        matches!(self.target, ScrollTarget::Bottom | ScrollTarget::BlockBottom(_))
     }
 
     /// Active snap: set target to Bottom. The view pass uses f32::MAX
@@ -55,6 +58,11 @@ impl ScrollModel {
     /// Actual offset is computed in view() after layout, applied next frame.
     pub fn scroll_to_block(&mut self, id: BlockId) {
         self.target = ScrollTarget::Block(id);
+    }
+
+    /// Tail a specific block: align the block's bottom with the viewport bottom.
+    pub fn scroll_to_block_bottom(&mut self, id: BlockId) {
+        self.target = ScrollTarget::BlockBottom(id);
     }
 
     /// Reset scroll to top with Bottom target. Used by clear screen.
@@ -77,8 +85,11 @@ impl ScrollModel {
             // Mid-gesture: contact, momentum, drag move/start — don't lock.
             _ => false,
         };
-        if self.target == ScrollTarget::Bottom {
-            self.state.offset = self.state.max.get();
+        if matches!(self.target, ScrollTarget::Bottom | ScrollTarget::BlockBottom(_)) {
+            // Sync offset from virtual position before applying user delta.
+            if self.target == ScrollTarget::Bottom {
+                self.state.offset = self.state.max.get();
+            }
             self.target = ScrollTarget::None;
         }
         self.state.apply(action);
@@ -108,9 +119,12 @@ impl ScrollModel {
     pub fn apply_pending(&mut self) {
         if let Some(offset) = self.pending_offset.take() {
             self.state.offset = offset;
-            // After navigating to a block, enter free-scroll so output
-            // arriving doesn't yank the viewport away from the target.
-            self.target = ScrollTarget::None;
+            // BlockBottom is a continuous follow — keep the target so it
+            // re-resolves each frame as the block grows with new output.
+            // Other targets (Block) are one-shot navigations.
+            if !matches!(self.target, ScrollTarget::BlockBottom(_)) {
+                self.target = ScrollTarget::None;
+            }
         }
     }
 

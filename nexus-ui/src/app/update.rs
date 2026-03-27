@@ -160,6 +160,18 @@ impl NexusState {
                     }
                 }
 
+                // Any PTY input should re-engage bottom follow so the
+                // viewport tracks output even if the user scrolled up.
+                if let ShellMsg::PtyInput(block_id, _) = &m {
+                    let is_last = self.shell.blocks.blocks.last()
+                        .map_or(true, |b| b.id == *block_id);
+                    if is_last {
+                        self.scroll.snap_to_bottom();
+                    } else {
+                        self.scroll.scroll_to_block_bottom(*block_id);
+                    }
+                }
+
                 // Remote PTY input: intercept and forward to agent
                 if let ShellMsg::PtyInput(block_id, ref event) = m {
                     if let Some(ref mut remote) = self.remote {

@@ -295,24 +295,32 @@ impl Component for NexusState {
 
         // Scroll-to-block: compute content-space position and store as pending offset.
         // The actual scroll mutation happens in update() via apply_pending().
-        if let crate::ui::scroll::ScrollTarget::Block(target_id) = self.scroll.target {
-            let source = crate::utils::ids::block_container(target_id);
-            if let Some(bounds) = snapshot.widget_bounds(&source) {
-                let scroll_bounds = self.scroll.state.bounds.get();
-                let content_y = bounds.y - scroll_bounds.y + self.scroll.state.offset;
-                let viewport_h = scroll_bounds.height;
+        match self.scroll.target {
+            crate::ui::scroll::ScrollTarget::Block(target_id)
+            | crate::ui::scroll::ScrollTarget::BlockBottom(target_id) => {
+                let is_bottom = matches!(self.scroll.target, crate::ui::scroll::ScrollTarget::BlockBottom(_));
+                let source = crate::utils::ids::block_container(target_id);
+                if let Some(bounds) = snapshot.widget_bounds(&source) {
+                    let scroll_bounds = self.scroll.state.bounds.get();
+                    let content_y = bounds.y - scroll_bounds.y + self.scroll.state.offset;
+                    let viewport_h = scroll_bounds.height;
 
-                let target_offset = if bounds.height > viewport_h {
-                    // Tall block: snap top to maximize visible content
-                    content_y
-                } else {
-                    // Short block: position at 1/3 down for context
-                    (content_y - viewport_h / 3.0).max(0.0)
-                };
+                    let target_offset = if is_bottom {
+                        // Align block bottom with viewport bottom
+                        (content_y + bounds.height - viewport_h).max(0.0)
+                    } else if bounds.height > viewport_h {
+                        // Tall block: snap top to maximize visible content
+                        content_y
+                    } else {
+                        // Short block: position at 1/3 down for context
+                        (content_y - viewport_h / 3.0).max(0.0)
+                    };
 
-                let max = self.scroll.state.max.get();
-                self.scroll.pending_offset.set(Some(target_offset.min(max)));
+                    let max = self.scroll.state.max.get();
+                    self.scroll.pending_offset.set(Some(target_offset.min(max)));
+                }
             }
+            _ => {}
         }
 
         // Drop target highlight

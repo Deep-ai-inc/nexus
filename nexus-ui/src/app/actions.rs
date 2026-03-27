@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use strata::ImageStore;
 
+use crate::data::Focus;
 use super::NexusState;
 
 const ZOOM_STEP: f32 = 0.1;
@@ -30,6 +31,25 @@ impl NexusState {
         self.focus = focus;
         self.input.text_input.focused = matches!(focus, crate::data::Focus::Input);
         self.agent.question_input.focused = matches!(focus, crate::data::Focus::AgentInput);
+
+        // When focusing a block that isn't the last one, switch from absolute
+        // Bottom to BlockBottom so output tails that block, not the content below it.
+        if let Focus::Block(id) = focus {
+            if self.scroll.target == crate::ui::scroll::ScrollTarget::Bottom {
+                let is_last = self.shell.blocks.blocks.last()
+                    .map_or(true, |b| b.id == id);
+                if !is_last {
+                    self.scroll.scroll_to_block_bottom(id);
+                }
+            }
+        }
+        // When leaving a block (e.g., to Input), restore absolute Bottom
+        // so new output tails normally.
+        if matches!(focus, Focus::Input | Focus::AgentInput) {
+            if matches!(self.scroll.target, crate::ui::scroll::ScrollTarget::BlockBottom(_)) {
+                self.scroll.snap_to_bottom();
+            }
+        }
     }
 
     // --- Output-arrived tick ---
@@ -205,8 +225,28 @@ impl NexusState {
             // fall through to the normal input/image paste path.
             if let crate::data::Focus::Block(id) = self.focus {
                 if let Ok(text) = clipboard.get_text() {
-                    if !text.is_empty() && self.shell.paste_to_pty(id, &text) {
-                        return;
+                    if !text.is_empty() {
+                        // Try local PTY first
+                        if self.shell.paste_to_pty(id, &text) {
+                            return;
+                        }
+                        // Remote PTY: send as raw bytes via the remote backend
+                        if let Some(ref mut remote) = self.remote {
+                            if self.shell.block_by_id(id).map_or(false, |b| b.is_running()) {
+                                let bracketed = self.shell.block_by_id(id)
+                                    .map_or(false, |b| b.parser.bracketed_paste());
+                                let mut payload = Vec::new();
+                                if bracketed {
+                                    payload.extend_from_slice(b"\x1b[200~");
+                                }
+                                payload.extend_from_slice(text.as_bytes());
+                                if bracketed {
+                                    payload.extend_from_slice(b"\x1b[201~");
+                                }
+                                remote.pty_input(id, payload);
+                                return;
+                            }
+                        }
                     }
                 }
             }

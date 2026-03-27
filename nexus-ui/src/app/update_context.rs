@@ -52,6 +52,11 @@ impl<'a> UpdateContext<'a> {
         self.scroll.snap_to_bottom();
     }
 
+    /// Scroll to align a block's bottom with the viewport bottom.
+    pub fn scroll_to_block_bottom(&mut self, id: nexus_api::BlockId) {
+        self.scroll.scroll_to_block_bottom(id);
+    }
+
     /// Passive hint — returns true if already at bottom.
     pub fn hint_bottom(&mut self) {
         self.scroll.hint_bottom();
