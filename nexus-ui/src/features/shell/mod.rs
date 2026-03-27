@@ -595,8 +595,8 @@ impl ShellWidget {
             ShellMsg::OpenAnchor(_, _) => {
                 // Handled at the root level in state_update.rs
             }
-            ShellMsg::ToggleTreeExpand(block_id, path) => {
-                self.toggle_tree_expand(block_id, path, uctx);
+            ShellMsg::ToggleTreeExpand(_, _) => {
+                // Handled at the root level in update.rs (needs remote backend access)
             }
             ShellMsg::TreeChildrenLoaded(block_id, path, entries) => {
                 self.set_tree_children(block_id, path, entries);
@@ -1018,15 +1018,16 @@ impl ShellWidget {
                 cells,
                 cols,
             } => {
-                // TODO: Feed structured scrollback into the parser's history buffer.
-                // For now, log receipt so we know the pipeline works end-to-end.
-                if let Some(_block) = self.blocks.get_mut(block_id) {
+                if let Some(block) = self.blocks.get_mut(block_id) {
                     let rows = if cols > 0 { cells.len() / cols as usize } else { 0 };
                     tracing::debug!(
                         "received scrollback for block {:?}: {rows} rows x {cols} cols",
                         block_id
                     );
+                    block.parser.set_scrollback_snapshot(cells, cols);
+                    block.version += 1;
                 }
+                self.terminal_dirty = true;
             }
             _ => {}
         }
@@ -1254,25 +1255,40 @@ impl ShellWidget {
 
     /// Toggle tree expansion for a directory.
     /// Enqueues LoadTreeChildren command if the directory was expanded and needs loading.
-    pub fn toggle_tree_expand(&mut self, block_id: BlockId, path: PathBuf, uctx: &mut UpdateContext) {
+    pub fn toggle_tree_expand(
+        &mut self,
+        block_id: BlockId,
+        path: PathBuf,
+        uctx: &mut UpdateContext,
+        list_dir_rx: Option<tokio::sync::oneshot::Receiver<Vec<nexus_api::FileEntry>>>,
+    ) {
         if let Some(block) = self.blocks.get_mut(block_id) {
             let tree = block.ensure_file_tree();
             let now_expanded = tree.toggle(path.clone());
             block.version += 1; // Trigger re-render
             if now_expanded && !block.ensure_file_tree().children.contains_key(&path) {
                 let path_clone = path.clone();
-                uctx.push_command(strata::Command::perform(async move {
-                    let mut entries = Vec::new();
-                    if let Ok(read_dir) = std::fs::read_dir(&path_clone) {
-                        for entry in read_dir.flatten() {
-                            if let Ok(file_entry) = nexus_api::FileEntry::from_path(entry.path()) {
-                                entries.push(file_entry);
+                if let Some(rx) = list_dir_rx {
+                    // Remote path: wait for the agent's ListDirResult
+                    uctx.push_command(strata::Command::perform(async move {
+                        let entries = rx.await.unwrap_or_default();
+                        NexusMessage::Shell(ShellMsg::TreeChildrenLoaded(block_id, path_clone, entries))
+                    }));
+                } else {
+                    // Local path: read directory on a blocking task
+                    uctx.push_command(strata::Command::perform(async move {
+                        let mut entries = Vec::new();
+                        if let Ok(read_dir) = std::fs::read_dir(&path_clone) {
+                            for entry in read_dir.flatten() {
+                                if let Ok(file_entry) = nexus_api::FileEntry::from_path(entry.path()) {
+                                    entries.push(file_entry);
+                                }
                             }
                         }
-                    }
-                    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                    NexusMessage::Shell(ShellMsg::TreeChildrenLoaded(block_id, path_clone, entries))
-                }));
+                        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                        NexusMessage::Shell(ShellMsg::TreeChildrenLoaded(block_id, path_clone, entries))
+                    }));
+                }
             }
         }
     }

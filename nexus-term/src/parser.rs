@@ -509,6 +509,57 @@ impl TerminalParser {
         *self.cached_viewport.borrow_mut() = Some(Rc::new(grid));
     }
 
+    /// Ingest scrollback history received from the agent on reconnect.
+    ///
+    /// Builds a combined grid (scrollback rows + current viewport) and
+    /// caches it as the scrollback grid. The next `feed()` call invalidates
+    /// both caches, so new PTY output overwrites this naturally.
+    pub fn set_scrollback_snapshot(&mut self, cells: Vec<crate::cell::Cell>, cols: u16) {
+        if cols == 0 {
+            return;
+        }
+        let scrollback_rows = cells.len() / cols as usize;
+        if scrollback_rows == 0 {
+            return;
+        }
+
+        // Get current viewport to append below scrollback
+        let viewport = self.extract_viewport();
+        let vp_rows = viewport.rows() as usize;
+        let vp_cols = viewport.cols();
+
+        // Use scrollback cols as the canonical width
+        let total_rows = scrollback_rows + vp_rows;
+        let mut grid = TerminalGrid::new(cols, total_rows as u16);
+
+        // Copy scrollback cells (row-major, oldest first)
+        for row in 0..scrollback_rows {
+            for col in 0..cols as usize {
+                let idx = row * cols as usize + col;
+                if idx < cells.len() {
+                    grid.set(col as u16, row as u16, cells[idx].clone());
+                }
+            }
+        }
+
+        // Copy viewport cells below scrollback
+        let min_cols = cols.min(vp_cols) as usize;
+        for row in 0..vp_rows {
+            for col in 0..min_cols {
+                if let Some(cell) = viewport.get(col as u16, row as u16) {
+                    grid.set(col as u16, (scrollback_rows + row) as u16, cell.clone());
+                }
+            }
+        }
+
+        // Position cursor relative to combined grid
+        let (vc, vr) = viewport.cursor();
+        grid.set_cursor(vc, vr + scrollback_rows as u16);
+        grid.set_cursor_shape(viewport.cursor_shape());
+
+        *self.cached_scrollback.borrow_mut() = Some(Rc::new(grid));
+    }
+
     /// Clear the terminal.
     pub fn clear(&mut self) {
         // Send clear screen escape sequence

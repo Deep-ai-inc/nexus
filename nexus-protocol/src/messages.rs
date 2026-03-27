@@ -114,6 +114,11 @@ pub enum Request {
     CancelFileRead {
         id: u32,
     },
+    /// List directory contents (for tree expansion over remote).
+    ListDir {
+        id: u32,
+        path: String,
+    },
 
     // -- Nesting --
     /// Deploy a child agent via the given transport and enter relay mode.
@@ -198,6 +203,11 @@ pub enum Response {
     FileWriteOk {
         id: u32,
         bytes_written: u64,
+    },
+    /// Result of a ListDir request.
+    ListDirResult {
+        id: u32,
+        entries: Vec<nexus_api::FileEntry>,
     },
 
     // -- Nesting --

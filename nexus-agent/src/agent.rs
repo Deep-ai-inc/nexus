@@ -362,6 +362,38 @@ impl Agent {
                     });
                 }
 
+                Request::ListDir { id, path } => {
+                    let writer = writer.clone();
+                    tokio::spawn(async move {
+                        // Do blocking fs work on a blocking thread, then send response async.
+                        let result = tokio::task::spawn_blocking(move || {
+                            match std::fs::read_dir(&path) {
+                                Ok(read_dir) => {
+                                    let mut entries = Vec::new();
+                                    for entry in read_dir.flatten() {
+                                        if let Ok(fe) = nexus_api::FileEntry::from_path(entry.path()) {
+                                            entries.push(fe);
+                                        }
+                                    }
+                                    entries.sort_by(|a, b| {
+                                        a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                                    });
+                                    Ok(entries)
+                                }
+                                Err(e) => Err(format!("failed to read directory: {e}")),
+                            }
+                        }).await;
+
+                        let resp = match result {
+                            Ok(Ok(entries)) => Response::ListDirResult { id, entries },
+                            Ok(Err(msg)) => Response::Error { id, message: msg },
+                            Err(e) => Response::Error { id, message: format!("task failed: {e}") },
+                        };
+                        let mut w = writer.lock().await;
+                        let _ = w.write(&resp, resp.priority()).await;
+                    });
+                }
+
                 Request::FileWrite {
                     id,
                     path,

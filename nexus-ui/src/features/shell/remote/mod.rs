@@ -33,6 +33,7 @@ enum PendingRequest {
     /// One entry per chunk — all share the same accumulator.
     /// The last chunk to complete fires the oneshot.
     FileWriteChunk(Arc<std::sync::Mutex<FileWriteAccum>>),
+    ListDir(oneshot::Sender<Vec<nexus_api::FileEntry>>),
 }
 
 /// Shared accumulator for multi-chunk file writes.
@@ -276,6 +277,29 @@ impl RemoteBackend {
             limit,
         });
         rx
+    }
+
+    /// List a directory on the remote agent (async).
+    ///
+    /// Returns a oneshot receiver that resolves with the directory entries.
+    /// The `block_id` and `path` are stored so the caller can match the
+    /// response back to the tree node, but are not sent over the wire.
+    pub fn list_dir(
+        &mut self,
+        path: std::path::PathBuf,
+        _block_id: BlockId,
+    ) -> Option<oneshot::Receiver<Vec<nexus_api::FileEntry>>> {
+        if self.state != ConnectionState::Connected {
+            return None;
+        }
+        let (tx, rx) = oneshot::channel();
+        let id = self.next_id();
+        self.pending.insert(id, PendingRequest::ListDir(tx));
+        self.send(Request::ListDir {
+            id,
+            path: path.to_string_lossy().into_owned(),
+        });
+        Some(rx)
     }
 
     /// Send a terminal resize to the remote agent.
@@ -583,6 +607,12 @@ impl RemoteBackend {
                             let _ = tx.send(state.total_written);
                         }
                     }
+                }
+                ResponseEffect::None
+            }
+            Response::ListDirResult { id, entries } => {
+                if let Some(PendingRequest::ListDir(tx)) = self.pending.remove(&id) {
+                    let _ = tx.send(entries);
                 }
                 ResponseEffect::None
             }

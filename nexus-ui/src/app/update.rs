@@ -229,6 +229,18 @@ impl NexusState {
                         }
                     }
                 }
+                // Tree expansion needs remote backend access
+                if let ShellMsg::ToggleTreeExpand(block_id, ref path) = m {
+                    let rx = self
+                        .remote
+                        .as_mut()
+                        .and_then(|r| r.list_dir(path.clone(), block_id));
+                    let (shell, mut uctx) = self.shell_ctx();
+                    shell.toggle_tree_expand(block_id, path.clone(), &mut uctx, rx);
+                    let cmds = uctx.into_commands();
+                    sync_focus_flags(&self.focus, &mut self.input, &mut self.agent);
+                    return cmds;
+                }
                 // Remote connection results are handled at the root level
                 let m = match m {
                     ShellMsg::RemoteConnected { block_id, remote, env } => {
