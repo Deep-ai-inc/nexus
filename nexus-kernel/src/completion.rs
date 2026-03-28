@@ -9,6 +9,12 @@
 use std::path::{Path, PathBuf};
 use std::collections::HashSet;
 
+/// Characters that need escaping in shell contexts (spaces, parens, brackets, etc.).
+const SHELL_META_CHARS: &[char] = &[
+    ' ', '\'', '"', '\\', '(', ')', '[', ']', '{', '}',
+    '!', '#', '$', '&', '*', '?', ';', '|', '<', '>', '`', '~',
+];
+
 use crate::commands::CommandRegistry;
 use crate::ShellState;
 
@@ -277,8 +283,8 @@ impl<'a> CompletionEngine<'a> {
             }
         }
 
-        // Sort by score (descending)
-        completions.sort_by(|a, b| b.score.cmp(&a.score));
+        // Sort alphabetically (case-insensitive), like Bash
+        completions.sort_by(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase()));
         completions
     }
 
@@ -333,41 +339,41 @@ impl<'a> CompletionEngine<'a> {
 
         // Read directory entries
         if let Ok(entries) = std::fs::read_dir(&dir) {
-            let prefix_lower = file_prefix.to_lowercase();
-
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
 
-                // Skip hidden files unless prefix starts with .
-                if name.starts_with('.') && !file_prefix.starts_with('.') {
+                // Skip . and .. entries only
+                if name == "." || name == ".." {
                     continue;
                 }
 
-                if name.to_lowercase().starts_with(&prefix_lower) {
+                // Case-sensitive prefix match, like Bash
+                if name.starts_with(&file_prefix) {
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     let is_exec = !is_dir && is_executable(&entry.path());
 
-                    // Build the completion text
+                    // Build the completion text with shell escaping
+                    let escaped_name = shell_escape(&name);
                     let completion_text = if prefix.contains('/') {
                         // Preserve the path prefix
                         let path_prefix = prefix.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
                         if is_dir {
-                            format!("{}/{}/", path_prefix, name)
+                            format!("{}/{}/", path_prefix, escaped_name)
                         } else {
-                            format!("{}/{}", path_prefix, name)
+                            format!("{}/{}", path_prefix, escaped_name)
                         }
                     } else if prefix.starts_with('~') {
                         // Preserve tilde
                         if is_dir {
-                            format!("~/{}/", name)
+                            format!("~/{}/", escaped_name)
                         } else {
-                            format!("~/{}", name)
+                            format!("~/{}", escaped_name)
                         }
                     } else {
                         if is_dir {
-                            format!("{}/", name)
+                            format!("{}/", escaped_name)
                         } else {
-                            name.clone()
+                            escaped_name
                         }
                     };
 
@@ -392,15 +398,8 @@ impl<'a> CompletionEngine<'a> {
             }
         }
 
-        // Sort: directories first, then by name
-        completions.sort_by(|a, b| {
-            match (a.kind, b.kind) {
-                (CompletionKind::Directory, CompletionKind::Directory) => a.text.cmp(&b.text),
-                (CompletionKind::Directory, _) => std::cmp::Ordering::Less,
-                (_, CompletionKind::Directory) => std::cmp::Ordering::Greater,
-                _ => a.text.cmp(&b.text),
-            }
-        });
+        // Sort alphabetically (case-insensitive), like Bash
+        completions.sort_by(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase()));
 
         completions
     }
@@ -477,7 +476,7 @@ impl<'a> CompletionEngine<'a> {
                 let branches = String::from_utf8_lossy(&output.stdout);
                 for branch in branches.lines() {
                     let branch = branch.trim();
-                    if branch.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                    if branch.starts_with(prefix) {
                         completions.push(Completion {
                             text: branch.to_string(),
                             display: format!("{} {}", CompletionKind::GitBranch.icon(), branch),
@@ -547,6 +546,49 @@ enum CompletionContext {
     GitBranch(String),
     /// Completing a command flag.
     Flag(String),
+}
+
+/// Escape shell metacharacters in a completion string using backslashes.
+/// Only escapes characters within the filename portion (after the last `/`).
+pub fn shell_escape(s: &str) -> String {
+    // Find the last path separator to only escape the filename part
+    let (prefix, to_escape) = match s.rfind('/') {
+        Some(i) => (&s[..=i], &s[i + 1..]),
+        None => ("", s.as_ref()),
+    };
+
+    let mut result = String::with_capacity(s.len() + 4);
+    result.push_str(prefix);
+    for c in to_escape.chars() {
+        if SHELL_META_CHARS.contains(&c) {
+            result.push('\\');
+        }
+        result.push(c);
+    }
+    result
+}
+
+/// Compute the longest common prefix of completion texts.
+pub fn longest_common_prefix(completions: &[Completion]) -> &str {
+    if completions.is_empty() {
+        return "";
+    }
+    let first = &completions[0].text;
+    let mut len = first.len();
+    for c in &completions[1..] {
+        len = first
+            .char_indices()
+            .zip(c.text.char_indices())
+            .take_while(|((_, a), (_, b))| a == b)
+            .last()
+            .map(|((i, ch), _)| i + ch.len_utf8())
+            .unwrap_or(0)
+            .min(len);
+        if len == 0 {
+            break;
+        }
+    }
+    &first[..len]
 }
 
 /// Check if a path is executable.

@@ -21,7 +21,7 @@ mod error;
 mod state;
 
 pub use commands::CommandRegistry;
-pub use completion::{Completion, CompletionEngine, CompletionKind};
+pub use completion::{Completion, CompletionEngine, CompletionKind, longest_common_prefix, shell_escape};
 pub use error::ShellError;
 pub use eval::is_builtin;
 pub use parser::Parser;

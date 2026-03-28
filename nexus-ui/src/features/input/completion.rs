@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use nexus_kernel::{Completion, Kernel};
+use nexus_kernel::{Completion, Kernel, longest_common_prefix};
 use tokio::sync::Mutex;
 
 use strata::{ScrollAction, ScrollState};
@@ -18,6 +18,16 @@ pub(crate) enum CompletionOutput {
     Accepted { text: String, cursor: usize },
     /// Popup was dismissed, no text change.
     Dismissed,
+}
+
+/// Append a trailing space to a completion if it's a terminal match (not a directory).
+/// Bash does this so the user can immediately start typing the next argument.
+fn with_trailing_space(text: &str) -> String {
+    if text.ends_with('/') {
+        text.to_string()
+    } else {
+        format!("{} ", text)
+    }
 }
 
 /// Snap a byte offset to the nearest valid char boundary (rounding down).
@@ -37,6 +47,10 @@ pub(crate) struct CompletionWidget {
     pub anchor: usize,
     pub scroll: ScrollState,
     pub hovered: Cell<Option<usize>>,
+    /// Stashed completions from the first Tab press (LCP was inserted, popup not yet shown).
+    /// Second Tab will open the popup from these.
+    pub(crate) pending_completions: Vec<Completion>,
+    pending_anchor: usize,
 }
 
 impl CompletionWidget {
@@ -47,6 +61,8 @@ impl CompletionWidget {
             anchor: 0,
             scroll: ScrollState::new(),
             hovered: Cell::new(None),
+            pending_completions: Vec::new(),
+            pending_anchor: 0,
         }
     }
 
@@ -54,31 +70,79 @@ impl CompletionWidget {
         !self.completions.is_empty()
     }
 
-    /// Trigger tab completion. Needs current input text, cursor, and kernel.
+    /// Trigger tab completion. Implements Bash-style LCP + double-tab:
+    /// - First Tab: insert longest common prefix (no popup).
+    /// - Second Tab (or first Tab if LCP adds nothing): open popup.
+    /// - Single match: apply immediately.
     pub fn tab_complete(
         &mut self,
         input_text: &str,
         input_cursor: usize,
         kernel: &Arc<Mutex<Kernel>>,
     ) -> CompletionOutput {
+        // Double-tab: if we have pending completions from a previous LCP insertion, show popup now
+        if !self.pending_completions.is_empty() {
+            // Re-filter pending completions against current input
+            let anchor = snap_to_char_boundary(input_text, self.pending_anchor);
+            let current_word = &input_text[anchor..input_cursor];
+            let filtered: Vec<Completion> = self.pending_completions.drain(..)
+                .filter(|c| c.text.starts_with(current_word))
+                .collect();
+            if filtered.len() <= 1 {
+                // Down to one or zero — apply if one, else nothing
+                if let Some(comp) = filtered.first() {
+                    let completed = with_trailing_space(&comp.text);
+                    let mut t = input_text.to_string();
+                    let end = snap_to_char_boundary(&t, input_cursor);
+                    t.replace_range(anchor..end, &completed);
+                    let cursor = anchor + completed.len();
+                    return CompletionOutput::Applied { text: t, cursor };
+                }
+                return CompletionOutput::None;
+            }
+            self.completions = filtered;
+            self.index = Some(0);
+            self.anchor = anchor;
+            self.scroll.offset = 0.0;
+            return CompletionOutput::None;
+        }
+
         let (completions, anchor) = kernel.blocking_lock().complete(input_text, input_cursor);
         if completions.len() == 1 {
-            // Single completion: apply immediately
+            // Single completion: apply immediately with trailing space (like Bash)
             let comp = &completions[0];
+            let completed = with_trailing_space(&comp.text);
             let mut t = input_text.to_string();
             let a = snap_to_char_boundary(&t, anchor);
             let end = snap_to_char_boundary(&t, input_cursor);
-            t.replace_range(a..end, &comp.text);
-            let cursor = a + comp.text.len();
+            t.replace_range(a..end, &completed);
+            let cursor = a + completed.len();
             self.completions.clear();
             self.index = None;
             CompletionOutput::Applied { text: t, cursor }
         } else if !completions.is_empty() {
-            self.completions = completions;
-            self.index = Some(0);
-            self.anchor = snap_to_char_boundary(input_text, anchor);
-            self.scroll.offset = 0.0;
-            CompletionOutput::None
+            // Multiple completions: compute LCP and try to extend
+            let a = snap_to_char_boundary(input_text, anchor);
+            let current_word = &input_text[a..input_cursor.min(input_text.len())];
+            let lcp = longest_common_prefix(&completions);
+
+            if lcp.len() > current_word.len() {
+                // LCP extends beyond what user typed — insert it, stash completions for double-tab
+                let mut t = input_text.to_string();
+                let end = snap_to_char_boundary(&t, input_cursor);
+                t.replace_range(a..end, lcp);
+                let cursor = a + lcp.len();
+                self.pending_completions = completions;
+                self.pending_anchor = anchor;
+                CompletionOutput::Applied { text: t, cursor }
+            } else {
+                // LCP adds nothing — show popup immediately (no point making user double-tap)
+                self.completions = completions;
+                self.index = Some(0);
+                self.anchor = a;
+                self.scroll.offset = 0.0;
+                CompletionOutput::None
+            }
         } else {
             self.completions.clear();
             self.index = None;
@@ -102,11 +166,12 @@ impl CompletionWidget {
     pub fn accept(&mut self, input_text: &str, input_cursor: usize) -> CompletionOutput {
         let output = if let Some(idx) = self.index {
             if let Some(comp) = self.completions.get(idx) {
+                let completed = with_trailing_space(&comp.text);
                 let mut t = input_text.to_string();
                 let a = snap_to_char_boundary(&t, self.anchor);
                 let end = snap_to_char_boundary(&t, input_cursor);
-                t.replace_range(a..end, &comp.text);
-                let cursor = a + comp.text.len();
+                t.replace_range(a..end, &completed);
+                let cursor = a + completed.len();
                 CompletionOutput::Accepted { text: t, cursor }
             } else {
                 CompletionOutput::Dismissed
@@ -119,21 +184,23 @@ impl CompletionWidget {
         output
     }
 
-    /// Dismiss the completion popup.
+    /// Dismiss the completion popup (and any pending double-tab state).
     pub fn dismiss(&mut self) -> CompletionOutput {
         self.completions.clear();
         self.index = None;
+        self.pending_completions.clear();
         CompletionOutput::Dismissed
     }
 
     /// Accept a specific completion by index (click).
     pub fn select(&mut self, index: usize, input_text: &str, input_cursor: usize) -> CompletionOutput {
         let output = if let Some(comp) = self.completions.get(index) {
+            let completed = with_trailing_space(&comp.text);
             let mut t = input_text.to_string();
             let a = snap_to_char_boundary(&t, self.anchor);
             let end = snap_to_char_boundary(&t, input_cursor);
-            t.replace_range(a..end, &comp.text);
-            let cursor = a + comp.text.len();
+            t.replace_range(a..end, &completed);
+            let cursor = a + completed.len();
             CompletionOutput::Accepted { text: t, cursor }
         } else {
             CompletionOutput::Dismissed
@@ -144,6 +211,7 @@ impl CompletionWidget {
     }
 
     /// Apply pre-fetched results from remote tab completion.
+    /// Uses the same LCP + double-tab logic as local completion.
     pub fn apply_remote_result(
         &mut self,
         completions: Vec<Completion>,
@@ -153,20 +221,35 @@ impl CompletionWidget {
     ) -> CompletionOutput {
         if completions.len() == 1 {
             let comp = &completions[0];
+            let completed = with_trailing_space(&comp.text);
             let mut t = input_text.to_string();
             let a = snap_to_char_boundary(&t, anchor);
             let end = snap_to_char_boundary(&t, input_cursor);
-            t.replace_range(a..end, &comp.text);
-            let cursor = a + comp.text.len();
+            t.replace_range(a..end, &completed);
+            let cursor = a + completed.len();
             self.completions.clear();
             self.index = None;
             CompletionOutput::Applied { text: t, cursor }
         } else if !completions.is_empty() {
-            self.completions = completions;
-            self.index = Some(0);
-            self.anchor = snap_to_char_boundary(input_text, anchor);
-            self.scroll.offset = 0.0;
-            CompletionOutput::None
+            let a = snap_to_char_boundary(input_text, anchor);
+            let current_word = &input_text[a..input_cursor.min(input_text.len())];
+            let lcp = longest_common_prefix(&completions);
+
+            if lcp.len() > current_word.len() {
+                let mut t = input_text.to_string();
+                let end = snap_to_char_boundary(&t, input_cursor);
+                t.replace_range(a..end, lcp);
+                let cursor = a + lcp.len();
+                self.pending_completions = completions;
+                self.pending_anchor = anchor;
+                CompletionOutput::Applied { text: t, cursor }
+            } else {
+                self.completions = completions;
+                self.index = Some(0);
+                self.anchor = a;
+                self.scroll.offset = 0.0;
+                CompletionOutput::None
+            }
         } else {
             self.completions.clear();
             self.index = None;
@@ -294,8 +377,8 @@ mod tests {
 
         let output = widget.accept("h", 1);
         if let CompletionOutput::Accepted { text, cursor } = output {
-            assert_eq!(text, "hello");
-            assert_eq!(cursor, 5);
+            assert_eq!(text, "hello ");
+            assert_eq!(cursor, 6);
         } else {
             panic!("Expected CompletionOutput::Accepted");
         }
@@ -328,8 +411,8 @@ mod tests {
 
         let output = widget.select(1, "b", 1);
         if let CompletionOutput::Accepted { text, cursor } = output {
-            assert_eq!(text, "bar");
-            assert_eq!(cursor, 3);
+            assert_eq!(text, "bar ");
+            assert_eq!(cursor, 4);
         } else {
             panic!("Expected CompletionOutput::Accepted");
         }

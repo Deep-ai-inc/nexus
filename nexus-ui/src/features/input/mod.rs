@@ -136,6 +136,8 @@ impl InputWidget {
 
     /// Handle a key event on the text input. Returns `Some` if submit occurred.
     pub fn handle_key(&mut self, event: &KeyEvent) -> Option<SubmitRequest> {
+        // Any non-Tab keystroke invalidates pending double-tab state
+        self.completion.pending_completions.clear();
         match self.text_input.handle_key(event, false) {
             TextInputAction::Submit(text) => self.process_submit(text),
             _ => None,
