@@ -107,6 +107,7 @@ impl<'a> CompletionEngine<'a> {
         let completions = match context {
             CompletionContext::Command => self.complete_command(&word),
             CompletionContext::Path => self.complete_path(&word),
+            CompletionContext::CommandPath => self.complete_path_executables(&word),
             CompletionContext::Variable => self.complete_variable(&word),
             CompletionContext::GitBranch(cmd) => self.complete_git(&cmd, &word),
             CompletionContext::Flag(cmd) => self.complete_flags(&cmd, &word),
@@ -161,9 +162,9 @@ impl<'a> CompletionEngine<'a> {
             || before_word.ends_with("&&")
             || before_word.ends_with("||")
         {
-            // But if word contains /, it's a path
+            // Path-like in command position: only show executables and directories
             if current_word.contains('/') || current_word.starts_with('.') || current_word.starts_with('~') {
-                return CompletionContext::Path;
+                return CompletionContext::CommandPath;
             }
             return CompletionContext::Command;
         }
@@ -404,6 +405,14 @@ impl<'a> CompletionEngine<'a> {
         completions
     }
 
+    /// Complete paths in command position — only executables and directories (like Bash's `./`).
+    fn complete_path_executables(&self, prefix: &str) -> Vec<Completion> {
+        self.complete_path(prefix)
+            .into_iter()
+            .filter(|c| matches!(c.kind, CompletionKind::Directory | CompletionKind::Executable))
+            .collect()
+    }
+
     /// Complete variable names.
     fn complete_variable(&self, prefix: &str) -> Vec<Completion> {
         let mut completions = Vec::new();
@@ -540,6 +549,8 @@ enum CompletionContext {
     Command,
     /// Completing a file/directory path.
     Path,
+    /// Completing a path in command position (only executables and directories).
+    CommandPath,
     /// Completing a variable name.
     Variable,
     /// Completing a git branch/ref.
