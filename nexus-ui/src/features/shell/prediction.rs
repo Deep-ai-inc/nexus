@@ -62,6 +62,13 @@ pub struct PredictionEngine {
     paste_suppress_epoch: Option<u64>,
     /// After paste epoch is reached, wait one more reconciliation cycle before re-enabling.
     paste_suppress_grace: bool,
+    /// Row where predictions were successfully confirmed against the grid.
+    /// Used to filter noisy last_write_cursor updates from non-input rows
+    /// (status bars, spinners, etc.).
+    confirmed_input_row: Option<u16>,
+    /// Consecutive rollbacks while on confirmed_input_row.
+    /// After 3, we clear the confirmed row and re-enter discovery mode.
+    consecutive_rollbacks: u8,
 }
 
 /// A prediction awaiting grid confirmation after epoch was acknowledged.
@@ -90,6 +97,8 @@ impl PredictionEngine {
             pre_feed_snapshot: Vec::new(),
             paste_suppress_epoch: None,
             paste_suppress_grace: false,
+            confirmed_input_row: None,
+            consecutive_rollbacks: 0,
         }
     }
 
@@ -158,6 +167,21 @@ impl PredictionEngine {
             self.anchor_col = cursor_col;
             self.anchor_row = cursor_row;
             self.cursor_col_offset = 0;
+        } else {
+            // Re-anchor if the caller's cursor is ahead of where we'd expect.
+            // This happens when the echo for the previous keystroke advances
+            // last_write_cursor past our stale anchor, fixing off-by-one drift.
+            let expected_col = self.anchor_col + self.cursor_col_offset;
+            if cursor_row == self.anchor_row && cursor_col > expected_col {
+                self.anchor_col = cursor_col;
+                self.cursor_col_offset = 0;
+                // Re-assign positions for existing pending predictions
+                for (i, pred) in self.pending.iter_mut().enumerate() {
+                    pred.col = self.anchor_col + i as u16;
+                    pred.row = self.anchor_row;
+                }
+                self.cursor_col_offset = self.pending.len() as u16;
+            }
         }
 
         let predicted_col = self.anchor_col + self.cursor_col_offset;
@@ -253,7 +277,9 @@ impl PredictionEngine {
                     .any(|&(c, r, ch)| c == pred.col && r == pred.row && ch == pred.ch);
 
                 if matched_at_pos && !was_already_there {
-                    // True match — confirmed
+                    // True match — learn this row as the input area
+                    self.confirmed_input_row = Some(pred.row);
+                    self.consecutive_rollbacks = 0;
                 } else {
                     // Mismatch or false positive — grace period
                     self.grace_pending.push_back(GraceEntry {
@@ -276,7 +302,17 @@ impl PredictionEngine {
         });
 
         if expired {
-            self.reset();
+            self.consecutive_rollbacks += 1;
+            // After 3 consecutive rollbacks, the input area may have moved.
+            // Clear confirmed_input_row to re-enter discovery mode.
+            if self.consecutive_rollbacks >= 3 {
+                self.confirmed_input_row = None;
+                self.consecutive_rollbacks = 0;
+            }
+            self.pending.clear();
+            self.grace_pending.clear();
+            self.cursor_col_offset = 0;
+            self.pre_feed_snapshot.clear();
             return true;
         }
 
@@ -299,6 +335,31 @@ impl PredictionEngine {
     /// and UI visibility checks.
     pub fn pending_count(&self) -> usize {
         self.pending.len() + self.grace_pending.len()
+    }
+
+    /// The row where predictions were last successfully confirmed.
+    /// Used by callers to filter noisy write-cursor updates.
+    pub fn confirmed_input_row(&self) -> Option<u16> {
+        self.confirmed_input_row
+    }
+
+    /// Check if a write-cursor position is plausibly on the input row.
+    /// Returns true if no confirmed row (discovery mode) or if the
+    /// position is within 1 row of the confirmed input area.
+    pub fn is_plausible_input_row(&self, row: u16) -> bool {
+        match self.confirmed_input_row {
+            None => true, // Discovery mode — accept anything
+            Some(confirmed) => {
+                let diff = (row as i32 - confirmed as i32).abs();
+                diff <= 1 // Allow ±1 for line wrapping
+            }
+        }
+    }
+
+    /// Hard reset: clear confirmed input row (alt screen, etc.).
+    pub fn clear_confirmed_row(&mut self) {
+        self.confirmed_input_row = None;
+        self.consecutive_rollbacks = 0;
     }
 }
 
@@ -326,6 +387,38 @@ mod tests {
         assert_eq!(engine.get(0, 0).unwrap().ch, 'h');
         assert_eq!(engine.get(1, 0).unwrap().ch, 'i');
         assert!(engine.get(2, 0).is_none());
+    }
+
+    #[test]
+    fn reanchor_when_cursor_advances_past_expected() {
+        let mut engine = PredictionEngine::new();
+        engine.set_cols(80);
+
+        // First prediction: anchor at col 3 (last_write=2, +1)
+        engine.predict(1, 'h', 3, 10);
+        assert_eq!(engine.get(3, 10).unwrap().ch, 'h');
+
+        // Second prediction: caller says cursor=5 (echo advanced last_write to 4)
+        // Expected position was anchor(3) + offset(1) = 4, but cursor is 5.
+        // Should re-anchor: move 'h' to col 5, predict 'e' at col 6.
+        engine.predict(2, 'e', 5, 10);
+        // 'h' should have been relocated to col 5
+        assert!(engine.get(3, 10).is_none()); // old position cleared
+        assert_eq!(engine.get(5, 10).unwrap().ch, 'h');
+        assert_eq!(engine.get(6, 10).unwrap().ch, 'e');
+        assert_eq!(engine.predicted_cursor(), Some((7, 10)));
+    }
+
+    #[test]
+    fn no_reanchor_when_cursor_matches_expected() {
+        let mut engine = PredictionEngine::new();
+        engine.set_cols(80);
+
+        engine.predict(1, 'h', 3, 10);
+        // cursor=4 matches expected anchor(3)+offset(1)=4 — no re-anchor
+        engine.predict(2, 'e', 4, 10);
+        assert_eq!(engine.get(3, 10).unwrap().ch, 'h');
+        assert_eq!(engine.get(4, 10).unwrap().ch, 'e');
     }
 
     #[test]
@@ -437,5 +530,101 @@ mod tests {
         // suppress_until_epoch calls reset(), clearing predictions
         engine.predict(11, 'x', 0, 0);
         assert_eq!(engine.pending_count(), 0);
+    }
+
+    #[test]
+    fn confirmed_input_row_learned_from_match() {
+        let mut engine = PredictionEngine::new();
+        engine.set_cols(80);
+        assert_eq!(engine.confirmed_input_row(), None);
+
+        // Predict at row 10
+        engine.predict(1, 'a', 5, 10);
+
+        let empty = make_grid(80, 24, &[]);
+        engine.snapshot_before_feed(&empty);
+
+        // Grid confirms 'a' at (5, 10)
+        let grid = make_grid(80, 24, &[(5, 10, 'a')]);
+        let rollback = engine.reconcile(1, &grid, 0);
+        assert!(!rollback);
+        assert_eq!(engine.confirmed_input_row(), Some(10));
+    }
+
+    #[test]
+    fn confirmed_row_filters_implausible_writes() {
+        let mut engine = PredictionEngine::new();
+        engine.set_cols(80);
+
+        // Simulate a confirmed row at 10
+        engine.predict(1, 'a', 5, 10);
+        let empty = make_grid(80, 24, &[]);
+        engine.snapshot_before_feed(&empty);
+        let grid = make_grid(80, 24, &[(5, 10, 'a')]);
+        engine.reconcile(1, &grid, 0);
+
+        // Row 10 is plausible (exact match)
+        assert!(engine.is_plausible_input_row(10));
+        // Row 11 is plausible (wrapping)
+        assert!(engine.is_plausible_input_row(11));
+        // Row 29 is not (status bar)
+        assert!(!engine.is_plausible_input_row(29));
+        // Row 5 is not
+        assert!(!engine.is_plausible_input_row(5));
+    }
+
+    #[test]
+    fn confirmed_row_survives_rollback() {
+        let mut engine = PredictionEngine::new();
+        engine.set_cols(80);
+
+        // Confirm row 10
+        engine.predict(1, 'a', 5, 10);
+        let empty = make_grid(80, 24, &[]);
+        engine.snapshot_before_feed(&empty);
+        let grid = make_grid(80, 24, &[(5, 10, 'a')]);
+        engine.reconcile(1, &grid, 0);
+        assert_eq!(engine.confirmed_input_row(), Some(10));
+
+        // Now predict and get a rollback
+        engine.predict(2, 'b', 6, 10);
+        let empty = make_grid(80, 24, &[(5, 10, 'a')]);
+        engine.snapshot_before_feed(&empty);
+        let grid = make_grid(80, 24, &[(5, 10, 'a'), (6, 10, '*')]);
+        engine.reconcile(2, &grid, 0);
+        // Not expired yet, wait for grace
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        engine.reconcile(2, &grid, 0);
+
+        // Confirmed row survives first rollback
+        assert_eq!(engine.confirmed_input_row(), Some(10));
+    }
+
+    #[test]
+    fn three_rollbacks_clears_confirmed_row() {
+        let mut engine = PredictionEngine::new();
+        engine.set_cols(80);
+
+        // Confirm row 10
+        engine.predict(1, 'a', 5, 10);
+        let empty = make_grid(80, 24, &[]);
+        engine.snapshot_before_feed(&empty);
+        let grid_ok = make_grid(80, 24, &[(5, 10, 'a')]);
+        engine.reconcile(1, &grid_ok, 0);
+        assert_eq!(engine.confirmed_input_row(), Some(10));
+
+        let grid_bad = make_grid(80, 24, &[(5, 10, '*')]);
+
+        // Three consecutive rollbacks
+        for epoch in 2..=4 {
+            engine.predict(epoch, 'x', 5, 10);
+            engine.snapshot_before_feed(&grid_ok);
+            engine.reconcile(epoch, &grid_bad, 0);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            engine.reconcile(epoch, &grid_bad, 0);
+        }
+
+        // After 3 rollbacks, confirmed row should be cleared
+        assert_eq!(engine.confirmed_input_row(), None);
     }
 }

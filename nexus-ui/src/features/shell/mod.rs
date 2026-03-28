@@ -906,6 +906,7 @@ impl ShellWidget {
                         block.sync_output_active = false;
                         block.sync_frame_started = None;
                         block.prediction.reset();
+                        block.prediction.clear_confirmed_row();
                         block.last_write_cursor = None;
                         block.last_visible_cursor = None;
                     }
@@ -925,17 +926,11 @@ impl ShellWidget {
                     let frame_complete = result.sync_output_closed || !block.sync_output_active;
                     if let Some(write_pos) = result.last_write_pos {
                         if !got_dectcem_this_chunk && frame_complete {
-                            // When predictions are active, reject jumps >2 rows
-                            // to avoid status bar hijack.
-                            let dominated = if block.prediction.pending_count() > 0 {
-                                block.last_write_cursor
-                                    .map_or(false, |(_, prev_row)| {
-                                        (write_pos.1 as i32 - prev_row as i32).abs() > 2
-                                    })
-                            } else {
-                                false
-                            };
-                            if !dominated {
+                            // Use confirmed_input_row to filter noise: once we've
+                            // confirmed predictions on a row, only accept writes
+                            // near that row. In discovery mode (no confirmed row),
+                            // accept everything.
+                            if block.prediction.is_plausible_input_row(write_pos.1) {
                                 block.last_write_cursor = Some(write_pos);
                             }
                         }
@@ -1256,9 +1251,10 @@ impl ShellWidget {
             block.last_visible_cursor = None;
         }
         tracing::debug!(
-            "[RECONCILE] epoch={last_echo_epoch} rtt={rtt_ms}ms before={pending_before} after={} rollback={rollback} grid_cursor=({gc},{gr}) learned=({},{}) grid_rows={} last_vis_cursor={:?}",
+            "[RECONCILE] epoch={last_echo_epoch} rtt={rtt_ms}ms before={pending_before} after={} rollback={rollback} grid_cursor=({gc},{gr}) learned=({},{}) grid_rows={} confirmed_row={:?} last_vis_cursor={:?}",
             block.prediction.pending_count(),
             learned.0, learned.1, grid.rows(),
+            block.prediction.confirmed_input_row(),
             block.last_visible_cursor
         );
     }
