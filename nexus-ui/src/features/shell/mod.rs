@@ -875,52 +875,94 @@ impl ShellWidget {
             ShellEvent::StdoutChunk { block_id, data, last_echo_epoch } => {
                 if let Some(block) = self.blocks.get_mut(block_id) {
                     // Snapshot predicted positions BEFORE feed for false-positive detection
-                    if last_echo_epoch > 0 && block.prediction.pending_count() > 0 {
+                    let should_reconcile = last_echo_epoch > 0 && block.prediction.pending_count() > 0;
+                    if should_reconcile {
                         let grid = block.parser.grid();
                         block.prediction.snapshot_before_feed(&grid);
                     }
-                    // Feed with write tracking — detect both DECTCEM transitions
-                    // and the last grid position where content was written.
-                    let (last_write, dectcem_pos) = block.parser.feed_tracking_writes(&data);
-                    if let Some(visible_pos) = dectcem_pos {
+                    // Feed with write tracking — detect DECTCEM transitions,
+                    // last write position, and synchronized output markers.
+                    let result = block.parser.feed_tracking_writes(&data);
+
+                    // --- Synchronized output frame tracking ---
+                    // A new 2026h without preceding 2026l means the previous frame
+                    // was abandoned — reconcile for it before starting the new one.
+                    if result.sync_output_opened && block.sync_output_active {
+                        // Abandoned frame: reconcile now, then start new frame
+                        if should_reconcile && !block.prediction.is_suppressed() {
+                            Self::reconcile_block(block, last_echo_epoch, self.rtt_ms);
+                        }
+                    }
+                    if result.sync_output_opened {
+                        block.sync_output_active = true;
+                        block.sync_frame_started = Some(std::time::Instant::now());
+                    }
+                    if result.sync_output_closed {
+                        block.sync_output_active = false;
+                        block.sync_frame_started = None;
+                    }
+                    // Alternate screen transitions reset sync output state
+                    if result.alt_screen_entered || result.alt_screen_exited {
+                        block.sync_output_active = false;
+                        block.sync_frame_started = None;
+                        block.prediction.reset();
+                        block.last_write_cursor = None;
+                        block.last_visible_cursor = None;
+                    }
+
+                    // --- Cursor tracking ---
+                    // DECTCEM show is the most reliable signal — if the app
+                    // flashed the cursor visible, that's the input position.
+                    if let Some(visible_pos) = result.dectcem_pos {
                         block.last_visible_cursor = Some(visible_pos);
                     }
-                    if let Some(write_pos) = last_write {
-                        // Only filter write positions when predictions are active.
-                        // When idle, always accept so the anchor tracks the real input line.
-                        // When active, reject jumps >2 rows to avoid status bar hijack.
-                        let dominated = if block.prediction.pending_count() > 0 {
-                            block.last_write_cursor
-                                .map_or(false, |(_, prev_row)| {
-                                    (write_pos.1 as i32 - prev_row as i32).abs() > 2
-                                })
-                        } else {
-                            false
-                        };
-                        if !dominated {
-                            block.last_write_cursor = Some(write_pos);
+                    // Write-tracking is a noisy fallback (status bars, progress
+                    // indicators can fool it). Only update last_write_cursor when:
+                    // 1. DECTCEM didn't give us a position in this same chunk, AND
+                    // 2. Either we're outside a sync frame, or this chunk closes one
+                    //    (complete frame = consistent grid state).
+                    let got_dectcem_this_chunk = result.dectcem_pos.is_some();
+                    let frame_complete = result.sync_output_closed || !block.sync_output_active;
+                    if let Some(write_pos) = result.last_write_pos {
+                        if !got_dectcem_this_chunk && frame_complete {
+                            // When predictions are active, reject jumps >2 rows
+                            // to avoid status bar hijack.
+                            let dominated = if block.prediction.pending_count() > 0 {
+                                block.last_write_cursor
+                                    .map_or(false, |(_, prev_row)| {
+                                        (write_pos.1 as i32 - prev_row as i32).abs() > 2
+                                    })
+                            } else {
+                                false
+                            };
+                            if !dominated {
+                                block.last_write_cursor = Some(write_pos);
+                            }
                         }
                     }
                     block.version += 1;
-                    // Reconcile predictions against the now-updated visible grid
-                    if last_echo_epoch > 0 && block.prediction.pending_count() > 0 {
-                        let pending_before = block.prediction.pending_count();
-                        let grid = block.parser.grid();
-                        let (gc, gr) = grid.cursor();
-                        let learned = block.prediction.learned_offset();
-                        let rollback = block.prediction.reconcile(last_echo_epoch, &grid, self.rtt_ms);
-                        if rollback {
-                            // Reset cursor hints so next keystroke picks up fresh position
-                            block.last_write_cursor = None;
-                            block.last_visible_cursor = None;
+
+                    // Check paste suppression
+                    if last_echo_epoch > 0 {
+                        block.prediction.check_paste_suppression(last_echo_epoch);
+                    }
+
+                    // --- Sync output timeout (500ms) ---
+                    if block.sync_output_active {
+                        if let Some(started) = block.sync_frame_started {
+                            if started.elapsed() >= std::time::Duration::from_millis(500) {
+                                block.sync_output_active = false;
+                                block.sync_frame_started = None;
+                                // Fall through to reconciliation below
+                            }
                         }
-                        tracing::debug!(
-                            "[RECONCILE] epoch={last_echo_epoch} rtt={}ms before={pending_before} after={} rollback={rollback} grid_cursor=({gc},{gr}) learned=({},{}) grid_rows={} last_vis_cursor={:?}",
-                            self.rtt_ms,
-                            block.prediction.pending_count(),
-                            learned.0, learned.1, grid.rows(),
-                            block.last_visible_cursor
-                        );
+                    }
+
+                    // --- Reconciliation ---
+                    // Defer reconciliation while a synchronized output frame is in progress.
+                    // The grid is mid-paint and comparing against it causes false rollbacks.
+                    if should_reconcile && !block.sync_output_active && !block.prediction.is_suppressed() {
+                        Self::reconcile_block(block, last_echo_epoch, self.rtt_ms);
                     }
                 }
                 self.terminal_dirty = true;
@@ -1195,6 +1237,30 @@ impl ShellWidget {
                 block.version += 1;
             }
         }
+    }
+
+    /// Run prediction reconciliation on a block and handle rollback.
+    fn reconcile_block(block: &mut crate::data::Block, last_echo_epoch: u64, rtt_ms: u64) {
+        let pending_before = block.prediction.pending_count();
+        let grid = block.parser.grid();
+        let (gc, gr) = grid.cursor();
+        let learned = block.prediction.learned_offset();
+        let rollback = block.prediction.reconcile(last_echo_epoch, &grid, rtt_ms);
+        if rollback {
+            // Clear DECTCEM cursor (it was captured at a specific moment and
+            // may be stale), but KEEP last_write_cursor — the input area
+            // hasn't moved, only the predicted chars were wrong. Clearing it
+            // would fall through to grid.cursor() which is typically the
+            // status bar (0, bottom_row), causing the next prediction to
+            // land in the wrong place.
+            block.last_visible_cursor = None;
+        }
+        tracing::debug!(
+            "[RECONCILE] epoch={last_echo_epoch} rtt={rtt_ms}ms before={pending_before} after={} rollback={rollback} grid_cursor=({gc},{gr}) learned=({},{}) grid_rows={} last_vis_cursor={:?}",
+            block.prediction.pending_count(),
+            learned.0, learned.1, grid.rows(),
+            block.last_visible_cursor
+        );
     }
 
     /// Paste text into a PTY, respecting Bracketed Paste mode.

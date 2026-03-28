@@ -243,7 +243,11 @@ impl NexusState {
                                 if bracketed {
                                     payload.extend_from_slice(b"\x1b[201~");
                                 }
-                                remote.pty_input(id, payload);
+                                let epoch = remote.pty_input(id, payload);
+                                // Suppress character predictions until paste is processed
+                                if let Some(block) = self.shell.blocks.get_mut(id) {
+                                    block.prediction.suppress_until_epoch(epoch);
+                                }
                                 return;
                             }
                         }

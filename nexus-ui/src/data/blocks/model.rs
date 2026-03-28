@@ -118,6 +118,11 @@ pub struct Block {
     /// Last grid position where a character was actually written during feed.
     /// For TUI apps with hidden cursors, this reveals the true input area.
     pub last_write_cursor: Option<(u16, u16)>,
+    /// Whether a synchronized output frame is in progress (between ESC[?2026h/l).
+    /// While active, prediction reconciliation is deferred until the frame completes.
+    pub sync_output_active: bool,
+    /// When the current synchronized output frame started.
+    pub sync_frame_started: Option<std::time::Instant>,
 }
 
 impl Block {
@@ -150,6 +155,8 @@ impl Block {
             prediction: PredictionEngine::new(),
             last_visible_cursor: None,
             last_write_cursor: None,
+            sync_output_active: false,
+            sync_frame_started: None,
         }
     }
 

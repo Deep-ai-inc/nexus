@@ -57,6 +57,11 @@ pub struct PredictionEngine {
     grace_pending: VecDeque<GraceEntry>,
     /// Pre-feed snapshot of characters at predicted positions.
     pre_feed_snapshot: Vec<(u16, u16, char)>,
+    /// Suppress predictions until server has processed past this epoch.
+    /// Set when a bracketed paste is sent — predictions during paste cause visual chaos.
+    paste_suppress_epoch: Option<u64>,
+    /// After paste epoch is reached, wait one more reconciliation cycle before re-enabling.
+    paste_suppress_grace: bool,
 }
 
 /// A prediction awaiting grid confirmation after epoch was acknowledged.
@@ -83,6 +88,8 @@ impl PredictionEngine {
             enabled: true,
             grace_pending: VecDeque::new(),
             pre_feed_snapshot: Vec::new(),
+            paste_suppress_epoch: None,
+            paste_suppress_grace: false,
         }
     }
 
@@ -106,11 +113,44 @@ impl PredictionEngine {
         (0, 0)
     }
 
+    /// Suppress predictions until the server has processed past the given epoch.
+    /// Used when sending a bracketed paste — predicting individual chars mid-paste
+    /// would cause visual chaos.
+    pub fn suppress_until_epoch(&mut self, epoch: u64) {
+        self.paste_suppress_epoch = Some(epoch);
+        self.paste_suppress_grace = false;
+        self.reset();
+    }
+
+    /// Check if paste suppression should be lifted given the latest confirmed epoch.
+    /// Called during reconciliation. Returns true if suppression was just lifted.
+    pub fn check_paste_suppression(&mut self, confirmed_epoch: u64) -> bool {
+        if let Some(target) = self.paste_suppress_epoch {
+            if confirmed_epoch >= target {
+                if self.paste_suppress_grace {
+                    // Grace cycle complete — fully lift suppression
+                    self.paste_suppress_epoch = None;
+                    self.paste_suppress_grace = false;
+                    return true;
+                } else {
+                    // Epoch reached, enter one-cycle grace before re-enabling
+                    self.paste_suppress_grace = true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether predictions are currently suppressed (paste in flight).
+    pub fn is_suppressed(&self) -> bool {
+        self.paste_suppress_epoch.is_some()
+    }
+
     /// Add a predicted keystroke at the given cursor position.
     /// The caller should pass the best-known cursor position
     /// (e.g., last visible cursor for TUI apps).
     pub fn predict(&mut self, epoch: u64, ch: char, cursor_col: u16, cursor_row: u16) {
-        if !self.enabled {
+        if !self.enabled || self.paste_suppress_epoch.is_some() {
             return;
         }
 
@@ -356,5 +396,46 @@ mod tests {
         engine.reset();
         assert_eq!(engine.pending_count(), 0);
         assert!(engine.predicted_cursor().is_none());
+    }
+
+    #[test]
+    fn paste_suppression_blocks_predictions() {
+        let mut engine = PredictionEngine::new();
+        engine.set_cols(80);
+
+        // Suppress until epoch 5
+        engine.suppress_until_epoch(5);
+        assert!(engine.is_suppressed());
+
+        // predict() should be no-op while suppressed
+        engine.predict(6, 'a', 0, 0);
+        assert_eq!(engine.pending_count(), 0);
+
+        // Epoch 4: still suppressed
+        assert!(!engine.check_paste_suppression(4));
+        assert!(engine.is_suppressed());
+
+        // Epoch 5: enters grace cycle
+        assert!(!engine.check_paste_suppression(5));
+        assert!(engine.is_suppressed());
+
+        // Next check: grace complete, suppression lifted
+        assert!(engine.check_paste_suppression(5));
+        assert!(!engine.is_suppressed());
+
+        // Predictions work again
+        engine.predict(6, 'a', 0, 0);
+        assert_eq!(engine.pending_count(), 1);
+    }
+
+    #[test]
+    fn paste_suppression_reset_clears() {
+        let mut engine = PredictionEngine::new();
+        engine.suppress_until_epoch(10);
+        assert!(engine.is_suppressed());
+
+        // suppress_until_epoch calls reset(), clearing predictions
+        engine.predict(11, 'x', 0, 0);
+        assert_eq!(engine.pending_count(), 0);
     }
 }

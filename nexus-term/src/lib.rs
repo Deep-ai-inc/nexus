@@ -9,7 +9,7 @@ mod cell;
 mod shadow;
 
 pub use grid::{CursorShape, TerminalGrid};
-pub use parser::TerminalParser;
+pub use parser::{FeedResult, TerminalParser};
 pub use cell::{Cell, CellFlags, Color, UnderlineStyle};
 pub use shadow::ShadowParser;
 

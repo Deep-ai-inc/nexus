@@ -13,6 +13,24 @@ use alacritty_terminal::vte::ansi::Processor;
 use crate::cell::{Cell, CellFlags, Color};
 use crate::grid::TerminalGrid;
 
+/// Signals returned from `feed_tracking_writes` about frame boundaries
+/// and cursor transitions detected in the byte stream.
+#[derive(Debug, Default)]
+pub struct FeedResult {
+    /// Last cell that changed (bottom-right-most) — write position heuristic.
+    pub last_write_pos: Option<(u16, u16)>,
+    /// Cursor position at DECTCEM-on transition (ESC[?25h).
+    pub dectcem_pos: Option<(u16, u16)>,
+    /// Synchronized output opened (ESC[?2026h) in this chunk.
+    pub sync_output_opened: bool,
+    /// Synchronized output closed (ESC[?2026l) in this chunk.
+    pub sync_output_closed: bool,
+    /// Alternate screen entered (ESC[?1049h) in this chunk.
+    pub alt_screen_entered: bool,
+    /// Alternate screen exited (ESC[?1049l) in this chunk.
+    pub alt_screen_exited: bool,
+}
+
 /// A terminal parser that maintains grid state.
 ///
 /// Uses interior mutability (RefCell) for grid caching to allow
@@ -157,13 +175,12 @@ impl TerminalParser {
     /// (like Claude Code) actually drew their input text, even when the
     /// terminal cursor is parked at a meaningless position with DECTCEM off.
     ///
-    /// Also performs DECTCEM tracking. Returns:
-    /// - `last_write_pos`: last cell that changed (bottom-right-most)
-    /// - `dectcem_pos`: cursor position at DECTCEM-on transition (if any)
+    /// Also performs DECTCEM tracking and detects synchronized output
+    /// markers (ESC[?2026h/l) and alternate screen transitions (ESC[?1049h/l).
     pub fn feed_tracking_writes(
         &mut self,
         bytes: &[u8],
-    ) -> (Option<(u16, u16)>, Option<(u16, u16)>) {
+    ) -> FeedResult {
         let cols = self.term.columns() as u16;
         let rows = self.term.screen_lines() as u16;
 
@@ -177,6 +194,13 @@ impl TerminalParser {
                 self.diff_buffer.push(grid_row[Column(col)].c);
             }
         }
+
+        // Scan for sync output and alt screen markers before feeding
+        // (simple byte scan — these are fixed sequences)
+        let sync_output_opened = find_subsequence(bytes, b"\x1b[?2026h").is_some();
+        let sync_output_closed = find_subsequence(bytes, b"\x1b[?2026l").is_some();
+        let alt_screen_entered = find_subsequence(bytes, b"\x1b[?1049h").is_some();
+        let alt_screen_exited = find_subsequence(bytes, b"\x1b[?1049l").is_some();
 
         // Feed with DECTCEM tracking
         let dectcem_pos = self.feed_tracking_cursor_inner(bytes);
@@ -197,7 +221,14 @@ impl TerminalParser {
             }
         }
 
-        (last_write, dectcem_pos)
+        FeedResult {
+            last_write_pos: last_write,
+            dectcem_pos,
+            sync_output_opened,
+            sync_output_closed,
+            alt_screen_entered,
+            alt_screen_exited,
+        }
     }
 
     /// Internal: feed with DECTCEM tracking, no cache invalidation.
@@ -207,6 +238,7 @@ impl TerminalParser {
     /// match isn't missed.
     fn feed_tracking_cursor_inner(&mut self, bytes: &[u8]) -> Option<(u16, u16)> {
         const SHOW_CURSOR_SEQ: &[u8] = b"\x1b[?25h";
+        const HIDE_CURSOR_SEQ: &[u8] = b"\x1b[?25l";
         let max_leftover = SHOW_CURSOR_SEQ.len() - 1;
 
         // Prepend any leftover bytes from a previous call.
@@ -221,6 +253,19 @@ impl TerminalParser {
         let leftover_len = self.dectcem_window.len();
         self.dectcem_window.clear();
 
+        // Diagnostic: check what DECTCEM sequences are present in the raw bytes
+        let has_show = find_subsequence(input, SHOW_CURSOR_SEQ).is_some();
+        let has_hide = find_subsequence(input, HIDE_CURSOR_SEQ).is_some();
+        // Also check for variant forms: ESC[?12;25h (combined mode set)
+        let has_25h_substring = find_subsequence(input, b"25h").is_some();
+        if has_show || has_hide || has_25h_substring {
+            tracing::debug!(
+                "[DECTCEM-RAW] chunk_len={} has_show={has_show} has_hide={has_hide} has_25h_variant={} leftover_len={leftover_len}",
+                bytes.len(),
+                has_25h_substring && !has_show,
+            );
+        }
+
         let mut last_visible_pos: Option<(u16, u16)> = None;
         let mut start = 0;
 
@@ -234,10 +279,12 @@ impl TerminalParser {
                     self.processor.advance(&mut self.term, &bytes[feed_start..feed_end]);
                 }
                 let cursor = &self.term.grid().cursor;
-                last_visible_pos = Some((
-                    cursor.point.column.0 as u16,
-                    cursor.point.line.0 as u16,
-                ));
+                let pos = (cursor.point.column.0 as u16, cursor.point.line.0 as u16);
+                tracing::debug!(
+                    "[DECTCEM-MATCH] captured cursor=({},{}) at byte_offset={} chunk_len={}",
+                    pos.0, pos.1, end, bytes.len()
+                );
+                last_visible_pos = Some(pos);
                 start = end;
             } else {
                 // No more matches — feed remaining original bytes and break.
@@ -260,6 +307,14 @@ impl TerminalParser {
             if let Some(esc_pos) = input.iter().position(|&b| b == 0x1b) {
                 self.dectcem_window.extend_from_slice(&input[esc_pos..]);
             }
+        }
+
+        if !self.dectcem_window.is_empty() {
+            tracing::debug!(
+                "[DECTCEM-SPLIT] saved {} leftover bytes for next chunk: {:?}",
+                self.dectcem_window.len(),
+                String::from_utf8_lossy(&self.dectcem_window)
+            );
         }
 
         *self.cached_viewport.borrow_mut() = None;
@@ -576,4 +631,65 @@ impl Default for TerminalParser {
 /// Find the first occurrence of `needle` in `haystack`.
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_tracking_detects_sync_output_open() {
+        let mut parser = TerminalParser::new(80, 24);
+        let result = parser.feed_tracking_writes(b"\x1b[?2026hHello");
+        assert!(result.sync_output_opened);
+        assert!(!result.sync_output_closed);
+    }
+
+    #[test]
+    fn feed_tracking_detects_sync_output_close() {
+        let mut parser = TerminalParser::new(80, 24);
+        let result = parser.feed_tracking_writes(b"content\x1b[?2026l");
+        assert!(!result.sync_output_opened);
+        assert!(result.sync_output_closed);
+    }
+
+    #[test]
+    fn feed_tracking_detects_both_sync_markers() {
+        let mut parser = TerminalParser::new(80, 24);
+        let result = parser.feed_tracking_writes(b"\x1b[?2026hframe content\x1b[?2026l");
+        assert!(result.sync_output_opened);
+        assert!(result.sync_output_closed);
+    }
+
+    #[test]
+    fn feed_tracking_detects_alt_screen() {
+        let mut parser = TerminalParser::new(80, 24);
+        let result = parser.feed_tracking_writes(b"\x1b[?1049h");
+        assert!(result.alt_screen_entered);
+        assert!(!result.alt_screen_exited);
+
+        let result = parser.feed_tracking_writes(b"\x1b[?1049l");
+        assert!(!result.alt_screen_entered);
+        assert!(result.alt_screen_exited);
+    }
+
+    #[test]
+    fn feed_tracking_detects_dectcem() {
+        let mut parser = TerminalParser::new(80, 24);
+        // Move cursor to (5, 0) then show it
+        let result = parser.feed_tracking_writes(b"\x1b[1;6H\x1b[?25h");
+        assert!(result.dectcem_pos.is_some());
+        let (col, row) = result.dectcem_pos.unwrap();
+        assert_eq!(col, 5);
+        assert_eq!(row, 0);
+    }
+
+    #[test]
+    fn feed_tracking_detects_write_position() {
+        let mut parser = TerminalParser::new(80, 24);
+        let result = parser.feed_tracking_writes(b"Hello");
+        assert!(result.last_write_pos.is_some());
+        let (col, _row) = result.last_write_pos.unwrap();
+        assert_eq!(col, 4); // 'o' at column 4
+    }
 }
