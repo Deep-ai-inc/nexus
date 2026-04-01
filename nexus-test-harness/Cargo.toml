@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+nexus-client = { path = "../nexus-client" }
 nexus-protocol = { path = "../nexus-protocol" }
 nexus-api = { path = "../nexus-api" }
 tokio = { workspace = true }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true }

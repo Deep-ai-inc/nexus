@@ -50,7 +50,7 @@ pub enum NexusMessage {
     /// Reconnection succeeded — swap transport.
     /// Uses Arc<Mutex<Option<...>>> pattern because Receiver/Child aren't Clone.
     RemoteReconnected {
-        request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
+        request_tx: tokio::sync::mpsc::UnboundedSender<nexus_protocol::messages::Request>,
         rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_pong_at: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -62,7 +62,7 @@ pub enum NexusMessage {
     /// Session resumed successfully — swap transport without orphan cleanup.
     /// Uses Arc<Mutex<Option<...>>> pattern because Receiver/Child aren't Clone.
     RemoteResumed {
-        request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
+        request_tx: tokio::sync::mpsc::UnboundedSender<nexus_protocol::messages::Request>,
         rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_pong_at: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,

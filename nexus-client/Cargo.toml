@@ -1,0 +1,12 @@
+[package]
+name = "nexus-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nexus-api = { workspace = true }
+nexus-protocol = { path = "../nexus-protocol" }
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }

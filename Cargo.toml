@@ -6,6 +6,7 @@ members = [
     "nexus-ui",
     "nexus-api",
     "nexus-protocol",
+    "nexus-client",
     "nexus-agent",
     "strata",
     "nexus-test-harness",

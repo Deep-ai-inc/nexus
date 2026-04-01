@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 nexus-api = { workspace = true }
 nexus-kernel = { workspace = true }
+nexus-client = { path = "../nexus-client" }
 nexus-protocol = { workspace = true }
 nexus-term = { workspace = true }
 strata = { workspace = true }

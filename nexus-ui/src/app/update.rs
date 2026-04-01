@@ -1740,15 +1740,8 @@ fn convert_completion_kind(kind: nexus_protocol::messages::CompletionKind) -> ne
 
 /// Async reconnection loop with exponential backoff.
 ///
-/// Two-phase approach per attempt:
-///   1. Try `Resume` with the stored session token — if the agent is still alive
-///      (e.g. running as a daemon or the UDS is intact), we seamlessly continue
-///      without killing orphan blocks or clearing the nesting stack.
-///   2. If Resume fails (agent restarted, token invalid, server rebooted), fall
-///      back to a fresh `Hello` handshake — this triggers orphan cleanup and
-///      stack clearing on the UI side.
-///
-/// Tries up to 20 times with exponential backoff then steady 15s retries (~5.5 min).
+/// Delegates to `nexus_client::reconnect::reconnect_loop` for the actual
+/// retry logic, then wraps the outcome into a `NexusMessage`.
 async fn reconnect_loop(
     transport: nexus_protocol::messages::Transport,
     agent_path: String,
@@ -1761,105 +1754,61 @@ async fn reconnect_loop(
     attempt_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> NexusMessage {
-    // Backoff then steady retry. Total: ~5.5 min, enough for the agent's
-    // 120s read timeout to fire and bind its UDS socket.
-    let delays = [1, 2, 4, 8, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15];
+    let params = nexus_client::ReconnectParams {
+        transport,
+        agent_path,
+        instance_id,
+        session_token,
+        last_seen_seq,
+        cols,
+        rows,
+        kernel_tx,
+        attempt_counter,
+        cancel,
+        forwarded_env: collect_forwarded_env(),
+    };
 
-    for (attempt, &delay_secs) in delays.iter().enumerate() {
-        // Wait before attempt (cancellable)
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
-            _ = cancel.cancelled() => {
-                tracing::info!("reconnect cancelled");
-                return NexusMessage::ReconnectFailed;
+    match nexus_client::reconnect::reconnect_loop(params).await {
+        Ok(nexus_client::ReconnectOutcome::Resumed {
+            handle,
+            env,
+            request_tx,
+        }) => {
+            let child = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.child)));
+            let response_rx =
+                std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
+            NexusMessage::RemoteResumed {
+                request_tx,
+                rtt_ms: handle.rtt_ms,
+                last_pong_at: handle.last_pong_at,
+                last_seen_seq: handle.last_seen_seq,
+                response_rx,
+                env,
+                child,
             }
         }
-
-        attempt_counter.store(attempt + 1, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!("reconnect attempt {}/{}", attempt + 1, delays.len());
-
-        // Phase 1: Try Resume (session token still valid → seamless reconnect)
-        let attach_id = if instance_id.is_empty() { None } else { Some(instance_id.as_str()) };
-        let resume_future = crate::features::shell::remote::transport::TransportHandle::resume(
-            &transport,
-            &agent_path,
-            attach_id,
-            session_token,
-            last_seen_seq,
-            cols,
-            rows,
-            kernel_tx.clone(),
-        );
-
-        let resume_result = tokio::select! {
-            res = resume_future => res,
-            _ = cancel.cancelled() => {
-                tracing::info!("reconnect cancelled during resume attempt");
-                return NexusMessage::ReconnectFailed;
-            }
-        };
-
-        match resume_result {
-            Ok((handle, env, request_tx)) => {
-                let child = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.child)));
-                let response_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
-                tracing::info!("resumed session on {}@{}", env.user, env.hostname);
-                return NexusMessage::RemoteResumed {
-                    request_tx,
-                    rtt_ms: handle.rtt_ms,
-                    last_pong_at: handle.last_pong_at,
-                    last_seen_seq: handle.last_seen_seq,
-                    response_rx,
-                    env,
-                    child,
-                };
-            }
-            Err(e) => {
-                tracing::info!("resume failed (expected if agent restarted): {e}");
+        Ok(nexus_client::ReconnectOutcome::FreshConnect {
+            handle,
+            env,
+            session_token: new_session_token,
+            request_tx,
+        }) => {
+            let child = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.child)));
+            let response_rx =
+                std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
+            NexusMessage::RemoteReconnected {
+                request_tx,
+                rtt_ms: handle.rtt_ms,
+                last_pong_at: handle.last_pong_at,
+                last_seen_seq: handle.last_seen_seq,
+                response_rx,
+                env,
+                child,
+                session_token: new_session_token,
             }
         }
-
-        // Phase 2: Fall back to fresh Hello (agent restarted → orphan cleanup on UI side)
-        let forwarded_env = collect_forwarded_env();
-        let connect_future = crate::features::shell::remote::transport::TransportHandle::connect(
-            &transport,
-            &agent_path,
-            forwarded_env,
-            kernel_tx.clone(),
-        );
-
-        let connect_result = tokio::select! {
-            res = connect_future => res,
-            _ = cancel.cancelled() => {
-                tracing::info!("reconnect cancelled during fresh connect attempt");
-                return NexusMessage::ReconnectFailed;
-            }
-        };
-
-        match connect_result {
-            Ok((handle, env, new_session_token, request_tx)) => {
-                let child = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.child)));
-                let response_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
-                tracing::info!("reconnected (fresh) to {}@{}", env.user, env.hostname);
-                return NexusMessage::RemoteReconnected {
-                    request_tx,
-                    rtt_ms: handle.rtt_ms,
-                    last_pong_at: handle.last_pong_at,
-                    last_seen_seq: handle.last_seen_seq,
-                    response_rx,
-                    env,
-                    child,
-                    session_token: new_session_token,
-                };
-            }
-            Err(e) => {
-                tracing::warn!("reconnect attempt {} failed: {}", attempt + 1, e);
-            }
-        }
+        Err(_) => NexusMessage::ReconnectFailed,
     }
-
-    tracing::error!("reconnect failed after {} attempts", delays.len());
-    NexusMessage::ReconnectFailed
 }
 
 /// Collect environment variables to forward to the remote agent.

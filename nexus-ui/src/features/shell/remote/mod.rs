@@ -79,7 +79,7 @@ pub(crate) enum ConnectionState {
 /// Not `Clone` because it contains oneshot channels for pending requests.
 pub(crate) struct RemoteBackend {
     /// Channel to send requests to the transport task.
-    request_tx: mpsc::UnboundedSender<RequestEnvelope>,
+    request_tx: mpsc::UnboundedSender<Request>,
     /// Remote environment info from the last HelloOk.
     pub env: EnvInfo,
     /// Last seen sequence number (for resume), shared with event bridge.
@@ -146,16 +146,11 @@ struct QueuedInput {
     echo_epoch: u64,
 }
 
-/// Envelope wrapping a request for the transport task.
-pub(crate) struct RequestEnvelope {
-    pub request: Request,
-}
-
 impl RemoteBackend {
     /// Create a new remote backend from an established transport.
     pub fn new(
         env: EnvInfo,
-        request_tx: mpsc::UnboundedSender<RequestEnvelope>,
+        request_tx: mpsc::UnboundedSender<Request>,
         rtt_ms: Arc<AtomicU64>,
         last_pong_at: Arc<AtomicU64>,
         last_seen_seq: Arc<AtomicU64>,
@@ -245,7 +240,7 @@ impl RemoteBackend {
     ///
     /// If the transport channel is closed, transitions to `Disconnected`.
     pub fn send(&mut self, request: Request) {
-        if self.request_tx.send(RequestEnvelope { request }).is_err() {
+        if self.request_tx.send(request).is_err() {
             self.state = ConnectionState::Disconnected;
         }
     }
@@ -488,13 +483,11 @@ impl RemoteBackend {
             let id = self.next_id();
             self.pending
                 .insert(id, PendingRequest::FileWriteChunk(accum.clone()));
-            envelopes.push(RequestEnvelope {
-                request: Request::FileWrite {
-                    id,
-                    path: path.to_string(),
-                    offset: (i * CHUNK_SIZE) as u64,
-                    data: chunk.to_vec(),
-                },
+            envelopes.push(Request::FileWrite {
+                id,
+                path: path.to_string(),
+                offset: (i * CHUNK_SIZE) as u64,
+                data: chunk.to_vec(),
             });
         }
 
@@ -502,9 +495,7 @@ impl RemoteBackend {
         if let Some(first) = envelopes.first() {
             if self
                 .request_tx
-                .send(RequestEnvelope {
-                    request: first.request.clone(),
-                })
+                .send(first.clone())
                 .is_err()
             {
                 self.state = ConnectionState::Disconnected;
@@ -515,7 +506,7 @@ impl RemoteBackend {
         // Remaining chunks are sent from a background task with yielding.
         if envelopes.len() > 1 {
             let sender = self.request_tx.clone();
-            let remaining: Vec<RequestEnvelope> = envelopes.into_iter().skip(1).collect();
+            let remaining: Vec<Request> = envelopes.into_iter().skip(1).collect();
             tokio::spawn(async move {
                 for envelope in remaining {
                     if sender.send(envelope).is_err() {
@@ -693,7 +684,7 @@ impl RemoteBackend {
     }
 
     /// Swap the request channel to a new transport (after reconnection).
-    pub fn swap_request_tx(&mut self, new_tx: mpsc::UnboundedSender<RequestEnvelope>) {
+    pub fn swap_request_tx(&mut self, new_tx: mpsc::UnboundedSender<Request>) {
         self.request_tx = new_tx;
     }
 
