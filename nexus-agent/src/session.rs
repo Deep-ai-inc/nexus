@@ -116,6 +116,11 @@ impl RingBuffer {
         self.frames.push_back((seq, payload));
     }
 
+    /// Get the lowest sequence number in the buffer.
+    pub fn oldest_seq(&self) -> u64 {
+        self.frames.front().map(|(seq, _)| *seq).unwrap_or(0)
+    }
+
     /// Get the highest sequence number in the buffer.
     pub fn latest_seq(&self) -> u64 {
         self.frames.back().map(|(seq, _)| *seq).unwrap_or(0)

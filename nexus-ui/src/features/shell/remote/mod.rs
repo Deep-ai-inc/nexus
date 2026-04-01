@@ -96,6 +96,9 @@ pub(crate) struct RemoteBackend {
     pub pending_queue: Vec<QueuedCommand>,
     /// Current RTT in milliseconds (shared with event bridge).
     pub rtt_ms: Arc<AtomicU64>,
+    /// Timestamp of the last received Pong (shared with event bridge).
+    /// Used to detect stale connections where SSH is alive but data isn't flowing.
+    pub last_pong_at: Arc<AtomicU64>,
     /// Receiver for non-event responses from the event bridge.
     pub(crate) response_rx: mpsc::UnboundedReceiver<Response>,
     /// The SSH/docker/kubectl child process (owned for lifecycle management).
@@ -154,6 +157,7 @@ impl RemoteBackend {
         env: EnvInfo,
         request_tx: mpsc::UnboundedSender<RequestEnvelope>,
         rtt_ms: Arc<AtomicU64>,
+        last_pong_at: Arc<AtomicU64>,
         last_seen_seq: Arc<AtomicU64>,
         response_rx: mpsc::UnboundedReceiver<Response>,
         child: Option<tokio::process::Child>,
@@ -171,6 +175,7 @@ impl RemoteBackend {
             backend_stack: Vec::new(),
             pending_queue: Vec::new(),
             rtt_ms,
+            last_pong_at,
             response_rx,
             child,
             transport,
@@ -185,6 +190,21 @@ impl RemoteBackend {
     /// Read the current RTT in milliseconds (0 = not yet measured).
     pub fn current_rtt_ms(&self) -> u64 {
         self.rtt_ms.load(Ordering::Relaxed)
+    }
+
+    /// Check if the connection is stale (no Pong received recently).
+    /// Returns true if data is still flowing, false if connection appears dead.
+    pub fn is_data_flowing(&self) -> bool {
+        let last = self.last_pong_at.load(Ordering::Relaxed);
+        if last == 0 {
+            return true; // No pongs yet — still in handshake
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // If no Pong in 10 seconds (pings sent every 500ms), connection is dead
+        now_ms.saturating_sub(last) < 10_000
     }
 
     /// Poll and process any pending non-event responses from the event bridge.

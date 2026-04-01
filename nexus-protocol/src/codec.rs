@@ -649,6 +649,8 @@ mod tests {
             Request::Resume {
                 session_token: [0u8; 16],
                 last_seen_seq: 42,
+                cols: 120,
+                rows: 24,
             },
             Request::CancelFileRead { id: 42 },
             Request::Shutdown,
@@ -737,6 +739,7 @@ mod tests {
                 token: [2u8; 16],
                 env: env.clone(),
                 active_blocks: vec![BlockId(1), BlockId(2)],
+                events_lost: false,
             },
             Response::Error {
                 id: 99,

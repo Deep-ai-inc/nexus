@@ -30,6 +30,10 @@ pub(crate) struct BreadcrumbBar<'a> {
     pub unnesting_to: Option<usize>,
     /// Whether the disconnect confirmation is active (first click happened).
     pub confirm_active: bool,
+    /// Current reconnection attempt (1-based) and total, if reconnecting.
+    pub reconnect_attempt: Option<(usize, usize)>,
+    /// Seconds since session was restored (for brief flash). None if not recently restored.
+    pub restored_secs: Option<f32>,
 }
 
 impl<'a> Widget<'a> for BreadcrumbBar<'a> {
@@ -114,9 +118,44 @@ impl<'a> Widget<'a> for BreadcrumbBar<'a> {
             );
         }
 
-        // RTT display (right-aligned)
-        if let Some(rtt) = self.rtt_ms {
-            row = row.push(Row::new().spacer(1.0)); // Push RTT to the right
+        // Right-aligned status area
+        row = row.push(Row::new().spacer(1.0));
+
+        // "Session restored" flash (fades out over 3 seconds)
+        if let Some(secs) = self.restored_secs {
+            if secs < 3.0 {
+                let alpha = 1.0 - (secs / 3.0);
+                row = row.push(
+                    TextElement::new("Session restored".to_string())
+                        .color(Color::rgba(0.3, 0.85, 0.3, alpha * 0.9))
+                        .size(11.0),
+                );
+            }
+        }
+        // Reconnection status text
+        else if self.state == ConnectionState::Reconnecting {
+            let status_text = match self.reconnect_attempt {
+                Some((attempt, total)) if attempt >= 4 => {
+                    format!("Reconnecting... ({}/{})", attempt, total)
+                }
+                _ => "Reconnecting...".to_string(),
+            };
+            row = row.push(
+                TextElement::new(status_text)
+                    .color(Color::rgba(0.9, 0.5, 0.2, 0.9))
+                    .size(11.0),
+            );
+        }
+        // Disconnected label
+        else if self.state == ConnectionState::Disconnected {
+            row = row.push(
+                TextElement::new("Disconnected".to_string())
+                    .color(Color::rgba(0.8, 0.2, 0.2, 0.9))
+                    .size(11.0),
+            );
+        }
+        // RTT display (connected state)
+        else if let Some(rtt) = self.rtt_ms {
             let rtt_color = if rtt < 50 {
                 Color::rgba(0.5, 0.7, 0.5, 0.7) // Low latency — green-ish
             } else if rtt < 200 {

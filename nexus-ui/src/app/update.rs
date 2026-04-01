@@ -347,6 +347,7 @@ impl NexusState {
             NexusMessage::RemoteReconnected {
                 request_tx,
                 rtt_ms,
+                last_pong_at,
                 last_seen_seq,
                 response_rx,
                 env,
@@ -405,6 +406,7 @@ impl NexusState {
                         }
                         remote.swap_request_tx(request_tx);
                         remote.rtt_ms = rtt_ms;
+                        remote.last_pong_at = last_pong_at;
                         remote.last_seen_seq = last_seen_seq;
                         remote.response_rx = rx;
                         remote.env = env;
@@ -413,12 +415,19 @@ impl NexusState {
                     }
                 }
 
+                // Sync CWD with the (potentially new) remote agent
+                if let Some(ref remote) = self.remote {
+                    self.cwd = remote.env.cwd.to_string_lossy().to_string();
+                }
                 self.reconnect_cancel = None;
+                self.reconnect_attempt.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.session_restored_at = Some(std::time::Instant::now());
                 Command::none()
             }
             NexusMessage::RemoteResumed {
                 request_tx,
                 rtt_ms,
+                last_pong_at,
                 last_seen_seq,
                 response_rx,
                 env,
@@ -431,6 +440,7 @@ impl NexusState {
                         remote.set_child(child.lock().unwrap().take());
                         remote.swap_request_tx(request_tx);
                         remote.rtt_ms = rtt_ms;
+                        remote.last_pong_at = last_pong_at;
                         remote.last_seen_seq = last_seen_seq;
                         remote.response_rx = rx;
                         remote.env = env;
@@ -439,11 +449,18 @@ impl NexusState {
                     }
                 }
 
+                // Sync CWD with the resumed remote agent
+                if let Some(ref remote) = self.remote {
+                    self.cwd = remote.env.cwd.to_string_lossy().to_string();
+                }
                 self.reconnect_cancel = None;
+                self.reconnect_attempt.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.session_restored_at = Some(std::time::Instant::now());
                 Command::none()
             }
             NexusMessage::ReconnectFailed => {
                 self.reconnect_cancel = None;
+                self.reconnect_attempt.store(0, std::sync::atomic::Ordering::Relaxed);
                 if let Some(ref mut remote) = self.remote {
                     if remote.state == crate::features::shell::remote::ConnectionState::Reconnecting {
                         remote.state = crate::features::shell::remote::ConnectionState::Disconnected;
@@ -798,6 +815,7 @@ impl NexusState {
             env.clone(),
             request_tx,
             handle.rtt_ms,
+            handle.last_pong_at,
             handle.last_seen_seq,
             handle.response_rx,
             Some(handle.child),
@@ -839,11 +857,18 @@ impl NexusState {
     pub(super) fn check_reconnect(&mut self) -> Command<NexusMessage> {
         use crate::features::shell::remote::ConnectionState;
 
-        // Detect SSH child death → mark as Disconnected
+        // Detect dead connection → mark as Disconnected
         if let Some(ref mut remote) = self.remote {
-            if remote.state == ConnectionState::Connected && !remote.check_child_alive() {
-                tracing::warn!("SSH child process died");
-                remote.state = ConnectionState::Disconnected;
+            if remote.state == ConnectionState::Connected {
+                if !remote.check_child_alive() {
+                    tracing::warn!("SSH child process died");
+                    remote.state = ConnectionState::Disconnected;
+                } else if !remote.is_data_flowing() {
+                    // SSH process alive but no Pong in 10s — dead TCP after sleep/roaming
+                    tracing::warn!("connection stale (no pong in 10s), killing SSH");
+                    remote.kill_child_sync();
+                    remote.state = ConnectionState::Disconnected;
+                }
             }
         }
 
@@ -879,13 +904,20 @@ impl NexusState {
 
         tracing::info!("remote connection lost, starting reconnect loop");
 
+        let (cols, rows) = self.last_remote_size;
+        let attempt_counter = self.reconnect_attempt.clone();
+        attempt_counter.store(0, std::sync::atomic::Ordering::Relaxed);
+
         Command::perform(reconnect_loop(
             transport,
             agent_path,
             instance_id,
             session_token,
             last_seen_seq,
+            cols,
+            rows,
             kernel_tx,
+            attempt_counter,
             cancel,
         ))
     }
@@ -1716,17 +1748,22 @@ fn convert_completion_kind(kind: nexus_protocol::messages::CompletionKind) -> ne
 ///      back to a fresh `Hello` handshake — this triggers orphan cleanup and
 ///      stack clearing on the UI side.
 ///
-/// Tries up to 10 times with delays [1, 2, 4, 8, 16, 30, 30, 30, 30, 30] seconds.
+/// Tries up to 20 times with exponential backoff then steady 15s retries (~5.5 min).
 async fn reconnect_loop(
     transport: nexus_protocol::messages::Transport,
     agent_path: String,
     instance_id: String,
     session_token: [u8; 16],
     last_seen_seq: u64,
+    cols: u16,
+    rows: u16,
     kernel_tx: tokio::sync::broadcast::Sender<nexus_api::ShellEvent>,
+    attempt_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> NexusMessage {
-    let delays = [1, 2, 4, 8, 16, 30, 30, 30, 30, 30];
+    // Backoff then steady retry. Total: ~5.5 min, enough for the agent's
+    // 120s read timeout to fire and bind its UDS socket.
+    let delays = [1, 2, 4, 8, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15];
 
     for (attempt, &delay_secs) in delays.iter().enumerate() {
         // Wait before attempt (cancellable)
@@ -1738,6 +1775,7 @@ async fn reconnect_loop(
             }
         }
 
+        attempt_counter.store(attempt + 1, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("reconnect attempt {}/{}", attempt + 1, delays.len());
 
         // Phase 1: Try Resume (session token still valid → seamless reconnect)
@@ -1748,6 +1786,8 @@ async fn reconnect_loop(
             attach_id,
             session_token,
             last_seen_seq,
+            cols,
+            rows,
             kernel_tx.clone(),
         );
 
@@ -1767,6 +1807,7 @@ async fn reconnect_loop(
                 return NexusMessage::RemoteResumed {
                     request_tx,
                     rtt_ms: handle.rtt_ms,
+                    last_pong_at: handle.last_pong_at,
                     last_seen_seq: handle.last_seen_seq,
                     response_rx,
                     env,
@@ -1803,6 +1844,7 @@ async fn reconnect_loop(
                 return NexusMessage::RemoteReconnected {
                     request_tx,
                     rtt_ms: handle.rtt_ms,
+                    last_pong_at: handle.last_pong_at,
                     last_seen_seq: handle.last_seen_seq,
                     response_rx,
                     env,

@@ -125,6 +125,14 @@ pub struct NexusState {
     pub(crate) resize_debounce_cancel: Option<tokio_util::sync::CancellationToken>,
     /// CancellationToken for the in-flight reconnection task (at most one).
     pub(crate) reconnect_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Timestamp of the last tick — used to detect sleep/wake (large gap = system slept).
+    pub(crate) last_tick_at: Instant,
+    /// Current reconnect attempt number, shared with the reconnect task.
+    pub(crate) reconnect_attempt: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Last seen attempt number — repaint only when this changes.
+    pub(crate) last_reconnect_attempt: usize,
+    /// Brief "Session restored" flash — set to `Instant::now()` on successful resume.
+    pub(crate) session_restored_at: Option<Instant>,
 
     // --- Layout ---
     pub zoom_level: f32,
@@ -457,12 +465,52 @@ impl Component for NexusState {
         let cursor_changed = cursor_now != self.last_cursor_blink;
         self.last_cursor_blink = cursor_now;
 
+        // Detect sleep/wake: if the tick gap exceeds 5s, the system probably
+        // slept. Cancel any in-flight reconnect so check_reconnect() starts
+        // a fresh attempt immediately (rather than waiting out old retry delays).
+        let now = Instant::now();
+        if now.duration_since(self.last_tick_at).as_secs() > 5 {
+            tracing::info!("detected system wake ({}s gap)",
+                now.duration_since(self.last_tick_at).as_secs());
+            if let Some(cancel) = self.reconnect_cancel.take() {
+                tracing::info!("restarting in-flight reconnect after wake");
+                cancel.cancel();
+                if let Some(ref mut remote) = self.remote {
+                    if remote.state == crate::features::shell::remote::ConnectionState::Reconnecting {
+                        remote.state = crate::features::shell::remote::ConnectionState::Disconnected;
+                    }
+                }
+            }
+            // Reset last_pong_at so is_data_flowing() gives the connection a
+            // grace period to resume pings instead of immediately killing it.
+            if let Some(ref remote) = self.remote {
+                remote.last_pong_at.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.last_tick_at = now;
+
         let cmd = self.check_reconnect();
+
+        // Clear "Session restored" flash after 3 seconds
+        let restoring = if let Some(t) = self.session_restored_at {
+            if t.elapsed().as_secs_f32() > 3.0 {
+                self.session_restored_at = None;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
 
         // Push session state to the scripting registry (cheap — just mutex + clone).
         self.update_session_registry();
 
-        let dirty = output_dirty || spring_animating || auto_scrolling || cursor_changed || connecting;
+        // Only repaint for reconnect when the attempt counter changes (not every frame).
+        let current_attempt = self.reconnect_attempt.load(std::sync::atomic::Ordering::Relaxed);
+        let reconnect_changed = current_attempt != self.last_reconnect_attempt;
+        self.last_reconnect_attempt = current_attempt;
+        let dirty = output_dirty || spring_animating || auto_scrolling || cursor_changed || connecting || restoring || reconnect_changed;
         (dirty, cmd)
     }
 
@@ -667,6 +715,10 @@ impl RootComponent for NexusState {
             disconnect_confirm: None,
             resize_debounce_cancel: None,
             reconnect_cancel: None,
+            last_tick_at: Instant::now(),
+            reconnect_attempt: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            last_reconnect_attempt: 0,
+            session_restored_at: None,
 
             zoom_level: 0.85,
 

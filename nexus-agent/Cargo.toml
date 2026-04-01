@@ -24,3 +24,4 @@ libc = { workspace = true }
 rand = { workspace = true }
 gethostname = { workspace = true }
 uuid = { workspace = true }
+tokio-util = "0.7"

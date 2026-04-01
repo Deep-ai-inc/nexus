@@ -23,6 +23,8 @@ pub(crate) struct TransportHandle {
     pub child: Child,
     /// Current RTT in milliseconds (0 = not yet measured).
     pub rtt_ms: Arc<AtomicU64>,
+    /// Timestamp (epoch ms) of last Pong received — for staleness detection.
+    pub last_pong_at: Arc<AtomicU64>,
     /// Last seen event sequence number from the agent.
     pub last_seen_seq: Arc<AtomicU64>,
     /// Receiver for non-event responses (ClassifyResult, CompleteResult, etc.)
@@ -53,13 +55,14 @@ impl TransportHandle {
         let codec = FrameCodec::new(stdout, stdin);
         let (reader, writer) = codec.into_parts();
 
-        let (env, session_token, _caps, request_tx, rtt_ms, last_seen_seq, response_rx) =
+        let (env, session_token, _caps, request_tx, rtt_ms, last_pong_at, last_seen_seq, response_rx) =
             Self::handshake(reader, writer, forwarded_env, kernel_tx).await?;
 
         Ok((
             Self {
                 child,
                 rtt_ms,
+                last_pong_at,
                 last_seen_seq,
                 response_rx,
             },
@@ -83,6 +86,8 @@ impl TransportHandle {
         instance_id: Option<&str>,
         session_token: [u8; 16],
         last_seen_seq: u64,
+        cols: u16,
+        rows: u16,
         kernel_tx: broadcast::Sender<ShellEvent>,
     ) -> Result<(Self, EnvInfo, mpsc::UnboundedSender<super::RequestEnvelope>)> {
         let mut child = Self::spawn_child_with_args(
@@ -103,14 +108,15 @@ impl TransportHandle {
         let codec = FrameCodec::new(stdout, stdin);
         let (reader, writer) = codec.into_parts();
 
-        let (env, request_tx, rtt_ms, last_seen_seq_arc, response_rx) =
-            Self::resume_handshake(reader, writer, session_token, last_seen_seq, kernel_tx)
+        let (env, request_tx, rtt_ms, last_pong_at, last_seen_seq_arc, response_rx) =
+            Self::resume_handshake(reader, writer, session_token, last_seen_seq, cols, rows, kernel_tx)
                 .await?;
 
         Ok((
             Self {
                 child,
                 rtt_ms,
+                last_pong_at,
                 last_seen_seq: last_seen_seq_arc,
                 response_rx,
             },
@@ -142,6 +148,9 @@ impl TransportHandle {
                 let mut cmd = Command::new("ssh");
                 cmd.arg("-o").arg("BatchMode=yes");
                 cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+                cmd.arg("-o").arg("ConnectTimeout=10");
+                cmd.arg("-o").arg("ServerAliveInterval=15");
+                cmd.arg("-o").arg("ServerAliveCountMax=3");
                 if let Some(port) = port {
                     cmd.arg("-p").arg(port.to_string());
                 }
@@ -225,10 +234,13 @@ impl TransportHandle {
         mut writer: FrameWriter<W>,
         session_token: [u8; 16],
         last_seen_seq: u64,
+        cols: u16,
+        rows: u16,
         kernel_tx: broadcast::Sender<ShellEvent>,
     ) -> Result<(
         EnvInfo,
         mpsc::UnboundedSender<super::RequestEnvelope>,
+        Arc<AtomicU64>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
         mpsc::UnboundedReceiver<Response>,
@@ -241,6 +253,8 @@ impl TransportHandle {
         let resume = Request::Resume {
             session_token,
             last_seen_seq,
+            cols,
+            rows,
         };
         writer
             .write(&resume, resume.priority())
@@ -253,8 +267,8 @@ impl TransportHandle {
             .await
             .map_err(|e| anyhow::anyhow!("failed to read SessionState: {e}"))?;
 
-        let env = match response {
-            Response::SessionState { env, .. } => env,
+        let (env, events_lost) = match response {
+            Response::SessionState { env, events_lost, .. } => (env, events_lost),
             Response::Error { message, .. } => {
                 anyhow::bail!("resume rejected: {message}");
             }
@@ -263,11 +277,15 @@ impl TransportHandle {
             }
         };
 
+        if events_lost {
+            tracing::warn!("resume: ring buffer overflowed, some output was lost during disconnection");
+        }
+
         // Set up event bridge (same as Hello path)
-        let (request_tx, rtt_ms, last_seen_seq_arc, response_rx) =
+        let (request_tx, rtt_ms, last_pong_at, last_seen_seq_arc, response_rx) =
             Self::setup_bridge(reader, writer, kernel_tx);
 
-        Ok((env, request_tx, rtt_ms, last_seen_seq_arc, response_rx))
+        Ok((env, request_tx, rtt_ms, last_pong_at, last_seen_seq_arc, response_rx))
     }
 
     /// Perform the Hello/HelloOk handshake and spawn event bridge tasks.
@@ -281,6 +299,7 @@ impl TransportHandle {
         [u8; 16],
         AgentCaps,
         mpsc::UnboundedSender<super::RequestEnvelope>,
+        Arc<AtomicU64>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
         mpsc::UnboundedReceiver<Response>,
@@ -326,7 +345,7 @@ impl TransportHandle {
             }
         };
 
-        let (request_tx, rtt_ms, last_seen_seq, response_rx) =
+        let (request_tx, rtt_ms, last_pong_at, last_seen_seq, response_rx) =
             Self::setup_bridge(reader, writer, kernel_tx);
 
         Ok((
@@ -335,6 +354,7 @@ impl TransportHandle {
             caps,
             request_tx,
             rtt_ms,
+            last_pong_at,
             last_seen_seq,
             response_rx,
         ))
@@ -351,14 +371,16 @@ impl TransportHandle {
         mpsc::UnboundedSender<super::RequestEnvelope>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
+        Arc<AtomicU64>,
         mpsc::UnboundedReceiver<Response>,
     )
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        // Shared state for RTT tracking
+        // Shared state for RTT tracking and staleness detection
         let rtt_ms = Arc::new(AtomicU64::new(0));
+        let last_pong_at = Arc::new(AtomicU64::new(0));
         let last_seen_seq = Arc::new(AtomicU64::new(0));
         let ping_timestamps: Arc<Mutex<HashMap<u64, Instant>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -388,6 +410,7 @@ impl TransportHandle {
 
         // Spawn response reader task (event bridge)
         let bridge_rtt = rtt_ms.clone();
+        let bridge_pong = last_pong_at.clone();
         let bridge_seq = last_seen_seq.clone();
         let bridge_timestamps = ping_timestamps.clone();
         let bridge_request_tx = request_tx.clone();
@@ -399,6 +422,7 @@ impl TransportHandle {
                 bridge_request_tx,
                 bridge_timestamps,
                 bridge_rtt,
+                bridge_pong,
                 bridge_seq,
             )
             .await;
@@ -436,6 +460,6 @@ impl TransportHandle {
             }
         });
 
-        (request_tx, rtt_ms, last_seen_seq, response_rx)
+        (request_tx, rtt_ms, last_pong_at, last_seen_seq, response_rx)
     }
 }

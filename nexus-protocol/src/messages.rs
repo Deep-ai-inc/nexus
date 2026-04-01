@@ -147,6 +147,10 @@ pub enum Request {
     Resume {
         session_token: [u8; 16],
         last_seen_seq: u64,
+        /// Current client terminal dimensions. The agent resizes all active
+        /// PTYs on resume (the window may have been resized while disconnected).
+        cols: u16,
+        rows: u16,
     },
     /// Graceful shutdown.
     Shutdown,
@@ -244,6 +248,9 @@ pub enum Response {
         token: [u8; 16],
         env: EnvInfo,
         active_blocks: Vec<BlockId>,
+        /// True if the ring buffer overflowed and some events were lost
+        /// between the client's `last_seen_seq` and the oldest buffered seq.
+        events_lost: bool,
     },
     /// Error response for a specific request.
     Error {

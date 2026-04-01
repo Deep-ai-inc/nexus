@@ -8,6 +8,7 @@ members = [
     "nexus-protocol",
     "nexus-agent",
     "strata",
+    "nexus-test-harness",
 ]
 
 [workspace.package]

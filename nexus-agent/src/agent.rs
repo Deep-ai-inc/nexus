@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -36,9 +37,18 @@ pub struct Agent {
     kernel_rx: broadcast::Receiver<ShellEvent>,
     idle_timeout_secs: u64,
     /// Monotonically increasing sequence number for outbound events.
-    next_seq: u64,
-    /// Ring buffer for session resume.
-    ring_buffer: RingBuffer,
+    next_seq: Arc<AtomicU64>,
+    /// Ring buffer for session resume (always shared — events are collected
+    /// even between client connections so nothing is lost on disconnect).
+    ring_buffer: Arc<tokio::sync::Mutex<RingBuffer>>,
+    /// Shared sender for the bg collector to forward encoded events to the wire sender.
+    /// Wrapped in Arc so the bg_collector and Agent can both reference it.
+    /// Swapped to a new channel each run() so the sender task gets a fresh receiver.
+    bg_wire_tx: Arc<std::sync::Mutex<mpsc::UnboundedSender<(u64, Vec<u8>)>>>,
+    /// Receiver end, moved into each run() call's sender task.
+    wire_rx: Option<mpsc::UnboundedReceiver<(u64, Vec<u8>)>>,
+    /// Handle to the persistent background collector task.
+    _bg_collector: tokio::task::JoinHandle<()>,
     /// Terminal viewport dimensions (for native commands like `ls`).
     viewport_cols: u16,
     viewport_rows: u16,
@@ -61,14 +71,60 @@ pub struct Agent {
 impl Agent {
     pub fn new(idle_timeout_secs: u64) -> Result<Self> {
         let (kernel, kernel_rx) = Kernel::new()?;
+        let kernel = Arc::new(Mutex::new(kernel));
+
+        let next_seq = Arc::new(AtomicU64::new(1));
+        let ring_buffer = Arc::new(tokio::sync::Mutex::new(
+            RingBuffer::new(4 * 1024 * 1024), // 4 MB
+        ));
+
+        // Persistent background collector: subscribes to kernel events and
+        // pushes them to the ring buffer with assigned seq numbers. Runs for
+        // the entire lifetime of the agent, including between client connections.
+        let bg_next_seq = next_seq.clone();
+        let bg_ring = ring_buffer.clone();
+        let bg_kernel_tx = {
+            kernel.try_lock().unwrap().event_sender().clone()
+        };
+        let mut bg_event_rx = bg_kernel_tx.subscribe();
+        let (wire_tx, wire_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+        let bg_wire_tx = Arc::new(std::sync::Mutex::new(wire_tx));
+        let bg_wire_tx_clone = bg_wire_tx.clone();
+        let bg_collector = tokio::spawn(async move {
+            loop {
+                match bg_event_rx.recv().await {
+                    Ok(event) => {
+                        let seq = bg_next_seq.fetch_add(1, Ordering::Relaxed);
+                        let resp = Response::Event { seq, event };
+                        match encode_payload(&resp) {
+                            Ok(payload) => {
+                                bg_ring.lock().await.push_raw(seq, payload.clone());
+                                // Best-effort forward to wire sender (fails if no sender active)
+                                let _ = bg_wire_tx_clone.lock().unwrap().send((seq, payload));
+                            }
+                            Err(e) => {
+                                tracing::warn!("bg collector: failed to encode event: {e}");
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("bg collector lagged by {n} events");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
 
         Ok(Self {
             instance_id: uuid::Uuid::new_v4().to_string(),
-            kernel: Arc::new(Mutex::new(kernel)),
+            kernel,
             kernel_rx,
             idle_timeout_secs,
-            next_seq: 1,
-            ring_buffer: RingBuffer::new(1024 * 1024), // 1 MB default
+            next_seq,
+            ring_buffer,
+            bg_wire_tx,
+            wire_rx: Some(wire_rx),
+            _bg_collector: bg_collector,
             viewport_cols: 80,
             viewport_rows: 24,
             pty_manager: PtyManager::new(),
@@ -85,14 +141,43 @@ impl Agent {
         &self.instance_id
     }
 
-    /// Returns true if the agent should persist after a parent disconnect
-    /// (has active relay or running PTY sessions).
+    /// Returns the shared set of PIDs managed by Tokio's child waiter.
+    /// The zombie reaper uses this to avoid stealing exit statuses.
+    pub fn tokio_pids(&self) -> Arc<std::sync::Mutex<std::collections::HashSet<u32>>> {
+        self.pty_manager.tokio_pids()
+    }
+
+    /// Exit statuses saved by the zombie reaper (for ECHILD recovery).
+    pub fn reaped_statuses(&self) -> Arc<std::sync::Mutex<std::collections::HashMap<u32, i32>>> {
+        self.pty_manager.reaped_statuses()
+    }
+
+    /// Returns true if the agent should persist after a parent disconnect.
+    /// Persists if there's an active relay, running PTY sessions, or we've
+    /// had at least one successful client handshake (so reconnect can find us).
     pub fn should_persist(&self) -> bool {
-        self.active_relay.is_some() || self.pty_manager.has_active_sessions()
+        self.active_relay.is_some()
+            || self.pty_manager.has_active_sessions()
+            || self.session_token.is_some()
     }
 
     /// Main loop: read requests from `input`, write responses to `output`.
     pub async fn run<R, W>(&mut self, input: R, output: W) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        self.run_cancellable(input, output, tokio_util::sync::CancellationToken::new()).await
+    }
+
+    /// Main loop with external cancellation support.
+    /// When `cancel` fires, the agent breaks out immediately (used for UDS takeover).
+    pub async fn run_cancellable<R, W>(
+        &mut self,
+        input: R,
+        output: W,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -108,80 +193,42 @@ impl Agent {
         let (mut reader, writer) = codec.into_parts();
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
-        // Move ring buffer into Arc<Mutex<>> for sharing with tasks
-        let ring_buffer = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
-            &mut self.ring_buffer,
-            RingBuffer::new(0),
-        )));
-
-        let next_seq = Arc::new(AtomicU64::new(self.next_seq));
+        let ring_buffer = self.ring_buffer.clone();
+        let next_seq = self.next_seq.clone();
         let credits = self.credits.clone();
         let kernel_tx = self.kernel.lock().await.event_sender().clone();
 
         // =====================================================================
-        // Event pipeline: collector → event_queue → sender (assigns seq inside
-        // writer lock to guarantee wire order = seq order)
+        // Wire sender: reads pre-encoded events from bg_collector via wire_rx,
+        // acquires flow-control credits, and writes to the transport.
+        // The bg_collector (persistent) handles seq assignment + ring buffer.
         // =====================================================================
 
-        let (event_queue_tx, mut event_queue_rx) = mpsc::unbounded_channel::<ShellEvent>();
-
-        // Collector: reads kernel events, pushes to unbounded channel
-        let mut event_rx = kernel_tx.subscribe();
-        let collector_task = tokio::spawn(async move {
-            loop {
-                match event_rx.recv().await {
-                    Ok(event) => {
-                        let _ = event_queue_tx.send(event);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("event forwarder lagged by {n} events");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-
-        // Sender: pops events, acquires credits, assigns seq inside writer lock
         let event_writer = writer.clone();
-        let sender_next_seq = next_seq.clone();
-        let sender_ring = ring_buffer.clone();
         let sender_credits = credits.clone();
+        // Take wire_rx for this run; it will be recreated if needed
+        let mut wire_rx = self.wire_rx.take()
+            .expect("wire_rx should be available at start of run()");
 
         let sender_task = tokio::spawn(async move {
-            while let Some(event) = event_queue_rx.recv().await {
-                // Encode with placeholder seq to estimate size for credit acquisition.
-                // The real seq is assigned inside the writer lock below.
-                let size_est = {
-                    let placeholder = Response::Event {
-                        seq: 0,
-                        event: event.clone(),
-                    };
-                    match encode_payload(&placeholder) {
-                        Ok(bytes) => bytes.len(),
-                        Err(_) => continue,
-                    }
-                };
-
-                // Acquire credits outside lock (avoids holding lock while blocked)
-                match sender_credits.acquire_many(size_est.max(1) as u32).await {
+            while let Some((_seq, payload)) = wire_rx.recv().await {
+                // Acquire credits — wait briefly, then skip wire write if none available
+                let size_est = payload.len();
+                match sender_credits.try_acquire_many(size_est.max(1) as u32) {
                     Ok(permit) => permit.forget(),
-                    Err(_) => return, // semaphore closed
-                }
-
-                // Lock writer → assign seq → encode → push to ring buffer → write
-                let mut w = event_writer.lock().await;
-                let seq = sender_next_seq.fetch_add(1, Ordering::Relaxed);
-                let resp = Response::Event { seq, event };
-                let payload = match encode_payload(&resp) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::warn!("failed to encode event: {e}");
-                        continue;
+                    Err(tokio::sync::TryAcquireError::Closed) => return,
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        match tokio::time::timeout(
+                            Duration::from_millis(500),
+                            sender_credits.acquire_many(size_est.max(1) as u32),
+                        ).await {
+                            Ok(Ok(permit)) => permit.forget(),
+                            Ok(Err(_)) => return,
+                            Err(_) => continue, // skip this frame on wire, it's in ring buffer
+                        }
                     }
-                };
-                {
-                    sender_ring.lock().await.push_raw(seq, payload.clone());
                 }
+                let mut w = event_writer.lock().await;
                 if w.write_raw_flagged(&payload, priority::INTERACTIVE, FLAG_EVENT)
                     .await
                     .is_err()
@@ -207,13 +254,14 @@ impl Agent {
                     &mut self.viewport_rows,
                     &self.kernel,
                     &self.instance_id,
+                    &cancel,
                 )
                 .await;
 
                 match exit {
                     RelayExit::ChildLost(reason) => {
                         tracing::info!("child lost: {reason}");
-                        active_relay.cleanup().await;
+                        active_relay.cleanup(&self.pty_manager.tokio_pids()).await;
                         // Fall through to normal dispatch
                     }
                     RelayExit::ParentDisconnected => {
@@ -222,24 +270,47 @@ impl Agent {
                         break;
                     }
                     RelayExit::Shutdown => {
-                        active_relay.cleanup().await;
+                        active_relay.cleanup(&self.pty_manager.tokio_pids()).await;
                         break;
                     }
                 }
                 continue;
             }
 
-            let request: Request = match reader.read().await {
-                Ok(req) => req,
-                Err(nexus_protocol::codec::CodecError::ConnectionClosed) => {
+            // Read with timeout and cancellation support.
+            // - 120s timeout: detects dead TCP without waiting for kernel keepalive
+            // - cancel token: allows UDS takeover to interrupt immediately
+            let request: Request = match tokio::select! {
+                result = tokio::time::timeout(Duration::from_secs(120), reader.read()) => result,
+                _ = cancel.cancelled() => {
+                    tracing::info!("connection cancelled (UDS takeover)");
+                    break;
+                }
+            } {
+                Ok(Ok(req)) => req,
+                Ok(Err(nexus_protocol::codec::CodecError::ConnectionClosed)) => {
                     tracing::info!("client disconnected");
                     break;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!("read error: {e}");
                     break;
                 }
+                Err(_) => {
+                    tracing::info!("read timeout (120s), assuming dead connection");
+                    break;
+                }
             };
+
+            // Macro to handle write results: treat errors as connection loss → break
+            macro_rules! try_write {
+                ($expr:expr) => {
+                    if $expr.await.is_err() {
+                        tracing::info!("write failed, client disconnected");
+                        break;
+                    }
+                };
+            }
 
             match request {
                 Request::Hello {
@@ -247,7 +318,9 @@ impl Agent {
                     capabilities: _,
                     forwarded_env,
                 } => {
-                    self.handle_hello(forwarded_env, &writer).await?;
+                    if self.handle_hello(forwarded_env, &writer).await.is_err() {
+                        break;
+                    }
                 }
 
                 Request::Execute {
@@ -259,16 +332,21 @@ impl Agent {
                 }
 
                 Request::Classify { id, command } => {
-                    self.handle_classify(id, &command, &writer).await?;
+                    if self.handle_classify(id, &command, &writer).await.is_err() {
+                        break;
+                    }
                 }
 
                 Request::Complete { id, input, cursor } => {
-                    self.handle_complete(id, &input, cursor, &writer).await?;
+                    if self.handle_complete(id, &input, cursor, &writer).await.is_err() {
+                        break;
+                    }
                 }
 
                 Request::SearchHistory { id, query, limit } => {
-                    self.handle_search_history(id, &query, limit, &writer)
-                        .await?;
+                    if self.handle_search_history(id, &query, limit, &writer).await.is_err() {
+                        break;
+                    }
                 }
 
                 Request::CancelBlock { id: _, block_id } => {
@@ -295,7 +373,7 @@ impl Agent {
                             message: format!("PTY spawn failed: {e}"),
                         };
                         let mut w = writer.lock().await;
-                        w.write(&resp, resp.priority()).await?;
+                        try_write!(w.write(&resp, resp.priority()));
                     }
                 }
 
@@ -400,8 +478,9 @@ impl Agent {
                     offset,
                     data,
                 } => {
-                    self.handle_file_write(id, &path, offset, &data, &writer)
-                        .await?;
+                    if self.handle_file_write(id, &path, offset, &data, &writer).await.is_err() {
+                        break;
+                    }
                 }
 
                 Request::Nest {
@@ -411,6 +490,10 @@ impl Agent {
                 } => {
                     match relay::spawn_and_handshake(&transport, self.forwarded_env.clone()).await {
                         Ok((child_reader, child_writer, child, env)) => {
+                            // Register relay child PID as Tokio-managed
+                            if let Some(pid) = child.id() {
+                                self.pty_manager.tokio_pids().lock().unwrap().insert(pid);
+                            }
                             let (reader_task, child_lost_rx) = relay::start_relay_reader(
                                 child_reader,
                                 writer.clone(),
@@ -426,7 +509,7 @@ impl Agent {
                             });
                             let resp = Response::NestOk { id, env };
                             let mut w = writer.lock().await;
-                            w.write(&resp, resp.priority()).await?;
+                            try_write!(w.write(&resp, resp.priority()));
                             // Next iteration enters relay mode
                         }
                         Err(e) => {
@@ -435,7 +518,7 @@ impl Agent {
                                 message: format!("Nest failed: {e}"),
                             };
                             let mut w = writer.lock().await;
-                            w.write(&resp, resp.priority()).await?;
+                            try_write!(w.write(&resp, resp.priority()));
                         }
                     }
                 }
@@ -444,6 +527,7 @@ impl Agent {
                     // Leaf node: shut down cleanly.
                     // Parent detects child pipe EOF → sends ChildLost to its parent.
                     self.pty_manager.shutdown_all();
+                    self.session_token = None;
                     break;
                 }
 
@@ -454,31 +538,41 @@ impl Agent {
                 Request::Ping { seq } => {
                     let resp = Response::Pong { seq };
                     let mut w = writer.lock().await;
-                    w.write(&resp, priority::CONTROL).await?;
+                    try_write!(w.write(&resp, priority::CONTROL));
                 }
 
                 Request::Resume {
                     session_token,
                     last_seen_seq,
+                    cols,
+                    rows,
                 } => {
-                    self.handle_resume(session_token, last_seen_seq, &writer, &ring_buffer, &next_seq)
-                        .await?;
+                    if self.handle_resume(session_token, last_seen_seq, cols, rows, &writer, &ring_buffer, &next_seq)
+                        .await.is_err() {
+                        break;
+                    }
                 }
 
                 Request::Shutdown => {
                     tracing::info!("received shutdown request");
                     self.pty_manager.shutdown_all();
+                    // Clear session token so we don't persist after clean shutdown
+                    self.session_token = None;
                     break;
                 }
             }
         }
 
-        collector_task.abort();
+        // Abort the sender task (it only writes to the wire)
         sender_task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), sender_task).await;
 
-        // Save ring buffer and seq counter for next run() call
-        self.ring_buffer = ring_buffer.lock().await.take();
-        self.next_seq = next_seq.load(Ordering::Relaxed);
+        // Recreate the wire channel for the next run() call.
+        // Swap the sender in the bg_collector's shared Arc so new events
+        // go to the new receiver.
+        let (new_tx, new_rx) = mpsc::unbounded_channel();
+        *self.bg_wire_tx.lock().unwrap() = new_tx;
+        self.wire_rx = Some(new_rx);
 
         Ok(())
     }
@@ -497,6 +591,7 @@ impl Agent {
         viewport_rows: &mut u16,
         kernel: &Arc<Mutex<Kernel>>,
         instance_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> RelayExit
     where
         R: AsyncRead + Unpin,
@@ -506,15 +601,23 @@ impl Agent {
 
         loop {
             tokio::select! {
-                result = reader.read_raw(&mut buf) => {
+                _ = cancel.cancelled() => {
+                    tracing::info!("relay cancelled (UDS takeover)");
+                    return RelayExit::ParentDisconnected;
+                }
+                result = tokio::time::timeout(Duration::from_secs(120), reader.read_raw(&mut buf)) => {
                     let (req_priority, _flags) = match result {
-                        Ok(pf) => pf,
-                        Err(nexus_protocol::codec::CodecError::ConnectionClosed) => {
+                        Ok(Ok(pf)) => pf,
+                        Ok(Err(nexus_protocol::codec::CodecError::ConnectionClosed)) => {
                             tracing::info!("parent disconnected during relay");
                             return RelayExit::ParentDisconnected;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!("relay read error: {e}");
+                            return RelayExit::ParentDisconnected;
+                        }
+                        Err(_) => {
+                            tracing::info!("relay read timeout (120s), assuming dead connection");
                             return RelayExit::ParentDisconnected;
                         }
                     };
@@ -584,6 +687,7 @@ impl Agent {
         }
     }
 
+    /// Returns Err only on write failure (connection lost).
     async fn handle_hello<W: AsyncWrite + Unpin + Send>(
         &mut self,
         forwarded_env: HashMap<String, String>,
@@ -618,14 +722,15 @@ impl Agent {
         };
 
         let mut w = writer.lock().await;
-        w.write(&resp, resp.priority()).await?;
-        Ok(())
+        w.write(&resp, resp.priority()).await.map_err(|e| anyhow::anyhow!(e))
     }
 
     async fn handle_resume<W: AsyncWrite + Unpin + Send>(
         &mut self,
         session_token: [u8; 16],
         last_seen_seq: u64,
+        cols: u16,
+        rows: u16,
         writer: &Arc<tokio::sync::Mutex<FrameWriter<W>>>,
         ring_buffer: &Arc<tokio::sync::Mutex<RingBuffer>>,
         next_seq: &Arc<AtomicU64>,
@@ -641,10 +746,35 @@ impl Agent {
             return Ok(());
         }
 
-        // Replay buffered events since last_seen_seq using raw writes
+        // Resize all active PTYs to the client's current terminal dimensions.
+        // The window may have been resized while disconnected — this triggers
+        // SIGWINCH so remote processes (vim, top, etc.) adapt immediately.
+        if cols > 0 && rows > 0 {
+            self.viewport_cols = cols;
+            self.viewport_rows = rows;
+            for &block_id in &self.pty_manager.active_block_ids() {
+                let _ = self.pty_manager.resize(block_id, cols, rows);
+            }
+        }
+
+        // Replay buffered events since last_seen_seq using raw writes.
+        // Detect if the ring buffer has overflowed (events were lost).
+        let events_lost;
         {
             let rb = ring_buffer.lock().await;
+            let oldest = rb.oldest_seq();
+            events_lost = last_seen_seq > 0 && oldest > 0 && last_seen_seq < oldest;
+            if events_lost {
+                tracing::warn!(
+                    "ring buffer overrun: client at seq {last_seen_seq}, oldest buffered is {oldest}"
+                );
+            }
             let frames = rb.replay_since(last_seen_seq);
+            tracing::debug!(
+                "resume replay: last_seen_seq={last_seen_seq}, oldest={}, frames={}",
+                rb.oldest_seq(),
+                frames.len()
+            );
             let mut w = writer.lock().await;
             for payload in frames {
                 let _ = w
@@ -695,12 +825,13 @@ impl Agent {
             }
         }
 
-        // Send session state
+        // Send session state (with gap warning if ring buffer overflowed)
         let env = self.collect_env_info().await;
         let resp = Response::SessionState {
             token: session_token,
             env,
             active_blocks,
+            events_lost,
         };
         let mut w = writer.lock().await;
         w.write(&resp, resp.priority()).await?;

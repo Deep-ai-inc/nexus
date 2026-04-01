@@ -52,6 +52,7 @@ pub enum NexusMessage {
     RemoteReconnected {
         request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
         rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        last_pong_at: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
         response_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<nexus_protocol::messages::Response>>>>,
         env: nexus_protocol::messages::EnvInfo,
@@ -63,6 +64,7 @@ pub enum NexusMessage {
     RemoteResumed {
         request_tx: tokio::sync::mpsc::UnboundedSender<crate::features::shell::remote::RequestEnvelope>,
         rtt_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        last_pong_at: std::sync::Arc<std::sync::atomic::AtomicU64>,
         last_seen_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
         response_rx: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<nexus_protocol::messages::Response>>>>,
         env: nexus_protocol::messages::EnvInfo,

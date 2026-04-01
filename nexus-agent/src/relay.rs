@@ -42,7 +42,11 @@ pub(crate) struct ActiveRelay {
 
 impl ActiveRelay {
     /// Clean up the relay: kill the child and abort the reader task.
-    pub async fn cleanup(mut self) {
+    /// Unregisters the child PID from the Tokio-managed set.
+    pub async fn cleanup(mut self, tokio_pids: &std::sync::Mutex<std::collections::HashSet<u32>>) {
+        if let Some(pid) = self.child.id() {
+            tokio_pids.lock().unwrap().remove(&pid);
+        }
         self.reader_task.abort();
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;

@@ -39,6 +39,7 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
     request_tx: mpsc::UnboundedSender<RequestEnvelope>,
     ping_timestamps: Arc<Mutex<HashMap<u64, Instant>>>,
     rtt_ms: Arc<AtomicU64>,
+    last_pong_at: Arc<AtomicU64>,
     last_seen_seq: Arc<AtomicU64>,
 ) {
     let mut bytes_since_grant: u64 = 0;
@@ -89,6 +90,12 @@ pub(crate) async fn run<R: AsyncRead + Unpin>(
                     let elapsed = sent_at.elapsed().as_millis() as u64;
                     rtt_ms.store(elapsed, Ordering::Relaxed);
                 }
+                // Record when we last heard from the agent (for stale connection detection)
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                last_pong_at.store(now_ms, Ordering::Relaxed);
             }
             Response::ChildLost {
                 reason,

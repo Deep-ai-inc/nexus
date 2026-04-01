@@ -1,0 +1,22 @@
+# Test infrastructure for Nexus SSH integration tests.
+#
+# Usage:
+#   cd tests/docker
+#   ./setup.sh          # generates test key + builds image
+#   docker compose up -d
+#   cargo test --test osc_integration
+#   docker compose down
+
+services:
+  sshd:
+    build:
+      context: .
+      dockerfile: Dockerfile.sshd
+    ports:
+      - "2222:22"
+    # Health check so tests can wait for sshd readiness
+    healthcheck:
+      test: ["CMD", "ssh-keyscan", "-p", "22", "localhost"]
+      interval: 1s
+      timeout: 2s
+      retries: 10

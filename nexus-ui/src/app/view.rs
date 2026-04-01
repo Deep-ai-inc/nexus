@@ -35,6 +35,9 @@ impl NexusState {
         // Breadcrumb bar (when connected to a remote)
         if let Some(ref remote) = self.remote {
             let rtt = remote.current_rtt_ms();
+            let attempt = self.reconnect_attempt.load(std::sync::atomic::Ordering::Relaxed);
+            let reconnect_attempt = if attempt > 0 { Some((attempt, 20)) } else { None };
+            let restored_secs = self.session_restored_at.map(|t| t.elapsed().as_secs_f32());
             col = col.push(crate::ui::widgets::BreadcrumbBar {
                 local_host: "local",
                 stack: &remote.backend_stack,
@@ -43,6 +46,8 @@ impl NexusState {
                 rtt_ms: if rtt > 0 { Some(rtt) } else { None },
                 unnesting_to: None,
                 confirm_active: self.disconnect_confirm.is_some(),
+                reconnect_attempt,
+                restored_secs,
             });
         }
 

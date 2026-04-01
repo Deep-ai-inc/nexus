@@ -30,6 +30,12 @@ use tokio::task::JoinHandle;
 pub(crate) struct PtyManager {
     /// Active PTY sessions indexed by block ID.
     sessions: HashMap<BlockId, PtySession>,
+    /// PIDs being waited on by Tokio. Shared with the zombie reaper so it
+    /// knows which PIDs to skip (reaping them would steal the exit status).
+    tokio_pids: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    /// Exit statuses reaped by the zombie reaper before Tokio's waiter could
+    /// collect them. When Tokio gets ECHILD, it looks here for the real code.
+    reaped_statuses: Arc<std::sync::Mutex<HashMap<u32, i32>>>,
 }
 
 /// Request types the reader task services between reads.
@@ -178,7 +184,21 @@ impl PtyManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            tokio_pids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            reaped_statuses: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Returns a handle to the set of PIDs managed by Tokio's child waiter.
+    /// Shared with the zombie reaper to avoid stealing exit statuses.
+    pub fn tokio_pids(&self) -> Arc<std::sync::Mutex<std::collections::HashSet<u32>>> {
+        self.tokio_pids.clone()
+    }
+
+    /// Exit statuses captured by the zombie reaper. When Tokio's waiter gets
+    /// ECHILD (because the reaper already reaped the PID), it checks here.
+    pub fn reaped_statuses(&self) -> Arc<std::sync::Mutex<HashMap<u32, i32>>> {
+        self.reaped_statuses.clone()
     }
 
     /// Spawn a new PTY session.
@@ -288,11 +308,19 @@ impl PtyManager {
             reader_epoch,
         ));
 
-        // 9. Spawn waiter task: wait for child exit and send CommandFinished
+        // 9. Register PID as Tokio-managed (zombie reaper must not touch it)
+        self.tokio_pids.lock().unwrap().insert(child_pid);
+
+        // 10. Spawn waiter task: wait for child exit and send CommandFinished
         let tx = kernel_tx.clone();
         let waiter_block_id = block_id;
+        let waiter_tokio_pids = self.tokio_pids.clone();
+        let waiter_reaped = self.reaped_statuses.clone();
+        let waiter_child_pid = child_pid;
         let waiter_handle = tokio::spawn(async move {
             let status = child.wait().await;
+            // Unregister — zombie reaper can now safely reap this PID if needed
+            waiter_tokio_pids.lock().unwrap().remove(&waiter_child_pid);
             let (exit_code, duration_ms) = match status {
                 Ok(s) => {
                     let code = s.code().unwrap_or(-1);
@@ -300,8 +328,15 @@ impl PtyManager {
                     (code, dur)
                 }
                 Err(e) => {
-                    tracing::warn!("wait error: {e}");
-                    (-1, start_time.elapsed().as_millis() as u64)
+                    // ECHILD means the zombie reaper already reaped this PID.
+                    // Check the saved exit status rather than defaulting to -1.
+                    let code = waiter_reaped.lock().unwrap()
+                        .remove(&waiter_child_pid)
+                        .unwrap_or_else(|| {
+                            tracing::warn!("wait error for pid {waiter_child_pid}: {e}");
+                            -1
+                        });
+                    (code, start_time.elapsed().as_millis() as u64)
                 }
             };
             let _ = tx.send(ShellEvent::CommandFinished {
@@ -420,6 +455,7 @@ impl PtyManager {
     pub fn has_active_sessions(&self) -> bool {
         !self.sessions.is_empty()
     }
+
 
     /// Request a terminal snapshot from the reader task (lock-free).
     /// Returns None if the session doesn't exist or the reader task has exited.

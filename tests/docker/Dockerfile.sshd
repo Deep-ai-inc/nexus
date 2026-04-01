@@ -1,0 +1,23 @@
+# Minimal sshd container for integration testing Nexus SSH transport.
+# Accepts key-based auth only; no password, no PAM.
+#
+# Build:  docker build -t nexus-test-sshd -f Dockerfile.sshd .
+# Run:    docker run -d -p 2222:22 nexus-test-sshd
+FROM alpine:3.19
+
+RUN apk add --no-cache openssh-server bash coreutils \
+    && ssh-keygen -A \
+    && mkdir -p /root/.ssh \
+    && chmod 700 /root/.ssh \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && echo "StrictModes no" >> /etc/ssh/sshd_config
+
+# The test key is generated at build time and copied out by the test harness.
+# Alternatively, mount a key at runtime.
+COPY test_key.pub /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys
+
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]
