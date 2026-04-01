@@ -79,7 +79,8 @@ pub(crate) enum ConnectionState {
 /// Not `Clone` because it contains oneshot channels for pending requests.
 pub(crate) struct RemoteBackend {
     /// Channel to send requests to the transport task.
-    request_tx: mpsc::UnboundedSender<Request>,
+    /// Wraps the raw channel with PTY input buffering for reconnection resilience.
+    request_tx: nexus_client::RequestSender,
     /// Remote environment info from the last HelloOk.
     pub env: EnvInfo,
     /// Last seen sequence number (for resume), shared with event bridge.
@@ -99,6 +100,8 @@ pub(crate) struct RemoteBackend {
     /// Timestamp of the last received Pong (shared with event bridge).
     /// Used to detect stale connections where SSH is alive but data isn't flowing.
     pub last_pong_at: Arc<AtomicU64>,
+    /// Highest echo epoch confirmed by the agent (shared with event bridge).
+    pub(crate) last_confirmed_epoch: Arc<AtomicU64>,
     /// Receiver for non-event responses from the event bridge.
     pub(crate) response_rx: mpsc::UnboundedReceiver<Response>,
     /// The SSH/docker/kubectl child process (owned for lifecycle management).
@@ -150,10 +153,11 @@ impl RemoteBackend {
     /// Create a new remote backend from an established transport.
     pub fn new(
         env: EnvInfo,
-        request_tx: mpsc::UnboundedSender<Request>,
+        request_tx: nexus_client::RequestSender,
         rtt_ms: Arc<AtomicU64>,
         last_pong_at: Arc<AtomicU64>,
         last_seen_seq: Arc<AtomicU64>,
+        last_confirmed_epoch: Arc<AtomicU64>,
         response_rx: mpsc::UnboundedReceiver<Response>,
         child: Option<tokio::process::Child>,
         transport: Transport,
@@ -171,6 +175,7 @@ impl RemoteBackend {
             pending_queue: Vec::new(),
             rtt_ms,
             last_pong_at,
+            last_confirmed_epoch,
             response_rx,
             child,
             transport,
@@ -240,7 +245,7 @@ impl RemoteBackend {
     ///
     /// If the transport channel is closed, transitions to `Disconnected`.
     pub fn send(&mut self, request: Request) {
-        if self.request_tx.send(request).is_err() {
+        if !self.request_tx.send(request) {
             self.state = ConnectionState::Disconnected;
         }
     }
@@ -493,11 +498,7 @@ impl RemoteBackend {
 
         // Send the first chunk immediately so small writes don't wait a tick.
         if let Some(first) = envelopes.first() {
-            if self
-                .request_tx
-                .send(first.clone())
-                .is_err()
-            {
+            if !self.request_tx.send(first.clone()) {
                 self.state = ConnectionState::Disconnected;
                 return rx;
             }
@@ -505,7 +506,7 @@ impl RemoteBackend {
 
         // Remaining chunks are sent from a background task with yielding.
         if envelopes.len() > 1 {
-            let sender = self.request_tx.clone();
+            let sender = self.request_tx.inner().clone();
             let remaining: Vec<Request> = envelopes.into_iter().skip(1).collect();
             tokio::spawn(async move {
                 for envelope in remaining {
@@ -684,8 +685,10 @@ impl RemoteBackend {
     }
 
     /// Swap the request channel to a new transport (after reconnection).
-    pub fn swap_request_tx(&mut self, new_tx: mpsc::UnboundedSender<Request>) {
-        self.request_tx = new_tx;
+    pub fn swap_request_tx(&mut self, new_tx: nexus_client::RequestSender) {
+        let confirmed = self.last_confirmed_epoch.load(Ordering::Relaxed);
+        // swap_transport prunes confirmed inputs, then replays unconfirmed ones
+        self.request_tx.swap_transport(new_tx.into_inner(), confirmed);
     }
 
     /// Replace the child process (after reconnection).

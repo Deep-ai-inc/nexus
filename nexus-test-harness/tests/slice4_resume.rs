@@ -251,3 +251,65 @@ async fn resume_after_server_side_blackhole() {
     assert!(output.contains("blackhole-survived"), "output: {output:?}");
     assert_eq!(exit_code, Some(0));
 }
+
+/// Proves the bug: PTY input sent just before SSH dies is lost.
+///
+/// Scenario: user types into a PTY, then WiFi drops. The input is in the
+/// transport channel but the writer task can't push it over the dead SSH pipe.
+/// On reconnect, that input is gone — the user's keystrokes vanish.
+///
+/// This test sends input to a `cat` PTY, kills SSH immediately after, resumes,
+/// and checks whether `cat` echoed the input back. Without the fix, it won't.
+#[tokio::test]
+async fn pty_input_during_disconnect_survives_reconnect() {
+    let mut env = TestEnv::start().await.expect("failed to start test env");
+    let mut client = TestClient::connect(&env).await.expect("connect failed");
+
+    // Spawn a PTY running cat (echoes stdin back to stdout)
+    let pty_block = BlockId(50);
+    client.spawn_pty("cat", pty_block, 80, 24);
+
+    // Wait for PTY to be ready
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let instance_id = client.instance_id().to_string();
+    let session_token = client.session_token;
+    let last_seq = client.last_seen_seq_value();
+
+    // Send PTY input THEN immediately kill SSH — simulates typing right
+    // after WiFi drops but before the client detects the dead connection.
+    // The input goes into the request channel but the writer task can't
+    // push it to the dead SSH pipe before we kill the process.
+    client.pty_input(pty_block, b"TYPED_DURING_DISCONNECT\n");
+    client.kill_ssh();
+
+    // Take the RequestSender — carries unconfirmed inputs across reconnection
+    let sender = client.take_request_sender();
+
+    // Wait for agent to detect disconnect and bind UDS
+    poll_until("UDS socket exists", Duration::from_secs(10), || {
+        let net = env.network.clone();
+        let id = instance_id.clone();
+        async move { net.agent_socket_exists(&id).await }
+    })
+    .await;
+
+    // Resume with the RequestSender — unconfirmed inputs are replayed automatically via swap_transport
+    let mut client2 =
+        TestClient::resume_with_sender(&env, &instance_id, session_token, last_seq, Some(sender))
+            .await
+            .expect("resume failed");
+
+    // cat should echo it back (from the replayed input)
+    let found = client2
+        .wait_for_event(Duration::from_secs(5), |ev| {
+            matches!(ev, nexus_api::ShellEvent::StdoutChunk { block_id, data, .. }
+                if *block_id == pty_block && String::from_utf8_lossy(data).contains("TYPED_DURING_DISCONNECT"))
+        })
+        .await;
+
+    assert!(
+        found.is_some(),
+        "PTY input typed during disconnect should appear after reconnect"
+    );
+}

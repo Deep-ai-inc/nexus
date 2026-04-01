@@ -35,6 +35,7 @@ pub async fn run<R: AsyncRead + Unpin>(
     rtt_ms: Arc<AtomicU64>,
     last_pong_at: Arc<AtomicU64>,
     last_seen_seq: Arc<AtomicU64>,
+    last_confirmed_epoch: Arc<AtomicU64>,
 ) {
     let mut bytes_since_grant: u64 = 0;
 
@@ -73,6 +74,12 @@ pub async fn run<R: AsyncRead + Unpin>(
                     continue;
                 }
                 last_seen_seq.store(seq, Ordering::Relaxed);
+                // Track confirmed echo epoch for input buffer pruning
+                if let ShellEvent::StdoutChunk { last_echo_epoch, .. } = &event {
+                    if *last_echo_epoch > 0 {
+                        last_confirmed_epoch.fetch_max(*last_echo_epoch, Ordering::Relaxed);
+                    }
+                }
                 let _ = kernel_tx.send(event);
             }
             Response::Pong { seq } => {

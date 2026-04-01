@@ -17,6 +17,8 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use nexus_api::ShellEvent;
 
+use crate::RequestSender;
+
 /// Handle to the remote transport (child process + codec).
 pub struct TransportHandle {
     /// The child process (SSH/Docker/kubectl).
@@ -27,6 +29,8 @@ pub struct TransportHandle {
     pub last_pong_at: Arc<AtomicU64>,
     /// Last seen event sequence number from the agent.
     pub last_seen_seq: Arc<AtomicU64>,
+    /// Highest echo epoch confirmed by the agent (from StdoutChunk).
+    pub last_confirmed_epoch: Arc<AtomicU64>,
     /// Receiver for non-event responses (ClassifyResult, CompleteResult, etc.)
     pub response_rx: mpsc::UnboundedReceiver<Response>,
 }
@@ -38,7 +42,7 @@ impl TransportHandle {
         agent_path: &str,
         forwarded_env: HashMap<String, String>,
         kernel_tx: broadcast::Sender<ShellEvent>,
-    ) -> Result<(Self, EnvInfo, [u8; 16], mpsc::UnboundedSender<Request>)> {
+    ) -> Result<(Self, EnvInfo, [u8; 16], RequestSender)> {
         let mut child = Self::spawn_child(transport, agent_path)?;
 
         let stdin = child
@@ -53,7 +57,7 @@ impl TransportHandle {
         let codec = FrameCodec::new(stdout, stdin);
         let (reader, writer) = codec.into_parts();
 
-        let (env, session_token, _caps, request_tx, rtt_ms, last_pong_at, last_seen_seq, response_rx) =
+        let (env, session_token, _caps, raw_tx, rtt_ms, last_pong_at, last_seen_seq, last_confirmed_epoch, response_rx) =
             Self::handshake(reader, writer, forwarded_env, kernel_tx).await?;
 
         Ok((
@@ -62,11 +66,12 @@ impl TransportHandle {
                 rtt_ms,
                 last_pong_at,
                 last_seen_seq,
+                last_confirmed_epoch,
                 response_rx,
             },
             env,
             session_token,
-            request_tx,
+            RequestSender::new(raw_tx),
         ))
     }
 
@@ -87,7 +92,7 @@ impl TransportHandle {
         cols: u16,
         rows: u16,
         kernel_tx: broadcast::Sender<ShellEvent>,
-    ) -> Result<(Self, EnvInfo, mpsc::UnboundedSender<Request>)> {
+    ) -> Result<(Self, EnvInfo, RequestSender)> {
         let mut child = Self::spawn_child_with_args(
             transport,
             agent_path,
@@ -108,7 +113,7 @@ impl TransportHandle {
         let codec = FrameCodec::new(stdout, stdin);
         let (reader, writer) = codec.into_parts();
 
-        let (env, request_tx, rtt_ms, last_pong_at, last_seen_seq_arc, response_rx) =
+        let (env, raw_tx, rtt_ms, last_pong_at, last_seen_seq_arc, last_confirmed_epoch, response_rx) =
             Self::resume_handshake(
                 reader,
                 writer,
@@ -126,10 +131,11 @@ impl TransportHandle {
                 rtt_ms,
                 last_pong_at,
                 last_seen_seq: last_seen_seq_arc,
+                last_confirmed_epoch,
                 response_rx,
             },
             env,
-            request_tx,
+            RequestSender::new(raw_tx),
         ))
     }
 
@@ -252,6 +258,7 @@ impl TransportHandle {
         Arc<AtomicU64>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
+        Arc<AtomicU64>,
         mpsc::UnboundedReceiver<Response>,
     )>
     where
@@ -297,7 +304,7 @@ impl TransportHandle {
             );
         }
 
-        let (request_tx, rtt_ms, last_pong_at, last_seen_seq_arc, response_rx) =
+        let (request_tx, rtt_ms, last_pong_at, last_seen_seq_arc, last_confirmed_epoch, response_rx) =
             Self::setup_bridge(reader, writer, kernel_tx);
 
         Ok((
@@ -306,6 +313,7 @@ impl TransportHandle {
             rtt_ms,
             last_pong_at,
             last_seen_seq_arc,
+            last_confirmed_epoch,
             response_rx,
         ))
     }
@@ -321,6 +329,7 @@ impl TransportHandle {
         [u8; 16],
         AgentCaps,
         mpsc::UnboundedSender<Request>,
+        Arc<AtomicU64>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
@@ -365,7 +374,7 @@ impl TransportHandle {
             }
         };
 
-        let (request_tx, rtt_ms, last_pong_at, last_seen_seq, response_rx) =
+        let (request_tx, rtt_ms, last_pong_at, last_seen_seq, last_confirmed_epoch, response_rx) =
             Self::setup_bridge(reader, writer, kernel_tx);
 
         Ok((
@@ -376,6 +385,7 @@ impl TransportHandle {
             rtt_ms,
             last_pong_at,
             last_seen_seq,
+            last_confirmed_epoch,
             response_rx,
         ))
     }
@@ -390,6 +400,7 @@ impl TransportHandle {
         Arc<AtomicU64>,
         Arc<AtomicU64>,
         Arc<AtomicU64>,
+        Arc<AtomicU64>,
         mpsc::UnboundedReceiver<Response>,
     )
     where
@@ -399,6 +410,7 @@ impl TransportHandle {
         let rtt_ms = Arc::new(AtomicU64::new(0));
         let last_pong_at = Arc::new(AtomicU64::new(0));
         let last_seen_seq = Arc::new(AtomicU64::new(0));
+        let last_confirmed_epoch = Arc::new(AtomicU64::new(0));
         let ping_timestamps: Arc<Mutex<HashMap<u64, Instant>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -422,6 +434,7 @@ impl TransportHandle {
         let bridge_rtt = rtt_ms.clone();
         let bridge_pong = last_pong_at.clone();
         let bridge_seq = last_seen_seq.clone();
+        let bridge_epoch = last_confirmed_epoch.clone();
         let bridge_timestamps = ping_timestamps.clone();
         let bridge_request_tx = request_tx.clone();
         tokio::spawn(async move {
@@ -434,6 +447,7 @@ impl TransportHandle {
                 bridge_rtt,
                 bridge_pong,
                 bridge_seq,
+                bridge_epoch,
             )
             .await;
         });
@@ -462,6 +476,6 @@ impl TransportHandle {
             }
         });
 
-        (request_tx, rtt_ms, last_pong_at, last_seen_seq, response_rx)
+        (request_tx, rtt_ms, last_pong_at, last_seen_seq, last_confirmed_epoch, response_rx)
     }
 }

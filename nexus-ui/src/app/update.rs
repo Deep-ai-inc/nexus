@@ -379,7 +379,8 @@ impl NexusState {
                 }
 
                 if let Some(ref mut remote) = self.remote {
-                    if let Some(rx) = response_rx.lock().unwrap().take() {
+                    let new_tx = request_tx.lock().unwrap().take();
+                    if let (Some(rx), Some(tx)) = (response_rx.lock().unwrap().take(), new_tx) {
                         // Take child from Arc<Mutex<Option<>>>
                         remote.set_child(child.lock().unwrap().take());
                         remote.session_token = session_token;
@@ -404,7 +405,7 @@ impl NexusState {
                             }
                             remote.backend_stack.clear();
                         }
-                        remote.swap_request_tx(request_tx);
+                        remote.swap_request_tx(tx);
                         remote.rtt_ms = rtt_ms;
                         remote.last_pong_at = last_pong_at;
                         remote.last_seen_seq = last_seen_seq;
@@ -436,9 +437,10 @@ impl NexusState {
                 // Seamless resume — the agent is the same process, all blocks are
                 // still running. Do NOT kill orphans or clear the backend stack.
                 if let Some(ref mut remote) = self.remote {
-                    if let Some(rx) = response_rx.lock().unwrap().take() {
+                    let new_tx = request_tx.lock().unwrap().take();
+                    if let (Some(rx), Some(tx)) = (response_rx.lock().unwrap().take(), new_tx) {
                         remote.set_child(child.lock().unwrap().take());
-                        remote.swap_request_tx(request_tx);
+                        remote.swap_request_tx(tx);
                         remote.rtt_ms = rtt_ms;
                         remote.last_pong_at = last_pong_at;
                         remote.last_seen_seq = last_seen_seq;
@@ -817,6 +819,7 @@ impl NexusState {
             handle.rtt_ms,
             handle.last_pong_at,
             handle.last_seen_seq,
+            handle.last_confirmed_epoch,
             handle.response_rx,
             Some(handle.child),
             transport.clone(),
@@ -1778,7 +1781,7 @@ async fn reconnect_loop(
             let response_rx =
                 std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
             NexusMessage::RemoteResumed {
-                request_tx,
+                request_tx: std::sync::Arc::new(std::sync::Mutex::new(Some(request_tx))),
                 rtt_ms: handle.rtt_ms,
                 last_pong_at: handle.last_pong_at,
                 last_seen_seq: handle.last_seen_seq,
@@ -1797,7 +1800,7 @@ async fn reconnect_loop(
             let response_rx =
                 std::sync::Arc::new(std::sync::Mutex::new(Some(handle.response_rx)));
             NexusMessage::RemoteReconnected {
-                request_tx,
+                request_tx: std::sync::Arc::new(std::sync::Mutex::new(Some(request_tx))),
                 rtt_ms: handle.rtt_ms,
                 last_pong_at: handle.last_pong_at,
                 last_seen_seq: handle.last_seen_seq,

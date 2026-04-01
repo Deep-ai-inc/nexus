@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use nexus_api::ShellEvent;
-use nexus_client::TransportHandle;
+use nexus_client::{RequestSender, TransportHandle};
 use nexus_protocol::messages::{EnvInfo, Request, Response, Transport};
 use tokio::sync::{broadcast, mpsc};
 
@@ -24,7 +24,8 @@ pub struct TestClient {
     pub rtt_ms: Arc<AtomicU64>,
     pub last_pong_at: Arc<AtomicU64>,
 
-    request_tx: mpsc::UnboundedSender<Request>,
+    request_tx: RequestSender,
+    last_confirmed_epoch: Arc<AtomicU64>,
     response_rx: mpsc::UnboundedReceiver<Response>,
     event_rx: broadcast::Receiver<ShellEvent>,
     kernel_tx: broadcast::Sender<ShellEvent>,
@@ -37,6 +38,7 @@ pub struct TestClient {
     agent_path: String,
 
     next_request_id: u32,
+    next_echo_epoch: u64,
 }
 
 impl TestClient {
@@ -59,6 +61,7 @@ impl TestClient {
             rtt_ms: handle.rtt_ms,
             last_pong_at: handle.last_pong_at,
             request_tx,
+            last_confirmed_epoch: handle.last_confirmed_epoch,
             response_rx: handle.response_rx,
             event_rx,
             kernel_tx,
@@ -66,6 +69,7 @@ impl TestClient {
             transport,
             agent_path,
             next_request_id: 1,
+            next_echo_epoch: 0,
         })
     }
 
@@ -76,13 +80,25 @@ impl TestClient {
         session_token: [u8; 16],
         last_seen_seq: u64,
     ) -> Result<Self> {
+        Self::resume_with_sender(env, instance_id, session_token, last_seen_seq, None).await
+    }
+
+    /// Resume with an optional RequestSender carried over from a previous client.
+    /// If provided, unconfirmed PTY inputs are replayed on the new transport via swap_transport.
+    pub async fn resume_with_sender(
+        env: &TestEnv,
+        instance_id: &str,
+        session_token: [u8; 16],
+        last_seen_seq: u64,
+        mut prev_sender: Option<RequestSender>,
+    ) -> Result<Self> {
         let transport = env.transport();
         let agent_path = env.agent_path().to_string();
         let (kernel_tx, _) = broadcast::channel::<ShellEvent>(256);
         // Subscribe before resume so we capture replay events sent during handshake
         let event_rx = kernel_tx.subscribe();
 
-        let (handle, env_info, request_tx) = TransportHandle::resume(
+        let (handle, env_info, new_request_tx) = TransportHandle::resume(
             &transport,
             &agent_path,
             Some(instance_id),
@@ -94,6 +110,15 @@ impl TestClient {
         )
         .await?;
 
+        // If we have a previous sender with buffered inputs, swap transport to replay them
+        let request_tx = if let Some(ref mut sender) = prev_sender {
+            let confirmed = handle.last_confirmed_epoch.load(Ordering::Relaxed);
+            sender.swap_transport(new_request_tx.into_inner(), confirmed);
+            prev_sender.take().unwrap()
+        } else {
+            new_request_tx
+        };
+
         Ok(Self {
             env: env_info,
             session_token,
@@ -101,6 +126,7 @@ impl TestClient {
             rtt_ms: handle.rtt_ms,
             last_pong_at: handle.last_pong_at,
             request_tx,
+            last_confirmed_epoch: handle.last_confirmed_epoch,
             response_rx: handle.response_rx,
             event_rx,
             kernel_tx,
@@ -108,6 +134,7 @@ impl TestClient {
             transport,
             agent_path,
             next_request_id: 1,
+            next_echo_epoch: 0,
         })
     }
 
@@ -166,6 +193,7 @@ impl TestClient {
             rtt_ms: handle.rtt_ms,
             last_pong_at: handle.last_pong_at,
             request_tx,
+            last_confirmed_epoch: handle.last_confirmed_epoch,
             response_rx: handle.response_rx,
             event_rx,
             kernel_tx,
@@ -173,7 +201,17 @@ impl TestClient {
             transport,
             agent_path,
             next_request_id: 1,
+            next_echo_epoch: 0,
         })
+    }
+
+    /// Take the RequestSender (for carrying across reconnections).
+    /// The sender holds buffered unconfirmed inputs that will be replayed on swap_transport.
+    pub fn take_request_sender(&mut self) -> RequestSender {
+        // Replace with a dummy sender (channel will be immediately closed, but that's fine
+        // since this client is about to be dropped)
+        let (dummy_tx, _) = mpsc::unbounded_channel();
+        std::mem::replace(&mut self.request_tx, RequestSender::new(dummy_tx))
     }
 
     /// Kill the SSH child process (simulates client-side disconnect).
@@ -215,7 +253,7 @@ impl TestClient {
 
     /// Send a request to the agent.
     pub fn send(&mut self, request: Request) {
-        let _ = self.request_tx.send(request);
+        self.request_tx.send(request);
     }
 
     /// Execute a command and return the block ID.
@@ -245,6 +283,17 @@ impl TestClient {
             rows,
             term: "xterm-256color".to_string(),
             cwd: "/home/testuser".to_string(),
+        });
+    }
+
+    /// Send input to a remote PTY (buffered for reconnect replay via RequestSender).
+    pub fn pty_input(&mut self, block_id: nexus_api::BlockId, data: &[u8]) {
+        self.next_echo_epoch += 1;
+        let epoch = self.next_echo_epoch;
+        self.request_tx.send(Request::PtyInput {
+            block_id,
+            data: data.to_vec(),
+            echo_epoch: epoch,
         });
     }
 

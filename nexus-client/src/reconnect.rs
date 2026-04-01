@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use nexus_api::ShellEvent;
-use nexus_protocol::messages::{EnvInfo, Request, Transport};
-use tokio::sync::{broadcast, mpsc};
+use nexus_protocol::messages::{EnvInfo, Transport};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::TransportHandle;
+use crate::{RequestSender, TransportHandle};
 
 /// Outcome of a successful reconnection attempt.
 pub enum ReconnectOutcome {
@@ -28,7 +28,7 @@ pub enum ReconnectOutcome {
     Resumed {
         handle: TransportHandle,
         env: EnvInfo,
-        request_tx: mpsc::UnboundedSender<Request>,
+        request_tx: RequestSender,
     },
     /// Fresh connection established (agent had restarted).
     /// The caller should perform orphan cleanup and stack clearing.
@@ -36,7 +36,7 @@ pub enum ReconnectOutcome {
         handle: TransportHandle,
         env: EnvInfo,
         session_token: [u8; 16],
-        request_tx: mpsc::UnboundedSender<Request>,
+        request_tx: RequestSender,
     },
 }
 
