@@ -92,6 +92,12 @@ fn main() {
         })
         .unwrap_or(7 * 24 * 3600); // 7 days default
 
+    // Parse read timeout (for dead connection detection)
+    let read_timeout_secs: u64 = std::env::var("NEXUS_AGENT_READ_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+
     // Ensure TERM is set — the agent is launched via `ssh host agent-path`
     // without a TTY, so TERM is unset. Child processes (top, vim, etc.) need it.
     if std::env::var("TERM").is_err() {
@@ -115,14 +121,14 @@ fn main() {
             tracing::error!("attach failed: {e}");
             process::exit(1);
         }
-    } else if let Err(e) = rt.block_on(run(idle_timeout_secs)) {
+    } else if let Err(e) = rt.block_on(run(idle_timeout_secs, read_timeout_secs)) {
         tracing::error!("agent exited with error: {e}");
         process::exit(1);
     }
 }
 
-async fn run(idle_timeout_secs: u64) -> Result<()> {
-    let mut agent = agent::Agent::new(idle_timeout_secs)?;
+async fn run(idle_timeout_secs: u64, read_timeout_secs: u64) -> Result<()> {
+    let mut agent = agent::Agent::new(idle_timeout_secs, read_timeout_secs)?;
 
     // Ensure ~/.nexus/ directory exists with restrictive permissions (0700).
     // UDS sockets grant unauthenticated access to terminal sessions — the
@@ -151,8 +157,12 @@ async fn run(idle_timeout_secs: u64) -> Result<()> {
     }
 
     // Spawn zombie reaper (needed because we set PR_SET_CHILD_SUBREAPER)
+    let reaper_interval_secs: u64 = std::env::var("NEXUS_AGENT_REAPER_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
     #[cfg(target_os = "linux")]
-    let _reaper = tokio::spawn(zombie_reaper(agent.tokio_pids(), agent.reaped_statuses()));
+    let _reaper = tokio::spawn(zombie_reaper(agent.tokio_pids(), agent.reaped_statuses(), reaper_interval_secs));
 
     // First connection: stdin/stdout (SSH pipe).
     // Concurrently accept UDS connections — if a new client arrives on the
@@ -320,9 +330,10 @@ async fn cleanup_stale_sockets(own_sock_path: &str) {
 async fn zombie_reaper(
     tokio_pids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     reaped_statuses: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, i32>>>,
+    interval_secs: u64,
 ) {
     loop {
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         loop {
             let mut status: i32 = 0;
             let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };

@@ -36,6 +36,8 @@ pub struct Agent {
     kernel: Arc<Mutex<Kernel>>,
     kernel_rx: broadcast::Receiver<ShellEvent>,
     idle_timeout_secs: u64,
+    /// Read timeout for client connections (seconds). Detects dead TCP.
+    read_timeout_secs: u64,
     /// Monotonically increasing sequence number for outbound events.
     next_seq: Arc<AtomicU64>,
     /// Ring buffer for session resume (always shared — events are collected
@@ -69,7 +71,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(idle_timeout_secs: u64) -> Result<Self> {
+    pub fn new(idle_timeout_secs: u64, read_timeout_secs: u64) -> Result<Self> {
         let (kernel, kernel_rx) = Kernel::new()?;
         let kernel = Arc::new(Mutex::new(kernel));
 
@@ -120,6 +122,7 @@ impl Agent {
             kernel,
             kernel_rx,
             idle_timeout_secs,
+            read_timeout_secs,
             next_seq,
             ring_buffer,
             bg_wire_tx,
@@ -255,6 +258,7 @@ impl Agent {
                     &self.kernel,
                     &self.instance_id,
                     &cancel,
+                    self.read_timeout_secs,
                 )
                 .await;
 
@@ -278,10 +282,10 @@ impl Agent {
             }
 
             // Read with timeout and cancellation support.
-            // - 120s timeout: detects dead TCP without waiting for kernel keepalive
+            // - read timeout: detects dead TCP without waiting for kernel keepalive
             // - cancel token: allows UDS takeover to interrupt immediately
             let request: Request = match tokio::select! {
-                result = tokio::time::timeout(Duration::from_secs(120), reader.read()) => result,
+                result = tokio::time::timeout(Duration::from_secs(self.read_timeout_secs), reader.read()) => result,
                 _ = cancel.cancelled() => {
                     tracing::info!("connection cancelled (UDS takeover)");
                     break;
@@ -297,7 +301,7 @@ impl Agent {
                     break;
                 }
                 Err(_) => {
-                    tracing::info!("read timeout (120s), assuming dead connection");
+                    tracing::info!("read timeout ({}s), assuming dead connection", self.read_timeout_secs);
                     break;
                 }
             };
@@ -592,6 +596,7 @@ impl Agent {
         kernel: &Arc<Mutex<Kernel>>,
         instance_id: &str,
         cancel: &tokio_util::sync::CancellationToken,
+        read_timeout_secs: u64,
     ) -> RelayExit
     where
         R: AsyncRead + Unpin,
@@ -605,7 +610,7 @@ impl Agent {
                     tracing::info!("relay cancelled (UDS takeover)");
                     return RelayExit::ParentDisconnected;
                 }
-                result = tokio::time::timeout(Duration::from_secs(120), reader.read_raw(&mut buf)) => {
+                result = tokio::time::timeout(Duration::from_secs(read_timeout_secs), reader.read_raw(&mut buf)) => {
                     let (req_priority, _flags) = match result {
                         Ok(Ok(pf)) => pf,
                         Ok(Err(nexus_protocol::codec::CodecError::ConnectionClosed)) => {
@@ -617,7 +622,7 @@ impl Agent {
                             return RelayExit::ParentDisconnected;
                         }
                         Err(_) => {
-                            tracing::info!("relay read timeout (120s), assuming dead connection");
+                            tracing::info!("relay read timeout ({read_timeout_secs}s), assuming dead connection");
                             return RelayExit::ParentDisconnected;
                         }
                     };

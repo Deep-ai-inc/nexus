@@ -136,6 +136,16 @@ impl TestEnv {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Set an environment variable in the container's testuser profile.
+    /// Takes effect on the next SSH session (agent startup).
+    pub async fn set_agent_env(&self, key: &str, value: &str) -> Result<()> {
+        self.docker_exec(&format!(
+            "echo 'export {key}={value}' >> /home/testuser/.bashrc"
+        ))
+        .await?;
+        Ok(())
+    }
+
     /// The remote path to the agent binary.
     pub fn agent_path(&self) -> &str {
         "/home/testuser/.nexus/nexus-agent"

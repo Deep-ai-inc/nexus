@@ -52,6 +52,40 @@ impl NetworkControl {
         Ok(())
     }
 
+    /// Degrade network with jitter: add latency ± jitter and optional packet loss.
+    pub async fn degrade_with_jitter(
+        &self,
+        delay_ms: u32,
+        jitter_ms: u32,
+        loss_pct: f32,
+    ) -> Result<()> {
+        self.exec(&format!(
+            "tc qdisc add dev eth0 root netem delay {delay_ms}ms {jitter_ms}ms loss {loss_pct}%"
+        ))
+        .await?;
+        Ok(())
+    }
+
+    /// Kill the agent process with SIGKILL (cannot be caught).
+    pub async fn kill_agent(&self) -> Result<()> {
+        // pkill returns 1 when no processes matched — use exec_ignore_status
+        let _ = tokio::process::Command::new("docker")
+            .args(["exec", &self.container_id, "sh", "-c", "pkill -9 -f nexus-agent"])
+            .output()
+            .await;
+        Ok(())
+    }
+
+    /// Count open file descriptors of the agent process (for leak detection).
+    /// Returns None if the agent is not running.
+    pub async fn agent_fd_count(&self) -> Option<usize> {
+        let output = self
+            .exec("ls /proc/$(pgrep -o -f nexus-agent)/fd 2>/dev/null | wc -l")
+            .await
+            .ok()?;
+        output.trim().parse().ok()
+    }
+
     /// Kill the sshd child process serving the test user.
     /// Simulates a clean server-side disconnect.
     pub async fn kill_sshd_session(&self) -> Result<()> {
@@ -89,6 +123,11 @@ impl NetworkControl {
         ))
         .await
         .map_or(false, |out| out.trim() == "yes")
+    }
+
+    /// Run a command inside the container (public, for tests that need custom checks).
+    pub async fn exec_raw(&self, cmd: &str) -> Result<String> {
+        self.exec(cmd).await
     }
 
     async fn exec(&self, cmd: &str) -> Result<String> {

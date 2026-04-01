@@ -245,6 +245,97 @@ Each agent in the chain has the same persistence behavior. If a middle agent
 loses its parent connection, it persists via UDS while maintaining its child
 relay. When the parent reconnects, the entire chain resumes.
 
+## PTY Input Buffering (RequestSender)
+
+A subtle data-loss scenario: the user types into a PTY right after WiFi drops
+but before the client detects the dead connection (~10s staleness window). The
+input goes to the old (stuck) channel and is lost when the transport swaps.
+
+**Fix**: `nexus_client::RequestSender` wraps the raw `mpsc::UnboundedSender<Request>`.
+Every `PtyInput` is automatically buffered with its `echo_epoch`. On reconnection,
+`swap_transport(new_tx, confirmed_epoch)` prunes inputs the agent already processed
+(via `last_echo_epoch` from `StdoutChunk`) and replays unconfirmed ones on the new
+channel.
+
+```
+Client types "ls\n"
+    │
+    ▼
+RequestSender.send(PtyInput { echo_epoch: 42, data: "ls\n" })
+    ├── forwards to mpsc channel (may be dead)
+    └── buffers { epoch: 42, data: "ls\n" }
+
+WiFi dies, reconnect happens:
+    │
+    ▼
+RequestSender.swap_transport(new_tx, confirmed_epoch: 41)
+    ├── prunes epochs ≤ 41
+    └── replays epoch 42 ("ls\n") on new channel
+```
+
+The `last_confirmed_epoch` is tracked in the event bridge from `StdoutChunk`
+responses — the agent piggybacks the highest echo epoch it has processed onto
+every stdout frame.
+
+This is implemented once in `nexus-client` and shared by both `nexus-ui` and
+the test harness.
+
+## Integration Test Harness
+
+The `nexus-test-harness` crate provides automated testing of the full
+client→SSH→agent pipeline against a real Docker container running SSH.
+
+### Architecture
+
+```
+cargo test -p nexus-test-harness
+    │
+    ▼
+TestEnv::start()
+    ├── docker run nexus-test-sshd (Ubuntu + OpenSSH)
+    ├── copies nexus-agent binary into container
+    └── exposes SSH on a random port
+
+TestClient::connect(&env)
+    ├── uses nexus_client::TransportHandle (same code as nexus-ui)
+    ├── Hello handshake, event bridge, ping loop
+    └── returns connected client with event stream
+```
+
+### Key Properties
+
+- **Shares real transport code**: `TestClient` uses `nexus_client::TransportHandle`,
+  `RequestSender`, and `reconnect_loop` — the same implementations as the real app.
+  A bug fix in `nexus-client` is automatically tested here.
+
+- **Network chaos simulation**: `TestEnv.network` can block/unblock SSH traffic
+  with iptables rules inside the container, simulating WiFi drops without killing
+  the SSH process.
+
+- **Full resume cycle**: Tests exercise `--attach` mode, UDS takeover, ring buffer
+  replay, and terminal snapshots against the real agent binary.
+
+### Test Slices
+
+| Slice | Tests | What it covers |
+|-------|-------|----------------|
+| slice1_infra | 1 | Container starts, SSH reachable |
+| slice2_happy_path | 3 | Connect, execute, pong heartbeat |
+| slice3_chaos | 3 | SSH kill, agent persistence, blackhole timeout |
+| slice4_resume | 7 | Resume after disconnect, PTY survival, output replay, CWD preservation, input-during-disconnect replay, 5-cycle stress test |
+
+### Running
+
+```bash
+cargo test -p nexus-test-harness          # all tests (~25s)
+cargo test -p nexus-test-harness slice4   # just resume tests
+```
+
+Requires Docker. The agent binary must be built first:
+```bash
+./scripts/build-agent.sh x86_64
+```
+
 ## What This Doesn't Handle
 
 - **Agent machine reboots**: The agent process dies. Fresh start required.
