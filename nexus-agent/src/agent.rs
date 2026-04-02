@@ -245,8 +245,10 @@ impl Agent {
         // Main request loop
         // =====================================================================
         loop {
-            // If we have an active relay, enter relay mode
+            // If we have an active relay, reconnect its forwarder to the new parent writer
+            // and enter relay mode
             if let Some(mut active_relay) = self.active_relay.take() {
+                active_relay.reconnect_parent(writer.clone());
                 let exit = Self::relay_loop(
                     &mut reader,
                     &mut active_relay.child_writer,
@@ -259,6 +261,10 @@ impl Agent {
                     &self.instance_id,
                     &cancel,
                     self.read_timeout_secs,
+                    self.session_token,
+                    &ring_buffer,
+                    &next_seq,
+                    &self.pty_manager,
                 )
                 .await;
 
@@ -269,7 +275,8 @@ impl Agent {
                         // Fall through to normal dispatch
                     }
                     RelayExit::ParentDisconnected => {
-                        // Relay stays alive for reconnection
+                        // Stop forwarding to dead parent but keep child alive
+                        active_relay.disconnect_parent();
                         self.active_relay = Some(active_relay);
                         break;
                     }
@@ -498,19 +505,26 @@ impl Agent {
                             if let Some(pid) = child.id() {
                                 self.pty_manager.tokio_pids().lock().unwrap().insert(pid);
                             }
+                            // Create swappable parent sender + initial forwarder
+                            let parent_sender: relay::ParentFrameSender =
+                                Arc::new(std::sync::Mutex::new(None));
                             let (reader_task, child_lost_rx) = relay::start_relay_reader(
                                 child_reader,
-                                writer.clone(),
+                                parent_sender.clone(),
                                 credits.clone(),
                                 next_seq.clone(),
                                 ring_buffer.clone(),
                             );
-                            self.active_relay = Some(ActiveRelay {
+                            let mut active = ActiveRelay {
                                 child,
                                 child_writer,
                                 reader_task,
                                 child_lost_rx,
-                            });
+                                parent_sender,
+                                forwarder_task: None,
+                            };
+                            active.reconnect_parent(writer.clone());
+                            self.active_relay = Some(active);
                             let resp = Response::NestOk { id, env };
                             let mut w = writer.lock().await;
                             try_write!(w.write(&resp, resp.priority()));
@@ -597,6 +611,10 @@ impl Agent {
         instance_id: &str,
         cancel: &tokio_util::sync::CancellationToken,
         read_timeout_secs: u64,
+        session_token: Option<[u8; 16]>,
+        ring_buffer: &Arc<tokio::sync::Mutex<RingBuffer>>,
+        next_seq: &Arc<AtomicU64>,
+        pty_manager: &crate::pty::PtyManager,
     ) -> RelayExit
     where
         R: AsyncRead + Unpin,
@@ -659,6 +677,96 @@ impl Agent {
                                 // Child write failed — will be caught by child_lost_rx
                                 continue;
                             }
+                        }
+                        Request::Resume {
+                            session_token: tok,
+                            last_seen_seq,
+                            cols,
+                            rows,
+                        } => {
+                            // Resume is for THIS agent, not the child.
+                            // Validate token and replay ring buffer.
+                            if session_token != Some(tok) {
+                                let resp = Response::Error {
+                                    id: 0,
+                                    message: "Invalid session token".into(),
+                                };
+                                let mut w = parent_writer.lock().await;
+                                let _ = w.write(&resp, resp.priority()).await;
+                                continue;
+                            }
+
+                            if cols > 0 && rows > 0 {
+                                *viewport_cols = cols;
+                                *viewport_rows = rows;
+                            }
+
+                            // Replay buffered events
+                            {
+                                let rb = ring_buffer.lock().await;
+                                let frames = rb.replay_since(last_seen_seq);
+                                let oldest = rb.oldest_seq();
+                                let events_lost = last_seen_seq > 0 && oldest > 0 && last_seen_seq < oldest;
+                                tracing::debug!(
+                                    "relay resume replay: last_seen_seq={last_seen_seq}, oldest={oldest}, frames={}",
+                                    frames.len()
+                                );
+                                let mut w = parent_writer.lock().await;
+                                for payload in frames {
+                                    let _ = w.write_raw_flagged(payload, priority::INTERACTIVE, FLAG_EVENT).await;
+                                }
+
+                                // Send PTY snapshots for any local active sessions
+                                let active_blocks = pty_manager.active_block_ids();
+                                {
+                                    let mut w = parent_writer.lock().await;
+                                    for &block_id in &active_blocks {
+                                        if let Some(snap) = pty_manager.snapshot(block_id).await {
+                                            let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                                            let snapshot_event = ShellEvent::TerminalSnapshot {
+                                                block_id,
+                                                grid: snap.grid,
+                                                alt_screen: snap.alt_screen,
+                                                app_cursor: snap.app_cursor,
+                                                bracketed_paste: snap.bracketed_paste,
+                                            };
+                                            let resp = Response::Event { seq, event: snapshot_event };
+                                            let _ = w.write(&resp, priority::INTERACTIVE).await;
+
+                                            if !snap.scrollback.is_empty() {
+                                                let seq = next_seq.fetch_add(1, Ordering::Relaxed);
+                                                let scrollback_event = ShellEvent::ScrollbackHistory {
+                                                    block_id,
+                                                    cells: snap.scrollback,
+                                                    cols: snap.scrollback_cols,
+                                                };
+                                                let resp = Response::Event { seq, event: scrollback_event };
+                                                let _ = w.write(&resp, priority::INTERACTIVE).await;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Send SessionState
+                                let env = Self::collect_env_info_static(instance_id).await;
+                                let resp = Response::SessionState {
+                                    token: tok,
+                                    env,
+                                    active_blocks,
+                                    events_lost,
+                                };
+                                let _ = w.write(&resp, resp.priority()).await;
+                            }
+                        }
+                        Request::Hello { .. } => {
+                            // Hello on a relay session means the client lost state.
+                            // Reject — they should use Resume.
+                            let resp = Response::Error {
+                                id: 0,
+                                message: "session already active, use Resume".into(),
+                            };
+                            let mut w = parent_writer.lock().await;
+                            let _ = w.write(&resp, resp.priority()).await;
                         }
                         Request::Shutdown => {
                             // Forward to child, then exit
@@ -870,6 +978,17 @@ impl Agent {
                     "Command panicked (unknown error)".to_string()
                 };
                 tracing::error!("{error_msg}");
+
+                // Emit CommandFinished so the client doesn't hang forever
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async {
+                    let k = kernel.lock().await;
+                    let _ = k.event_sender().send(ShellEvent::CommandFinished {
+                        block_id,
+                        exit_code: 1,
+                        duration_ms: 0,
+                    });
+                });
             }
         });
     }

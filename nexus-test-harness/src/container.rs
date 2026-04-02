@@ -22,6 +22,8 @@ pub struct TestEnv {
     pub ssh_key: PathBuf,
     pub network: NetworkControl,
     agent_logs: Option<String>,
+    /// If this env was created on a Docker network, clean it up on drop.
+    docker_network: Option<String>,
 }
 
 impl TestEnv {
@@ -61,6 +63,7 @@ impl TestEnv {
             ssh_port,
             ssh_key,
             agent_logs: None,
+            docker_network: None,
         };
 
         // Wait for sshd to accept connections
@@ -73,6 +76,129 @@ impl TestEnv {
         env.network.shrink_tcp_timeouts().await;
 
         Ok(env)
+    }
+
+    /// Start a pair of test environments on a shared Docker network.
+    ///
+    /// Container A can SSH to container B using the test key. The SSH private
+    /// key is installed in container A, and container B's host key is accepted.
+    /// Both containers have the agent binary deployed.
+    ///
+    /// The Docker network is owned by `env_a` and cleaned up when it is dropped.
+    pub async fn start_pair() -> Result<(Self, Self)> {
+        Self::ensure_image_built()?;
+
+        // Create a Docker network for the pair
+        let net_name = format!("{}net-{}", CONTAINER_PREFIX, uuid_short());
+        run_cmd("docker", &["network", "create", &net_name])?;
+
+        // Start both containers on the network
+        let start_on_net = |alias: &str, net: &str| -> Result<(String, u16)> {
+            let name = format!("{}{}", CONTAINER_PREFIX, uuid_short());
+            let container_id = run_cmd(
+                "docker",
+                &[
+                    "run", "-d",
+                    "--cap-add", "NET_ADMIN",
+                    "--network", net,
+                    "--network-alias", alias,
+                    "-p", "0:22",
+                    "--name", &name,
+                    IMAGE_NAME,
+                ],
+            )?;
+            let container_id = container_id.trim().to_string();
+            let port_str = run_cmd("docker", &["port", &container_id, "22"])?;
+            let ssh_port = parse_docker_port(&port_str)
+                .context("failed to parse Docker port mapping")?;
+            Ok((container_id, ssh_port))
+        };
+
+        let (id_a, port_a) = start_on_net("agent-a", &net_name)?;
+        let (id_b, port_b) = start_on_net("agent-b", &net_name)?;
+
+        let ssh_key = docker_dir().join("id_test");
+
+        let mut env_a = Self {
+            network: NetworkControl::new(id_a.clone()),
+            container_id: id_a,
+            ssh_port: port_a,
+            ssh_key: ssh_key.clone(),
+            agent_logs: None,
+            docker_network: Some(net_name), // env_a owns the network
+        };
+        let mut env_b = Self {
+            network: NetworkControl::new(id_b.clone()),
+            container_id: id_b,
+            ssh_port: port_b,
+            ssh_key,
+            agent_logs: None,
+            docker_network: None, // env_b does NOT own the network
+        };
+
+        // Wait for both SSHd instances
+        env_a.wait_for_ssh(Duration::from_secs(10)).await?;
+        env_b.wait_for_ssh(Duration::from_secs(10)).await?;
+
+        // Deploy agent to both
+        env_a.deploy_agent().await?;
+        env_b.deploy_agent().await?;
+
+        // Shrink TCP timeouts
+        env_a.network.shrink_tcp_timeouts().await;
+        env_b.network.shrink_tcp_timeouts().await;
+
+        // Deploy agent at the nesting path (~/.nexus/agent-{PROTOCOL_VERSION})
+        // in container B so agent A's auto-deploy skips the arch check.
+        let proto_ver = nexus_protocol::PROTOCOL_VERSION;
+        env_b
+            .docker_exec(&format!(
+                "cp /home/testuser/.nexus/nexus-agent /home/testuser/.nexus/agent-{proto_ver} && \
+                 chmod +x /home/testuser/.nexus/agent-{proto_ver} && \
+                 chown testuser:testuser /home/testuser/.nexus/agent-{proto_ver}"
+            ))
+            .await?;
+
+        // Install SSH private key in container A so agent A can SSH to B
+        let key_src = docker_dir().join("id_test");
+        run_cmd(
+            "docker",
+            &[
+                "cp",
+                key_src.to_str().unwrap(),
+                &format!("{}:/home/testuser/.ssh/id_test", env_a.container_id),
+            ],
+        )?;
+        env_a
+            .docker_exec("chown testuser:testuser /home/testuser/.ssh/id_test && chmod 600 /home/testuser/.ssh/id_test")
+            .await?;
+
+        // Install an ssh_config so agent A connects to B without host key prompts
+        // and also install openssh-client so agent A has the `ssh` command
+        env_a.docker_exec("apk add --no-cache openssh-client >/dev/null 2>&1").await?;
+        env_a
+            .docker_exec(
+                "cat > /home/testuser/.ssh/config << 'SSHEOF'\n\
+                 Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  IdentityFile /home/testuser/.ssh/id_test\n  LogLevel ERROR\n\
+                 SSHEOF\n\
+                 chown testuser:testuser /home/testuser/.ssh/config && chmod 600 /home/testuser/.ssh/config",
+            )
+            .await?;
+
+        Ok((env_a, env_b))
+    }
+
+    /// Get the container's IP address on the Docker network.
+    pub async fn container_ip(&self) -> Result<String> {
+        let ip = self
+            .docker_exec("hostname -i")
+            .await?
+            .trim()
+            .to_string();
+        if ip.is_empty() {
+            anyhow::bail!("failed to get container IP");
+        }
+        Ok(ip)
     }
 
     /// Wait until we can establish an SSH connection.
@@ -237,6 +363,12 @@ impl Drop for TestEnv {
         let _ = Command::new("docker")
             .args(["rm", "-f", &self.container_id])
             .output();
+        // Clean up Docker network if we own it
+        if let Some(ref net) = self.docker_network {
+            let _ = Command::new("docker")
+                .args(["network", "rm", net])
+                .output();
+        }
     }
 }
 

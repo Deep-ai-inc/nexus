@@ -286,6 +286,18 @@ impl TestClient {
         });
     }
 
+    /// Send a Nest request to enter relay mode (agent chains to a deeper level).
+    /// Returns the request ID for matching the NestOk response.
+    pub fn nest(&mut self, transport: Transport) -> u32 {
+        let id = self.next_id();
+        self.send(Request::Nest {
+            id,
+            transport,
+            force_redeploy: false,
+        });
+        id
+    }
+
     /// Send input to a remote PTY (buffered for reconnect replay via RequestSender).
     pub fn pty_input(&mut self, block_id: nexus_api::BlockId, data: &[u8]) {
         self.next_echo_epoch += 1;

@@ -23,10 +23,21 @@ use nexus_protocol::messages::{EnvInfo, Request, Response, Transport};
 use nexus_protocol::{priority, ClientCaps, PROTOCOL_VERSION};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{oneshot, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::session::RingBuffer;
+
+/// A frame to be forwarded from relay child to parent.
+pub(crate) struct RelayFrame {
+    pub data: Vec<u8>,
+    pub priority: u8,
+    pub flags: u8,
+}
+
+/// Swappable sender for child→parent frames.
+/// Set to None when parent disconnects; replaced with a new sender on reconnect.
+pub(crate) type ParentFrameSender = Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<RelayFrame>>>>;
 
 /// Active relay state. Stored in Agent struct, survives parent disconnects.
 pub(crate) struct ActiveRelay {
@@ -34,22 +45,62 @@ pub(crate) struct ActiveRelay {
     pub child: Child,
     /// Writer to the child's stdin (for forwarding requests).
     pub child_writer: FrameWriter<ChildStdin>,
-    /// Background task reading child stdout and forwarding to parent.
+    /// Background task reading child stdout and forwarding via parent_sender.
     pub reader_task: JoinHandle<()>,
     /// Fires when the child dies or its pipe closes.
     pub child_lost_rx: oneshot::Receiver<String>,
+    /// Swappable sender for routing child frames to the current parent writer.
+    /// On parent disconnect, set to None. On reconnect, set to a new sender
+    /// whose receiver is consumed by a forwarding task writing to the new parent.
+    pub parent_sender: ParentFrameSender,
+    /// Handle to the current forwarding task (writes relay frames to parent).
+    /// Aborted and replaced on reconnect.
+    pub forwarder_task: Option<JoinHandle<()>>,
 }
 
 impl ActiveRelay {
-    /// Clean up the relay: kill the child and abort the reader task.
+    /// Clean up the relay: kill the child and abort tasks.
     /// Unregisters the child PID from the Tokio-managed set.
     pub async fn cleanup(mut self, tokio_pids: &std::sync::Mutex<std::collections::HashSet<u32>>) {
         if let Some(pid) = self.child.id() {
             tokio_pids.lock().unwrap().remove(&pid);
         }
         self.reader_task.abort();
+        if let Some(fwd) = self.forwarder_task.take() {
+            fwd.abort();
+        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+    }
+
+    /// Disconnect from parent: stop forwarding but keep child alive.
+    pub fn disconnect_parent(&mut self) {
+        *self.parent_sender.lock().unwrap() = None;
+        if let Some(fwd) = self.forwarder_task.take() {
+            fwd.abort();
+        }
+    }
+
+    /// Reconnect to a new parent writer: create a new forwarding channel and task.
+    pub fn reconnect_parent<W>(&mut self, parent_writer: Arc<Mutex<FrameWriter<W>>>)
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayFrame>();
+        *self.parent_sender.lock().unwrap() = Some(tx);
+
+        let fwd_writer = parent_writer;
+        self.forwarder_task = Some(tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let mut w = fwd_writer.lock().await;
+                if w.write_raw_flagged(&frame.data, frame.priority, frame.flags)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
     }
 }
 
@@ -120,20 +171,21 @@ pub(crate) async fn spawn_and_handshake(
 
 /// Spawn the relay reader task.
 ///
-/// Reads frames from the child, rewrites Event seq numbers inside the writer lock,
-/// and forwards everything to the parent. Non-event frames are forwarded as raw bytes
-/// without deserialization.
+/// Reads frames from the child, rewrites Event seq numbers, pushes to ring
+/// buffer, and forwards to the parent via the swappable `parent_sender`.
 ///
-/// Returns a join handle and a oneshot receiver that fires when the child dies.
-pub(crate) fn start_relay_reader<W>(
+/// The reader task survives parent disconnections — when the parent_sender
+/// is None, events are still pushed to the ring buffer (for resume replay)
+/// but not forwarded. On reconnect, the caller sets a new sender.
+///
+/// Returns the task handle, child_lost receiver, and the swappable sender.
+pub(crate) fn start_relay_reader(
     mut child_reader: FrameReader<ChildStdout>,
-    parent_writer: Arc<Mutex<FrameWriter<W>>>,
+    parent_sender: ParentFrameSender,
     credits: Arc<Semaphore>,
     next_seq: Arc<AtomicU64>,
     ring_buffer: Arc<tokio::sync::Mutex<RingBuffer>>,
 ) -> (JoinHandle<()>, oneshot::Receiver<String>)
-where
-    W: AsyncWrite + Unpin + Send + 'static,
 {
     let (child_lost_tx, child_lost_rx) = oneshot::channel();
 
@@ -144,10 +196,9 @@ where
                 Ok((child_priority, flags)) => {
                     // Credit-gate non-control frames
                     if child_priority > priority::CONTROL {
-                        // acquire_many panics on 0, and we want to block on credits
                         let size = buf.len().max(1) as u32;
                         match credits.acquire_many(size).await {
-                            Ok(permit) => permit.forget(), // consumed
+                            Ok(permit) => permit.forget(),
                             Err(_) => break "credit semaphore closed".to_string(),
                         }
                     }
@@ -166,16 +217,18 @@ where
                             Response::Event { event, .. } => event,
                             _ => {
                                 // FLAG_EVENT set but not an Event? Forward as-is.
-                                let mut w = parent_writer.lock().await;
-                                if w.write_raw(&buf, child_priority).await.is_err() {
-                                    break "parent write failed".to_string();
+                                let tx = parent_sender.lock().unwrap().clone();
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(RelayFrame {
+                                        data: buf.clone(),
+                                        priority: child_priority,
+                                        flags,
+                                    });
                                 }
                                 continue;
                             }
                         };
 
-                        // Assign seq INSIDE writer lock — guarantees wire order = seq order
-                        let mut w = parent_writer.lock().await;
                         let new_seq = next_seq.fetch_add(1, Ordering::Relaxed);
                         let rewritten = Response::Event {
                             seq: new_seq,
@@ -189,25 +242,30 @@ where
                             }
                         };
 
-                        // Push to ring buffer for resume replay
-                        {
-                            ring_buffer
-                                .lock()
-                                .await
-                                .push_raw(new_seq, encoded.clone());
-                        }
-
-                        if w.write_raw_flagged(&encoded, priority::INTERACTIVE, FLAG_EVENT)
+                        // Always push to ring buffer (survives parent disconnect)
+                        ring_buffer
+                            .lock()
                             .await
-                            .is_err()
-                        {
-                            break "parent write failed".to_string();
+                            .push_raw(new_seq, encoded.clone());
+
+                        // Forward to parent if connected
+                        let tx = parent_sender.lock().unwrap().clone();
+                        if let Some(tx) = tx {
+                            let _ = tx.send(RelayFrame {
+                                data: encoded,
+                                priority: priority::INTERACTIVE,
+                                flags: FLAG_EVENT,
+                            });
                         }
                     } else {
                         // Non-event: forward raw without decode
-                        let mut w = parent_writer.lock().await;
-                        if w.write_raw(&buf, child_priority).await.is_err() {
-                            break "parent write failed".to_string();
+                        let tx = parent_sender.lock().unwrap().clone();
+                        if let Some(tx) = tx {
+                            let _ = tx.send(RelayFrame {
+                                data: buf.clone(),
+                                priority: child_priority,
+                                flags,
+                            });
                         }
                     }
                 }
