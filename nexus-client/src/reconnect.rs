@@ -89,6 +89,12 @@ pub async fn reconnect_loop_with_delays(
         forwarded_env,
     } = params;
 
+    // Track consecutive transport-level Resume failures. If Resume keeps
+    // failing with transport errors (not token rejections), eventually give
+    // up and fall through to fresh Hello — the agent is probably truly dead.
+    let mut consecutive_transport_failures: usize = 0;
+    const MAX_RESUME_TRANSPORT_RETRIES: usize = 3;
+
     for (attempt, &delay_secs) in delays.iter().enumerate() {
         // Wait before attempt (cancellable)
         tokio::select! {
@@ -137,11 +143,34 @@ pub async fn reconnect_loop_with_delays(
                 });
             }
             Err(e) => {
-                tracing::info!("resume failed (expected if agent restarted): {e}");
+                let msg = format!("{e}");
+                // Only fall through to fresh Hello if the agent explicitly
+                // rejected our token (meaning it restarted and has a new
+                // session). Transport-level failures (connection closed,
+                // SSH timeout, pipe broken) should be retried as Resume —
+                // the agent may still be alive but we got a stale pipe
+                // (e.g. laptop slept, SSH established before sleep died).
+                let is_token_rejection = msg.contains("Invalid session token")
+                    || msg.contains("session already active");
+                if is_token_rejection {
+                    tracing::info!("resume rejected by agent: {e}");
+                    consecutive_transport_failures = 0;
+                } else {
+                    consecutive_transport_failures += 1;
+                    if consecutive_transport_failures <= MAX_RESUME_TRANSPORT_RETRIES {
+                        tracing::info!(
+                            "resume failed (transport error {consecutive_transport_failures}/{MAX_RESUME_TRANSPORT_RETRIES}, will retry): {e}"
+                        );
+                        continue; // retry Resume on next attempt
+                    }
+                    tracing::info!(
+                        "resume failed {consecutive_transport_failures} times, falling back to fresh connect: {e}"
+                    );
+                }
             }
         }
 
-        // Phase 2: Fall back to fresh Hello (agent restarted → orphan cleanup on caller side)
+        // Phase 2: Fall back to fresh Hello (agent rejected token → it restarted)
         let connect_future = TransportHandle::connect(
             &transport,
             &agent_path,

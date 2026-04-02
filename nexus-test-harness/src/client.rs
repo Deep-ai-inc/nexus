@@ -172,19 +172,24 @@ impl TestClient {
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let (handle, env_info, request_tx, session_token) = match outcome {
+        let (handle, env_info, request_tx, session_token, was_fresh) = match outcome {
             nexus_client::ReconnectOutcome::Resumed {
                 handle,
                 env,
                 request_tx,
-            } => (handle, env, request_tx, session_token),
+            } => (handle, env, request_tx, session_token, false),
             nexus_client::ReconnectOutcome::FreshConnect {
                 handle,
                 env,
                 session_token: new_token,
                 request_tx,
-            } => (handle, env, request_tx, new_token),
+            } => (handle, env, request_tx, new_token, true),
         };
+        if was_fresh {
+            tracing::info!("reconnect_with_retry: fell through to fresh Hello");
+        } else {
+            tracing::info!("reconnect_with_retry: resumed existing session");
+        }
 
         Ok(Self {
             env: env_info,

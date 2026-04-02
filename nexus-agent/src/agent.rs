@@ -64,6 +64,8 @@ pub struct Agent {
     /// IDs of file reads that have been cancelled by the client.
     /// Checked by spawned file-read tasks on each chunk iteration.
     cancelled_reads: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
+    /// IDs of file reads currently in flight.
+    active_reads: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
     /// Active relay to a nested child agent (persists across disconnects).
     active_relay: Option<ActiveRelay>,
     /// Environment variables forwarded from the client (for nesting).
@@ -134,6 +136,7 @@ impl Agent {
             session_token: None,
             credits: Arc::new(Semaphore::new(0)),
             cancelled_reads: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            active_reads: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             active_relay: None,
             forwarded_env: HashMap::new(),
         })
@@ -429,7 +432,12 @@ impl Agent {
                 }
 
                 Request::CancelFileRead { id } => {
-                    self.cancelled_reads.lock().unwrap().insert(id);
+                    let mut cr = self.cancelled_reads.lock().unwrap();
+                    // Only insert if the read is still active; otherwise
+                    // the task already finished and won't clean up the ID.
+                    if self.active_reads.lock().unwrap().contains(&id) {
+                        cr.insert(id);
+                    }
                 }
 
                 Request::FileRead {
@@ -440,6 +448,8 @@ impl Agent {
                 } => {
                     let writer = writer.clone();
                     let cancelled = self.cancelled_reads.clone();
+                    let active = self.active_reads.clone();
+                    active.lock().unwrap().insert(id);
                     tokio::spawn(async move {
                         if let Err(e) =
                             Self::handle_file_read_task(id, &path, offset, len, &writer, &cancelled)
@@ -447,6 +457,7 @@ impl Agent {
                         {
                             tracing::error!("file read error (id={id}): {e}");
                         }
+                        active.lock().unwrap().remove(&id);
                         cancelled.lock().unwrap().remove(&id);
                     });
                 }
