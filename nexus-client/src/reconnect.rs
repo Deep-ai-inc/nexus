@@ -93,7 +93,14 @@ pub async fn reconnect_loop_with_delays(
     // failing with transport errors (not token rejections), eventually give
     // up and fall through to fresh Hello — the agent is probably truly dead.
     let mut consecutive_transport_failures: usize = 0;
-    const MAX_RESUME_TRANSPORT_RETRIES: usize = 3;
+    const MAX_RESUME_TRANSPORT_RETRIES: usize = 8;
+
+    // Per-attempt timeout: caps how long a single SSH+handshake can take.
+    // Must be long enough for large scrollback replays (1000+ rows) to
+    // complete after SSH connects. SSH itself has ConnectTimeout=10, so
+    // this mainly guards against frozen processes from laptop sleep.
+    // Child processes use kill_on_drop(true) so they're cleaned up on timeout.
+    const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     for (attempt, &delay_secs) in delays.iter().enumerate() {
         // Wait before attempt (cancellable)
@@ -126,7 +133,15 @@ pub async fn reconnect_loop_with_delays(
         );
 
         let resume_result = tokio::select! {
-            res = resume_future => res,
+            res = tokio::time::timeout(ATTEMPT_TIMEOUT, resume_future) => {
+                match res {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        tracing::warn!("resume attempt {} timed out after {}s", attempt + 1, ATTEMPT_TIMEOUT.as_secs());
+                        Err(anyhow::anyhow!("attempt timed out"))
+                    }
+                }
+            },
             _ = cancel.cancelled() => {
                 tracing::info!("reconnect cancelled during resume attempt");
                 return Err(ReconnectError::Cancelled);
@@ -179,7 +194,15 @@ pub async fn reconnect_loop_with_delays(
         );
 
         let connect_result = tokio::select! {
-            res = connect_future => res,
+            res = tokio::time::timeout(ATTEMPT_TIMEOUT, connect_future) => {
+                match res {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        tracing::warn!("fresh connect attempt {} timed out after {}s", attempt + 1, ATTEMPT_TIMEOUT.as_secs());
+                        Err(anyhow::anyhow!("attempt timed out"))
+                    }
+                }
+            },
             _ = cancel.cancelled() => {
                 tracing::info!("reconnect cancelled during fresh connect attempt");
                 return Err(ReconnectError::Cancelled);

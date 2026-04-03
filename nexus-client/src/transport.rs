@@ -179,7 +179,8 @@ impl TransportHandle {
                 }
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
                 cmd.spawn()?
             }
             Transport::Docker { container, user } => {
@@ -195,7 +196,8 @@ impl TransportHandle {
                 }
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
                 cmd.spawn()?
             }
             Transport::Kubectl {
@@ -217,7 +219,8 @@ impl TransportHandle {
                 }
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
                 cmd.spawn()?
             }
             Transport::Command { argv } => {
@@ -233,7 +236,8 @@ impl TransportHandle {
                 }
                 cmd.stdin(Stdio::piped())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
                 cmd.spawn()?
             }
         };
